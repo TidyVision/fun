@@ -1,0 +1,682 @@
+twinspeak v6.5.7 -- the 500 MICROSECOND PUMP build (one audio-thread change)
+============================================
+
+What changed in v6.5.7 (nothing in the sample path)
+---------------------------------------------------
+Field report: "it's something that doesn't resemble a chime."
+
+The audio-thread inspection, on the record:
+
+  * WHERE THE NON-CHIME BEEP LIVES: bufferSwitchFill()'s shortfall
+    path. When the out ring cannot fill a device buffer switch, the
+    engine follows the ASIO underrun convention and fills the gap by
+    LOOPING the last played fragment (replayFill: lastBlock,
+    i % lastN -- up to kReplayMaxPeriods = 4 periods, ~16 ms at
+    outXms = 4). Looping a short fragment of TONAL program audio
+    synthesizes a buzzy tone at the fragment repeat rate (~60-250 Hz
+    plus the fragment's own content) -- a beep that is literally made
+    of the program audio, which is why it does not resemble the chime,
+    and it "resolves afterward" because it ends the moment the ring
+    refills. The same filler runs the drift warden's in-place pad.
+
+  * WHAT FEEDS IT: the pump tick. Both pump threads (and the KS
+    pacing thread) drained on a PERIODIC 1 ms waitable timer. Every
+    buffer switch therefore had to survive up to one millisecond of
+    pump-refill jitter plus the pump's own body time.
+
+  * THE FIX (user directive: "the speed interval ... 500 microseconds,
+    yeah, the very minimum"): a periodic SetWaitableTimer cannot go
+    below 1 ms -- lPeriod is whole milliseconds. So the high-res
+    timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION was already in use)
+    now runs ONE-SHOT with a relative due time of -5000 (100-ns
+    units = 500 us, lPeriod = 0) and is RE-ARMED at the top of every
+    cycle / every KS slack sleep. 0.5 ms is the minimum the OS
+    honors; the high-resolution flag is what makes it real (without
+    it the expiry coalesces to the scheduler tick). The KS slack
+    threshold moved with it: sleep only when > 0.5 ms of slack
+    (kSampleRate / 2000), timeout 2 ms.
+
+  * COST: the pumps now wake at 2 kHz instead of 1 kHz -- trivial
+    memcpy bursts each wake (drain-to-empty loop), a fraction of a
+    percent of a core on the v6.5-optimized path. The KS thread
+    polls at 2 kHz only while it has slack to burn.
+
+  * NOTE: an interim v6.5.6 (watchdog_ms / reopen_chime ini keys,
+    the chime diagnosis) was WITHDRAWN -- it did not match the ear.
+    Its full source archive ships beside this build unchanged for
+    anyone who wants those keys back.
+
+The replay/shortfall rules, the rings, the gates, the bit-exact
+guarantee: untouched. Version resource 6.5.7.0.
+
+
+twinspeak v6.5.5 -- the FACE build (icon + Task Manager name)
+============================================
+
+What changed in v6.5.5 (nothing in the audio path)
+--------------------------------------------------
+Field directive: "I want an idea for an icon for it, and that the task
+manager names the program TwinSpeak."
+
+  * ICON: twinspeak.exe ships a multi-size icon (256/128/64/48/32/24/16),
+    concept "one voice, twin speakers" -- a white waveform enters a dark
+    tile, forks at a node into two IDENTICAL mirrored legs, each ending
+    in a speaker driver; cyan = the mains leg (out1), amber = the voice
+    leg (out2). The .ico also ships beside the exe for desktop
+    shortcuts; the generator (scripts/make_icon_v655.py in the source
+    kit) re-renders it from scratch.
+
+  * VERSIONINFO: the exe now carries a version resource, so Task Manager
+    calls it "TwinSpeak" (FileDescription) instead of the bare image
+    name; Explorer > Properties > Details shows ProductName "TwinSpeak",
+    FileVersion/ProductVersion 6.5.5.0, OriginalFilename twinspeak.exe.
+
+  * BUILD: build.sh compiles twinspeak.rc (icon + VERSIONINFO; windows.h
+    not required) and links the resource object into the exe -- zig rc on
+    the pip-zig path, windres -O coff on an llvm-mingw path. Engine
+    sources otherwise unchanged: zero audio-path deltas, same flags,
+    same static CRT, same single file.
+
+
+twinspeak v6.5.4 -- the PLACEMENT PULLED build
+============================================
+
+What changed in v6.5.4 (v6.5.3's CPU placement is gone)
+-------------------------------------------------------
+Field verdict: "Turns out it was from the cpu affinity." The v6.5.3
+placement layer got field-tested and the pin was PROVEN to be the glitch
+source. The engineering post-mortem, for the record:
+
+  * A deadline-spin realtime engine wants the scheduler's FULL core
+    inventory. The KS thread's final-stretch YieldProcessor spin is a
+    latency optimization that silently assumes a free neighbor core
+    exists; pin every thread to 2 cores and the spin now runs against
+    the very pumps and capture thread that need those cycles.
+  * An MMCSS-boosted audiodg.exe (Pro Audio, priority ~23) on the same
+    pair outranks twinspeak's time-critical-15 threads; on disjoint
+    cores that is irrelevant, on SHARED cores it is a fight twinspeak
+    audibly loses.
+  * Windows' scheduler across all 6 cores was the better placing agent
+    all along -- v6.5.2's free-roaming was glitch-free for months.
+
+Removed entirely: cpu_affinity, priority, applyCpuPlacement, the
+process-wide mask, the banner's placement lines, the pumpThread
+class-aware notch, the ini template section. Exact v6.5.2 scheduling
+returns; the engine otherwise unchanged from v6.5.3 (power guard stays).
+
+Note: the ini parser silently ignores unknown keys, so an ini that still
+carries cpu_affinity/priority lines keeps working untouched -- no need
+to edit it. audiodg.exe placement remains a Process Lasso concern,
+outside twinspeak entirely.
+
+
+twinspeak v6.5.3 -- the CPU PLACEMENT build
+==========================================
+
+What changed in v6.5.3 (pin the engine to your audio cores)
+-----------------------------------------------------------
+Field directive: "how optimized is this, actually? ... I want to also ensure
+it runs on the last two threads of my cpu, same going with audiodg.exe which
+I have modified affinity and priority properties of on process lasso."
+
+The honest audit first: the realtime internals were already there -- MMCSS
+"Pro Audio" registration + THREAD_PRIORITY_TIME_CRITICAL on every pump and
+device thread (v3.8), FTZ/DAZ denormal guards on every realtime thread
+(v6.5), high-resolution waitable timers with a deliberate YieldProcessor
+spin only at the KS deadline, lock-free CAS rings with wrap-aware bulk
+memcpys (v6.5), and -O3 -march=x86-64-v3 with -ffp-contract=off so nothing
+can bend the bit-exact path. What was missing: CPU PLACEMENT. The Windows
+scheduler was free to roam all ~8 threads across all cores -- racing the
+desktop's threads and DPCs, going cache-cold on every migration, and
+sharing the core that hosts the KS deadline spin with anything Windows
+decided to run there.
+
+The fix is two ini keys, applied in main() BEFORE any audio thread exists:
+
+1. cpu_affinity -- SetProcessAffinityMask for the whole process. Accepted:
+   last:N (the N highest logical CPUs; last:2 on a 6-thread i5-8400 = CPUs
+   4-5, mask 0x30), explicit lists "4,5", inclusive ranges "4-5", raw masks
+   "0x30", or off. Requested CPUs outside the system affinity are clamped
+   and the banner says so. Default: off (exact v6.5.2 behavior).
+2. priority -- SetPriorityClass: normal / above_normal / high / realtime /
+   off. The audio threads were already time-critical on their own; high
+   lifts the REST of the process (health loop, watchers, reopen logic).
+   One interaction handled: in the HIGH class HIGHEST == TIME_CRITICAL ==
+   15, which would have silently ERASED the out2_first notch -- so in that
+   class the mains pump takes ABOVE_NORMAL (11) instead. REALTIME prints a
+   caution: it can starve the USB stack; high is the sane class here.
+
+The shipped twinspeak.ini sets cpu_affinity = last:2 + priority = high
+(audiodg.exe via Process Lasso on the same two cores = the whole audio
+chain on dedicated silicon). The banner reports both on every start
+("cpu placement :" / "priority :" lines). generate_ini.bat does not emit
+these keys (the default -- off -- covers any ini without them).
+
+Build recipe unchanged (v6.5 flags): -O3 -ffp-contract=off -std=c++17
+-march=x86-64-v3, zero warnings.
+
+
+twinspeak v6.5.2 -- the POWER GUARD build
+=========================================
+
+What changed in v6.5.2 (sleep / Modern-Standby survival)
+--------------------------------------------------------
+Field report: "It eventually starts acting up whenever I let my computer
+sleep" + a 4-hour health log from the M720Q. The log catches the whole
+failure:
+
+  line ~1345 : first excess drops (288 fr, then 576 fr) -- the machine is
+               degrading into sleep; the S5 stops consuming at the real rate
+  line ~1433 : the break. leg2's device thread KEEPS TICKING but consumes at
+               ~42% of the cable's rate (off +1,345,794 ppm). The out2 ring
+               stuffs to 85 ms, ~572 ms/s is passively evicted (drop
+               +27456/s), and the gated drop + the drift warden fight a
+               limit cycle they can never win. out1 (Realtek) is flawless
+               through all of it -- the damage is exclusively the USB leg.
+  the tail   : hours of audible glitching; the heartbeat watchdog is
+               STRUCTURALLY BLIND because the callback thread never went
+               silent, so nothing ever reopened the leg.
+
+v6.5.1 was faultless while devices behave; nothing in it handled a
+half-alive device. The fix is the POWER GUARD (power_guard = on, default):
+
+1. WM_POWERBROADCAST on a hidden top-level window (a message-only HWND
+   would never receive broadcasts). PBT_APMSUSPEND parks the pumps -- no
+   more data into a device the OS is taking away -- and suppresses the
+   watchdog (no reopen storms mid-suspend). The resume pair (RESUMEAUTOMATIC
+   / RESUMESUSPEND) clears the park; the health loop then rebuilds the
+   capture pin AND BOTH LEGS from scratch, replays the startup chime, and
+   resets the warden/hint state. A post-sleep stream is never trusted.
+
+2. A consumption-collapse sentinel: a healthy 48 kHz link never leaves
+   +-10% (the same log's worst HEALTHY wobble was +-4000 ppm). Two
+   consecutive 1-s windows beyond that triggers a fix, branched by sign
+   (per-leg 10 s cooldown, 30 s boot grace): a POSITIVE collapse -- the
+   device under-consumed, the field log's half-alive S5 -- reopens that
+   leg fresh; a NEGATIVE collapse -- the leg asked for frames the capture
+   never delivered -- rebuilds the capture pin instead. This catches the
+   degraded sleep-ENTRY window (which fires BEFORE the suspend broadcast),
+   the half-alive post-wake stream, and any driver reset that leaves a
+   thread ticking at a bogus rate.
+
+With both layers the worst case across any sleep is one fresh reopen on
+wake plus the chime -- instead of a permanently glitching path. Every
+action is logged as "power guard :". power_guard = off restores exact
+v6.5.1 behavior.
+
+Notes: generate_ini.bat does not yet emit power_guard; the key defaults to
+on, so bat-generated configs get the guard anyway. No audio-path, ledger,
+or rule change of any kind -- the guard only adds reopen/park triggers on
+top of the v6.5.1 engine.
+
+twinspeak v6.5.1 -- the BIT-EXACT ASIO-strict build
+==================================================
+
+What changed in v6.5.1 (the 'err' column -- display only)
+---------------------------------------------------------
+Field report: "I found that my delay between speakers are ~65ms" -- read off
+the health line's drift column while delay1_ms = 60. That number is CORRECT
+and was never a fault: ~60 ms of it is the user's own delay1_ms (the
+deliberate, bit-exact alignment that pushes the mains later so they meet
+the S5's silicon-lagged center), and the few-ms remainder is the legs'
+natural start asymmetry. The warden had calibrated exactly that number as
+the baseline and was holding the path on it. The column merely conflates
+the DELIBERATE alignment with DRIFT -- so v6.5.1 splits the two:
+
+    | ... | drift -65.2 | err +0.0 |
+
+drift stays the RAW inter-speaker offset in cable time (your delay
+calibration included) -- the alignment instrument it always was. err is
+the live distance from the calibrated baseline -- the exact number the
+warden's correction rule acts on (|drift - baseline| >= drift_correct_ms
+held 3 s). err ~ +0.0 = the path is pinned to your calibration. err moving
+and holding = a real drift event (the warden log names the leg and the
+frames). For the first ~15 s (before the baseline exists) err reads ----.
+
+Reading the pair:
+
+    * drift ~ -65, err ~ +0.0 -> aligned and pinned; the 65 is your 60 +
+      the legs' asymmetry. This is the healthy steady state.
+    * err grows past drift_correct_ms and holds -> the host relation
+      moved; the warden re-pins bit-exactly (skip or in-place replay) and
+      err returns to ~0.
+    * drift flat on the baseline while the EARS hear drift -> the offset
+      is below the USB packetizer (the S5's own FIFO): delay1_ms /
+      delay2_ms by ear remain the only instrument, and the log proves the
+      host is clean.
+
+No audio-path, ledger, rule or ini-key change of any kind -- the engine is
+otherwise byte-for-byte v6.5.
+
+What twinspeak is
+-----------------
+twinspeak captures the VAC "Line 1" 8ch stream (WASAPI-exclusive direct
+pin on a WaveRT port) and plays it to TWO devices at once, with a strict,
+verifiable split:
+
+    out1 (mains)  : FL = ch1 + gain_lfe*ch4(LFE) | FR = ch2 + gain_lfe*ch4(LFE)
+                    FC + discrete LFE + SL + SR are DRIVEN DIGITAL SILENCE
+                    (the center physically cannot enter out1)
+    out2 (center) : L = R = ch3 ONLY -- ch1/ch2/ch4..ch8 are EXPLICITLY MUTED
+                    in the out2 path, so out2 is NOT a clone of the program
+                    audio. + 40 Hz @ 1% keep-alive at the device layer.
+
+What changed in v6.5 (the optimization pass -- NOTHING but speed)
+---------------------------------------------------------------
+Field directive: "optimize it max whilst also preserving everything in the
+code that's meaningful". This is a pure optimization pass: every ini key,
+every log line, every rule, every gate and every sample value is BIT-
+IDENTICAL to v6.4. Only the CPU cost of the realtime path dropped. Every
+rewrite was validated by a randomized bit-equivalence harness that runs the
+v6.4 and v6.5 code side by side on adversarial inputs (15 ring geometries,
+both mixers, both keep-alive paths, four optimization levels) -- all bit-
+exact. The harness caught three genuine bit-level hazards BEFORE they could
+ship; they are listed below because they are exactly the kind of thing that
+would otherwise have been an audible or ledger-visible regression.
+
+1.  BULK RING COPIES. pushOverwrite/pop now copy each run as one wrap-aware
+    memcpy (two at the wrap seam) instead of one memcpy PER FRAME. The
+    v6.0 "the path is memcpy" promise now holds at the call level too: a
+    1 ms capture burst lands in each leg's raw ring as a single 1.5 KB
+    memcpy instead of 48 separate 32-byte ones. Same data, same order,
+    same head/tail/seqTail CAS discipline.
+
+2.  BULK MIXER. The per-frame mixFrame() call became mixBlock(): the ini
+    gains are hoisted into locals and the leg2 loop still READS ONLY ch3
+    (the explicit-mute guarantee stays structural). The build pins
+    -ffp-contract=off so no mul+add can ever fuse into an FMA and change a
+    rounding. The harness even caught that dropping the literal "+ 0.0f"
+    in the discrete-LFE branch would flip IEEE negative zeros (-0 + +0 =
+    +0) -- so the add is kept and the v6.4 bit pattern is preserved.
+
+3.  KEEP-ALIVE FAST PATH. sumLeg2Extras sums the 40 Hz tone in wrap-free
+    RUNS over the cycle table (the wrap check fires once per table cycle,
+    not per frame) and drops the chime branch from the hot loop when no
+    chime is armed -- the 99.9% case. Same (idx + i) mod len sequence,
+    same clamps. The chime-active loop is unchanged.
+
+4.  DENORMAL GUARD (FTZ/DAZ). Every realtime thread (capture, both pumps,
+    both device callbacks, both KS pacers) now runs with SSE flush-to-zero
+    + denormals-are-zero set. Honest scope: this affects ONLY f32 denormals
+    -- samples below ~-370 dBFS, over 100 dB under any DAC's LSB and 330 dB
+    under the keep-alive's -40 dBFS. What it buys: a denormal microcode
+    assist (100+ cycles per operation) can no longer stall the audio path
+    -- a real dropout class when volume_follow sits near zero and
+    multiplies quiet content into the denormal range.
+
+5.  BUILD: -O3 + x86-64-v3 (SSE4.2/AVX2 auto-vectorization of the bulk
+    loops -- YMM instructions are now all over the mix/keep-alive/gain
+    paths). REQUIREMENT: the exe needs any 2013-or-newer x86-64 CPU (Intel
+    Haswell+, AMD Zen+). Your M720q (Coffee Lake) is far inside that. If
+    you ever need a pre-2013 fallback, rebuild with build.sh and remove
+    -march (the code is architecture-neutral C++).
+
+6.  The harness also caught (and the fix ships): pushSilence prefills in
+    cap-sized chunks -- a chunk larger than the ring cap would be clamped
+    by pushOverwrite and silently LOSE prefill frames. The v6.4 one-frame
+    loop never hit that clamp; neither do the v6.5 chunks.
+
+Everything else -- the drift warden, the clock rules, the gates, the
+keep-alive, the chimes, the watchdog, all ini keys, all log lines -- is
+byte-for-byte the v6.4 behavior. The exe is a drop-in replacement.
+
+What changed in v6.4 (the drift warden -- the timestamp system)
+---------------------------------------------------------------
+Field directive: "a timestamp system capturing every frame by its intervals
+which are corrected when there's even a 10ms drift between the two speakers"
+-- detector only, no live trim input.
+
+1.  THE FRAME-INTERVAL LEDGER. Every capture burst is stamped into a
+    monotonic ledger. Each leg tracks the capture SEQUENCE NUMBER of its
+    play boundary -- the frame the DAC is currently eating -- and that
+    boundary advances by exactly the real frames that cross it:
+
+        pops            advance it (the frame really played)
+        gated drops     advance it (the frame was skipped past)
+        warden skips    advance it (same operation, warden-initiated)
+        replays         NEVER advance it (the same frames play again)
+        deliberate pads NEVER advance it (the stream is held in place)
+        boot prefill    carries no sequence at all
+
+    The difference of the two legs' boundaries IS the measured delay
+    between the two speakers, in cable time, 48 frames per millisecond.
+    It is printed every second as 'drift' on the health line. No clock
+    is involved -- pure frame arithmetic, so it cannot drift, skew or
+    lie. The lag of each leg (age of its newest played frame) is also
+    tracked for the log.
+
+2.  CALIBRATION. For the first ~15 s the warden only watches: it averages
+    the settled drift into a BASELINE and prints it once
+    ("baseline calibrated at ..."). The baseline includes your
+    delay1_ms/delay2_ms calibration -- at delay1 = 50 it reads -50.0 ms
+    (leg1's boundary sits 50 ms behind leg2's; that IS your delay, seen
+    from the ledger's side). What matters from then on is only the
+    DISTANCE from that baseline.
+
+3.  AUTO RE-PIN AT 10 MS. When the drift leaves the baseline by
+    >= drift_correct_ms (default 10) for 3 consecutive seconds, the
+    warden re-pins the pipeline, at most once per 30 s:
+
+        the LATE leg's ring gives back its excess  -- a bit-exact SKIP
+        (the same operation as the v6.0 gated drop), or
+        the EARLY leg is held -- its last buffer REPLAYS in place (the
+        exact ASIO convention) until the depth returns.
+
+    No sample value is ever touched; the path stays bit-exact. Every
+    correction is logged with its size and the drift before/after.
+
+4.  THE HONEST LIMIT, WRITTEN INTO THE LOG. The ledger sees the HOST
+    pipeline: rings, bursts, drops, pads, pump stalls. It cannot see
+    anything BELOW the USB packetizer -- the S5's own receiver FIFO and
+    amp silicon. If the drift column stays flat while your ears hear
+    drift, the offset is device silicon, no host trigger exists, and
+    this log is the proof of exactly that. (drift_guard = off keeps the
+    ledger + the drift column but disables the automatic re-pin.)
+
+5.  NEW INI KEYS: drift_guard (on), drift_correct_ms (10, clamped
+    2..500). The health line gained the 'drift' column. Nothing else
+    changed: the engine, the routing guarantees, KS backend, chimes,
+    keep-alive and gates are byte-for-byte the v6.3.1 paths.
+
+What changed in v6.3.1 (the Adesso residual)
+--------------------------------------------
+1.  KS-LEG RING FLOOR. A WASAPI-exclusive leg must survive miniaudio's
+    worst legitimate pull -- the WHOLE device buffer popped as two
+    back-to-back period callbacks -- so its ring floor carries a 4 ms
+    margin. A KS leg has no such bite: its only pull is twinspeak's OWN
+    pacing thread, exactly ks_period_frames frames per switch, never
+    merged, paced against the DAC's position register and refilled by a
+    pump that drains every 1 ms. The KS floor is now one bite + one
+    capture burst + 1 ms. At the field config (ks_period_frames 96,
+    cap_ms 1) that is a 5 ms ring and an est path of ~10 ms per leg,
+    down from 8 ms / ~14 ms on the WASAPI legs.
+
+    Flip BOTH legs to ks and the two est paths come out EQUAL and
+    minimal; whatever offset the ear still hears after that is the S5's
+    own USB+amp latency vs the Realtek's ~1 ms FIFO -- device silicon,
+    invisible to every transport setting. The banner's align line now
+    does the arithmetic (item 3) and the delay knobs trim the rest.
+
+2.  HONEST CLAMPS. ks_periods below 2 and ks_period_frames outside
+    32..4096 were silently clamped; the log now names the clamp and the
+    reason. (ks_periods = 1 has NO write lead: a 1-period WaveRT loop
+    means the DAC eats whatever sits in the buffer the moment the pacer
+    hiccups. 2 is the floor, 3 the recommended.)
+
+3.  THE ALIGN LINE DOES THE ARITHMETIC. It now prints both est paths,
+    their difference (current delay included), and which delay knob
+    moves in which direction:
+
+        align : delay1 +0 ms, delay2 +0 ms -- bit-exact ring delay; ...
+                est path: leg1 ~10.1 ms vs leg2 ~10.1 ms (difference
+                +0.0 ms with the current delay included -> printed
+                paths are EQUAL -- any offset left is device silicon).
+
+    Same formula as the per-leg device lines, so the numbers always
+    agree. The S5's own amp latency stays OUTSIDE the print; the ear
+    trims the last 1-2 ms steps.
+
+What changed in v6.3 (WDM-KS inside twinspeak -- the FlexASIO path)
+-------------------------------------------------------------------
+1.  WDM-KS OUTPUT BACKEND, per leg. FlexASIO gets its low-latency path
+    from Windows Kernel Streaming; v6.3 speaks the same protocol
+    natively and paces it harder:
+
+        backend1 = wasapi | ks      (leg1, the 5.1 mains)
+        backend2 = wasapi | ks      (leg2, the center speaker)
+        ks_period_frames = 256      (buffer-switch size, in SAMPLES)
+        ks_periods       = 3        (looped WaveRT buffer, in periods)
+
+    backend = ks walks the exact chain the low-latency ASIO wrappers use:
+
+      a. enumerate KSCATEGORY_RENDER wave filters (SetupAPI) and match
+         the SAME output_deviceN needles you already use (twinspeak
+         --list-ks prints every KS filter with its pins and formats);
+      b. find a render sink pin that accepts 48 kHz (6ch on leg1 / 2ch
+         on leg2) and instantiate it with KsCreatePin (ksuser.dll,
+         loaded dynamically) -- KSPIN_CONNECT + KSDATAFORMAT wrapping a
+         WAVEFORMATEXTENSIBLE, looped-streaming interface first;
+      c. allocate the WaveRT looped buffer (KSPROPERTY_RTAUDIO_BUFFER) --
+         the driver's own DMA memory, mapped into twinspeak's address
+         space -- and map the hardware play-position register
+         (KSPROPERTY_RTAUDIO_POSITIONREGISTER; a driver without one
+         falls back to polling KSPROPERTY_AUDIO_POSITION);
+      d. STOP -> ACQUIRE -> PAUSE -> prefill -> RUN, then a TIME-CRITICAL
+         MMCSS "Pro Audio" thread writes exactly ks_period_frames frames
+         per bite, pacing itself against the DAC's own position: sleep
+         while far ahead of the lead, spin over the last millisecond.
+         No events, no Windows audio engine, no scheduler intermediaries.
+
+    The audio crossing the buffer switch is BIT-IDENTICAL to the WASAPI
+    path -- same rings, same v6.0 replay/gated-drop clock rules, same
+    volume follow, same center gates, keep-alive and chimes. Only the
+    transport under it changes. Format is negotiated per pin in this
+    order: float32 (a straight memcpy -- bit-exact), int32, int24,
+    int24-packed, int16; whatever the driver takes first.
+
+    LATENCY: one KS bite is 256 samples = 5.33 ms. With the default
+    ks_periods = 3 the write cursor stays ~2 periods ahead of the DAC,
+    so the transport adds ~13.3 ms (app -> DAC) on top of the ring and
+    capture burst; the banner prints the real numbers per leg. For the
+    absolute floor set ks_periods = 2 (~8 ms transport): the pump then
+    has one period of deadline slack and NO more -- if you ever hear a
+    stutter under load, go back to 3. The DAC's hardware FIFO (~1-2 ms)
+    sits outside both numbers; the KS line in the banner prints it.
+
+    WHAT KS CHANGES AROUND THE DEVICE: a KS pin is a direct line to the
+    DAC. The Windows endpoint volume/mute and the audio engine's mixing
+    do not apply while twinspeak holds the pin (pin_outputs is a no-op
+    on a KS leg -- logged once). volume_follow STILL governs a KS leg,
+    applied in the pump exactly as before. If the driver refuses the
+    pin (no WaveRT support, format refused, pin busy) that leg logs the
+    reason and falls back to the proven WASAPI exclusive path -- a leg
+    is never left without a device. Two KS legs may not both win pins on
+    the SAME filter (pin instances are limited); the fallback covers it.
+
+    out1ms/out2ms are WASAPI settings; a KS leg ignores them (its bite
+    is ks_period_frames) and the ring floor follows that. The banner's
+    per-leg "device" line shows which transport each leg actually got.
+
+2.  twinspeak --list-ks: every WDM-KS render filter on the system with
+    its render pins (max channels, bit depths, rate ranges), for picking
+    output_deviceN needles that match the KS layer. The KS filter names
+    are the driver-level ones ("Realtek HD Audio output", the USB
+    product name) -- usually the same substrings you already match.
+
+What changed in v6.2 (background run + the CenterFold chimes)
+-------------------------------------------------------------
+1.  BACKGROUND = ON (new ini key, default off). background = on runs
+    twinspeak as a background process: after a SUCCESSFUL startup the
+    console detaches and every log line -- banner, sync events, health
+    line -- goes to twinspeak.log next to the ini (the health line is
+    written every 10 s there, so the file grows slowly). A FAILED start
+    keeps the console open so the reason stays on screen.
+
+      stop a background run :  taskkill /IM twinspeak.exe
+      run visible once      :  twinspeak --foreground
+      second instance       :  refused (single-instance lock); --multi
+                               allows one deliberately. Two engines would
+                               fight over the same exclusive pins.
+
+2.  CHIMES -- the CenterFold startup signature is back, modernized. The
+    old jingle was a rising SQUARE fifth (G5 784 Hz -> D6 1174.66 Hz);
+    the v6.2 chime keeps the rising fifth but plays two short TRIANGLE
+    BLIPS in the low treble instead: C7 2093 Hz (42 ms) -> G7 3136 Hz
+    (72 ms), fast exponential decay -- a blip, not a horn.
+
+    It plays on the CENTER speaker (out2) the moment the engine goes
+    live, and again whenever the watchdog brings out2 back (3 s cooldown
+    against a flapping device). It is a UI cue, not program audio: it is
+    summed at the out2 DEVICE layer exactly like the keep-alive, so
+    volume_follow does NOT scale it, and out1 -- the bit-exact mains
+    path -- NEVER carries it. chimes = on|off, chime_gain = 0..1
+    (default 0.4; lower it if the center speaker runs hot).
+
+3.  HINT HONESTY (field report: a "-10000 ppm" hint right after launch).
+    Two real defects, both fixed. (a) The hint threshold was 1000 ppm --
+    BELOW the meter's own noise floor: the ~2 ms device switch quantizes
+    each 1 s measurement window by +-2000 ppm (one period), +-4000 under
+    load, so ordinary jitter could cross the line. The threshold is now
+    5000 ppm. (b) The hint fired on the first over-threshold window, which
+    at startup is the settle transient (initial replays reading as
+    -10000..-13944 ppm for a second or two). It now requires a SETTLED
+    path: 10 s up, a quiet window (no corrections/replays inside it), and
+    the same-sign exceedance held across THREE consecutive windows. The
+    one-time startup excess drop is also tagged "(startup settle)" in the
+    log -- it is the strict rule trimming the capture backlog that
+    accumulated while the devices were still being opened, BEFORE any
+    program audio mattered.
+
+What changed in v6.1 (alignment delay + center presence)
+--------------------------------------------------------
+1.  ALIGNMENT DELAY -- delay1_ms / delay2_ms (ini keys, default 0).
+    Each pushes ONE leg's output later by whole milliseconds. The
+    mechanism is the honest one for a bit-exact path: the leg's ring
+    target grows by the delay and the samples simply leave it later --
+    nothing is resampled, regenerated, or pitch-bent anywhere.
+
+    Put the delay on whichever leg arrives EARLY. If the center
+    speaker's USB path (S5 amp + DSP) lags the mains, raise delay1_ms so
+    out1 waits for it; if the center leg runs early instead, raise
+    delay2_ms. The banner prints each leg's "est path" -- start at the
+    printed difference between the two legs, then trim by ear in 1-2 ms
+    steps. (The S5's own amp latency lives OUTSIDE the printed path;
+    only the ear can see it.) Each ms costs 1 ms of latency on that leg
+    only, and the legs' clock-sync rules ride on the same target, so the
+    delay cannot cause false corrections.
+
+2.  OUT2 IS PROCESSED FIRST. With out2_first = on the center leg's pump
+    thread is CREATED first and runs at a higher priority than the mains
+    pump ("it needs the most attention"): the center leg gets the
+    freshest data and wins any scheduling tie. The center device thread
+    already started first and the watchdog already checks it first.
+    Device threads themselves stay equal priority -- both are
+    deadline-bound; only the movers are ranked.
+
+3.  CENTER PRESENCE GATES on out2 -- "if the center channel is absent,
+    something mixes left and right instead; zero everything except the
+    keep-alive." Root cause found: that L+R substitute is WINDOWS' OWN
+    stereo -> 8ch upmix. A stereo app cannot write center to the cable,
+    so the Windows engine fills FC = a*FL + b*R at the cable's playback
+    side -- BEFORE twinspeak captures it. It IS ch3 by then; channel
+    muting cannot remove it. v6.1 adds two gates in the out2 pump (both
+    default ON, both ini-switchable):
+
+      center_gate         a block whose ch3 is digital zero emits NOTHING
+                          but the keep-alive tone -- the literal "center
+                          ever zero -> every channel of the sample zero"
+                          rule.
+      center_upmix_guard  a least-squares fit per block: if ch3 is an
+                          EXACT linear mix of ch1/ch2 (residual < -30 dB,
+                          gains inside the upmix-matrix band, fronts
+                          active) the block is engine upmix, not center,
+                          and is MUTED -- out2 = keep-alive only. Genuine
+                          5.1 dialogue is an INDEPENDENT track and never
+                          matches the fingerprint; it always passes.
+
+    The health line counts guarded blocks ("cm +N"); with real 5.1
+    content it must read 0. The log announces guard hits with the fitted
+    gains, e.g. "ch3 matches 0.71*ch1 + 0.71*ch2". If the guard ever
+    mutes genuine center dialogue, set center_upmix_guard = off and say
+    so -- but a real 5.1 mix cannot fit ch3 ~ a*ch1 + b*ch2 over a whole
+    block, so it should never happen.
+
+Clock discipline (device-master ASIO rules, not a resampler)
+------------------------------------------------------------
+Unchanged from v6.0. The path is bit-exact, so the drift between the
+cable's virtual clock and each device crystal is absorbed by exactly two
+RULES at the buffer switch, exactly where an ASIO driver acts -- never by
+a rate change:
+
+  * SHORTFALL -> REPLAY. A buffer switch the ring cannot fill replays the
+    last played buffer (the ASIO underrun convention) instead of punching
+    a silence hole. Counted as "und" on the health line.
+  * EXCESS -> GATED DROP. If the cable clock runs faster than the device
+    and the ring grows past its natural sawtooth by a full period, the
+    oldest excess is discarded -- at most once per 5 s per leg, each event
+    logged ("legN sync: dropped N fr of excess"). Counted as "corr".
+
+At crystal-level offsets these events are minutes apart. The health line
+measures the actual offset and a one-shot hint prints the exact ppm if
+the cable free-runs: enable Clock Correction for the cable in the VAC
+Control Panel and trim until "off" reads ~0 -- a bit-exact path plus a
+corrected cable clock is a silent path forever.
+
+clock_sync = on/off (ini) turns the discipline off entirely (A/B only).
+The old auto_resync key is still accepted. (On a KS leg the same rules
+run inside twinspeak's own pacing thread -- the DAC register replaces
+the WASAPI event as the clock.)
+
+The health line (1 s)
+---------------------
+out1  19.2 | out2  19.2 | vol  36%  | held  20.1/ 20.0 | off   +12/  +12 | und +0/0 | drop +0/0 | corr 0/0 | cm +0
+
+  out1/out2  ring fill in ms per leg.
+  vol        the Line 1 playback-side slider (master for both legs);
+             M = muted, --- = volume follow off / endpoint not found.
+             (Volume follow works on KS legs too -- applied in the pump.)
+  held       ring + capture backlog per leg -- the latency anchor is the
+             ring target printed in the banner (delay included).
+  off        MEASURED clock offset in ppm per leg (cable vs device).
+  und        buffer switches padded by the replay rule. Must stay +0/0
+             in steady state.
+  drop       frames discarded by passive overwrite. Must stay +0/0.
+  corr       gated excess-drop events (~1 per 100 s per 100 ppm).
+  cm         blocks muted by the upmix guard this second. +0 with real
+             5.1 content; a sustained +N while a STEREO source plays is
+             the guard doing exactly its job.
+
+Watchdog / self-healing (unchanged since v3.8/v3.9)
+---------------------------------------------------
+A device thread silent >5 s is reopened BY NAME automatically. A KS leg
+first re-opens its KS pin (fresh pin, prefill, RUN); only if the driver
+now refuses does it step down to WASAPI exclusive (then shared), volume
+re-pinned. The Line 1 slider drives both legs (volume follow); out1/out2
+WASAPI endpoints are pinned at 100% and re-checked every 2 s. Out2's
+keep-alive tone never enters the volume path, so the S5 stays awake even
+at volume 0.
+
+Quick start (WDM-KS)
+--------------------
+1.  twinspeak --list-ks       (see the KS filters; usually "Realtek" and
+                               the S5's product name match as-is)
+2.  edit twinspeak.ini:       backend1 = ks, backend2 = ks
+3.  twinspeak                 (run; Ctrl+C stops)
+4.  read the banner: each leg's "device" line prints the KS filter, pin
+    number, negotiated format, the WaveRT loop size, the write lead and
+    the position source (mapped REGISTER or IOCTL-polled). "est path"
+    per leg = ring + KS lead + capture burst.
+5.  watch the health line: off near 0, und/drop +0/0, corr 0/0, cm +0.
+    If a leg says "refused -- falling back to WASAPI", read the reason
+    line above it (twinspeak --list-ks shows what the driver exposes).
+6.  align by ear: the banner's "align" line prints the est-path
+    difference AND which delay knob to move; start there and retune in
+    1-2 ms steps. Any offset the ear still hears with a ~0 ms printed
+    difference is the S5's own amp latency -- delay knobs are the only
+    instrument for that part.
+
+Build: bash build.sh (llvm-mingw or zig c++, WASAPI + WDM-KS, static, x64).
+Source: twinspeak.cpp + miniaudio.h (single translation unit). The KS
+layer is an original implementation of the public KS/WaveRT property
+interface (KSCATEGORY_RENDER, KsCreatePin, KSPROPERTY_RTAUDIO_BUFFER /
+POSITIONREGISTER), following the same wire layout as the reference
+WDM-KS backends.
+
+generate_ini.bat -- interactive config generator (repo tooling note)
+-------------------------------------------------------------------
+The ini generator now works in PROMPTS, not arguments. It asks for the
+twelve keys that get tuned on this rig -- input_device, output_device1/2,
+backend1/2, ks_period_frames, ks_periods, delay1_ms, delay2_ms,
+drift_guard, keepalive_gain, background -- and every prompt shows its
+tuned default in [brackets]: pressing Enter keeps the default, typing a
+value overrides it. Holding Enter from the top accepts every default and
+reproduces the tuned twinspeak.ini byte-for-byte. A refused answer (cmd
+metacharacters, a non-number in a number field, an on/off or
+wasapi/ks typo) is announced and falls back to the default BEFORE
+anything is written, so a bad answer never touches the current ini. An
+advanced key=value prompt at the end of step 1 can override ANY ini key,
+spaces included (volume_endpoint=Line 1 (VAC)). The five-step narration
+(backup -- quiet write with line/byte report -- key-by-key verification
+-- summary of your changes) is unchanged. The earlier key=value
+command-line interface is gone; run the bat with no arguments and answer
+the prompts.
