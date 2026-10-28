@@ -8,7 +8,11 @@ FORMERLY CENTERFOLD
 
 ## Download
 
-pending
+[TwinSpeak Program](https://github.com/TidyVision/fun/raw/main/sound/twinspeak/TidyVision%20TwinSpeak.zip)
+
+## How to integrate into startup (if either temporary or forever)
+
+Press Windows Key + R, then type in shell:startup. Then create a new shortcut with the exe to your specific twinspeak location where you downloaded it on. And that's it.
 
 # Twinspeak
 
