@@ -1,5 +1,25 @@
 // ============================================================================
-//  twinspeak v6.6.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.1 (THE WINDOW LIVES IN THE TRAY. Two user-reported fixes:
+//          (1) STALE PAINT: the window only refreshed after a minimize or
+//          resize. Root cause: WS_EX_COMPOSITED plus invalidating only the
+//          FRAME -- owner-drawn child buttons (START, tabs, toggles, EQ
+//          presets) are separate windows that own their own pixels, so a
+//          parent InvalidateRect never reaches them. The frame now carries
+//          WS_CLIPCHILDREN (and loses WS_EX_COMPOSITED), and every visual
+//          state change invalidates the exact child control it changed.
+//          (2) CLOSE = HIDE TO TRAY: the X button no longer quits -- the
+//          window hides and a tray icon appears (first close shows a balloon
+//          hint); the engine keeps running while hidden. The tray icon
+//          restores on double/left-click; right-click opens a menu: Open,
+//          Start/Stop engine, "Run at Windows startup", Exit. The startup
+//          option is the HKCU Run key -- no shell:startup hack -- and it
+//          launches twinspeak with the new --tray flag, which starts the
+//          window straight in the tray. A second copy of twinspeak.exe no
+//          longer scolds with a MessageBox: it activates the running
+//          window instead (tray included). No engine DSP changed in this
+//          version: the sample path is byte-identical to v6.5.18.)
 //
 //  v6.6.0 (THE CONTROL WINDOW. Running twinspeak.exe with no arguments now
 //          opens a black+cyan GUI instead of the console -- every flag mode
@@ -960,6 +980,7 @@
 #include "miniaudio.h"
 #include <windows.h>
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
+#include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
 #include <mmsystem.h>
 #include <cstdio>
 #include <cstring>
@@ -3293,7 +3314,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4208,6 +4229,20 @@ static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
 static std::string g_lastHealth;               // latest "out1 ..." health line
 static std::atomic<bool> g_logDirty{false};
+// v6.6.1: tray + startup
+static NOTIFYICONDATAA g_nid = {};
+static bool g_trayVisible = false;             // icon currently in the tray
+static bool g_trayHint    = false;             // one-time close balloon shown
+static bool g_startTray   = false;             // --tray: begin hidden in the tray
+static UINT g_taskbarCreated = 0;              // explorer restart re-adds the icon
+
+// v6.6.1 forward decls (helpers defined below the page builder)
+static void guiRepaint(HWND w, int id);
+static void guiRepaintPresets(HWND w);
+static void trayAdd(bool hint);
+static void trayRemove();
+// v6.6.1 tray context-menu commands
+enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
 static const char* kTabNames[6] = {
     "DEVICES", "TIMING", "TRANSPORT", "SYNC + POWER", "CENTER + VOLUME", "CENTER EQ"
@@ -4386,7 +4421,8 @@ static void guiApplyPreset(HWND w, int i) {
     SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_SETPOS, TRUE, (LPARAM)qToPos(kEqPre[i].q));
     g_eqPreset = i;
     guiUpdateEqLabels(w);
-    InvalidateRect(w, nullptr, TRUE);
+    guiRepaint(w, IDC_TGL_EQ);   // v6.6.1: preset + toggle pills repaint themselves
+    guiRepaintPresets(w);
 }
 
 // ---- live device enumeration for the pickers -------------------------------
@@ -4703,7 +4739,7 @@ static void guiStartEngine(HWND w) {
     if (!guiSaveIni())
         tlog("[twinspeak] gui           : could not write the ini -- running with the in-window values\n");
     g_engState.store(1);
-    InvalidateRect(g_hwnd, nullptr, TRUE);
+    guiRepaint(g_hwnd, IDC_START);   // v6.6.1: the button owns its own pixels
     g_engThread = CreateThread(nullptr, 0, guiEngineThread, nullptr, 0, nullptr);
 }
 
@@ -4711,7 +4747,7 @@ static void guiStopEngine() {
     const int st = g_engState.load();
     if (st == 0 || st == 3) return;
     g_engState.store(3);
-    InvalidateRect(g_hwnd, nullptr, TRUE);
+    if (g_hwnd) guiRepaint(g_hwnd, IDC_START);
     g_run.store(false);
     if (g_engThread) {
         WaitForSingleObject(g_engThread, 10000);
@@ -4719,7 +4755,7 @@ static void guiStopEngine() {
         g_engThread = nullptr;
     }
     g_engState.store(0);
-    InvalidateRect(g_hwnd, nullptr, TRUE);
+    if (g_hwnd) guiRepaint(g_hwnd, IDC_START);
 }
 
 // ---- page building ----------------------------------------------------------
@@ -4877,6 +4913,88 @@ static void guiShowPage(HWND w, int p) {
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     g_tab = p;
     InvalidateRect(w, nullptr, TRUE);
+    // v6.6.1: tabs are owner-drawn children -- they own their own pixels and
+    // a parent-only invalidation never repaints them.
+    for (int i = 0; i < 6; ++i)
+        if (HWND h = GetDlgItem(w, IDC_TAB0 + i)) InvalidateRect(h, nullptr, TRUE);
+}
+
+// ---- v6.6.1: repaint helpers -----------------------------------------------
+// Owner-drawn children own their pixels: invalidating the frame never repaints
+// them (that was the "it only updates when I minimize" bug -- a minimize or
+// resize invalidates the whole tree, which is why THAT fixed it). Every visual
+// state change below now invalidates the exact child control it changed.
+static void guiRepaint(HWND w, int id) {
+    if (HWND h = GetDlgItem(w, id)) InvalidateRect(h, nullptr, TRUE);
+}
+static void guiRepaintPresets(HWND w) {
+    static const int ids[5] = { IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS,
+                                IDC_PRE_WARM, IDC_PRE_CIN };
+    for (int i = 0; i < 5; ++i) guiRepaint(w, ids[i]);
+}
+
+// ---- v6.6.1: "Run at Windows startup" (HKCU Run key, no shell:startup hack)
+static const char* kRunKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char* kRunVal = "twinspeak";
+
+static bool startupEnabled() {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return false;
+    const LONG r = RegQueryValueExA(k, kRunVal, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+static void startupSet(bool on) {
+    HKEY k;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    if (on) {
+        char exe[MAX_PATH];
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string cmd = std::string("\"") + exe + "\" --tray";
+        RegSetValueExA(k, kRunVal, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)cmd.size() + 1);
+    } else {
+        RegDeleteValueA(k, kRunVal);
+    }
+    RegCloseKey(k);
+}
+
+// ---- v6.6.1: the tray icon --------------------------------------------------
+static void trayRemove() {
+    if (!g_trayVisible) return;
+    Shell_NotifyIconA(NIM_DELETE, &g_nid);
+    g_trayVisible = false;
+}
+static void trayAdd(bool hint) {
+    if (!g_hwnd || g_trayVisible) return;
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize           = sizeof(g_nid);
+    g_nid.hWnd             = g_hwnd;
+    g_nid.uID              = 1;
+    g_nid.uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP + 3;
+    g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
+                                    IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    lstrcpynA(g_nid.szTip, "twinspeak control", (int)sizeof(g_nid.szTip));
+    g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
+    if (g_trayVisible && hint && !g_trayHint) {
+        g_trayHint = true;
+        g_nid.uFlags       = NIF_INFO;
+        lstrcpynA(g_nid.szInfoTitle, "twinspeak", (int)sizeof(g_nid.szInfoTitle));
+        lstrcpynA(g_nid.szInfo,
+                  "Still running -- the engine stays up.\n"
+                  "Double-click this icon to reopen the window; "
+                  "right-click for Start/Stop and Exit.",
+                  (int)sizeof(g_nid.szInfo));
+        g_nid.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+    }
+}
+static void guiRestoreWindow() {
+    ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(g_hwnd);
 }
 
 // ---- the window procedure ---------------------------------------------------
@@ -4894,6 +5012,12 @@ static bool guiIsToggle(int id) {
 }
 
 static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    // v6.6.1: explorer restarted -- the tray icon vanished; re-add it when the
+    // window is hidden (a visible window re-adds its icon on first close).
+    if (g_taskbarCreated && msg == g_taskbarCreated) {
+        if (!IsWindowVisible(g_hwnd)) trayAdd(false);
+        return 0;
+    }
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -4904,7 +5028,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 8, 420, 42 };
         guiText(dc, hdr, "TWINSPEAK CONTROL", guic::cAccent, g_fHead,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        const std::string verLine = "v6.6.0  |  " + g_guiIniPath;
+        const std::string verLine = "v6.6.1  |  " + g_guiIniPath;
         const RECT ver = { 300, 14, 984, 38 };
         guiText(dc, ver, verLine.c_str(), guic::cDim, g_fSml,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -5001,11 +5125,29 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (code != BN_CLICKED) break;
         if (guiIsToggle(id)) {
             g_tog[id] = !g_tog[id];
-            InvalidateRect(w, nullptr, TRUE);
+            guiRepaint(w, id);          // v6.6.1: the pill repaints itself
             return 0;
         }
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) { guiShowPage(w, id - IDC_TAB0); return 0; }
         switch (id) {
+            case IDM_TRAY_OPEN:                 // v6.6.1 tray menu
+                guiRestoreWindow();
+                return 0;
+            case IDM_TRAY_START:
+                if (g_engState.load() == 0) guiStartEngine(w); else guiStopEngine();
+                return 0;
+            case IDM_TRAY_AUTORUN: {
+                const bool on = !startupEnabled();
+                startupSet(on);
+                SetDlgItemTextA(w, IDC_STATUS, on
+                    ? "startup: twinspeak will run at sign-in (hidden in the tray)"
+                    : "startup entry removed");
+                return 0; }
+            case IDM_TRAY_EXIT:
+                trayRemove();
+                if (g_engState.load() != 0) guiStopEngine();
+                DestroyWindow(w);
+                return 0;
             case IDC_START:
                 if (g_engState.load() == 0) guiStartEngine(w); else guiStopEngine();
                 return 0;
@@ -5040,7 +5182,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == IDC_SLD_FREQ || id == IDC_SLD_GAIN || id == IDC_SLD_Q) {
             g_eqPreset = -1;                       // manual = CUSTOM
             guiUpdateEqLabels(w);
-            InvalidateRect(w, nullptr, TRUE);
+            guiRepaintPresets(w);                  // v6.6.1: highlight -> CUSTOM
         }
         return 0; }
     case WM_TIMER: {
@@ -5063,13 +5205,44 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetDlgItemTextA(w, IDC_STATUS, s.c_str());
         return 0; }
     case WM_APP + 2:                                   // engine thread ended
-        InvalidateRect(w, nullptr, TRUE);
+        guiRepaint(w, IDC_START);                      // v6.6.1
+        return 0;
+    case WM_APP + 3: {                                 // v6.6.1: tray icon events
+        if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
+            guiRestoreWindow();
+        } else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+            // SetForegroundWindow before TrackPopupMenu + the WM_NULL after:
+            // without them the menu refuses to dismiss when the user clicks
+            // elsewhere.
+            SetForegroundWindow(g_hwnd);
+            HMENU m = CreatePopupMenu();
+            AppendMenuA(m, MF_STRING, IDM_TRAY_OPEN, "Open twinspeak");
+            AppendMenuA(m, MF_STRING, IDM_TRAY_START,
+                        g_engState.load() == 0 ? "Start engine" : "Stop engine");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING | (startupEnabled() ? MF_CHECKED : MF_UNCHECKED),
+                        IDM_TRAY_AUTORUN, "Run at Windows startup");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, IDM_TRAY_EXIT,
+                        g_engState.load() != 0 ? "Exit (stops the engine)" : "Exit");
+            POINT p; GetCursorPos(&p);
+            TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, p.x, p.y, 0, g_hwnd, nullptr);
+            DestroyMenu(m);
+            PostMessageA(g_hwnd, WM_NULL, 0, 0);
+        }
+        return 0; }
+    case WM_APP + 4:                                   // v6.6.1: second instance
+        guiRestoreWindow();                            // says "come up"
         return 0;
     case WM_CLOSE:
-        if (g_engState.load() != 0) guiStopEngine();
-        DestroyWindow(w);
+        // v6.6.1: closing hides to the tray -- the engine keeps running.
+        // Real exit lives in the tray menu (Exit), which stops the engine
+        // first. A one-time balloon tells the user where the window went.
+        trayAdd(true);
+        ShowWindow(w, SW_HIDE);
         return 0;
     case WM_DESTROY:
+        trayRemove();
         PostQuitMessage(0);
         return 0;
     }
@@ -5077,14 +5250,32 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---- entry ------------------------------------------------------------------
-static int guiMain(const std::string& iniPath) {
+// v6.6.1: startTray -- --tray launches the window already hidden in the tray
+// (the "Run at Windows startup" entry uses it).
+static int guiMain(const std::string& iniPath, bool startTray) {
     g_guiIniPath = iniPath;
+    g_startTray  = startTray;
     g_logSink = guiLogSink;                            // everything logs to the pane now
     FreeConsole();                                     // the window replaces the console
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
     HANDLE mutex = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // v6.6.1: another CONTROL WINDOW just comes to the front (tray
+        // included) instead of a scolding MessageBox. A console-engine run
+        // has no window, so it still gets the message below.
+        for (int i = 0; i < 20; ++i) {
+            if (HWND other = FindWindowA("twinspeak.control", nullptr)) {
+                DWORD_PTR res = 0;
+                if (SendMessageTimeoutA(other, WM_APP + 4, 0, 0,
+                                        SMTO_ABORTIFHUNG, 4000, &res)) {
+                    CloseHandle(mutex);
+                    return 0;
+                }
+                break;
+            }
+            Sleep(50);
+        }
         MessageBoxA(nullptr, "twinspeak is already running.\n\nStop the running copy first:\n  taskkill /IM twinspeak.exe",
                     "twinspeak control", MB_ICONINFORMATION);
         CloseHandle(mutex);
@@ -5092,6 +5283,7 @@ static int guiMain(const std::string& iniPath) {
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
     guiMakeGdi();
+    g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
     WNDCLASSA wc = {};
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = guiWndProc;
@@ -5104,8 +5296,14 @@ static int guiMain(const std::string& iniPath) {
     RegisterClassA(&wc);
     RECT r = { 0, 0, 1000, 750 };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowExA(WS_EX_COMPOSITED, "twinspeak.control", "twinspeak control -- v6.6.0",
-                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    // v6.6.1 STALE-PAINT FIX: WS_EX_COMPOSITED was deferring child repaints
+    // (the "only updates after a minimize" bug) and the frame invalidated
+    // only itself, never the owner-drawn children. The frame now carries
+    // WS_CLIPCHILDREN -- the parent never paints over its children and every
+    // visual state change invalidates the exact child (see guiRepaint). The
+    // window starts HIDDEN; --tray leaves it in the tray, otherwise it shows.
+    g_hwnd = CreateWindowExA(0, "twinspeak.control", "twinspeak control -- v6.6.1",
+                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) { if (mutex) CloseHandle(mutex); return 1; }
@@ -5122,8 +5320,17 @@ static int guiMain(const std::string& iniPath) {
     guiShowPage(g_hwnd, 0);
     guiFillCombos(g_hwnd);
     SetTimer(g_hwnd, 1, 250, nullptr);
+    if (g_startTray) {
+        // --tray: straight to the tray (the startup path). The balloon shows
+        // once so a boot-time launch is not a silent process.
+        trayAdd(true);
+        tlog("[twinspeak] gui           : running in the tray -- double-click the icon to open.\n");
+    } else {
+        ShowWindow(g_hwnd, SW_SHOW);
+    }
     tlog("[twinspeak] gui           : control window up -- ini at %s\n", iniPath.c_str());
-    tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n\n");
+    tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
+    tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
@@ -5151,16 +5358,21 @@ int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
     std::string iniPath;
     bool doList = false, doListKS = false, fgForce = false, allowMulti = false;
+    bool wantGui = false, startTray = false;   // v6.6.1: --gui / --tray
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--list")) doList = true;
         else if (!strcmp(argv[i], "--list-ks")) doListKS = true;   // v6.3
         else if (!strcmp(argv[i], "--ini") && i + 1 < argc) iniPath = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) fgForce = true;    // v6.2
         else if (!strcmp(argv[i], "--multi"))      allowMulti = true; // v6.2
-        else if (!strcmp(argv[i], "--gui"))      { /* v6.6.0: explicit, same as default */ }
+        else if (!strcmp(argv[i], "--gui"))      wantGui = true;      // v6.6.0: explicit, same as default
+        else if (!strcmp(argv[i], "--tray"))     { wantGui = true; startTray = true; }   // v6.6.1: window hidden in the tray
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             tlog("usage: twinspeak [--list] [--list-ks] [--ini path] [--foreground] [--multi]\n"
                  "  (no args)     the control window -- every ini option + START/STOP + live log\n"
+                 "                (closing it hides to the TRAY; the engine stays up)\n"
+                 "  --tray        the control window, already hidden in the tray\n"
+                 "                (this is what the tray's 'Run at Windows startup' writes)\n"
                  "  --list        show every WASAPI endpoint (the usual device needles)\n"
                  "  --list-ks     show every WDM-KS render filter with its pins/formats (v6.3)\n"
                  "  --foreground  ignore background = on for this run (keep the console)\n"
@@ -5180,8 +5392,9 @@ int main(int argc, char** argv) {
     if (doListKS) { ksListKs(); return 0; }   // v6.3
 
     // v6.6.0: NO ARGUMENTS = the control window. The console modes all keep
-    // their exact behavior behind explicit flags.
-    if (argc <= 1) return guiMain(iniPath);
+    // their exact behavior behind explicit flags. v6.6.1: --gui is the same
+    // default made explicit; --tray starts hidden in the tray.
+    if (argc <= 1 || wantGui) return guiMain(iniPath, startTray);
 
     // v6.2 single-instance lock (console runs; the GUI holds its own).
     HANDLE hInstance = nullptr;
@@ -5617,7 +5830,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.0        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.1        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
