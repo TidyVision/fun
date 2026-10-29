@@ -1,3 +1,7 @@
+Disclaimer: This tool was made for free, bypassing the requirement of paying for e.g. voicemeeter potato. Use this at your own risk.
+
+A GUI should come with twinspeak.exe. And there should be a built-in E.Q. setting to use instead of utilizing Equalizer APO, as that software uses shared-mode, where as this software bypasses all of that by WASAPI Exclusive/KS.
+
 ## Overview & Metadata
 
 PROPERTY OF TIDYVISION, GENERATED FROM GLM 5.3 FLASH
