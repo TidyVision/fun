@@ -1,5 +1,21 @@
 // ============================================================================
-//  twinspeak v6.5.16 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.17 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.17 (field report: crackling in L/R leg1 playback of a miniaudio
+//          app, suspected on the v6.5.14-16 default-device/endpoint-volume
+//          machinery. Two changes, both diagnostic-first:
+//            YIELD MACHINERY DEFAULT-OFF -- yieldDefault now defaults to
+//            false: out of the box this build runs the pre-v6.5.14 behavior
+//            (legs never release, no default-device watching, no session
+//            probing). The ini key yield_default = on opts back in. This
+//            makes the machinery's innocence or guilt directly A/B-testable
+//            with zero config edits.
+//            HIGH PROCESS PRIORITY -- SetPriorityClass(HIGH_PRIORITY_CLASS)
+//            at startup. The realtime threads already run MMCSS "Pro Audio"
+//            + TIME_CRITICAL; the process class is the scheduler's
+//            cross-process weight, and NORMAL class lets foreground app
+//            boost windows delay the engine's helper threads (pump park,
+//            warden, yield watcher) behind arbitrary background work.)
 //
 //  v6.5.16 (field report: switching the default render from a leg device
 //          back to the main speaker (the VAC) "causes some doubling issue
@@ -1117,7 +1133,10 @@ struct Config {
     // closed / WASAPI device freed, pump parked) so the app playing to the
     // default device owns the hardware; the leg reopens through the
     // watchdog path when the default moves elsewhere.
-    bool        yieldDefault    = true;
+    // v6.5.17: default OFF. The machinery is now opt-in via the ini key
+    // (yield_default = on) so a stock build runs the pre-v6.5.14 behavior
+    // and the field crackle report can be A/B-tested against it cleanly.
+    bool        yieldDefault    = false;
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
@@ -3105,7 +3124,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3950,6 +3969,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // v6.5.17: HIGH process priority class. The RT threads already carry
+    // MMCSS "Pro Audio" + THREAD_PRIORITY_TIME_CRITICAL -- that orders them
+    // WITHIN the process. The process class is the scheduler's cross-process
+    // weight: at NORMAL, a foreground app's priority-boost window can push
+    // the engine's helper threads (pump park, warden, health loop, yield
+    // watcher) behind seconds of background work. HIGH is the weight a DAW
+    // host takes by default; it does not starve other processes' streams.
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+
     // v6.2 single-instance lock: two engines would fight over the same
     // exclusive pins. background = on makes this easy to hit (the running
     // copy may have no window at all), so the refusal names the exact cure.
@@ -4354,7 +4382,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.16        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.17        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
