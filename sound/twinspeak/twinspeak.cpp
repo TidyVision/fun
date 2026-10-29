@@ -1,5 +1,36 @@
 // ============================================================================
-//  twinspeak v6.5.17 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.18 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.18 (crackle case CLOSED + one feature. The field culprit was
+//          EQUALIZER APO hooked to the cable's playback endpoint: a system
+//          APO runs inside the Windows audio engine on every shared-mode
+//          stream, so its processing was baked into Line 1 BEFORE twinspeak
+//          captured it. That explains every surviving piece of evidence:
+//          version-independent, restart-persistent, VLC/system-sounds clean
+//          (different endpoints), OBS clean (captures the app pre-engine),
+//          invariant to every period value, and the recording's 18-23.9 kHz
+//          ultrasonic hash with ZERO sample discontinuities -- digital
+//          processing, upstream of a bit-exact path. The engine was
+//          innocent all along. The "Stage:" command in the APO config is
+//          what exposed it: pre-mix (LFX) vs post-mix (GFX) placement.
+//          NEW: CENTER DIALOGUE EQ. The original reason for touching
+//          Equalizer APO was a mid-boost on the center channel for
+//          dialogue. That can NEVER be done with an APO on the leg
+//          devices: the legs are kernel-streaming pins, and KS (like
+//          ASIO and WASAPI-exclusive) bypasses the audio engine -- and
+//          every APO -- entirely. So the boost lives where the center
+//          sample is born: mixBlock's out2 path, an RBJ peaking biquad
+//          (transposed direct form II) on ch3, opt-in via ini:
+//            center_eq       = on|off   (default OFF -- bit-exact preserved)
+//            center_eq_freq  = peak Hz  (default 1800)
+//            center_eq_gain  = peak dB  (default +4.0, clamped +-12)
+//            center_eq_q     = peak Q   (default 0.8, clamped 0.1..10)
+//          A block whose ch3 is digital zero RESETS the filter instead of
+//          feeding it (a biquad fed zeros still rings from its state, and
+//          the center-gate contract says a gated block emits NOTHING).
+//          Keep-alive and chime stay raw (UI cues, not dialogue). With
+//          center_eq = off the out2 path is the same single multiply,
+//          bit for bit as v6.5.17.)
 //
 //  v6.5.17 (field report: crackling in L/R leg1 playback of a miniaudio
 //          app, suspected on the v6.5.14-16 default-device/endpoint-volume
@@ -1086,6 +1117,16 @@ struct Config {
     float       gainR          = 1.0f;
     float       gainLfe        = 0.4f;
     float       gainCenter     = 1.0f;
+    // v6.5.18 CENTER DIALOGUE EQ: an RBJ peaking biquad on ch3, applied in
+    // the out2 mix path ONLY. Default OFF -- with it off, out2 is the same
+    // single multiply as always (bit-exact). It exists because the legs are
+    // KS/WaveRT pins: kernel streaming bypasses the Windows audio engine and
+    // every APO, so Equalizer APO can never touch what out2 plays. The
+    // dialogue boost must live in the engine itself.
+    bool        centerEq       = false;
+    float       centerEqFreq   = 1800.0f; // peak frequency (Hz, clamped 20..20000)
+    float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
+    float       centerEqQ      = 0.8f;    // peak Q (clamped 0.1..10)
     bool        clockSync      = true;    // v6.0: device-master replay/drop discipline
                                           // (replaces v5.0's auto_resync / resampler)
     float       delay1Ms       = 0.0f;    // v6.1: bit-exact ring delay per leg
@@ -1997,6 +2038,53 @@ static void playCallback2(ma_device*, void* pOutput, const void*, ma_uint32 fram
     sumLeg2Extras((float*)pOutput, frameCount);
 }
 
+// ------------------------------------------- v6.5.18 center dialogue EQ ----
+// An RBJ peaking biquad on the center channel, out2 only. One filter serves
+// both out2 channels: the out2 mixer writes the SAME center value to L and
+// R, so filtering that value once before the fan-out is identical to
+// filtering both channels and cheaper. Coefficients are computed ONCE at
+// startup from kSampleRate (the engine has no resampler: every leg runs at
+// the cable's rate). Transposed direct form II: two state floats, no
+// division in the hot loop, denormal-safe at these gain levels (boost
+// coefficients are O(1), state decays fast). Touched ONLY by the leg2 pump
+// thread -- both pump loops (live + final drain) are in pumpThread, so no
+// locking. Accessed by mixBlock below via g_ceq.on (startup-frozen).
+struct CenterEq {
+    bool    on     = false;
+    float   f0     = 0.0f;   // clamped values, for the banner
+    float   gainDb = 0.0f;
+    float   q      = 0.0f;
+    float   b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    float   z1 = 0.0f, z2 = 0.0f;          // transposed DF2 state
+};
+static CenterEq g_ceq;
+
+static void centerEqInit() {
+    g_ceq.on = g_cfg.centerEq;
+    if (!g_ceq.on) return;
+    // clamp to sane bands so a typo in the ini cannot nuke the coefficients
+    const float f0  = g_cfg.centerEqFreq < 20.0f    ? 20.0f
+                    : g_cfg.centerEqFreq > 20000.0f ? 20000.0f
+                    : g_cfg.centerEqFreq;
+    const float gdb = g_cfg.centerEqGain < -12.0f   ? -12.0f
+                    : g_cfg.centerEqGain > 12.0f    ? 12.0f
+                    : g_cfg.centerEqGain;
+    const float qv  = g_cfg.centerEqQ < 0.1f        ? 0.1f
+                    : g_cfg.centerEqQ > 10.0f       ? 10.0f
+                    : g_cfg.centerEqQ;
+    // RBJ audio-EQ-cookbook peaking section
+    const double A     = pow(10.0, (double)gdb / 40.0);
+    const double w0    = kTwoPi * (double)f0 / (double)kSampleRate;
+    const double alpha = sin(w0) / (2.0 * (double)qv);
+    const double b0 = 1.0 + alpha * A, b1 = -2.0 * cos(w0), b2 = 1.0 - alpha * A;
+    const double a0 = 1.0 + alpha / A, a1 = -2.0 * cos(w0), a2 = 1.0 - alpha / A;
+    g_ceq.f0 = f0; g_ceq.gainDb = gdb; g_ceq.q = qv;
+    g_ceq.b0 = (float)(b0 / a0); g_ceq.b1 = (float)(b1 / a0);
+    g_ceq.b2 = (float)(b2 / a0); g_ceq.a1 = (float)(a1 / a0);
+    g_ceq.a2 = (float)(a2 / a0);
+    g_ceq.z1 = g_ceq.z2 = 0.0f;
+}
+
 // ----------------------------------------------------------------- mixer ----
 // v6.5: the mixer is applied to a WHOLE BLOCK with the ini gains hoisted
 // into locals (the config is startup-frozen), replacing the per-frame
@@ -2042,10 +2130,46 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // else, and can never be a clone of the program audio. (The
         // guarantee is structural, exactly as in v6.4's mixFrame.)
         const float gC = g_cfg.gainCenter;
-        for (size_t i = 0; i < n; ++i) {
-            const float c = gC * sc[i * kInCh + 2];
-            chunk[i * 2 + 0] = c;
-            chunk[i * 2 + 1] = c;
+        if (g_ceq.on) {
+            // v6.5.18: peaking EQ on the center sample, BEFORE the gain. A
+            // block whose ch3 is digital zero (a gate hit, or true silence)
+            // RESETS the filter instead of feeding it: a biquad fed zeros
+            // still rings from its state, and the center-gate contract says
+            // a gated block emits NOTHING. A nonzero block runs every sample
+            // through the filter, internal zeros included (that is what a
+            // real filter does -- the ring decays naturally inside speech
+            // gaps shorter than a block).
+            bool allZero = true;
+            for (size_t i = 0; i < n; ++i)
+                if (sc[i * kInCh + 2] != 0.0f) { allZero = false; break; }
+            if (allZero) {
+                g_ceq.z1 = 0.0f;
+                g_ceq.z2 = 0.0f;
+                for (size_t i = 0; i < n; ++i) {
+                    chunk[i * 2 + 0] = 0.0f;
+                    chunk[i * 2 + 1] = 0.0f;
+                }
+            } else {
+                for (size_t i = 0; i < n; ++i) {
+                    const float x = sc[i * kInCh + 2];
+                    const float y = g_ceq.b0 * x + g_ceq.z1;
+                    g_ceq.z1 = g_ceq.b1 * x - g_ceq.a1 * y + g_ceq.z2;
+                    g_ceq.z2 = g_ceq.b2 * x - g_ceq.a2 * y;
+                    float c = gC * y;
+                    // the boost can push past full scale; clamp here so the
+                    // EQ mode is self-contained (the device layer would clip
+                    // the same peak a moment later, after the keep-alive sum)
+                    if (c >  1.0f) c =  1.0f; else if (c < -1.0f) c = -1.0f;
+                    chunk[i * 2 + 0] = c;
+                    chunk[i * 2 + 1] = c;
+                }
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                const float c = gC * sc[i * kInCh + 2];
+                chunk[i * 2 + 0] = c;
+                chunk[i * 2 + 1] = c;
+            }
         }
     }
 }
@@ -3124,7 +3248,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3204,6 +3328,24 @@ static void writeTemplate(const char* path) {
         "gain_r = 1.0\n"
         "gain_lfe = 0.4\n"
         "gain_center = 1.0\n"
+        "\n"
+        "; CENTER DIALOGUE EQ (v6.5.18): an opt-in peaking boost on the center\n"
+        "; channel, applied ONLY to out2 (the center speaker). Built for exactly\n"
+        "; one job: lifting dialogue presence without touching the mains. It\n"
+        "; CANNOT be done with Equalizer APO -- the legs are kernel-streaming\n"
+        "; pins, and KS bypasses the Windows audio engine (and every APO) whole.\n"
+        "; center_eq = off keeps out2 bit-exact (the default). When on:\n"
+        ";   center_eq_freq -- the peak's center in Hz. Dialogue presence and\n"
+        ";     intelligibility live around 1.5-3 kHz; 1800 Hz is the general pick.\n"
+        ";   center_eq_gain -- boost in dB. +2..+4 subtle, +6 obvious; the path\n"
+        ";     clamps at full scale and gain_center stacks on top, so loud\n"
+        ";     center peaks may clip first -- lower gain_center if they do.\n"
+        ";   center_eq_q    -- sharpness. 0.7-1.0 = broad musical bump; 2+ = a\n"
+        ";     narrow spike (harsh faster).\n"
+        "center_eq = off\n"
+        "center_eq_freq = 1800\n"
+        "center_eq_gain = 4.0\n"
+        "center_eq_q = 0.8\n"
         "\n"
         "; VOLUME: volume_follow = the Windows volume of the cable's PLAYBACK\n"
         "; side (the Line 1 slider in sndvol, or the volume hotkeys when Line 1\n"
@@ -3492,6 +3634,10 @@ static bool loadIni(const char* path) {
         else if (key == "gain_r")         g_cfg.gainR = (float)atof(val.c_str());
         else if (key == "gain_lfe")       g_cfg.gainLfe = (float)atof(val.c_str());
         else if (key == "gain_center")    g_cfg.gainCenter = (float)atof(val.c_str());
+        else if (key == "center_eq")      g_cfg.centerEq     = !isOff(val);          // v6.5.18
+        else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
+        else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
+        else if (key == "center_eq_q")    g_cfg.centerEqQ    = (float)atof(val.c_str());
         else if (key == "clock_sync")     g_cfg.clockSync = !isOff(val);
         else if (key == "auto_resync")    g_cfg.clockSync = !isOff(val);  // v3.7-v5.0 key alias
         else if (key == "delay1_ms")      g_cfg.delay1Ms = (float)atof(val.c_str());
@@ -4017,6 +4163,9 @@ int main(int argc, char** argv) {
         g_kaTable[i] = (float)(sin(kTwoPi * (double)g_kaHz * (double)i / (double)kSampleRate)
                                * (double)g_kaGain);
 
+    // v6.5.18: center dialogue EQ coefficients (ini: center_eq*)
+    centerEqInit();
+
     // v6.2 chimes: render the modernized CenterFold signature ONCE -- two
     // short triangle blips in the low treble, the old rising fifth (G5->D6
     // square) two-plus octaves up: C7 2093 Hz (42 ms) -> G7 3136 Hz (72 ms),
@@ -4382,7 +4531,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.17        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.18        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4443,6 +4592,12 @@ int main(int argc, char** argv) {
            (g_cfg.centerGate && g_cfg.centerUpmixGuard) ? "BOTH ON" :
            (g_cfg.centerUpmixGuard ? "upmix guard on, gate OFF" :
            (g_cfg.centerGate ? "gate on, upmix guard OFF" : "OFF (center_gate = off)")));
+    if (g_ceq.on)
+        tlog("[twinspeak] route out2     : center EQ ON -- peaking %.0f Hz %+.1f dB Q %.2f on ch3 (dialogue boost;\n"
+               "                            a KS/WaveRT leg bypasses every system APO, so the boost lives here)\n",
+               g_ceq.f0, g_ceq.gainDb, g_ceq.q);
+    else
+        tlog("[twinspeak] route out2     : center EQ off -- out2 is bit-exact\n");
     // v6.3.1: the align line does the arithmetic -- both est paths and their
     // difference, with the trim direction spelled out. Same formula as
     // printLegDevice (ring + device lead + capture burst, delay included),
