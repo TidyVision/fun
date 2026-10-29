@@ -1,5 +1,22 @@
 // ============================================================================
-//  twinspeak v6.6.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.2 (LAYOUT REPAIRS, same two bugs the user saw in v6.6.0/6.6.1:
+//          (1) BUTTONS OVERLAPPING ACROSS TABS: mkBtn() was the only control
+//          factory that never called regPage(), so every owner-drawn toggle
+//          pill and the five EQ preset buttons existed on ALL SIX pages at
+//          once -- page 3/4/5 ON/OFF pills covered the Devices combos and
+//          the FLAT..CINEMA row covered the leg1 row. The pills and presets
+//          now register into the page they are built on (tabs and the
+//          START/APPLY/SAVE bar correctly stay on every page).
+//          (2) LOG PANE TEXT MERGED + OVERLAPPING: tlog lines end in a bare
+//          \n, but a Win32 multiline EDIT honors only \r\n -- a lone LF is
+//          not a break, so the pane merged every line into one paragraph
+//          AND its wrap layout collapsed into overlapping rows. guiAppendLog
+//          now normalizes every break (CR, LF, CRLF -- even a chunk boundary
+//          cut mid-pair) to exactly one CRLF before EM_REPLACESEL.
+//          No engine DSP changed in this version: the sample path is
+//          byte-identical to v6.5.18.)
 //
 //  v6.6.1 (THE WINDOW LIVES IN THE TRAY. Two user-reported fixes:
 //          (1) STALE PAINT: the window only refreshed after a minimize or
@@ -3314,7 +3331,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4327,6 +4344,9 @@ static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val
 }
 
 static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt) {
+    // NOTE: deliberately NOT regPage()d here -- the tab strip and the
+    // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
+    // presets, REFRESH) are registered by their builders (v6.6.2).
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4364,7 +4384,8 @@ static void row(HWND w, int colX, int y, const char* label, int id, const char* 
 // one ini row: label + ON/OFF pill
 static void tglRow(HWND w, int colX, int y, const char* label, int id, bool on) {
     mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
-    mkBtn(w, id, colX + LBL_W + 8, y, 64, 24, "");
+    HWND b = mkBtn(w, id, colX + LBL_W + 8, y, 64, 24, "");
+    regPage(b);                        // v6.6.2: the pill lives on THIS page
     g_tog[id] = on;
 }
 
@@ -4708,6 +4729,23 @@ static void guiLogSink(const char* s) {
 static void guiAppendLog(const std::string& s) {
     HWND e = GetDlgItem(g_hwnd, IDC_LOG);
     if (!e) return;
+    // v6.6.2: the multiline EDIT honors only \r\n. A bare \n is not a break:
+    // lines merge into one paragraph and the wrap layout collapses into
+    // OVERLAPPING rows (the "console text overlaps" bug). Normalize every
+    // break -- CR, LF, CRLF, even a ring-trim cut mid-pair -- to exactly
+    // one CRLF before it touches the control.
+    std::string norm;
+    norm.reserve(s.size() + 16);
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\r') {
+            norm += "\r\n";
+            if (i + 1 < s.size() && s[i + 1] == '\n') ++i;   // swallow the pair's LF
+        } else if (s[i] == '\n') {
+            norm += "\r\n";
+        } else {
+            norm += s[i];
+        }
+    }
     int len = GetWindowTextLengthA(e);
     if (len > 131072) {                               // keep the pane bounded
         SendMessageA(e, EM_SETSEL, 0, len / 2);
@@ -4715,7 +4753,7 @@ static void guiAppendLog(const std::string& s) {
         len = GetWindowTextLengthA(e);
     }
     SendMessageA(e, EM_SETSEL, len, len);
-    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
+    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
     SendMessageA(e, EM_SCROLLCARET, 0, 0);
 }
 
@@ -4776,7 +4814,8 @@ static void guiBuildPages(HWND w) {
     comboRow(w, COLA_X, 166, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
     comboRow(w, COLA_X, 204, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
     row(w, COLA_X, 242, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    mkBtn(w, IDC_REFRESH, COLA_X, 284, 150, 28, "REFRESH DEVICES");
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 284, 150, 28, "REFRESH DEVICES");
+    regPage(b);                        // v6.6.2: page 0 only
     note(w, COLA_X, 326,
          "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
          "leg2 carries ONLY the center channel.\n"
@@ -4866,7 +4905,7 @@ static void guiBuildPages(HWND w) {
     g_tab = 5;
     tglRow(w, COLA_X, 122, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
     for (int i = 0; i < 5; ++i)
-        mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 96, 160, 88, 30, kEqPre[i].name);
+        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 96, 160, 88, 30, kEqPre[i].name));
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 220, 430, "PEAK FREQUENCY", g_fUIb);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 244, 430, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 292, 430, "BOOST", g_fUIb);
@@ -5028,7 +5067,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 8, 420, 42 };
         guiText(dc, hdr, "TWINSPEAK CONTROL", guic::cAccent, g_fHead,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        const std::string verLine = "v6.6.1  |  " + g_guiIniPath;
+        const std::string verLine = "v6.6.2  |  " + g_guiIniPath;
         const RECT ver = { 300, 14, 984, 38 };
         guiText(dc, ver, verLine.c_str(), guic::cDim, g_fSml,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -5302,7 +5341,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // WS_CLIPCHILDREN -- the parent never paints over its children and every
     // visual state change invalidates the exact child (see guiRepaint). The
     // window starts HIDDEN; --tray leaves it in the tray, otherwise it shows.
-    g_hwnd = CreateWindowExA(0, "twinspeak.control", "twinspeak control -- v6.6.1",
+    g_hwnd = CreateWindowExA(0, "twinspeak.control", "twinspeak control -- v6.6.2",
                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
@@ -5830,7 +5869,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.1        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
