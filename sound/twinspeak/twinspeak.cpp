@@ -1665,9 +1665,6 @@ struct Leg {
     // banner) and center-presence gate state (pump-2 thread owned):
     size_t              delayFrames = 0;         // extra ring depth = delay_ms * 48
     float               delayMs     = 0.0f;      // as configured (banner)
-    size_t              tickBase    = 0;         // v7.0.0: ring depth WITHOUT the
-                                                 // delay -- the 120 bpm tick's per-leg
-                                                 // dispatch anchor (see tickSum)
     std::atomic<unsigned long long> cmUpmix{0}; // blocks muted by the upmix guard
     size_t              upmixHoldFrames = 0;     // keep muting small blocks after a hit
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
@@ -2561,21 +2558,23 @@ static inline bool bitZero8(const float* p, size_t n) {
 }
 
 // ---- v7.0.0: the 120 BPM tempo tick (the sync test) ------------------------
-// One sharp 7.5 ms burst every 500 ms (120 bpm), 12 beats = 6 s, rendered ONCE
-// into g_tickWave (half amplitude, 0.3 -- the first cut was LOUD). The pumps
-// sum the SAME tick samples to BOTH legs, keyed to CAPTURE-SEQUENCE time and
-// offset per leg by tickBase (the leg's ring depth WITHOUT the delay): the
-// tick enters leg N's stream tickBase frames early, rides the full ring depth
-// (target = tickBase + delay), and reaches leg N's DAC exactly delay_msN
-// after the beat -- delay1_ms on leg1, delay2_ms on leg2, NOTHING else. Any
-// flam the ear hears is (delay1 - delay2) plus the real physical path
-// difference: trim the delay knobs until the ticks match. 1500 Hz, fast
-// decay: audible on small speakers, sharp enough that a few ms reads as a flam.
+// One sharp 7.5 ms burst every 500 ms (120 bpm), 8 beats = 4 s, rendered ONCE
+// into g_tickWave (0.3 amplitude -- the first cut was LOUD). RAW BY DESIGN:
+// the pumps sum the SAME tick samples at the SAME capture-sequence position
+// on BOTH legs -- NO latency compensation of any kind -- onto the tick
+// channels of each leg (leg1: FL/FR/LFE, leg2: the center pair; FC on leg1
+// stays driven silence). Whatever each speaker's path adds is exactly what
+// you hear: the flam IS the measurement. The button is a PLAY/STOP toggle
+// and the test ends itself after 4 s. 1500 Hz, fast decay: sharp enough that
+// a few ms of offset reads as a flam.
 static std::atomic<bool>      g_tickOn{false};
 static std::atomic<long long> g_tickSeq0{-1};      // capture-seq of tick beat zero
+static std::atomic<unsigned long long> g_tickEndMs{0};   // wall time the 4 s run ends
+                                                 // (0 = idle; the GUI timer flips
+                                                 // the button back when it passes)
 static std::vector<float>     g_tickWave;          // ONE pre-rendered tick (48 kHz mono)
 static constexpr size_t kTickPeriod = 24000;       // 500 ms @ 48 kHz = 120 bpm
-static constexpr size_t kTickCount  = 12;          // 12 beats = 6 s, then it stops
+static constexpr size_t kTickCount  = 8;           // 8 beats = 4 s, then it stops
 
 static void tickRender() {
     if (!g_tickWave.empty()) return;
@@ -2592,12 +2591,10 @@ static void tickRender() {
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore) {
     const long long t0 = g_tickSeq0.load(std::memory_order_acquire);
     if (t0 < 0) return;
-    // v7.0.0 dispatch rule: write the tick tickBase frames EARLY in the leg's
-    // stream. The ring's non-delay depth (tickBase) then cancels against the
-    // early write and the DAC fires the tick exactly delay_ms after the beat
-    // -- delay1_ms on leg1, delay2_ms on leg2, nothing else in the flam.
-    const long long pos = (long long)seqBefore - t0
-                        + (long long)g_leg[idx].tickBase;
+    // v7.0.0 RAW dispatch: no latency compensation of any kind -- the tick
+    // lands at the same capture-sequence position on both legs and rides
+    // whatever path each leg actually has. The flam is the measurement.
+    const long long pos = (long long)seqBefore - t0;
     if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
     const size_t wn = g_tickWave.size();
     const int    ch = (idx == 0) ? kOutCh1 : 2;
@@ -2608,7 +2605,14 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
         if (ph >= wn) continue;
         const float s = g_tickWave[ph];
         float* o = chunk + i * (size_t)ch;
-        for (int c = 0; c < 2; ++c) {
+        // v7.0.0: the tick channels -- leg1: FL, FR, LFE (FC is DRIVEN
+        // SILENCE on purpose and SL/SR are unused); leg2: the center pair.
+        static const int kTickCh1[3] = { 0, 1, 3 };
+        static const int kTickCh2[2] = { 0, 1 };
+        const int   nc = (idx == 0) ? 3 : 2;
+        const int*  tc = (idx == 0) ? kTickCh1 : kTickCh2;
+        for (int k = 0; k < nc; ++k) {
+            const int c = tc[k];
             float v = o[c] + s;
             if (v >  1.0f) v =  1.0f; else if (v < -1.0f) v = -1.0f;
             o[c] = v;
@@ -2732,7 +2736,7 @@ static DWORD WINAPI pumpThread(LPVOID p) {
                 mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
             }
             if (g_tickOn.load(std::memory_order_relaxed))
-                tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, delay_ms dispatch
+                tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, raw, both legs
             const size_t dropped = L.out.pushOverwrite(chunk, n);
             if (dropped && L.streamSeeded)         // v6.4: passive evict = a seq skip
                 L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
@@ -5280,7 +5284,9 @@ static void guiStopEngine() {
 
 // ---- page building ----------------------------------------------------------
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
-static const int kTabW[6] = { 118, 100, 128, 152, 172, 128 };
+// v7.0.0: uniform tab width -- the same 798 px strip span the per-name widths
+// owned (6 x 133 px + 5 x 4 px gaps), every tab the same size.
+static const int kTabW[6] = { 133, 133, 133, 133, 133, 133 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -5655,8 +5661,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         char txt[128];
         GetWindowTextA(d->hwndItem, txt, sizeof(txt));
         const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        // v7.0.0: the bottom-bar set is EXPLICIT -- the old [IDC_START..
+        // IDC_TICK] range test swallowed IDC_REFRESH (205), so the page-bound
+        // REFRESH DEVICES button erased with the window background while
+        // sitting ON the panel: a rectangle of the wrong color, and its
+        // transparent face showed the wrong surface through.
         const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
-                              (id >= IDC_START && id <= IDC_TICK));
+                              id == IDC_START  || id == IDC_APPLY ||
+                              id == IDC_SAVE   || id == IDC_TICK  ||
+                              id == IDC_THEME);
         // v6.6.7: erase FIRST and in PLAIN GDI -- exact opaque pixels, no
         // GDI+ alpha. The old GDI+ fill let the square corners blend
         // against whatever the button's own WM_ERASEBKGND had put there
@@ -5668,18 +5681,31 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
+            // v7.0.0: the selected tab GLOWS -- the face is filled, then
+            // layered accent strokes (widest + faintest first) burn a soft
+            // halo inward from the rim, capped by a bright 1 px border. The
+            // child DC clips anything outside the tab, so the halo is drawn
+            // inside. The old underline bar is gone; resting tabs are
+            // transparent faces like every other button.
             const bool act = (id - IDC_TAB0) == g_tab;
             const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
             Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
-            Gdiplus::SolidBrush fb(GCol(act ? guic::cPanelHi : guic::cPanel));
-            Gdiplus::Pen        pb(GCol(act ? guic::cAccentDk : guic::cLine), 1.0f);
-            g.FillPath(&fb, p);
-            g.DrawPath(&pb, p);
-            delete p;
             if (act) {
-                Gdiplus::SolidBrush ab(GCol(guic::cAccent));
-                g.FillRectangle(&ab, grc.X + 7, grc.Y + grc.Height - 4, grc.Width - 14, 3);
+                Gdiplus::SolidBrush fb(GCol(guic::cPanelHi));
+                g.FillPath(&fb, p);
+                const BYTE  ga[3]  = { 34, 64, 110 };   // alphas, widest first
+                const float gwd[3] = { 10.0f, 6.0f, 3.0f };
+                for (int k = 0; k < 3; ++k) {
+                    Gdiplus::Pen gp(GCol(guic::cAccent, ga[k]), gwd[k]);
+                    g.DrawPath(&gp, p);
+                }
+                Gdiplus::Pen pb(GCol(guic::cAccent), 1.0f);
+                g.DrawPath(&pb, p);
+            } else {
+                Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
+                g.DrawPath(&pb, p);
             }
+            delete p;
             guiAAString(g, dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb, 0);
             return TRUE;
         }
@@ -5693,7 +5719,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (on) g.FillPath(&fb, p);
             g.DrawPath(&pb, p);
             delete p;
-            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cDim,
+            // v7.0.0: OFF reads in full text color -- cDim washed out on
+            // every theme; ON keeps the accent.
+            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cText,
                         g_fUIb, 0);
             return TRUE;
         }
@@ -5786,22 +5814,33 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 cfgFromControls(w); cfgSanitize();
                 SetDlgItemTextA(w, IDC_STATUS, guiSaveIni() ? "ini saved" : "ini save FAILED");
                 return 0; }
-            case IDC_TICK: {                   // v7.0.0: the 120 bpm sync tick, both legs
+            case IDC_TICK: {                   // v7.0.0: the 120 bpm sync tick -- PLAY/STOP toggle
                 if (g_engState.load() == 0) {
                     SetDlgItemTextA(w, IDC_STATUS, "tick test: start the engine first");
                     return 0;
                 }
+                if (g_tickOn.load(std::memory_order_acquire)) {
+                    // v7.0.0: second press -- stop the test where it is
+                    g_tickOn.store(false, std::memory_order_release);
+                    g_tickSeq0.store(-1, std::memory_order_relaxed);
+                    g_tickEndMs.store(0, std::memory_order_relaxed);
+                    SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
+                    SetDlgItemTextA(w, IDC_STATUS, "tempo tick: stopped");
+                    return 0;
+                }
                 tickRender();
-                // Tick beat zero = one second of capture time ahead. Each pump
-                // writes the tick tickBase frames EARLY in its own stream, so
-                // after the ring depth the DAC fires it exactly delay1_ms /
-                // delay2_ms after the beat -- trim those knobs until the two
-                // speakers tick as one.
+                // Raw dispatch: beat zero = one second of capture time ahead;
+                // both pumps write the SAME samples at the SAME capture-seq
+                // position, onto FL/FR/LFE and the center pair. No latency
+                // compensation -- the flam between the speakers IS the data.
                 g_tickSeq0.store((long long)g_leg[0].captured.load(std::memory_order_relaxed)
                                  + (long long)kSampleRate, std::memory_order_release);
+                g_tickEndMs.store(GetTickCount64() + 1000ULL + 4000ULL,
+                                  std::memory_order_relaxed);
                 g_tickOn.store(true, std::memory_order_release);
+                SetDlgItemTextA(w, IDC_TICK, "STOP TICK TEST");
                 SetDlgItemTextA(w, IDC_STATUS,
-                    "tempo tick: 120 bpm, 12 beats (6 s) -- dispatch = delay1_ms / delay2_ms");
+                    "tempo tick: 120 bpm, 8 beats (4 s) -- raw, all four channels");
                 return 0; }
             case IDC_THEME: {                  // v7.0.0: cycle the eight themes
                 applyTheme(g_theme + 1);
@@ -5848,6 +5887,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0; }
     case WM_TIMER: {
+        // v7.0.0: the tick test ends itself -- flip the button back once the
+        // 4 s run is over. An engine restart clears g_tickOn on the engine
+        // thread; this same branch restores the label (endMs stays set).
+        if (!g_tickOn.load(std::memory_order_relaxed)) {
+            const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
+            if (end != 0 && GetTickCount64() > end) {
+                g_tickEndMs.store(0, std::memory_order_relaxed);
+                SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
+            }
+        }
         if (g_logDirty.exchange(false)) {
             EnterCriticalSection(&g_logCS);
             const std::string chunk = g_logRing;
@@ -5855,8 +5904,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             LeaveCriticalSection(&g_logCS);
             if (!chunk.empty()) guiAppendLog(chunk);
         }
-        static const char* stName[4] = { "engine stopped", "engine starting...",
+        static const char* stName[4] = { "engine stopped", "engine started",
                                          "engine RUNNING", "engine stopping..." };
+        // v7.0.0: "engine starting..." renamed "engine started" -- the label
+        // says the start process has finished, not that it is grinding.
         std::string s = stName[g_engState.load()];
         if (g_engState.load() == 0 && g_engRC.load() != 0) {
             char eb[32];
@@ -6348,9 +6399,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.targetFrames = std::max<size_t>(cfgFrames,
                             devPeriodFr + g_capBurstFrames + marginFr)
                          + L.delayFrames;
-        L.tickBase    = L.targetFrames - L.delayFrames;   // v7.0.0: the tick's
-        // dispatch anchor -- the non-delay depth this leg's tick must exit
-        // through so the DAC fires it exactly delay_ms after the beat
         L.raw.init(L.targetFrames * 4, kInCh);
         L.out.init(L.targetFrames + kRingSpareFrames, L.outCh);
         L.out.pushSilence(L.targetFrames);   // prefill so playbacks start smooth
