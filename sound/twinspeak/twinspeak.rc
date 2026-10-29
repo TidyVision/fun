@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TidyVision TwinSpeak"
-            VALUE "FileVersion",      "7.0.0.0"
+            VALUE "FileVersion",      "7.0.2.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.0.0.0"
+            VALUE "ProductVersion",   "7.0.2.0"
         END
     END
     BLOCK "VarFileInfo"

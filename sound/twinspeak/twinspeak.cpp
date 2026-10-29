@@ -1,5 +1,28 @@
 // ============================================================================
-//  twinspeak v7.0.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v7.0.2 (POLISH, THREE PIECES, ZERO DSP. (1) THE TAB GLOW, OUTWARD ONLY:
+//          the selected tab's halo moved to the FRAME's WM_PAINT -- the
+//          child DC clips at the tab rect, the frame's WS_CLIPCHILDREN DC
+//          clips the other way, so centered strokes on the tab path drawn
+//          by the frame lose exactly their inward half and the outward
+//          half IS the glow, hugging the border from outside. The tab
+//          itself paints just face + border now. (2) THE TICK BUTTON
+//          UNTOGGLES ITSELF: nothing on the engine side cleared g_tickOn
+//          when the 4 s run finished (tickSum just went quiet past beat
+//          8), so the button stayed on STOP TICK TEST until pressed; the
+//          GUI timer now owns the natural end -- flag, anchor, label.
+//          (3) The CENTER + VOLUME tab is renamed VOLUME.)
+//
+//  v7.0.1 (THE LEDGER RESTART FIX: a restart re-arms the whole frame-
+//          interval ledger -- Ring::init zeroes seqTail and the leg's
+//          captured/popped/streamSeeded/counters re-arm at engine start --
+//          so APPLY + RESTART can no longer drag the previous run's ring
+//          fill into the capture-sequence math: the 120 bpm tick's flam
+//          stays exactly where the delay knobs put it, every start. The
+//          selected tab's glow paints fully INSIDE the tab now (the child
+//          DC used to clip the halo's outer half at the rect) and a notch
+//          quieter.)
 //
 //  v7.0.0 (THE ONE-POINT-OH. (1) THE STOP GAP: APPLY + RESTART (and STOP)
 //          silences the legs BEFORE the devices close -- the WASAPI callbacks
@@ -1486,6 +1509,14 @@ struct Ring {
         buf.assign(c * stride, 0.0f);
         cap = c; mask = c - 1;
         head.store(0); tail.store(0);
+        // v7.0.1 THE LEDGER RESTART FIX: init() runs on every engine start
+        // (a restart included), so the sequence ledger MUST re-arm with the
+        // ring. A stale seqTail made the raw ledger carry the previous
+        // run's leftover -- whatever its ring still held at the STOP -- and
+        // the 120 bpm tick landed at a different capture position on each
+        // leg: the flam moved in completely diverted ways on every
+        // APPLY + RESTART.
+        seqTail.store(0, std::memory_order_release);
     }
     size_t count() const {
         return (size_t)(head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire));
@@ -3624,7 +3655,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4558,7 +4589,7 @@ static void trayRemove();
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
 static const char* kTabNames[6] = {
-    "DEVICES", "TIMING", "TRANSPORT", "OTHER", "CENTER + VOLUME", "CENTER EQ"
+    "DEVICES", "TIMING", "TRANSPORT", "OTHER", "VOLUME", "CENTER EQ"
 };
 
 // v6.6.4: the title bar carries ONLY the close button. No maximize (the
@@ -5371,7 +5402,7 @@ static void guiBuildPages(HWND w) {
          "drift_interval_ms: minimum spacing between corrections (2000..60000).\n"
          "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
 
-    // ============ page 4: CENTER + VOLUME ============
+    // ============ page 4: VOLUME ============
     g_tab = 4;
     header(w, COLA_X, KHDR_Y, "CENTER CUES");
     tglRow(w, COLA_X, KROW0, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
@@ -5568,10 +5599,34 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);
             g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
         }
+        {   // v7.0.2: the selected tab's OUTWARD glow (see the child's
+            // WM_DRAWITEM note). Centered accent strokes on the tab's face
+            // path, widest + faintest first: WS_CLIPCHILDREN keeps this DC
+            // OUT of the child rects, so the inward half of every stroke is
+            // clipped away and exactly the outward half survives -- a halo
+            // that hugs the border and burns outward, never touching the
+            // face. Tab selection only changes through guiShowPage, which
+            // invalidates the frame, so the halo always repaints with it.
+            if (HWND th = GetDlgItem(w, IDC_TAB0 + g_tab)) {
+                RECT tr;
+                GetWindowRect(th, &tr);
+                MapWindowPoints(nullptr, w, (POINT*)&tr, 2);
+                const Gdiplus::Rect tfr(tr.left, tr.top, tr.right - tr.left,
+                                        tr.bottom - tr.top - 3);
+                Gdiplus::GraphicsPath* tp = guiRoundPath(tfr, 6);
+                const BYTE  ga[3]  = { 26, 48, 84 };    // alphas, widest first
+                const float gwd[3] = { 10.0f, 6.0f, 3.0f };
+                for (int k = 0; k < 3; ++k) {
+                    Gdiplus::Pen gp(GCol(guic::cAccent, ga[k]), gwd[k]);
+                    g.DrawPath(&gp, tp);
+                }
+                delete tp;
+            }
+        }
         const RECT hdr = { 18, 6, 420, 40 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.0  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.2  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 12, 866, 36 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -5681,11 +5736,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
-            // v7.0.0: the selected tab GLOWS -- the face is filled, then
-            // layered accent strokes (widest + faintest first) burn a soft
-            // halo inward from the rim, capped by a bright 1 px border. The
-            // child DC clips anything outside the tab, so the halo is drawn
-            // inside. The old underline bar is gone; resting tabs are
+            // v7.0.2: the selected tab GLOWS OUTWARD ONLY -- and the halo
+            // lives in the FRAME's WM_PAINT now, not here. The child DC
+            // clips at the tab rect, so a halo drawn inside the child can
+            // never leave it (v7.0.0 burned it inward, v7.0.1 inset it --
+            // both fought the clip). The parent's DC is clipped the other
+            // way: OUT of the child rects. Centered strokes on the tab path
+            // drawn there lose exactly their inward half to WS_CLIPCHILDREN
+            // -- the outward half IS the glow. This child paints only the
+            // face (active) and the bright 1 px border; resting tabs are
             // transparent faces like every other button.
             const bool act = (id - IDC_TAB0) == g_tab;
             const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
@@ -5693,18 +5752,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (act) {
                 Gdiplus::SolidBrush fb(GCol(guic::cPanelHi));
                 g.FillPath(&fb, p);
-                const BYTE  ga[3]  = { 34, 64, 110 };   // alphas, widest first
-                const float gwd[3] = { 10.0f, 6.0f, 3.0f };
-                for (int k = 0; k < 3; ++k) {
-                    Gdiplus::Pen gp(GCol(guic::cAccent, ga[k]), gwd[k]);
-                    g.DrawPath(&gp, p);
-                }
-                Gdiplus::Pen pb(GCol(guic::cAccent), 1.0f);
-                g.DrawPath(&pb, p);
-            } else {
-                Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
-                g.DrawPath(&pb, p);
             }
+            Gdiplus::Pen pb(GCol(act ? guic::cAccent : guic::cLine), 1.0f);
+            g.DrawPath(&pb, p);
             delete p;
             guiAAString(g, dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb, 0);
             return TRUE;
@@ -5887,10 +5937,25 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0; }
     case WM_TIMER: {
-        // v7.0.0: the tick test ends itself -- flip the button back once the
-        // 4 s run is over. An engine restart clears g_tickOn on the engine
-        // thread; this same branch restores the label (endMs stays set).
-        if (!g_tickOn.load(std::memory_order_relaxed)) {
+        // v7.0.2: the tick test ends itself -- and now the BUTTON untoggles
+        // with it. Nothing on the engine side clears g_tickOn at the end of
+        // the 4 s run (tickSum just goes quiet past beat 8), so the GUI
+        // timer owns the natural end: flag, anchor, label, all reset here.
+        // The v7.0.0 branch only ran when g_tickOn was ALREADY false, so a
+        // self-finished run left the button reading STOP TICK TEST forever.
+        // The else side keeps the old job: an engine restart voids the run
+        // (g_tickOn cleared on the engine thread, endMs left set) and the
+        // stale endMs restores the label.
+        if (g_tickOn.load(std::memory_order_relaxed)) {
+            const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
+            if (end != 0 && GetTickCount64() > end) {
+                g_tickOn.store(false, std::memory_order_release);
+                g_tickSeq0.store(-1, std::memory_order_relaxed);
+                g_tickEndMs.store(0, std::memory_order_relaxed);
+                SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
+                SetDlgItemTextA(w, IDC_STATUS, "tempo tick: finished");
+            }
+        } else {
             const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
             if (end != 0 && GetTickCount64() > end) {
                 g_tickEndMs.store(0, std::memory_order_relaxed);
@@ -6409,6 +6474,30 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.lastBlock.assign(L.lastCap * (size_t)L.outCh, 0.0f);
         L.lastN = 0;
         L.haveLast = false;
+        // v7.0.1 THE LEDGER RESTART FIX (leg side): every clock the ledger
+        // reads is PER RUN. A restart used to inherit the previous run's
+        // captured/popped/streamSeeded, so the pumps' seqBefore and the tick
+        // press's beat-zero anchor (captured + 1 s) lived in mismatched
+        // capture-sequence spaces -- the stale part was whatever the old
+        // run's rings held at the STOP, and it differed per leg. The drift
+        // warden read the same stale out-ledger and corrected against it.
+        // Zero the whole per-run state HERE, before any device or pump
+        // thread exists (no concurrency at this point): raw seqTail, out
+        // seqTail, captured and the tick anchor now start the same run
+        // together, on both legs, every start.
+        L.captured.store(0, std::memory_order_relaxed);
+        L.popped.store(0, std::memory_order_relaxed);
+        L.streamSeeded = false;
+        L.rawDrop.store(0, std::memory_order_relaxed);
+        L.outDrop.store(0, std::memory_order_relaxed);
+        L.und.store(0, std::memory_order_relaxed);
+        L.corrDrops.store(0, std::memory_order_relaxed);
+        L.cmUpmix.store(0, std::memory_order_relaxed);
+        L.padFrames.store(0, std::memory_order_relaxed);
+        L.padTotal.store(0, std::memory_order_relaxed);
+        L.wardenDrops.store(0, std::memory_order_relaxed);
+        L.wardenPads.store(0, std::memory_order_relaxed);
+        L.lastCorrMs = 0;
     }
 
     // ---------------- v3.8 COM volume layer (setup on the main thread) -----
@@ -6561,7 +6650,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.0        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
