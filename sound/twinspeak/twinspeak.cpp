@@ -1,5 +1,22 @@
 // ============================================================================
-//  twinspeak v6.6.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.9 (THREE FINAL TWEAKS, ZERO DSP. (1) INI LEAK PLUGGED: guiSaveIni
+//          skipped splicing any known key whose current value was empty --
+//          clear volume_endpoint in the window, hit APPLY, and the stale
+//          cable name stayed in the file verbatim while an empty duplicate
+//          of the key was appended at the bottom. Every known key line is
+//          spliced now, empty value or not: one key, one line, current.
+//          (2) THE BUTTON TELLS THE TRUTH: during the transient "starting"
+//          engine state the START button read "STARTING..." while its click
+//          already meant stop -- the label is now "STOP".
+//          (3) SILENCE COMPRESSION in the pumps: a block that is bit-zero
+//          (literal +0 samples, scanned word-wise) mixes to a bit-zero
+//          chunk whenever the leg's gains make that provable -- the pump
+//          memsets the chunk and skips the per-frame multiply-add fan-out;
+//          leg2 with the EQ on also resets the biquad state exactly like
+//          mixBlock's all-zero branch. Same bytes out, a fraction of the
+//          work. No engine DSP changed: byte-identical to v6.5.18.)
 //
 //  v6.6.8 (FINAL POLISH: the engine swallows its switches, the sliders go
 //          dark. (1) TEN SWITCHES INTEGRATED: capture_exclusive, exclusive,
@@ -1597,6 +1614,7 @@ struct KsOut {
 struct Leg {
     int                 index = 0;               // 0-based; printed as +1
     int                 outCh = kOutCh1;         // 6 for mains, 2 for center
+    bool                zeroFast = false;        // v6.6.9: bit-zero blocks skip the mix (pump-frozen gate)
     Ring                raw;                     // 8ch: capture cb -> pump
     Ring                out;                     // outCh: pump -> playback cb
     size_t              targetFrames = 576;      // latency anchor (floor: FULL device buffer + burst + 4 ms)
@@ -2489,6 +2507,24 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
     }
 }
 
+// ---- v6.6.9: silence compression -------------------------------------------
+// TRUE bit-zero test, two frames per word: every sample must be the LITERAL
+// +0.0f bit pattern. (A float == 0.0f compare would also match -0.0f, whose
+// mix output carries the sign -- this scan is stricter, so the fast path's
+// proof holds.) n is frames of kInCh floats = kInCh/2 uint64 words per frame;
+// the pump's scratch always holds whole ring frames, so there is no
+// odd-float tail and the base stays frame-aligned. The memcpy reads compile
+// to plain 8-byte loads; the loop bails at the first nonzero word.
+static inline bool bitZero8(const float* p, size_t n) {
+    unsigned long long w;
+    const size_t nw = n * (size_t)(kInCh / 2);
+    for (size_t i = 0; i < nw; ++i) {
+        memcpy(&w, p + i * 2, sizeof(w));
+        if (w) return false;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------- pumps ----
 // v6.0: the pump is a dumb, fast MOVER (ASIO discipline -- the device thread
 // is the master; the producer never corrects anything):
@@ -2540,6 +2576,20 @@ static DWORD WINAPI pumpThread(LPVOID p) {
     // channel count from idx itself (the config is startup-frozen).
     float*       sc     = L.scratch.data();
     float*       chunk  = L.chunk.data();
+    // v6.6.9 SILENCE COMPRESSION gate, frozen at pump start (the config is
+    // startup-frozen). The fast path replaces mixBlock with a memset ONLY
+    // where the mix of a bit-zero block is PROVABLY a bit-zero chunk:
+    //   leg1: o = gL*f0 (+ gLfe*f3) -- strictly positive gains give +0 out
+    //         for +0 in, in BOTH lfeFold states (a negative gain would emit
+    //         -0, so the fast path refuses it; the full loop stays exact).
+    //   leg2: EQ on -- the all-zero branch already resets the biquad and
+    //         writes literal zeros (the memset reproduces it exactly);
+    //         EQ off -- the chunk is gC*ch3, +0 for any non-negative gC.
+    // centerGuard still runs inside the fast path: its gate state and
+    // logging must see the same blocks it always saw.
+    L.zeroFast = (idx == 0)
+        ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f)
+        : (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f);
 
     while (g_run.load()) {
         if (timerOK) {
@@ -2581,7 +2631,15 @@ static DWORD WINAPI pumpThread(LPVOID p) {
                 }
             }
             if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
-            mixBlock(idx, sc, chunk, n);           // v6.5: hoisted bulk mix
+            // v6.6.9: silence compression -- a bit-zero block needs no mix
+            // (see the gate above): same bytes out, none of the FP work.
+            if (L.zeroFast && bitZero8(sc, n)) {
+                if (idx == 1 && g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
+                memset(chunk, 0, (size_t)n * (idx == 0 ? (size_t)kOutCh1
+                                                       : (size_t)kOutCh2) * sizeof(float));
+            } else {
+                mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
+            }
             const size_t dropped = L.out.pushOverwrite(chunk, n);
             if (dropped && L.streamSeeded)         // v6.4: passive evict = a seq skip
                 L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
@@ -2614,7 +2672,13 @@ static DWORD WINAPI pumpThread(LPVOID p) {
             }
         }
         if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
-        mixBlock(idx, sc, chunk, n);           // v6.5: hoisted bulk mix
+        if (L.zeroFast && bitZero8(sc, n)) {   // v6.6.9: silence compression
+            if (idx == 1 && g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
+            memset(chunk, 0, (size_t)n * (idx == 0 ? (size_t)kOutCh1
+                                                   : (size_t)kOutCh2) * sizeof(float));
+        } else {
+            mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
+        }
         const size_t dropped = L.out.pushOverwrite(chunk, n);
         if (dropped && L.streamSeeded)
             L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
@@ -3452,7 +3516,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4846,12 +4910,14 @@ static bool guiSaveIni() {
                 if (key == kIniKeys[k]) { isKey = true; keyIdx = k; break; }
         }
         if (isKey) {
-            const std::string val = cfgValueText(key);
-            if (!val.empty()) {
-                seen[keyIdx] = true;
-                out += head.substr(0, eq + 1) + " " + val + "\r\n";
-                continue;
-            }
+            // v6.6.9: splice EVERY known key line, empty value or not. The old
+            // "skip empty" rule left a cleared volume_endpoint (or device
+            // name) verbatim in the file -- the stale endpoint name leaked
+            // into every later save -- and then appended a second, empty copy
+            // of the same key at the bottom. One key, one line, current.
+            seen[keyIdx] = true;
+            out += head.substr(0, eq + 1) + " " + cfgValueText(key) + "\r\n";
+            continue;
         }
         out += s;                       // comments / blanks / unknowns: verbatim
     }
@@ -5336,7 +5402,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 6, 420, 40 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v6.6.8  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v6.6.9  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 12, 866, 36 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -5476,7 +5542,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g.FillPath(&fb, p);
                 g.DrawPath(&pb, p);
                 delete p;
-                guiAAString(g, dc, rc, st == 1 ? "STARTING..." : "STOPPING...", guic::cDim,
+                // v6.6.9: the transient says what the CLICK does -- starting
+                // the engine is already stoppable, so the label reads STOP.
+                guiAAString(g, dc, rc, st == 1 ? "STOP" : "STOPPING...", guic::cDim,
                             g_fUIb, 0);
             }
             return TRUE;
@@ -6235,7 +6303,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.8        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.9        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
