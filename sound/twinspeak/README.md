@@ -14,10 +14,6 @@ FORMERLY CENTERFOLD
 
 [TwinSpeak Program](https://github.com/TidyVision/fun/raw/main/sound/twinspeak/TidyVision%20TwinSpeak.zip)
 
-## How to integrate into startup (if either temporary or forever)
-
-Press Windows Key + R, then type in shell:startup. Then create a new shortcut with the exe to your specific twinspeak location where you downloaded it on. And that's it.
-
 # Twinspeak
 
 **Bit-exact 5.1 → 2.1 + center splitter for Windows — WASAPI / WDM-KS, no resampler, no clones, no surprises, and no external lag.**

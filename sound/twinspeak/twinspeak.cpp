@@ -1,5 +1,26 @@
 // ============================================================================
-//  twinspeak v6.5.18 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.0 (THE CONTROL WINDOW. Running twinspeak.exe with no arguments now
+//          opens a black+cyan GUI instead of the console -- every flag mode
+//          (--list/--list-ks/--ini/--foreground/--multi and a bare ini path)
+//          behaves exactly as before. The window holds EVERY ini key, hand-
+//          laid out across six tabs (Devices / Timing / Transport /
+//          Sync+Power / Center+Volume / Center EQ), with the engine itself
+//          running IN-PROCESS: START/STOP on a worker thread (the engine
+//          body is now engineMain(), shared by the console and GUI paths --
+//          one implementation, no drift), a live log pane fed by a tlog
+//          sink, and a status line carrying the engine state + the live
+//          health line. SAVE INI writes the file in place -- every comment
+//          line survives, values are spliced, a .bak is kept. APPLY+RESTART
+//          saves and cycles the engine in one click. Device pickers are
+//          populated by live WASAPI enumeration and stay free-text needles.
+//          The CENTER EQ page carries the built-in presets: FLAT (EQ off,
+//          bit-exact), DIALOGUE (1.8 kHz +4 dB Q0.8), BASS (90 Hz +6 dB
+//          Q0.7), WARMTH (250 Hz +3 dB Q0.9), CINEMA (2 kHz +5 dB Q0.7);
+//          moving a slider by hand marks CUSTOM. Frequency/Q sliders are
+//          log-scaled. No engine DSP changed in this version: the sample
+//          path is byte-identical to v6.5.18.)
 //
 //  v6.5.18 (crackle case CLOSED + one feature. The field culprit was
 //          EQUALIZER APO hooked to the cable's playback endpoint: a system
@@ -938,6 +959,7 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #include <windows.h>
+#include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <mmsystem.h>
 #include <cstdio>
 #include <cstring>
@@ -947,6 +969,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 #include <atomic>
 #include <algorithm>
 #include <cwctype>
@@ -1587,13 +1610,35 @@ static void boostDeviceThread() {
 static CRITICAL_SECTION g_logCS;
 static bool g_logToFile = false;   // v6.2: stdout is twinspeak.log (background = on)
 
+// v6.6.0: GUI log tap. When the control window owns the process, every tlog
+// line is handed to this sink INSTEAD of stdout (the console is detached and
+// the pane is the log). Set once by guiMain before anything else logs.
+static void (*g_logSink)(const char* line) = nullptr;
+
 static void tlog(const char* fmt, ...) {
     va_list ap;
     EnterCriticalSection(&g_logCS);
-    va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
-    va_end(ap);
-    fflush(stdout);
+    if (g_logSink) {
+        char buf[8192];
+        va_start(ap, fmt);
+        const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        if (n >= 0 && n < (int)sizeof(buf)) {
+            g_logSink(buf);
+        } else {
+            // one very long line (the banner essays can exceed 8 KB)
+            std::string big((size_t)(n > 0 ? n : 8191) + 1, '\0');
+            va_start(ap, fmt);
+            vsnprintf(&big[0], big.size(), fmt, ap);
+            va_end(ap);
+            g_logSink(big.c_str());
+        }
+    } else {
+        va_start(ap, fmt);
+        vfprintf(stdout, fmt, ap);
+        va_end(ap);
+        fflush(stdout);
+    }
     LeaveCriticalSection(&g_logCS);
 }
 
@@ -3248,7 +3293,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3605,6 +3650,58 @@ static float clampMs(float ms) {
     return ms < 2.0f ? 2.0f : (ms > 100.0f ? 100.0f : ms);
 }
 
+// v6.6.0: the post-parse clamps, shared by loadIni AND the GUI's
+// apply-from-controls path (so hand-typed values get the same guardrails
+// and the same log lines whichever way they arrive).
+static void cfgSanitize() {
+    // legacy fallback: buffer_size applies to any leg without an explicit outXms
+    if (!g_cfg.haveOut1) g_cfg.out1Ms = g_cfg.legacyBufferMs;
+    if (!g_cfg.haveOut2) g_cfg.out2Ms = g_cfg.legacyBufferMs;
+    g_cfg.out1Ms = clampMs(g_cfg.out1Ms);
+    g_cfg.out2Ms = clampMs(g_cfg.out2Ms);
+    g_cfg.capMs  = clampMs(g_cfg.capMs);
+    if (g_cfg.delay1Ms < 0.0f)   g_cfg.delay1Ms = 0.0f;
+    if (g_cfg.delay1Ms > 1000.0f) g_cfg.delay1Ms = 1000.0f;
+    if (g_cfg.delay2Ms < 0.0f)   g_cfg.delay2Ms = 0.0f;
+    if (g_cfg.delay2Ms > 1000.0f) g_cfg.delay2Ms = 1000.0f;
+    if (g_cfg.ring1Ms >= 0.0f) g_cfg.ring1Ms = clampMs(g_cfg.ring1Ms);
+    if (g_cfg.ring2Ms >= 0.0f) g_cfg.ring2Ms = clampMs(g_cfg.ring2Ms);
+    if (g_cfg.driftIntervalMs < 2000)  g_cfg.driftIntervalMs = 2000;   // v6.5.12: was 5000
+    if (g_cfg.driftIntervalMs > 60000) g_cfg.driftIntervalMs = 60000;
+    if (g_cfg.deepResyncMin > 0 && g_cfg.deepResyncMin < 5) g_cfg.deepResyncMin = 5;
+    if (g_cfg.deepResyncMin > 1440) g_cfg.deepResyncMin = 1440;
+    // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
+    // kernel-streaming pin; anything else stays WASAPI.
+    for (int i = 0; i < 2; ++i) {
+        std::string& b = (i == 0) ? g_cfg.backend1 : g_cfg.backend2;
+        if (b == "ks" || b == "wdm-ks" || b == "wdmks" || b == "wdm_kernel_streaming" ||
+            b == "kernel-streaming" || b == "kernelstreaming") b = "ks";
+        else b = "wasapi";
+    }
+    // v6.3.1: the clamps are now LOGGED -- a silently-ignored ini value looks
+    // exactly like a broken feature from the driver's seat.
+    if (g_cfg.ksPeriodFrames < 32 || g_cfg.ksPeriodFrames > 4096) {
+        tlog("[twinspeak] config        : ks_period_frames %u -> %u (usable bite range is 32..4096)\n",
+             g_cfg.ksPeriodFrames, g_cfg.ksPeriodFrames < 32 ? 32u : 4096u);
+        g_cfg.ksPeriodFrames = g_cfg.ksPeriodFrames < 32 ? 32 : 4096;
+    }
+    if (g_cfg.ksPeriods < 2 || g_cfg.ksPeriods > 8) {
+        tlog("[twinspeak] config        : ks_periods %u -> %u -- the WaveRT loop needs 2..8 periods; a\n"
+             "                            1-period loop has NO write lead (the DAC eats whatever sits in\n"
+             "                            the buffer the moment the pacer hiccups), above 8 just wastes RAM\n",
+             g_cfg.ksPeriods, g_cfg.ksPeriods < 2 ? 2u : 8u);
+        g_cfg.ksPeriods = g_cfg.ksPeriods < 2 ? 2 : 8;
+    }
+    if (g_cfg.ksPeriodFrames < 128) {   // v6.5.14: field note, NOT a clamp
+        tlog("[twinspeak] config        : ks_period_frames %u -- field note: bites under 128 frames pace on\n"
+             "                            the edge (the lapse-guard lap window shrinks with the loop and\n"
+             "                            64-frame loops buzzed in the field); 128+ is the steady zone\n",
+             g_cfg.ksPeriodFrames);
+    }
+    if (g_cfg.driftCorrectMs < 2.0f)   g_cfg.driftCorrectMs = 2.0f;
+    if (g_cfg.driftCorrectMs > 500.0f) g_cfg.driftCorrectMs = 500.0f;
+}
+
 static bool loadIni(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) return false;
@@ -3665,52 +3762,7 @@ static bool loadIni(const char* path) {
         else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
     }
     fclose(f);
-    // legacy fallback: buffer_size applies to any leg without an explicit outXms
-    if (!g_cfg.haveOut1) g_cfg.out1Ms = g_cfg.legacyBufferMs;
-    if (!g_cfg.haveOut2) g_cfg.out2Ms = g_cfg.legacyBufferMs;
-    g_cfg.out1Ms = clampMs(g_cfg.out1Ms);
-    g_cfg.out2Ms = clampMs(g_cfg.out2Ms);
-    g_cfg.capMs  = clampMs(g_cfg.capMs);
-    if (g_cfg.delay1Ms < 0.0f)   g_cfg.delay1Ms = 0.0f;
-    if (g_cfg.delay1Ms > 1000.0f) g_cfg.delay1Ms = 1000.0f;
-    if (g_cfg.delay2Ms < 0.0f)   g_cfg.delay2Ms = 0.0f;
-    if (g_cfg.delay2Ms > 1000.0f) g_cfg.delay2Ms = 1000.0f;
-    if (g_cfg.ring1Ms >= 0.0f) g_cfg.ring1Ms = clampMs(g_cfg.ring1Ms);
-    if (g_cfg.ring2Ms >= 0.0f) g_cfg.ring2Ms = clampMs(g_cfg.ring2Ms);
-    if (g_cfg.driftIntervalMs < 2000)  g_cfg.driftIntervalMs = 2000;   // v6.5.12: was 5000
-    if (g_cfg.driftIntervalMs > 60000) g_cfg.driftIntervalMs = 60000;
-    if (g_cfg.deepResyncMin > 0 && g_cfg.deepResyncMin < 5) g_cfg.deepResyncMin = 5;
-    if (g_cfg.deepResyncMin > 1440) g_cfg.deepResyncMin = 1440;
-    // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
-    // kernel-streaming pin; anything else stays WASAPI.
-    for (int i = 0; i < 2; ++i) {
-        std::string& b = (i == 0) ? g_cfg.backend1 : g_cfg.backend2;
-        if (b == "ks" || b == "wdm-ks" || b == "wdmks" || b == "wdm_kernel_streaming" ||
-            b == "kernel-streaming" || b == "kernelstreaming") b = "ks";
-        else b = "wasapi";
-    }
-    // v6.3.1: the clamps are now LOGGED -- a silently-ignored ini value looks
-    // exactly like a broken feature from the driver's seat.
-    if (g_cfg.ksPeriodFrames < 32 || g_cfg.ksPeriodFrames > 4096) {
-        tlog("[twinspeak] config        : ks_period_frames %u -> %u (usable bite range is 32..4096)\n",
-             g_cfg.ksPeriodFrames, g_cfg.ksPeriodFrames < 32 ? 32u : 4096u);
-        g_cfg.ksPeriodFrames = g_cfg.ksPeriodFrames < 32 ? 32 : 4096;
-    }
-    if (g_cfg.ksPeriods < 2 || g_cfg.ksPeriods > 8) {
-        tlog("[twinspeak] config        : ks_periods %u -> %u -- the WaveRT loop needs 2..8 periods; a\n"
-             "                            1-period loop has NO write lead (the DAC eats whatever sits in\n"
-             "                            the buffer the moment the pacer hiccups), above 8 just wastes RAM\n",
-             g_cfg.ksPeriods, g_cfg.ksPeriods < 2 ? 2u : 8u);
-        g_cfg.ksPeriods = g_cfg.ksPeriods < 2 ? 2 : 8;
-    }
-    if (g_cfg.ksPeriodFrames < 128) {   // v6.5.14: field note, NOT a clamp
-        tlog("[twinspeak] config        : ks_period_frames %u -- field note: bites under 128 frames pace on\n"
-             "                            the edge (the lapse-guard lap window shrinks with the loop and\n"
-             "                            64-frame loops buzzed in the field); 128+ is the steady zone\n",
-             g_cfg.ksPeriodFrames);
-    }
-    if (g_cfg.driftCorrectMs < 2.0f)   g_cfg.driftCorrectMs = 2.0f;
-    if (g_cfg.driftCorrectMs > 500.0f) g_cfg.driftCorrectMs = 500.0f;
+    cfgSanitize();
     return true;
 }
 
@@ -4070,8 +4122,1030 @@ static void printLegDevice(int idx) {
                 idx + 1, (unsigned)sr, (unsigned)sr);
 }
 
+// ============================================================ v6.6.0 GUI ====
+// THE CONTROL WINDOW. Launched by running twinspeak.exe with NO arguments
+// (console modes unchanged behind their flags). Black + cyan, hand-drawn:
+//
+//   * SIX TABS -- Devices / Timing / Transport / Sync+Power / Center+Vol /
+//     Center EQ -- covering EVERY ini key (nothing lives only in the file).
+//   * START / STOP runs the engine IN-PROCESS on a worker thread; the pane
+//     below is the live log (the same tlog stream the console shows), the
+//     status line carries the engine state + the live health line.
+//   * APPLY+RESTART saves the ini and cycles the engine in one click;
+//     SAVE writes twinspeak.ini in place, preserving every comment line
+//     (values are spliced into the existing lines; new keys are appended).
+//   * CENTER EQ presets: FLAT / DIALOGUE / BASS / WARMTH / CINEMA -- one
+//     click sets the peaking filter (and FLAT turns the EQ off). Moving a
+//     slider by hand marks the section CUSTOM.
+//   * Device pickers are populated by live WASAPI enumeration (the same
+//     names --list prints); the edit part stays a free-text needle.
+//
+// Controls are stock Win32 (edits/combos dark via the DarkMode_Explorer
+// theme when available, else WM_CTLCOLOR*), and every button/toggle/tab is
+// owner-drawn so the whole window stays in the black+cyan language. The
+// engine thread is the SAME engineMain the console path runs -- no second
+// implementation to drift out of sync.
+// ----------------------------------------------------------------------------
+static int engineMain(const std::string& iniPath, bool fgForce,
+                      bool allowMulti, bool guiMode);
+
+namespace guic {
+    const COLORREF cBg        = RGB(9, 10, 12);      // window base (near black)
+    const COLORREF cPanel     = RGB(16, 18, 21);     // page panel
+    const COLORREF cPanel2    = RGB(24, 27, 31);     // edits / combo / buttons
+    const COLORREF cPanelHi   = RGB(31, 35, 40);     // pressed / hover fill
+    const COLORREF cLine      = RGB(44, 49, 55);     // borders
+    const COLORREF cText      = RGB(226, 232, 234);
+    const COLORREF cDim      = RGB(126, 136, 142);
+    const COLORREF cAccent    = RGB(0, 229, 238);    // cyan
+    const COLORREF cAccentDk  = RGB(0, 121, 128);
+    const COLORREF cOnText    = RGB(4, 24, 26);      // text ON an accent fill
+    const COLORREF cStop      = RGB(255, 105, 115);
+    const COLORREF cLog       = RGB(150, 222, 214);  // log pane text (soft cyan)
+    const COLORREF cLogBg     = RGB(6, 7, 8);
+}
+
+// ---- control ids -----------------------------------------------------------
+enum {
+    IDC_TAB0 = 100,             // ..105: the six tabs
+    IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
+    IDC_LOG = 204, IDC_REFRESH = 205,
+    // page: devices
+    IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
+    IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
+    IDC_TGL_LFEFOLD, IDC_TGL_CAPEXCL, IDC_TGL_EXCLUSIVE, IDC_TGL_ALIGN,
+    // page: timing
+    IDC_OUT1MS, IDC_OUT2MS, IDC_CAPMS, IDC_RING1, IDC_RING2,
+    IDC_DELAY1, IDC_DELAY2, IDC_TGL_OUT2FIRST, IDC_TGL_PINOUT,
+    // page: transport
+    IDC_BE1, IDC_BE2, IDC_KSPF, IDC_KSPD,
+    // page: sync & power
+    IDC_TGL_CLOCK, IDC_TGL_DRIFTG, IDC_TGL_POWER, IDC_TGL_YIELD,
+    IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
+    // page: center & volume
+    IDC_TGL_CGATE, IDC_TGL_UPMIX, IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
+    IDC_TGL_BG, IDC_KAHZ, IDC_KAGAIN, IDC_CHIMGAIN,
+    // page: center eq
+    IDC_TGL_EQ, IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS, IDC_PRE_WARM,
+    IDC_PRE_CIN, IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
+    IDC_LBL_FREQ, IDC_LBL_GAIN, IDC_LBL_Q,
+};
+
+// ---- gui state -------------------------------------------------------------
+static HWND      g_hwnd          = nullptr;
+static HFONT     g_fHead = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
+                 g_fSml = nullptr, g_fMono = nullptr;
+static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
+                 g_brLog = nullptr;
+static std::string g_guiIniPath;
+static int       g_tab           = 0;
+static std::map<int, bool> g_tog;            // toggle button states
+static int       g_eqPreset      = 1;          // active preset index (-1 = custom)
+static std::vector<HWND> g_pageHw[6];          // children per page (show/hide)
+static HANDLE    g_engThread     = nullptr;
+static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
+static std::atomic<int>  g_engRC{0};
+static std::string g_logRing;                  // pending log lines (g_logCS-locked)
+static std::string g_lastHealth;               // latest "out1 ..." health line
+static std::atomic<bool> g_logDirty{false};
+
+static const char* kTabNames[6] = {
+    "DEVICES", "TIMING", "TRANSPORT", "SYNC + POWER", "CENTER + VOLUME", "CENTER EQ"
+};
+
+// ---- fonts / brushes -------------------------------------------------------
+static void guiMakeGdi() {
+    g_fHead = CreateFontA(-21, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_fUI   = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_fUIb  = CreateFontA(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_fSml  = CreateFontA(-11, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          FIXED_PITCH | FF_MODERN, "Consolas");
+    g_brBg     = CreateSolidBrush(guic::cBg);
+    g_brPanel  = CreateSolidBrush(guic::cPanel);
+    g_brPanel2 = CreateSolidBrush(guic::cPanel2);
+    g_brLog    = CreateSolidBrush(guic::cLogBg);
+}
+
+// ---- small drawing helpers -------------------------------------------------
+static void guiRoundRect(HDC dc, const RECT& rc, COLORREF border, COLORREF fill,
+                         int radius, int borderWidth) {
+    SetBkMode(dc, TRANSPARENT);
+    HPEN pen   = CreatePen(PS_SOLID, borderWidth, border);
+    HBRUSH br  = CreateSolidBrush(fill);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, br);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+static void guiText(HDC dc, const RECT& rc, const char* txt, COLORREF col,
+                    HFONT f, UINT flags) {
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, col);
+    SelectObject(dc, f);
+    DrawTextA(dc, txt, -1, (RECT*)&rc, flags | DT_NOPREFIX);
+}
+
+// ---- control factories -----------------------------------------------------
+static const int COLA_X = 36, COLB_X = 520, LBL_W = 186, CTL_W = 240;
+
+static void regPage(HWND h) { g_pageHw[g_tab].push_back(h); }
+
+// DarkMode_Explorer when the OS has it (1809+); controls without it fall
+// back to the WM_CTLCOLOR* handlers below -- both land on the same palette.
+static void guiDarkCtl(HWND h) {
+    typedef HRESULT (WINAPI *SWTFN)(HWND, LPCWSTR, LPCWSTR);
+    static SWTFN f = nullptr;
+    if (!f) { HMODULE ux = LoadLibraryA("uxtheme.dll"); if (ux) f = (SWTFN)GetProcAddress(ux, "SetWindowTheme"); }
+    if (f) f(h, L"DarkMode_Explorer", nullptr);
+}
+
+static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
+    HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
+                             x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
+    regPage(h);
+    return h;
+}
+
+static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
+    HWND h = CreateWindowExA(0, "EDIT", val,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
+        x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+    guiDarkCtl(h);
+    regPage(h);
+    return h;
+}
+
+static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt) {
+    HWND h = CreateWindowExA(0, "BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUIb, TRUE);
+    return h;
+}
+
+static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
+    HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
+        (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
+        x, y, CTL_W, 220, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, 18);
+    guiDarkCtl(h);
+    regPage(h);
+    return h;
+}
+
+static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
+    HWND h = CreateWindowExA(0, TRACKBAR_CLASSA, nullptr,
+        WS_CHILD | WS_VISIBLE | TBS_HORZ, x, y, cw, 30, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, TBM_SETRANGE, TRUE, MAKELPARAM(lo, hi));
+    guiDarkCtl(h);
+    regPage(h);
+    return h;
+}
+
+// one ini row: label + edit box
+static void row(HWND w, int colX, int y, const char* label, int id, const char* val) {
+    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
+    mkEdit(w, id, colX + LBL_W + 8, y, CTL_W, 24, val);
+}
+
+// one ini row: label + ON/OFF pill
+static void tglRow(HWND w, int colX, int y, const char* label, int id, bool on) {
+    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
+    mkBtn(w, id, colX + LBL_W + 8, y, 64, 24, "");
+    g_tog[id] = on;
+}
+
+static void header(HWND w, int colX, int y, const char* txt) {
+    static int hdrId = 600;
+    mkLabel(w, hdrId++, colX, y, 420, txt, g_fUIb);
+}
+
+static void note(HWND w, int colX, int y, const char* txt, int lines) {
+    mkLabel(w, 0, colX, y, 430, txt, g_fSml, lines * 15 + 4);
+}
+
+// ---- EQ slider mapping (freq and Q on log scales, gain linear) ------------
+static int freqToPos(float f) {
+    if (f < 20.0f) f = 20.0f; if (f > 20000.0f) f = 20000.0f;
+    return (int)(1000.0 * log((double)f / 20.0) / log(1000.0) + 0.5);
+}
+static float posToFreq(int p) { return (float)(20.0 * pow(1000.0, (double)p / 1000.0)); }
+static int qToPos(float q) {
+    if (q < 0.1f) q = 0.1f; if (q > 10.0f) q = 10.0f;
+    return (int)(1000.0 * log((double)q / 0.1) / log(100.0) + 0.5);
+}
+static float posToQ(int p) { return (float)(0.1 * pow(100.0, (double)p / 1000.0)); }
+
+// ---- the built-in presets ---------------------------------------------------
+struct EqPre { const char* name; bool on; float f, g, q; };
+static const EqPre kEqPre[5] = {
+    { "FLAT",     false, 1800, 4.0f, 0.8f },   // EQ off -- bit-exact out2
+    { "DIALOGUE", true,  1800, 4.0f, 0.8f },   // presence/intelligibility bump
+    { "BASS",     true,    90, 6.0f, 0.7f },   // low-end weight on the center
+    { "WARMTH",   true,   250, 3.0f, 0.9f },   // chest/vocal body
+    { "CINEMA",   true,  2000, 5.0f, 0.7f },   // bright, forward dialogue
+};
+
+static void guiUpdateEqLabels(HWND w) {
+    char b[96];
+    const int pf = (int)SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_GETPOS, 0, 0);
+    const int pg = (int)SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_GETPOS, 0, 0);
+    const int pq = (int)SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_GETPOS, 0, 0);
+    const float f = posToFreq(pf), g = pg * 0.5f, q = posToQ(pq);
+    if (f >= 1000.0f) snprintf(b, sizeof(b), "PEAK FREQUENCY     %.2f kHz", f / 1000.0f);
+    else              snprintf(b, sizeof(b), "PEAK FREQUENCY     %.0f Hz", f);
+    SetWindowTextA(GetDlgItem(w, IDC_LBL_FREQ), b);
+    snprintf(b, sizeof(b), "BOOST     %+.1f dB", g);
+    SetWindowTextA(GetDlgItem(w, IDC_LBL_GAIN), b);
+    snprintf(b, sizeof(b), "SHARPNESS (Q)     %.2f", q);
+    SetWindowTextA(GetDlgItem(w, IDC_LBL_Q), b);
+}
+
+static void guiApplyPreset(HWND w, int i) {
+    g_tog[IDC_TGL_EQ] = kEqPre[i].on;
+    SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_SETPOS, TRUE, (LPARAM)freqToPos(kEqPre[i].f));
+    SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_SETPOS, TRUE, (LPARAM)(int)(kEqPre[i].g * 2.0f));
+    SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_SETPOS, TRUE, (LPARAM)qToPos(kEqPre[i].q));
+    g_eqPreset = i;
+    guiUpdateEqLabels(w);
+    InvalidateRect(w, nullptr, TRUE);
+}
+
+// ---- live device enumeration for the pickers -------------------------------
+static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>& cp) {
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context ctx;
+    if (ma_context_init(be, 1, nullptr, &ctx) != MA_SUCCESS) return;
+    ma_device_info* p = nullptr; ma_uint32 np = 0;
+    ma_device_info* c = nullptr; ma_uint32 nc = 0;
+    if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
+        for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
+        for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
+    }
+    ma_context_uninit(&ctx);
+}
+
+static void guiFillCombos(HWND w) {
+    std::vector<std::string> pb, cp;
+    guiEnumNames(pb, cp);
+    const int ids[3] = { IDC_OUT1, IDC_OUT2, IDC_INDEV };   // 0,1 playback; 2 capture
+    for (int k = 0; k < 3; ++k) {
+        HWND h = GetDlgItem(w, ids[k]);
+        char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
+        SendMessageA(h, CB_RESETCONTENT, 0, 0);
+        const std::vector<std::string>& v = (k < 2) ? pb : cp;
+        for (size_t i = 0; i < v.size(); ++i)
+            SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
+        if (cur[0]) SetWindowTextA(h, cur);
+    }
+}
+
+// ---- ini values <-> gui ----------------------------------------------------
+static std::string boolText(bool b) { return b ? "on" : "off"; }
+
+static std::string cfgValueText(const std::string& key) {
+    char b[512];
+    if      (key == "out1ms")            { snprintf(b, 64, "%g", g_cfg.out1Ms);  return b; }
+    else if (key == "out2ms")            { snprintf(b, 64, "%g", g_cfg.out2Ms);  return b; }
+    else if (key == "cap_ms")            { snprintf(b, 64, "%g", g_cfg.capMs);   return b; }
+    else if (key == "ring1_ms")          { snprintf(b, 64, "%g", g_cfg.ring1Ms); return b; }
+    else if (key == "ring2_ms")          { snprintf(b, 64, "%g", g_cfg.ring2Ms); return b; }
+    else if (key == "delay1_ms")         { snprintf(b, 64, "%g", g_cfg.delay1Ms); return b; }
+    else if (key == "delay2_ms")         { snprintf(b, 64, "%g", g_cfg.delay2Ms); return b; }
+    else if (key == "gain_l")            { snprintf(b, 64, "%g", g_cfg.gainL);     return b; }
+    else if (key == "gain_r")            { snprintf(b, 64, "%g", g_cfg.gainR);     return b; }
+    else if (key == "gain_lfe")          { snprintf(b, 64, "%g", g_cfg.gainLfe);   return b; }
+    else if (key == "gain_center")       { snprintf(b, 64, "%g", g_cfg.gainCenter);return b; }
+    else if (key == "keepalive_hz")      { snprintf(b, 64, "%g", g_cfg.keepaliveHz); return b; }
+    else if (key == "keepalive_gain")    { snprintf(b, 64, "%g", g_cfg.keepaliveGain); return b; }
+    else if (key == "chime_gain")        { snprintf(b, 64, "%g", g_cfg.chimeGain); return b; }
+    else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
+    else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
+    else if (key == "center_eq_q")       { snprintf(b, 64, "%g", g_cfg.centerEqQ); return b; }
+    else if (key == "drift_correct_ms")  { snprintf(b, 64, "%g", g_cfg.driftCorrectMs); return b; }
+    else if (key == "ks_period_frames")  { snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); return b; }
+    else if (key == "ks_periods")        { snprintf(b, 64, "%u", g_cfg.ksPeriods); return b; }
+    else if (key == "drift_interval_ms") { snprintf(b, 64, "%u", g_cfg.driftIntervalMs); return b; }
+    else if (key == "deep_resync_min")   { snprintf(b, 64, "%u", g_cfg.deepResyncMin); return b; }
+    else if (key == "buffer_size")       { snprintf(b, 64, "%g", g_cfg.legacyBufferMs); return b; }
+    else if (key == "capture_exclusive") return boolText(g_cfg.captureExclusive);
+    else if (key == "exclusive")         return boolText(g_cfg.exclusive);
+    else if (key == "align_modes")       return boolText(g_cfg.alignModes);
+    else if (key == "lfe_fold")          return boolText(g_cfg.lfeFold);
+    else if (key == "center_eq")         return boolText(g_cfg.centerEq);
+    else if (key == "clock_sync")        return boolText(g_cfg.clockSync);
+    else if (key == "center_gate")       return boolText(g_cfg.centerGate);
+    else if (key == "center_upmix_guard")return boolText(g_cfg.centerUpmixGuard);
+    else if (key == "volume_follow")     return boolText(g_cfg.volumeFollow);
+    else if (key == "pin_outputs")       return boolText(g_cfg.pinOutputs);
+    else if (key == "out2_first")        return boolText(g_cfg.out2First);
+    else if (key == "background")        return boolText(g_cfg.background);
+    else if (key == "chimes")            return boolText(g_cfg.chimes);
+    else if (key == "drift_guard")       return boolText(g_cfg.driftGuard);
+    else if (key == "yield_default")     return boolText(g_cfg.yieldDefault);
+    else if (key == "power_guard")       return boolText(g_cfg.powerGuard);
+    else if (key == "input_device")      return g_cfg.inputDevice;
+    else if (key == "output_device1")    return g_cfg.outputDevice1;
+    else if (key == "output_device2")    return g_cfg.outputDevice2;
+    else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
+    else if (key == "backend1")          return g_cfg.backend1;
+    else if (key == "backend2")          return g_cfg.backend2;
+    return "";
+}
+
+// every key the window can write, in canonical order (for appending)
+static const char* kIniKeys[] = {
+    "out1ms", "out2ms", "cap_ms", "capture_exclusive", "ring1_ms", "ring2_ms",
+    "delay1_ms", "delay2_ms", "exclusive", "align_modes", "lfe_fold",
+    "input_device", "output_device1", "output_device2",
+    "gain_l", "gain_r", "gain_lfe", "gain_center",
+    "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
+    "volume_follow", "volume_endpoint", "pin_outputs", "out2_first",
+    "keepalive_hz", "keepalive_gain", "chimes", "chime_gain", "background",
+    "yield_default", "backend1", "backend2", "ks_period_frames", "ks_periods",
+    "clock_sync", "drift_guard", "drift_correct_ms", "drift_interval_ms",
+    "deep_resync_min", "center_gate", "center_upmix_guard", "power_guard",
+};
+
+// v6.6.0: write twinspeak.ini WITHOUT destroying it. Every line that is not a
+// known key (comments, blanks) is copied byte-for-byte; a known key keeps its
+// line position and only the value after '=' is spliced. Keys missing from
+// the file are appended at the end. A .bak of the previous file is kept.
+static bool guiSaveIni() {
+    std::vector<std::string> lines;
+    if (FILE* f = fopen(g_guiIniPath.c_str(), "r")) {
+        char l[2048];
+        while (fgets(l, sizeof(l), f)) lines.push_back(l);
+        fclose(f);
+        CopyFileA(g_guiIniPath.c_str(), (g_guiIniPath + ".bak").c_str(), FALSE);
+    }
+    bool seen[sizeof(kIniKeys) / sizeof(kIniKeys[0])] = { false };
+    std::string out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& s = lines[i];
+        std::string head = s;
+        const size_t h = head.find_first_of("#;");
+        if (h != std::string::npos) head = head.substr(0, h);
+        const size_t eq = head.find('=');
+        std::string key;
+        bool isKey = false;
+        size_t keyIdx = 0;
+        if (eq != std::string::npos) {
+            key = lower(trim(head.substr(0, eq)));
+            for (size_t k = 0; k < sizeof(kIniKeys) / sizeof(kIniKeys[0]); ++k)
+                if (key == kIniKeys[k]) { isKey = true; keyIdx = k; break; }
+        }
+        if (isKey) {
+            const std::string val = cfgValueText(key);
+            if (!val.empty()) {
+                seen[keyIdx] = true;
+                out += head.substr(0, eq + 1) + " " + val + "\r\n";
+                continue;
+            }
+        }
+        out += s;                       // comments / blanks / unknowns: verbatim
+    }
+    bool appended = false;
+    for (size_t k = 0; k < sizeof(kIniKeys) / sizeof(kIniKeys[0]); ++k) {
+        if (seen[k]) continue;
+        if (!appended) { out += "\r\n; added by the twinspeak control window\r\n"; appended = true; }
+        out += std::string(kIniKeys[k]) + " = " + cfgValueText(kIniKeys[k]) + "\r\n";
+    }
+    FILE* f = fopen(g_guiIniPath.c_str(), "w");
+    if (!f) return false;
+    fputs(out.c_str(), f);
+    fclose(f);
+    return true;
+}
+
+// ---- controls -> g_cfg ------------------------------------------------------
+static float editFloat(HWND w, int id, float def) {
+    char b[64]; GetDlgItemTextA(w, id, b, sizeof(b));
+    return b[0] ? (float)atof(b) : def;
+}
+static std::string editStr(HWND w, int id) {
+    char b[512]; GetDlgItemTextA(w, id, b, sizeof(b));
+    return b;
+}
+
+static void cfgFromControls(HWND w) {
+    g_cfg.inputDevice    = editStr(w, IDC_INDEV);
+    g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
+    g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
+    g_cfg.volumeEndpoint = editStr(w, IDC_VOLEP);
+    g_cfg.gainL     = editFloat(w, IDC_GAIN_L,  1.0f);
+    g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
+    g_cfg.gainLfe   = editFloat(w, IDC_GAIN_LFE, 0.4f);
+    g_cfg.gainCenter= editFloat(w, IDC_GAIN_CTR, 1.0f);
+    g_cfg.lfeFold          = g_tog[IDC_TGL_LFEFOLD];
+    g_cfg.captureExclusive = g_tog[IDC_TGL_CAPEXCL];
+    g_cfg.exclusive        = g_tog[IDC_TGL_EXCLUSIVE];
+    g_cfg.alignModes       = g_tog[IDC_TGL_ALIGN];
+    g_cfg.out1Ms   = editFloat(w, IDC_OUT1MS, 1.0f);
+    g_cfg.out2Ms   = editFloat(w, IDC_OUT2MS, 1.0f);
+    g_cfg.capMs    = editFloat(w, IDC_CAPMS,  1.0f);
+    g_cfg.ring1Ms  = editFloat(w, IDC_RING1, -1.0f);
+    g_cfg.ring2Ms  = editFloat(w, IDC_RING2, -1.0f);
+    g_cfg.delay1Ms = editFloat(w, IDC_DELAY1, 0.0f);
+    g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
+    g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
+    g_cfg.pinOutputs = g_tog[IDC_TGL_PINOUT];
+    g_cfg.backend1 = editStr(w, IDC_BE1);  // normalized by cfgSanitize()
+    g_cfg.backend2 = editStr(w, IDC_BE2);
+    g_cfg.ksPeriodFrames = (unsigned)editFloat(w, IDC_KSPF, 256);
+    g_cfg.ksPeriods      = (unsigned)editFloat(w, IDC_KSPD, 3);
+    g_cfg.clockSync   = g_tog[IDC_TGL_CLOCK];
+    g_cfg.driftGuard  = g_tog[IDC_TGL_DRIFTG];
+    g_cfg.powerGuard  = g_tog[IDC_TGL_POWER];
+    g_cfg.yieldDefault= g_tog[IDC_TGL_YIELD];
+    g_cfg.driftCorrectMs  = editFloat(w, IDC_DCORR, 10.0f);
+    g_cfg.driftIntervalMs = (unsigned)editFloat(w, IDC_DINTERVAL, 5000);
+    g_cfg.deepResyncMin   = (unsigned)editFloat(w, IDC_DEEPRESYNC, 0);
+    g_cfg.centerGate      = g_tog[IDC_TGL_CGATE];
+    g_cfg.centerUpmixGuard= g_tog[IDC_TGL_UPMIX];
+    g_cfg.volumeFollow    = g_tog[IDC_TGL_VOLFOLLOW];
+    g_cfg.chimes          = g_tog[IDC_TGL_CHIMES];
+    g_cfg.background      = g_tog[IDC_TGL_BG];
+    g_cfg.keepaliveHz     = editFloat(w, IDC_KAHZ, 40.0f);
+    g_cfg.keepaliveGain   = editFloat(w, IDC_KAGAIN, 0.01f);
+    g_cfg.chimeGain       = editFloat(w, IDC_CHIMGAIN, 0.4f);
+    g_cfg.centerEq       = g_tog[IDC_TGL_EQ];
+    g_cfg.centerEqFreq   = posToFreq((int)SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_GETPOS, 0, 0));
+    g_cfg.centerEqGain   = (int)SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_GETPOS, 0, 0) * 0.5f;
+    g_cfg.centerEqQ      = posToQ((int)SendMessageA(GetDlgItem(w, IDC_SLD_Q), TBM_GETPOS, 0, 0));
+}
+
+static void controlsFromCfg(HWND w) {
+    char b[64];
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
+    SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
+    SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
+    SetDlgItemTextA(w, IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    snprintf(b, 64, "%g", g_cfg.gainL);      SetDlgItemTextA(w, IDC_GAIN_L, b);
+    snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
+    snprintf(b, 64, "%g", g_cfg.gainLfe);    SetDlgItemTextA(w, IDC_GAIN_LFE, b);
+    snprintf(b, 64, "%g", g_cfg.gainCenter); SetDlgItemTextA(w, IDC_GAIN_CTR, b);
+    g_tog[IDC_TGL_LFEFOLD]    = g_cfg.lfeFold;
+    g_tog[IDC_TGL_CAPEXCL]    = g_cfg.captureExclusive;
+    g_tog[IDC_TGL_EXCLUSIVE]  = g_cfg.exclusive;
+    g_tog[IDC_TGL_ALIGN]      = g_cfg.alignModes;
+    snprintf(b, 64, "%g", g_cfg.out1Ms);  SetDlgItemTextA(w, IDC_OUT1MS, b);
+    snprintf(b, 64, "%g", g_cfg.out2Ms);  SetDlgItemTextA(w, IDC_OUT2MS, b);
+    snprintf(b, 64, "%g", g_cfg.capMs);   SetDlgItemTextA(w, IDC_CAPMS, b);
+    if (g_cfg.ring1Ms >= 0.0f) { snprintf(b, 64, "%g", g_cfg.ring1Ms); SetDlgItemTextA(w, IDC_RING1, b); }
+    if (g_cfg.ring2Ms >= 0.0f) { snprintf(b, 64, "%g", g_cfg.ring2Ms); SetDlgItemTextA(w, IDC_RING2, b); }
+    snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
+    snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
+    g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
+    g_tog[IDC_TGL_PINOUT]    = g_cfg.pinOutputs;
+    SetDlgItemTextA(w, IDC_BE1, g_cfg.backend1.c_str());
+    SetDlgItemTextA(w, IDC_BE2, g_cfg.backend2.c_str());
+    snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); SetDlgItemTextA(w, IDC_KSPF, b);
+    snprintf(b, 64, "%u", g_cfg.ksPeriods);      SetDlgItemTextA(w, IDC_KSPD, b);
+    g_tog[IDC_TGL_CLOCK]  = g_cfg.clockSync;
+    g_tog[IDC_TGL_DRIFTG] = g_cfg.driftGuard;
+    g_tog[IDC_TGL_POWER]  = g_cfg.powerGuard;
+    g_tog[IDC_TGL_YIELD]  = g_cfg.yieldDefault;
+    snprintf(b, 64, "%g", g_cfg.driftCorrectMs);   SetDlgItemTextA(w, IDC_DCORR, b);
+    snprintf(b, 64, "%u", g_cfg.driftIntervalMs);  SetDlgItemTextA(w, IDC_DINTERVAL, b);
+    snprintf(b, 64, "%u", g_cfg.deepResyncMin);    SetDlgItemTextA(w, IDC_DEEPRESYNC, b);
+    g_tog[IDC_TGL_CGATE]      = g_cfg.centerGate;
+    g_tog[IDC_TGL_UPMIX]      = g_cfg.centerUpmixGuard;
+    g_tog[IDC_TGL_VOLFOLLOW]  = g_cfg.volumeFollow;
+    g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
+    g_tog[IDC_TGL_BG]         = g_cfg.background;
+    snprintf(b, 64, "%g", g_cfg.keepaliveHz);    SetDlgItemTextA(w, IDC_KAHZ, b);
+    snprintf(b, 64, "%g", g_cfg.keepaliveGain);  SetDlgItemTextA(w, IDC_KAGAIN, b);
+    snprintf(b, 64, "%g", g_cfg.chimeGain);      SetDlgItemTextA(w, IDC_CHIMGAIN, b);
+    g_tog[IDC_TGL_EQ] = g_cfg.centerEq;
+    SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_SETPOS, TRUE, (LPARAM)freqToPos(g_cfg.centerEqFreq));
+    SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_SETPOS, TRUE, (LPARAM)(int)(g_cfg.centerEqGain * 2.0f));
+    SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_SETPOS, TRUE, (LPARAM)qToPos(g_cfg.centerEqQ));
+    g_eqPreset = -1;   // custom unless the values match a preset exactly
+    for (int i = 0; i < 5; ++i) {
+        if (g_cfg.centerEq     == kEqPre[i].on &&
+            fabsf(g_cfg.centerEqFreq - kEqPre[i].f) < 1.0f &&
+            fabsf(g_cfg.centerEqGain - kEqPre[i].g) < 0.26f &&
+            fabsf(g_cfg.centerEqQ    - kEqPre[i].q) < 0.02f) { g_eqPreset = i; break; }
+    }
+    guiUpdateEqLabels(w);
+    InvalidateRect(w, nullptr, TRUE);
+}
+
+// ---- engine control ---------------------------------------------------------
+static void guiLogSink(const char* s) {
+    std::string line(s);
+    if (line.compare(0, 5, "out1 ") == 0) {          // the live health line:
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+            line.pop_back();
+        g_lastHealth = line;                          // status bar, not the pane
+        g_logDirty.store(true);
+        return;
+    }
+    for (size_t i = 0; i < line.size(); ++i)
+        if (line[i] == '\r') line[i] = '\n';          // console \r-overwrite -> lines
+    EnterCriticalSection(&g_logCS);
+    if (g_logRing.size() > 65536) g_logRing.erase(0, 32768);
+    g_logRing += line;
+    LeaveCriticalSection(&g_logCS);
+    g_logDirty.store(true);
+}
+
+static void guiAppendLog(const std::string& s) {
+    HWND e = GetDlgItem(g_hwnd, IDC_LOG);
+    if (!e) return;
+    int len = GetWindowTextLengthA(e);
+    if (len > 131072) {                               // keep the pane bounded
+        SendMessageA(e, EM_SETSEL, 0, len / 2);
+        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)"");
+        len = GetWindowTextLengthA(e);
+    }
+    SendMessageA(e, EM_SETSEL, len, len);
+    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
+    SendMessageA(e, EM_SCROLLCARET, 0, 0);
+}
+
+static DWORD WINAPI guiEngineThread(LPVOID) {
+    tlog("[twinspeak] gui           : ---- engine start (%s) ----\n", g_guiIniPath.c_str());
+    const int rc = engineMain(g_guiIniPath, false, false, true);
+    g_engRC.store(rc);
+    g_engState.store(0);
+    PostMessageA(g_hwnd, WM_APP + 2, 0, 0);           // refresh the START button
+    return 0;
+}
+
+static void guiStartEngine(HWND w) {
+    if (g_engState.load() != 0) return;
+    cfgFromControls(w);
+    cfgSanitize();
+    if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty() || g_cfg.outputDevice2.empty()) {
+        SetDlgItemTextA(g_hwnd, IDC_STATUS, "set input_device / output_device1 / output_device2 first");
+        return;
+    }
+    if (!guiSaveIni())
+        tlog("[twinspeak] gui           : could not write the ini -- running with the in-window values\n");
+    g_engState.store(1);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+    g_engThread = CreateThread(nullptr, 0, guiEngineThread, nullptr, 0, nullptr);
+}
+
+static void guiStopEngine() {
+    const int st = g_engState.load();
+    if (st == 0 || st == 3) return;
+    g_engState.store(3);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+    g_run.store(false);
+    if (g_engThread) {
+        WaitForSingleObject(g_engThread, 10000);
+        CloseHandle(g_engThread);
+        g_engThread = nullptr;
+    }
+    g_engState.store(0);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+}
+
+// ---- page building ----------------------------------------------------------
+static const int kTabW[6] = { 118, 100, 128, 152, 172, 128 };
+
+static void comboRow(HWND w, int colX, int y, const char* label, int id,
+                     bool listOnly, const char* cur) {
+    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
+    HWND h = mkCombo(w, id, colX + LBL_W + 8, y, listOnly);
+    if (cur && cur[0]) SetWindowTextA(h, cur);
+}
+
+static void guiBuildPages(HWND w) {
+    // ============ page 0: DEVICES ============
+    g_tab = 0;
+    header(w, COLA_X, 100, "DEVICE NEEDLES (live list; the edit stays a free-text needle)");
+    comboRow(w, COLA_X, 128, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
+    comboRow(w, COLA_X, 166, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
+    comboRow(w, COLA_X, 204, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
+    row(w, COLA_X, 242, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    mkBtn(w, IDC_REFRESH, COLA_X, 284, 150, 28, "REFRESH DEVICES");
+    note(w, COLA_X, 326,
+         "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
+         "leg2 carries ONLY the center channel.\n"
+         "volume_endpoint overrides which playback-side slider is the master volume.", 4);
+    header(w, COLB_X, 100, "GAINS (on the raw 8ch stream) + PIN MODES");
+    row(w, COLB_X, 128, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
+    row(w, COLB_X, 166, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
+    row(w, COLB_X, 204, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
+    row(w, COLB_X, 242, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 284, "lfe_fold (LFE onto FL/FR)", IDC_TGL_LFEFOLD, g_cfg.lfeFold);
+    tglRow(w, COLB_X, 322, "capture_exclusive", IDC_TGL_CAPEXCL, g_cfg.captureExclusive);
+    tglRow(w, COLB_X, 360, "exclusive (both legs)", IDC_TGL_EXCLUSIVE, g_cfg.exclusive);
+    tglRow(w, COLB_X, 398, "align_modes", IDC_TGL_ALIGN, g_cfg.alignModes);
+
+    // ============ page 1: TIMING ============
+    g_tab = 1;
+    header(w, COLA_X, 100, "DEVICE PERIODS (ms) -- keep the legs EQUAL");
+    row(w, COLA_X, 128, "out1ms", IDC_OUT1MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out1Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 166, "out2ms", IDC_OUT2MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out2Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 204, "cap_ms (capture burst)", IDC_CAPMS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.capMs); return std::string(b); }().c_str());
+    row(w, COLA_X, 242, "ring1_ms", IDC_RING1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring1Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 280, "ring2_ms", IDC_RING2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring2Ms); return std::string(b); }().c_str());
+    header(w, COLB_X, 100, "ALIGNMENT (bit-exact ring delay) + PINS");
+    row(w, COLB_X, 128, "delay1_ms", IDC_DELAY1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay1Ms); return std::string(b); }().c_str());
+    row(w, COLB_X, 166, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 204, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
+    tglRow(w, COLB_X, 242, "pin_outputs (100% / unmuted)", IDC_TGL_PINOUT, g_cfg.pinOutputs);
+    note(w, COLB_X, 284,
+         "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
+         "EARLY leg. The banner prints both est paths; the health line's 'drift'\n"
+         "column already includes your delay (it IS the alignment, not a fault).", 4);
+
+    // ============ page 2: TRANSPORT ============
+    g_tab = 2;
+    header(w, COLA_X, 100, "OUTPUT TRANSPORT PER LEG");
+    comboRow(w, COLA_X, 128, "backend1 (leg1)", IDC_BE1, true, g_cfg.backend1.c_str());
+    comboRow(w, COLA_X, 166, "backend2 (leg2)", IDC_BE2, true, g_cfg.backend2.c_str());
+    row(w, COLA_X, 204, "ks_period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
+    row(w, COLA_X, 242, "ks_periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
+    note(w, COLB_X, 104,
+         "wasapi -- the proven path: miniaudio, exclusive WaveRT event mode.\n\n"
+         "ks -- the FlexASIO-grade path: a direct kernel-streaming render pin,\n"
+         "the WaveRT looped buffer as the device's own DMA memory, paced\n"
+         "against the hardware play-position register. Below the Windows\n"
+         "engine: no events, no scheduler intermediaries.\n\n"
+         "ks_period_frames = the buffer-switch size in SAMPLES (128 @ 48 kHz\n"
+         "= one bite every 2.67 ms; 128+ paces steadiest in the field).\n"
+         "ks_periods = the looped buffer around it (3 recommended, 2..8).\n\n"
+         "A driver refusal falls back to WASAPI exclusive automatically and\n"
+         "the log says so. twinspeak --list-ks shows every KS filter.", 13);
+
+    // ============ page 3: SYNC + POWER ============
+    g_tab = 3;
+    header(w, COLA_X, 100, "GUARDS");
+    tglRow(w, COLA_X, 128, "clock_sync (ASIO replay/drop rules)", IDC_TGL_CLOCK, g_cfg.clockSync);
+    tglRow(w, COLA_X, 166, "drift_guard (auto re-pin)", IDC_TGL_DRIFTG, g_cfg.driftGuard);
+    tglRow(w, COLA_X, 204, "power_guard (sleep survival)", IDC_TGL_POWER, g_cfg.powerGuard);
+    tglRow(w, COLA_X, 242, "yield_default (release a leg that IS the default)", IDC_TGL_YIELD, g_cfg.yieldDefault);
+    header(w, COLB_X, 100, "DRIFT WARDEN NUMBERS");
+    row(w, COLB_X, 128, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
+    row(w, COLB_X, 166, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
+    row(w, COLB_X, 204, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
+    note(w, COLB_X, 246,
+         "drift_correct_ms: trigger distance from the calibrated baseline.\n"
+         "drift_interval_ms: minimum spacing between corrections (2000..60000).\n"
+         "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
+
+    // ============ page 4: CENTER + VOLUME ============
+    g_tab = 4;
+    header(w, COLA_X, 100, "CENTER PRESENCE + CUES");
+    tglRow(w, COLA_X, 128, "center_gate (ch3 zero -> keep-alive only)", IDC_TGL_CGATE, g_cfg.centerGate);
+    tglRow(w, COLA_X, 166, "center_upmix_guard (stereo-upmix mute)", IDC_TGL_UPMIX, g_cfg.centerUpmixGuard);
+    tglRow(w, COLA_X, 204, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
+    tglRow(w, COLA_X, 242, "background (console runs only)", IDC_TGL_BG, g_cfg.background);
+    header(w, COLB_X, 100, "VOLUME + LEVELS");
+    tglRow(w, COLB_X, 128, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
+    row(w, COLB_X, 166, "keepalive_hz", IDC_KAHZ, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveHz); return std::string(b); }().c_str());
+    row(w, COLB_X, 204, "keepalive_gain", IDC_KAGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveGain); return std::string(b); }().c_str());
+    row(w, COLB_X, 242, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    note(w, COLB_X, 284,
+         "The keep-alive tone keeps the center speaker awake; if the S5 still\n"
+         "sleeps, raise keepalive_gain to 0.03..0.05 (still inaudible at 40 Hz).\n"
+         "In this window the log lives in the pane below -- background = on\n"
+         "only affects --console runs.", 4);
+
+    // ============ page 5: CENTER EQ ============
+    g_tab = 5;
+    tglRow(w, COLA_X, 122, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
+    for (int i = 0; i < 5; ++i)
+        mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 96, 160, 88, 30, kEqPre[i].name);
+    mkLabel(w, IDC_LBL_FREQ, COLA_X, 220, 430, "PEAK FREQUENCY", g_fUIb);
+    mkSlider(w, IDC_SLD_FREQ, COLA_X, 244, 430, 0, 1000);
+    mkLabel(w, IDC_LBL_GAIN, COLA_X, 292, 430, "BOOST", g_fUIb);
+    mkSlider(w, IDC_SLD_GAIN, COLA_X, 316, 430, -24, 24);
+    mkLabel(w, IDC_LBL_Q, COLA_X, 364, 430, "SHARPNESS (Q)", g_fUIb);
+    mkSlider(w, IDC_SLD_Q, COLA_X, 388, 430, 0, 1000);
+    note(w, COLB_X, 108,
+         "One peaking band on ch3, applied inside the engine's out2 mix path --\n"
+         "out2 ONLY. The mains (out1) are never touched.\n\n"
+         "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
+         "EQs (Equalizer APO and friends) can never see this stream. The\n"
+         "boost lives here instead.\n\n"
+         "FLAT turns the EQ off -- out2 returns to the bit-exact path.\n\n"
+         "The boost stacks with gain_center; the mix clamps at full scale,\n"
+         "so loud center peaks may clip first -- lower gain_center if they\n"
+         "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 12);
+}
+
+static void guiBuildControls(HWND w) {
+    // bottom bar -- always visible
+    mkBtn(w, IDC_START, 16, 478, 150, 46, "");
+    mkBtn(w, IDC_APPLY, 180, 478, 170, 46, "APPLY + RESTART");
+    mkBtn(w, IDC_SAVE, 364, 478, 130, 46, "SAVE INI");
+    HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD | WS_VISIBLE,
+                              16, 534, 968, 18, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
+    SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
+    HWND log = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        16, 560, 968, 174, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+    SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
+    guiDarkCtl(log);
+    // tab strip
+    int tx = 16;
+    for (int i = 0; i < 6; ++i) {
+        mkBtn(w, IDC_TAB0 + i, tx, 46, kTabW[i], 30, kTabNames[i]);
+        tx += kTabW[i] + 6;
+    }
+    guiBuildPages(w);
+}
+
+static void guiShowPage(HWND w, int p) {
+    for (int i = 0; i < 6; ++i)
+        for (size_t k = 0; k < g_pageHw[i].size(); ++k)
+            ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
+    g_tab = p;
+    InvalidateRect(w, nullptr, TRUE);
+}
+
+// ---- the window procedure ---------------------------------------------------
+static bool guiIsToggle(int id) {
+    switch (id) {
+        case IDC_TGL_LFEFOLD: case IDC_TGL_CAPEXCL: case IDC_TGL_EXCLUSIVE:
+        case IDC_TGL_ALIGN: case IDC_TGL_OUT2FIRST: case IDC_TGL_PINOUT:
+        case IDC_TGL_CLOCK: case IDC_TGL_DRIFTG: case IDC_TGL_POWER:
+        case IDC_TGL_YIELD: case IDC_TGL_CGATE: case IDC_TGL_UPMIX:
+        case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES: case IDC_TGL_BG:
+        case IDC_TGL_EQ:
+            return true;
+    }
+    return false;
+}
+
+static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        const RECT panel = { 12, 84, 988, 468 };
+        FillRect(dc, &panel, g_brPanel);
+        FrameRect(dc, &panel, g_brPanel2);
+        const RECT hdr = { 18, 8, 420, 42 };
+        guiText(dc, hdr, "TWINSPEAK CONTROL", guic::cAccent, g_fHead,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        const std::string verLine = "v6.6.0  |  " + g_guiIniPath;
+        const RECT ver = { 300, 14, 984, 38 };
+        guiText(dc, ver, verLine.c_str(), guic::cDim, g_fSml,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        EndPaint(w, &ps);
+        return 0; }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        const int id = GetDlgCtrlID((HWND)lp);
+        SetBkMode(dc, TRANSPARENT);
+        if (id == IDC_STATUS) { SetTextColor(dc, guic::cAccent); return (LRESULT)g_brBg; }
+        if (id == IDC_LBL_FREQ || id == IDC_LBL_GAIN || id == IDC_LBL_Q) {
+            SetTextColor(dc, guic::cAccent);
+            return (LRESULT)g_brPanel;
+        }
+        if (id >= 600 && id <= 611) {           // section headers
+            SetTextColor(dc, guic::cText);
+            return (LRESULT)g_brPanel;
+        }
+        SetTextColor(dc, guic::cDim);
+        return (LRESULT)g_brPanel; }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetBkMode(dc, TRANSPARENT);
+        if (GetDlgCtrlID((HWND)lp) == IDC_LOG) {   // the pane: soft cyan on near-black
+            SetTextColor(dc, guic::cLog);
+            return (LRESULT)g_brLog;
+        }
+        SetTextColor(dc, guic::cText);
+        return (LRESULT)g_brPanel2; }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wp;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, guic::cText);
+        return (LRESULT)g_brPanel2; }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
+        HDC dc = d->hDC;
+        const RECT rc = d->rcItem;
+        const int id = (int)d->CtlID;
+        char txt[128];
+        GetWindowTextA(d->hwndItem, txt, sizeof(txt));
+        SetBkMode(dc, TRANSPARENT);
+        const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
+            const bool act = (id - IDC_TAB0) == g_tab;
+            RECT fr = rc; fr.bottom -= 3;
+            guiRoundRect(dc, fr, act ? guic::cAccentDk : guic::cLine,
+                         act ? guic::cPanelHi : guic::cPanel, 8, 1);
+            if (act) {
+                const RECT bar = { rc.left + 8, rc.bottom - 4, rc.right - 8, rc.bottom - 1 };
+                HBRUSH b = CreateSolidBrush(guic::cAccent);
+                FillRect(dc, &bar, b);
+                DeleteObject(b);
+            }
+            guiText(dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        if (guiIsToggle(id)) {
+            const bool on = g_tog[id];
+            guiRoundRect(dc, rc, on ? guic::cAccent : guic::cLine,
+                         on ? guic::cAccentDk : guic::cPanel2, 12, 1);
+            guiText(dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cDim,
+                    g_fUIb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        if (id == IDC_START) {
+            const int st = g_engState.load();
+            if (st == 0) {
+                guiRoundRect(dc, rc, guic::cAccent, pressed ? guic::cAccentDk : guic::cAccent, 10, 1);
+                guiText(dc, rc, "START ENGINE", guic::cOnText, g_fUIb,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else if (st == 2) {
+                guiRoundRect(dc, rc, guic::cStop, guic::cPanel2, 10, 1);
+                guiText(dc, rc, "STOP ENGINE", guic::cStop, g_fUIb,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                guiRoundRect(dc, rc, guic::cLine, guic::cPanel2, 10, 1);
+                guiText(dc, rc, st == 1 ? "STARTING..." : "STOPPING...", guic::cDim,
+                        g_fUIb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            return TRUE;
+        }
+        bool accentBtn = false;
+        for (int i = 0; i < 5; ++i)
+            if (id == IDC_PRE_FLAT + i) accentBtn = (g_eqPreset == i);
+        guiRoundRect(dc, rc, accentBtn ? guic::cAccent : (pressed ? guic::cPanelHi : guic::cLine),
+                     pressed ? guic::cPanelHi : guic::cPanel2, accentBtn ? 14 : 8, accentBtn ? 2 : 1);
+        guiText(dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return TRUE; }
+    case WM_COMMAND: {
+        const int id = LOWORD(wp), code = HIWORD(wp);
+        if (code != BN_CLICKED) break;
+        if (guiIsToggle(id)) {
+            g_tog[id] = !g_tog[id];
+            InvalidateRect(w, nullptr, TRUE);
+            return 0;
+        }
+        if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) { guiShowPage(w, id - IDC_TAB0); return 0; }
+        switch (id) {
+            case IDC_START:
+                if (g_engState.load() == 0) guiStartEngine(w); else guiStopEngine();
+                return 0;
+            case IDC_SAVE: {
+                cfgFromControls(w); cfgSanitize();
+                SetDlgItemTextA(w, IDC_STATUS, guiSaveIni() ? "ini saved" : "ini save FAILED");
+                return 0; }
+            case IDC_APPLY: {
+                const bool wasRunning = g_engState.load() != 0;
+                cfgFromControls(w); cfgSanitize();
+                const bool ok = guiSaveIni();
+                if (wasRunning) {
+                    guiStopEngine();
+                    guiStartEngine(w);
+                    SetDlgItemTextA(w, IDC_STATUS,
+                                    ok ? "saved -- engine restarted"
+                                       : "save FAILED -- restarted with the previous ini");
+                } else {
+                    SetDlgItemTextA(w, IDC_STATUS, ok ? "saved -- START to apply" : "ini save FAILED");
+                }
+                return 0; }
+            case IDC_REFRESH:   guiFillCombos(w);     return 0;
+            case IDC_PRE_FLAT:  guiApplyPreset(w, 0); return 0;
+            case IDC_PRE_DLG:   guiApplyPreset(w, 1); return 0;
+            case IDC_PRE_BASS:  guiApplyPreset(w, 2); return 0;
+            case IDC_PRE_WARM:  guiApplyPreset(w, 3); return 0;
+            case IDC_PRE_CIN:   guiApplyPreset(w, 4); return 0;
+        }
+        break; }
+    case WM_HSCROLL: {
+        const int id = GetDlgCtrlID((HWND)lp);
+        if (id == IDC_SLD_FREQ || id == IDC_SLD_GAIN || id == IDC_SLD_Q) {
+            g_eqPreset = -1;                       // manual = CUSTOM
+            guiUpdateEqLabels(w);
+            InvalidateRect(w, nullptr, TRUE);
+        }
+        return 0; }
+    case WM_TIMER: {
+        if (g_logDirty.exchange(false)) {
+            EnterCriticalSection(&g_logCS);
+            const std::string chunk = g_logRing;
+            g_logRing.clear();
+            LeaveCriticalSection(&g_logCS);
+            if (!chunk.empty()) guiAppendLog(chunk);
+        }
+        static const char* stName[4] = { "engine stopped", "engine starting...",
+                                         "engine RUNNING", "engine stopping..." };
+        std::string s = stName[g_engState.load()];
+        if (g_engState.load() == 0 && g_engRC.load() != 0) {
+            char eb[32];
+            snprintf(eb, sizeof(eb), " (exit code %d)", g_engRC.load());
+            s += eb;
+        }
+        if (!g_lastHealth.empty()) { s += "   |   "; s += g_lastHealth; }
+        SetDlgItemTextA(w, IDC_STATUS, s.c_str());
+        return 0; }
+    case WM_APP + 2:                                   // engine thread ended
+        InvalidateRect(w, nullptr, TRUE);
+        return 0;
+    case WM_CLOSE:
+        if (g_engState.load() != 0) guiStopEngine();
+        DestroyWindow(w);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// ---- entry ------------------------------------------------------------------
+static int guiMain(const std::string& iniPath) {
+    g_guiIniPath = iniPath;
+    g_logSink = guiLogSink;                            // everything logs to the pane now
+    FreeConsole();                                     // the window replaces the console
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+    HANDLE mutex = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxA(nullptr, "twinspeak is already running.\n\nStop the running copy first:\n  taskkill /IM twinspeak.exe",
+                    "twinspeak control", MB_ICONINFORMATION);
+        CloseHandle(mutex);
+        return 1;
+    }
+    if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
+    guiMakeGdi();
+    WNDCLASSA wc = {};
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = guiWndProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
+    if (!wc.hIcon) wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wc.hbrBackground = g_brBg;
+    wc.lpszClassName = "twinspeak.control";
+    RegisterClassA(&wc);
+    RECT r = { 0, 0, 1000, 750 };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    g_hwnd = CreateWindowExA(WS_EX_COMPOSITED, "twinspeak.control", "twinspeak control -- v6.6.0",
+                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_hwnd) { if (mutex) CloseHandle(mutex); return 1; }
+    {   // dark title bar (1809+), best effort
+        HMODULE dw = LoadLibraryA("dwmapi.dll");
+        if (dw) {
+            typedef HRESULT (WINAPI *DSWAFN)(HWND, DWORD, LPCVOID, DWORD);
+            DSWAFN d = (DSWAFN)GetProcAddress(dw, "DwmSetWindowAttribute");
+            if (d) { BOOL t = TRUE; d(g_hwnd, 20, &t, sizeof(t)); }
+        }
+    }
+    guiBuildControls(g_hwnd);
+    controlsFromCfg(g_hwnd);
+    guiShowPage(g_hwnd, 0);
+    guiFillCombos(g_hwnd);
+    SetTimer(g_hwnd, 1, 250, nullptr);
+    tlog("[twinspeak] gui           : control window up -- ini at %s\n", iniPath.c_str());
+    tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n\n");
+    MSG m;
+    while (GetMessageA(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+    KillTimer(g_hwnd, 1);
+    if (g_engState.load() != 0) guiStopEngine();
+    if (mutex) CloseHandle(mutex);
+    return 0;
+}
+
 // ---------------------------------------------------------------- main ------
 static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
+
+// v6.6.0: the engine body, split out of main() so the GUI can run it on a
+// worker thread and restart it in-process. The caller owns the single-
+// instance mutex (console main or the GUI holds it for the process lifetime).
+// guiMode: the background/FreeConsole detach is suppressed (the log pane is
+// the destination; g_logSink is already armed) and the run must be restart-
+// safe (g_run is re-armed here; every engine global is (re)initialized below).
+static int engineMain(const std::string& iniPath, bool fgForce,
+                      bool allowMulti, bool guiMode);
 
 int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
@@ -4083,8 +5157,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ini") && i + 1 < argc) iniPath = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) fgForce = true;    // v6.2
         else if (!strcmp(argv[i], "--multi"))      allowMulti = true; // v6.2
+        else if (!strcmp(argv[i], "--gui"))      { /* v6.6.0: explicit, same as default */ }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             tlog("usage: twinspeak [--list] [--list-ks] [--ini path] [--foreground] [--multi]\n"
+                 "  (no args)     the control window -- every ini option + START/STOP + live log\n"
                  "  --list        show every WASAPI endpoint (the usual device needles)\n"
                  "  --list-ks     show every WDM-KS render filter with its pins/formats (v6.3)\n"
                  "  --foreground  ignore background = on for this run (keep the console)\n"
@@ -4093,9 +5169,6 @@ int main(int argc, char** argv) {
         } else iniPath = argv[i];
     }
 
-    if (doList) { listDevices(); return 0; }
-    if (doListKS) { ksListKs(); return 0; }   // v6.3
-
     char exePath[MAX_PATH] = {0};
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     std::string exeDir = exePath;
@@ -4103,6 +5176,33 @@ int main(int argc, char** argv) {
     if (sl != std::string::npos) exeDir = exeDir.substr(0, sl); else exeDir = ".";
     if (iniPath.empty()) iniPath = exeDir + "\\twinspeak.ini";
 
+    if (doList) { listDevices(); return 0; }
+    if (doListKS) { ksListKs(); return 0; }   // v6.3
+
+    // v6.6.0: NO ARGUMENTS = the control window. The console modes all keep
+    // their exact behavior behind explicit flags.
+    if (argc <= 1) return guiMain(iniPath);
+
+    // v6.2 single-instance lock (console runs; the GUI holds its own).
+    HANDLE hInstance = nullptr;
+    if (!allowMulti) {
+        hInstance = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
+        if (hInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
+            tlog( "[twinspeak] already running -- twinspeak is single-instance.\n"
+                            "            stop the running copy first:  taskkill /IM twinspeak.exe\n"
+                            "            (a deliberate second copy: add --multi)\n");
+            return 1;
+        }
+    }
+    const int rc = engineMain(iniPath, fgForce, allowMulti, false);
+    if (hInstance) CloseHandle(hInstance);
+    return rc;
+}
+
+static int engineMain(const std::string& iniPath, bool fgForce,
+                      bool allowMulti, bool guiMode) {
+    (void)allowMulti;   // the lock is the caller's business
+    g_run.store(true);  // v6.6.0: fresh run -- a GUI restart arrives with it false
     if (!loadIni(iniPath.c_str())) {
         writeTemplate(iniPath.c_str());
         tlog( "[twinspeak] no config at %s\n"
@@ -4123,20 +5223,6 @@ int main(int argc, char** argv) {
     // watcher) behind seconds of background work. HIGH is the weight a DAW
     // host takes by default; it does not starve other processes' streams.
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-
-    // v6.2 single-instance lock: two engines would fight over the same
-    // exclusive pins. background = on makes this easy to hit (the running
-    // copy may have no window at all), so the refusal names the exact cure.
-    HANDLE hInstance = nullptr;
-    if (!allowMulti) {
-        hInstance = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
-        if (hInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
-            tlog( "[twinspeak] already running -- twinspeak is single-instance.\n"
-                            "            stop the running copy first:  taskkill /IM twinspeak.exe\n"
-                            "            (a deliberate second copy: add --multi)\n");
-            return 1;
-        }
-    }
 
     timeBeginPeriod(1);
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
@@ -4510,7 +5596,7 @@ int main(int argc, char** argv) {
     // FreeConsole closes a console the process owns; a console shared with
     // the shell the user ran us from simply stays theirs. Stop a background
     // run: taskkill /IM twinspeak.exe
-    if (g_cfg.background && !fgForce) {
+    if (!guiMode && g_cfg.background && !fgForce) {   // v6.6.0: never detach under the GUI
         size_t ds = iniPath.find_last_of("\\/");
         std::string logPath = (ds == std::string::npos)
                             ? std::string("twinspeak.log")
@@ -4527,11 +5613,11 @@ int main(int argc, char** argv) {
         } else {
             tlog("[twinspeak] background    : could not open the log file -- staying in the foreground\n");
         }
-    } else if (g_cfg.background && fgForce) {
+    } else if (!guiMode && g_cfg.background && fgForce) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.18        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.0        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
