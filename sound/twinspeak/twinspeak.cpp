@@ -1,5 +1,27 @@
 // ============================================================================
-//  twinspeak v6.5.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.16 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.16 (field report: switching the default render from a leg device
+//          back to the main speaker (the VAC) "causes some doubling issue
+//          and applications using miniaudio with it can deadlock". Two
+//          causes found, two fixes:
+//            QUIET-REGRAB GUARD -- the app that played to a leg while it
+//            was the Windows default does not re-route the instant the
+//            default moves; its stream stays attached. The v6.5.14 release
+//            path re-grabbed the DAC immediately anyway: twinspeak's render
+//            plus the stale app stream out of the same speaker = the
+//            doubled audio, and the exclusive re-grab mid-re-route is what
+//            wedged miniaudio apps. The release path now probes the leg
+//            endpoint's audio sessions (IAudioSessionManager2) and re-grabs
+//            only when NO foreign session is ACTIVE on it; while busy it
+//            stays yielded (logged, rate-limited 1/5 s) and re-probes each
+//            tick. A failed probe fails OPEN -- pre-v6.5.16 behavior.
+//            CHEAP DEFAULT READ -- v6.5.14 also walked EVERY render endpoint
+//            (ma_context_enumerate_devices) every health tick just to learn
+//            the default's name. That per-second endpoint-store churn is
+//            visible to other processes doing device work. Now it is one
+//            GetDefaultAudioEndpoint + one property read (same eConsole
+//            role miniaudio uses); the full walk is gone.)
 //
 //  v6.5.15 (field report: "when the DAC is yielded, the output devices
 //          aren't supposed to be changed to 100% by the program". The
@@ -886,6 +908,7 @@
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
+#include <audiopolicy.h>    // v6.5.16: IAudioSessionManager2/Enumerator (yield re-grab guard)
 #include <endpointvolume.h>
 #include <xmmintrin.h>     // v6.5: FTZ (SSE flush-to-zero)
 #include <pmmintrin.h>     // v6.5: DAZ (denormals-are-zero)
@@ -1413,6 +1436,11 @@ static const IID kIID_IAudioEndpointVolume =
     { 0x5CDF2C82, 0x841E, 0x4546, { 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A } };
 static const PROPERTYKEY kPKEY_Device_FriendlyName =
     { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
+// v6.5.16: yield re-grab guard -- active-session probe on a leg endpoint.
+// (Only IAudioSessionManager2's IID is needed: dev->Activate() takes an IID;
+// the enumerator/control objects come back from plain method calls.)
+static const IID kIID_IAudioSessionManager2 =
+    { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
 
 static std::atomic<float>    g_vol{1.0f};             // Line 1 endpoint scalar (0..1)
 static std::atomic<bool>     g_volMuted{false};
@@ -3077,7 +3105,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3214,7 +3242,11 @@ static void writeTemplate(const char* path) {
         "; immediately -- the KS pin closes / the WASAPI device frees, the pump\n"
         "; parks -- so the app playing to the default device owns the hardware\n"
         "; with nothing fighting it. The leg reopens by itself (chime + warden\n"
-        "; re-arm included) the moment the default moves elsewhere. The log\n"
+        "; re-arm included) once the default moves elsewhere AND the device is\n"
+        "; QUIET: if another app's audio session is still active on it (the\n"
+        "; app has not finished re-routing), the release holds until the app\n"
+        "; is done -- re-grabbing the DAC under a live stream doubles the\n"
+        "; audio and can wedge the other app. The log\n"
         "; announces both directions ('legN YIELD'); a yielded leg shows '----'\n"
         "; on the devbuf line and a stale heartbeat, both BY DESIGN. While a\n"
         "; leg is yielded the program touches NOTHING on that device -- its\n"
@@ -3571,25 +3603,107 @@ static bool pickDevice(ma_context* ctx, ma_device_type type, const std::string& 
     return true;
 }
 
-// v6.5.14: the friendly name of the CURRENT default render endpoint, via a
-// LIVE re-enumeration (ma_context_enumerate_devices re-walks the endpoints
-// on every call, so a default-device switch is visible immediately; the
-// cached ma_context_get_devices list is not). Consumed by the health loop's
-// DAC-yield check.
-struct YieldEnum { std::string defName; };
-static ma_bool32 yieldEnumCb(ma_context*, ma_device_type deviceType,
-                             const ma_device_info* pInfo, void* pUserData) {
-    if (deviceType != ma_device_type_playback) return MA_TRUE;
-    YieldEnum* d = (YieldEnum*)pUserData;
-    if (pInfo->isDefault && d->defName.empty()) d->defName = pInfo->name;
-    return MA_TRUE;
+// v6.5.16: the friendly name of the CURRENT default render endpoint, read
+// directly (GetDefaultAudioEndpoint = one endpoint, one property read, the
+// same eConsole role miniaudio itself uses). v6.5.14 walked EVERY render
+// endpoint through ma_context_enumerate_devices on every health tick -- a
+// full endpoint-store sweep per second just to learn one name, and that
+// churn is visible to every other process doing device work (miniaudio
+// apps enumerating/initing at the same moment contended with us). One
+// name, one read; the per-tick walk is gone.
+static bool defaultRenderName(std::string* outName) {
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return false;
+    IMMDevice* dev = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) && dev) {
+        IPropertyStore* ps = nullptr;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+            PROPVARIANT var; PropVariantInit(&var);
+            if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
+                var.vt == VT_LPWSTR && var.pwszVal) {
+                *outName = wideToNarrow(var.pwszVal);
+                ok = !outName->empty();
+            }
+            PropVariantClear(&var);
+            ps->Release();
+        }
+        dev->Release();
+    }
+    en->Release();
+    return ok;
 }
-static bool defaultRenderName(ma_context* ctx, std::string* outName) {
-    YieldEnum d;
-    if (ma_context_enumerate_devices(ctx, yieldEnumCb, &d) != MA_SUCCESS) return false;
-    if (d.defName.empty()) return false;
-    *outName = d.defName;
-    return true;
+
+// v6.5.16: how many FOREIGN audio sessions are ACTIVE on the render endpoint
+// whose friendly name contains the needle (first name match -- the same
+// rule that opens the leg)? Consumed by the yield-release path: the app
+// that played to this device while it WAS the Windows default does not
+// re-route the instant the default moves -- its stream stays attached.
+// Re-grabbing the DAC under a live stream produced the field-reported
+// doubled audio (twinspeak's render plus the stale app stream out of the
+// same speaker) and wedged miniaudio apps mid-re-route. The release path
+// therefore re-grabs only a QUIET device.
+// Returns: >= 0 foreign active sessions; -1 the probe itself failed
+// (caller fails OPEN -- pre-v6.5.16 behavior, logged).
+static int foreignActiveSessions(const std::string& nameNeedle) {
+    const std::wstring wNeedle = narrowToWide(nameNeedle);
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return -1;
+    int count = -1;
+    IMMDeviceCollection* col = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col) {
+        count = 0;   // store walk works; from here zero means "no activity found"
+        UINT n = 0;
+        if (SUCCEEDED(col->GetCount(&n))) {
+            for (UINT i = 0; i < n; ++i) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(col->Item(i, &dev)) || !dev) continue;
+                IPropertyStore* ps = nullptr;
+                bool match = false;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+                    PROPVARIANT var; PropVariantInit(&var);
+                    if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
+                        var.vt == VT_LPWSTR && var.pwszVal)
+                        match = wContainsCI(var.pwszVal, wNeedle);
+                    PropVariantClear(&var);
+                    ps->Release();
+                }
+                if (match) {
+                    IAudioSessionManager2* sm2 = nullptr;
+                    if (SUCCEEDED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL,
+                                                nullptr, (void**)&sm2)) && sm2) {
+                        IAudioSessionEnumerator* se = nullptr;
+                        if (SUCCEEDED(sm2->GetSessionEnumerator(&se)) && se) {
+                            int sn = 0;
+                            if (SUCCEEDED(se->GetCount(&sn))) {
+                                for (int s = 0; s < sn; ++s) {
+                                    IAudioSessionControl* sc = nullptr;
+                                    if (SUCCEEDED(se->GetSession(s, &sc)) && sc) {
+                                        AudioSessionState st = AudioSessionStateInactive;
+                                        if (SUCCEEDED(sc->GetState(&st)) && st == AudioSessionStateActive)
+                                            ++count;
+                                        sc->Release();
+                                    }
+                                }
+                            }
+                            se->Release();
+                        }
+                        sm2->Release();
+                    }
+                    dev->Release();
+                    break;   // first name match only -- the leg-opening rule
+                }
+                dev->Release();
+            }
+        }
+        col->Release();
+    }
+    en->Release();
+    return count;
 }
 
 // ---------------------------------------------------------- device init -----
@@ -4240,7 +4354,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.15        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.16        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4536,7 +4650,7 @@ int main(int argc, char** argv) {
         // line prints '----'. Reaction time: one health tick (<= 1 s).
         if (g_cfg.yieldDefault && !g_powerPark.load(std::memory_order_relaxed)) {
             std::string defName;
-            if (defaultRenderName(&ctx, &defName)) {
+            if (defaultRenderName(&defName)) {
                 for (int i = 0; i < 2; ++i) {
                     const char* yneedle = (i == 0) ? g_cfg.outputDevice1.c_str()
                                                    : g_cfg.outputDevice2.c_str();
@@ -4565,13 +4679,45 @@ int main(int argc, char** argv) {
                         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
                         g_pin[i].id.clear();
                         Y.lastReopenMs = nowMs;   // warden settle gates stay coherent
-                    } else if (!mine && Y.yielded.exchange(false, std::memory_order_relaxed)) {
-                        tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
-                             "                            -- reopening (\"%s\")\n",
-                             i + 1, Y.name.c_str());
-                        Y.lastReopenMs = nowMs;
-                        tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2,
-                                      "yield release (default device moved away)");
+                    } else if (!mine && Y.yielded.load(std::memory_order_relaxed)) {
+                        // v6.5.16: the default moved away -- but the app that
+                        // played to this device while it WAS the default does
+                        // not re-route the instant Windows moves it; its
+                        // stream stays attached. Re-grabbing the DAC under a
+                        // live stream doubled the audio (our render plus the
+                        // stale app stream out of the same speaker) and
+                        // wedged miniaudio apps mid-re-route (field: "some
+                        // doubling issue and applications using miniaudio
+                        // ... can deadlock"). So the re-grab waits for a
+                        // QUIET device; a failed probe fails OPEN (logged).
+                        const int busy = foreignActiveSessions(yneedle);
+                        if (busy > 0) {
+                            static unsigned long long lastBusyLog[2] = { 0, 0 };
+                            if (nowMs - lastBusyLog[i] >= 5000) {
+                                tlog("[twinspeak] leg%d YIELD     : the default moved away, but %d foreign audio\n"
+                                     "                            session(s) are still ACTIVE on this device --\n"
+                                     "                            holding the release until they finish (re-grabbing\n"
+                                     "                            under them is the doubled-audio/deadlock bug)\n",
+                                     i + 1, busy);
+                                lastBusyLog[i] = nowMs;
+                            }
+                        } else {
+                            if (busy < 0) {
+                                static unsigned long long lastProbeLog[2] = { 0, 0 };
+                                if (nowMs - lastProbeLog[i] >= 5000) {
+                                    tlog("[twinspeak] leg%d YIELD     : session probe unavailable -- releasing fail-open\n", i + 1);
+                                    lastProbeLog[i] = nowMs;
+                                }
+                            }
+                            if (Y.yielded.exchange(false, std::memory_order_relaxed)) {
+                                tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
+                                     "                            -- reopening (\"%s\")\n",
+                                     i + 1, Y.name.c_str());
+                                Y.lastReopenMs = nowMs;
+                                tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2,
+                                              "yield release (default device moved away)");
+                            }
+                        }
                     }
                 }
             }
