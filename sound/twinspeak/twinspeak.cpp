@@ -1,5 +1,17 @@
 // ============================================================================
-//  twinspeak v7.0.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v7.0.3 (THE GLOW, PERFECTED. (1) ROUNDED TAB REGIONS: each tab's window
+//          region is now its face shape -- WS_CLIPCHILDREN clips the frame's
+//          halo out of the child's REGION instead of its square rect, so the
+//          glow's rounded shoulders survive every corner; the square clip is
+//          what read as a box around the burn. (2) FADE-IN: selecting a tab
+//          eases the halo + face + border + label in over ~170 ms (a 16 ms
+//          GUI timer drives the frames and lands one final full-strength
+//          pass), instead of snapping on at the next paint. (3) THE LABEL
+//          STOPS FLICKERING: the tab renders into a memory DC and lands as
+//          ONE opaque blit -- the erase pass and the GDI+ pass can no longer
+//          be seen apart.)
 //
 //  v7.0.2 (POLISH, THREE PIECES, ZERO DSP. (1) THE TAB GLOW, OUTWARD ONLY:
 //          the selected tab's halo moved to the FRAME's WM_PAINT -- the
@@ -3655,7 +3667,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4563,6 +4575,24 @@ static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
 static int       g_tab           = 0;
+// v7.0.3: the tab fade-in. guiShowPage anchors the clock and arms the 16 ms
+// WM_TIMER id 2; the frame's halo and the selected tab's face/border/label
+// read their strength from guiTabFade() (ease-out cubic). 0 = settled -- every
+// paint then reads full strength, exactly the pre-animation look.
+static ULONGLONG g_tabAnimStart  = 0;
+static const int KTAB_FADE_MS    = 170;
+static double guiTabFade() {
+    if (!g_tabAnimStart) return 1.0;
+    const ULONGLONG dt = GetTickCount64() - g_tabAnimStart;
+    if (dt >= (ULONGLONG)KTAB_FADE_MS) return 1.0;
+    const double t = (double)dt / (double)KTAB_FADE_MS;
+    return 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+}
+static COLORREF guiLerpRGB(COLORREF a, COLORREF b, double t) {
+    return RGB(GetRValue(a) + (int)((GetRValue(b) - GetRValue(a)) * t),
+               GetGValue(a) + (int)((GetGValue(b) - GetGValue(a)) * t),
+               GetBValue(a) + (int)((GetBValue(b) - GetBValue(a)) * t));
+}
 static std::map<int, bool> g_tog;            // toggle button states
 static int       g_eqPreset      = 1;          // active preset index (-1 = custom)
 static std::vector<HWND> g_pageHw[6];          // children per page (show/hide)
@@ -5465,7 +5495,17 @@ static void guiBuildControls(HWND w) {
     // tab strip
     int tx = 14;
     for (int i = 0; i < 6; ++i) {
-        mkBtn(w, IDC_TAB0 + i, tx, 34, kTabW[i], 26, kTabNames[i]);
+        HWND ht = mkBtn(w, IDC_TAB0 + i, tx, 34, kTabW[i], 26, kTabNames[i]);
+        // v7.0.3 THE BOXINESS FIX: the tab's window REGION is its face shape.
+        // The frame paints the halo under WS_CLIPCHILDREN, which clips its DC
+        // out of the child's REGION -- not the square rect. Along the straight
+        // edges both clips agree (outward-only glow), but at every rounded
+        // corner the halo's shoulder crossed back inside the SQUARE rect and
+        // was guillotined along it: straight clip edges cutting a round burn.
+        // The region below is the face path's bounds + 1 px of antialias
+        // margin; the 3 px bottom notch stays outside it, free for the glow.
+        HRGN rg = CreateRoundRectRgn(0, 0, kTabW[i], 24, 13, 13);
+        SetWindowRgn(ht, rg, TRUE);
         tx += kTabW[i] + 4;
     }
     guiBuildPages(w);
@@ -5476,6 +5516,12 @@ static void guiShowPage(HWND w, int p) {
         for (size_t k = 0; k < g_pageHw[i].size(); ++k)
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     g_tab = p;
+    // v7.0.3: the selected tab FADES IN instead of snapping on at the next
+    // paint. Anchor the clock here and let the 16 ms timer (WM_TIMER id 2)
+    // drive ~10 eased frames of halo + face + label; it kills itself and
+    // lands one final full-strength pass when the run completes.
+    g_tabAnimStart = GetTickCount64();
+    SetTimer(w, 2, 16, nullptr);
     InvalidateRect(w, nullptr, TRUE);
     // v6.6.1: tabs are owner-drawn children -- they own their own pixels and
     // a parent-only invalidation never repaints them.
@@ -5614,7 +5660,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 const Gdiplus::Rect tfr(tr.left, tr.top, tr.right - tr.left,
                                         tr.bottom - tr.top - 3);
                 Gdiplus::GraphicsPath* tp = guiRoundPath(tfr, 6);
-                const BYTE  ga[3]  = { 26, 48, 84 };    // alphas, widest first
+                // v7.0.3: the halo eases in with the tab fade (guiTabFade --
+                // 1.0 whenever no animation is running, so the settled look
+                // is byte-identical to v7.0.2's).
+                const double fs  = guiTabFade();
+                const BYTE  ga[3]  = { (BYTE)(26 * fs), (BYTE)(48 * fs),
+                                       (BYTE)(84 * fs) };    // alphas, widest first
                 const float gwd[3] = { 10.0f, 6.0f, 3.0f };
                 for (int k = 0; k < 3; ++k) {
                     Gdiplus::Pen gp(GCol(guic::cAccent, ga[k]), gwd[k]);
@@ -5626,7 +5677,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 6, 420, 40 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.2  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.3  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 12, 866, 36 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -5748,15 +5799,44 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // transparent faces like every other button.
             const bool act = (id - IDC_TAB0) == g_tab;
             const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
+            // v7.0.3 THE FLICKER FIX: the whole tab renders into a memory DC
+            // and lands as ONE opaque blit. Owner-draw used to erase the tab
+            // to the background and then draw face + label GDI+ -- two passes
+            // the eye could see apart, so the label blinked on every repaint
+            // (and would have strobed under the fade-in's 16 ms frames).
+            // Nothing exists between the passes anymore.
+            HDC     mdc = CreateCompatibleDC(dc);
+            HBITMAP mbm = CreateCompatibleBitmap(dc, grc.Width, grc.Height);
+            HBITMAP obm = (HBITMAP)SelectObject(mdc, mbm);
+            const RECT mrc = { 0, 0, grc.Width, grc.Height };
+            FillRect(mdc, &mrc, g_brBg);
+            Gdiplus::Graphics gm(mdc);
+            gm.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            gm.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
             Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
+            double   fs = 1.0;
+            COLORREF tc = guic::cDim;
             if (act) {
-                Gdiplus::SolidBrush fb(GCol(guic::cPanelHi));
-                g.FillPath(&fb, p);
+                // v7.0.3: face + accent border + label ease in together.
+                // The cLine border stays beneath the accent overlay so the
+                // tab never loses its outline mid-fade.
+                fs = guiTabFade();
+                if (fs > 0.004) {
+                    Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs)));
+                    gm.FillPath(&fb, p);
+                    Gdiplus::Pen ab(GCol(guic::cAccent, (BYTE)(255 * fs)), 1.0f);
+                    gm.DrawPath(&ab, p);
+                }
+                tc = guiLerpRGB(guic::cDim, guic::cAccent, fs);
             }
-            Gdiplus::Pen pb(GCol(act ? guic::cAccent : guic::cLine), 1.0f);
-            g.DrawPath(&pb, p);
+            Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
+            gm.DrawPath(&pb, p);
             delete p;
-            guiAAString(g, dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb, 0);
+            guiAAString(gm, mdc, mrc, txt, tc, g_fUIb, 0);
+            BitBlt(dc, 0, 0, grc.Width, grc.Height, mdc, 0, 0, SRCCOPY);
+            SelectObject(mdc, obm);
+            DeleteObject(mbm);
+            DeleteDC(mdc);
             return TRUE;
         }
         if (guiIsToggle(id)) {
@@ -5937,6 +6017,27 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0; }
     case WM_TIMER: {
+        // v7.0.3: timer 2 drives the tab fade-in. Each 16 ms tick repaints
+        // the frame (halo strength = guiTabFade) and the selected tab (face,
+        // border accent and label all read the same clock); when the eased
+        // run completes the timer kills itself and lands one final
+        // full-strength pass so no fractional-alpha frame is ever left on
+        // screen.
+        if (wp == 2) {
+            if (g_tabAnimStart &&
+                GetTickCount64() - g_tabAnimStart < (ULONGLONG)KTAB_FADE_MS) {
+                InvalidateRect(w, nullptr, TRUE);
+                if (HWND h = GetDlgItem(w, IDC_TAB0 + g_tab))
+                    InvalidateRect(h, nullptr, TRUE);
+            } else {
+                KillTimer(w, 2);
+                g_tabAnimStart = 0;
+                InvalidateRect(w, nullptr, TRUE);
+                if (HWND h = GetDlgItem(w, IDC_TAB0 + g_tab))
+                    InvalidateRect(h, nullptr, TRUE);
+            }
+            return 0;
+        }
         // v7.0.2: the tick test ends itself -- and now the BUTTON untoggles
         // with it. Nothing on the engine side clears g_tickOn at the end of
         // the 4 s run (tickSum just goes quiet past beat 8), so the GUI
@@ -6650,7 +6751,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.3        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
