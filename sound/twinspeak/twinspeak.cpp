@@ -1,5 +1,20 @@
 // ============================================================================
-//  twinspeak v6.6.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.7 (THE GHOST CORNERS, SECOND ROUND. The screenshot showed every
+//          owner-drawn button with bright gray arcs on its rounded corners
+//          -- the corner path's antialiasing blending against WHITE that
+//          lived underneath it. Three locks, belt + suspenders + a third
+//          belt: (1) WM_CTLCOLORBTN now answers g_brBg -- DefWindowProc's
+//          WHITE-brush answer was feeding every button-side WM_ERASEBKGND
+//          (RDW_ERASE|RDW_ALLCHILDREN, InvalidateRect(..., TRUE));
+//          (2) WM_DRAWITEM erases in plain GDI FillRect -- exact opaque
+//          pixels, no GDI+ alpha in the corners; (3) the rounded path sits
+//          1px inside the item rect, so the centered pen stroke's outer
+//          half is no longer clipped away by the control DC -- borders
+//          render at their full width and the corner AA never straddles
+//          the window edge again. No engine DSP changed: byte-identical
+//          to v6.5.18.)
 //
 //  v6.6.6 (THREE USER-REPORTED FIXES + ONE MISSING BUTTON.
 //          (1) GHOST BORDERED BOX: the log pane carried WS_EX_CLIENTEDGE --
@@ -3408,7 +3423,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4387,7 +4402,13 @@ static Gdiplus::Color GCol(COLORREF c, BYTE a = 255) {
 }
 
 // rounded-rect path out of four arcs -- the AA replacement for guiRoundRect
-static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& r, int rad) {
+static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& rin, int rad) {
+    // v6.6.7: the path is inset 1px inside the item rect. The pen stroke is
+    // centered on the path -- at the rect boundary its outer half was
+    // clipped away by the control DC, thinning every border and letting the
+    // corner AA straddle the window edge. Inset, the full 1px stroke is
+    // visible and its AA always blends against our own dark erase.
+    const Gdiplus::Rect r(rin.X + 1, rin.Y + 1, rin.Width - 2, rin.Height - 2);
     Gdiplus::GraphicsPath* p = new Gdiplus::GraphicsPath();
     const int d = rad * 2;
     p->AddArc(r.X, r.Y, d, d, 180, 90);
@@ -5233,12 +5254,21 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 6, 420, 40 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v6.6.6  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v6.6.7  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 12, 866, 36 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
         EndPaint(w, &ps);
         return 0; }
+    case WM_CTLCOLORBTN:
+        // v6.6.7: RDW_ERASE|RDW_ALLCHILDREN (the white-flash fix) and every
+        // InvalidateRect(..., TRUE) send the owner-drawn buttons a
+        // WM_ERASEBKGND, and DefWindowProc answers WM_CTLCOLORBTN with the
+        // classic WHITE brush. Whatever WM_DRAWITEM paints afterwards, that
+        // white pass is what the corner antialiasing blended against -- the
+        // bright ghost arcs on every rounded corner. Answer DARK so no
+        // pass can ever put white under the AA again.
+        return (LRESULT)g_brBg;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         const int id = GetDlgCtrlID((HWND)lp);
@@ -5300,17 +5330,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int id = (int)d->CtlID;
         char txt[128];
         GetWindowTextA(d->hwndItem, txt, sizeof(txt));
+        const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
+                              (id >= IDC_START && id <= IDC_SAVE));
+        // v6.6.7: erase FIRST and in PLAIN GDI -- exact opaque pixels, no
+        // GDI+ alpha. The old GDI+ fill let the square corners blend
+        // against whatever the button's own WM_ERASEBKGND had put there
+        // (DefWindowProc answers WM_CTLCOLORBTN with the WHITE brush),
+        // leaving bright ghost arcs on every rounded corner.
+        FillRect(dc, &rc, onPage ? g_brPanel : g_brBg);
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
-        const bool pressed = (d->itemState & ODS_SELECTED) != 0;
-        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
-                              (id >= IDC_START && id <= IDC_SAVE));
-        {   // erase the square corners with the surface the button sits on
-            Gdiplus::SolidBrush eb(GCol(onPage ? guic::cPanel : guic::cBg));
-            g.FillRectangle(&eb, grc);
-        }
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
             const bool act = (id - IDC_TAB0) == g_tab;
             const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
@@ -6121,7 +6153,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
