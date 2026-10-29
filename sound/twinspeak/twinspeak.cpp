@@ -1665,6 +1665,9 @@ struct Leg {
     // banner) and center-presence gate state (pump-2 thread owned):
     size_t              delayFrames = 0;         // extra ring depth = delay_ms * 48
     float               delayMs     = 0.0f;      // as configured (banner)
+    size_t              tickBase    = 0;         // v7.0.0: ring depth WITHOUT the
+                                                 // delay -- the 120 bpm tick's per-leg
+                                                 // dispatch anchor (see tickSum)
     std::atomic<unsigned long long> cmUpmix{0}; // blocks muted by the upmix guard
     size_t              upmixHoldFrames = 0;     // keep muting small blocks after a hit
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
@@ -2559,12 +2562,15 @@ static inline bool bitZero8(const float* p, size_t n) {
 
 // ---- v7.0.0: the 120 BPM tempo tick (the sync test) ------------------------
 // One sharp 7.5 ms burst every 500 ms (120 bpm), 12 beats = 6 s, rendered ONCE
-// into g_tickWave. The pumps sum the SAME tick samples to BOTH legs, keyed to
-// CAPTURE-SEQUENCE time: beat n lands at stream frame t0 + n*24000 on leg1 AND
-// leg2 alike. The ticks are therefore born sample-aligned in stream time --
-// any flam the ear hears is the legs' real ring-depth difference, exactly the
-// misalignment the drift warden fights. 1500 Hz, fast decay: audible on small
-// speakers, sharp enough that a few ms of offset reads as a flam.
+// into g_tickWave (half amplitude, 0.3 -- the first cut was LOUD). The pumps
+// sum the SAME tick samples to BOTH legs, keyed to CAPTURE-SEQUENCE time and
+// offset per leg by tickBase (the leg's ring depth WITHOUT the delay): the
+// tick enters leg N's stream tickBase frames early, rides the full ring depth
+// (target = tickBase + delay), and reaches leg N's DAC exactly delay_msN
+// after the beat -- delay1_ms on leg1, delay2_ms on leg2, NOTHING else. Any
+// flam the ear hears is (delay1 - delay2) plus the real physical path
+// difference: trim the delay knobs until the ticks match. 1500 Hz, fast
+// decay: audible on small speakers, sharp enough that a few ms reads as a flam.
 static std::atomic<bool>      g_tickOn{false};
 static std::atomic<long long> g_tickSeq0{-1};      // capture-seq of tick beat zero
 static std::vector<float>     g_tickWave;          // ONE pre-rendered tick (48 kHz mono)
@@ -2577,7 +2583,7 @@ static void tickRender() {
     g_tickWave.resize(n);
     for (size_t i = 0; i < n; ++i) {
         const double t = (double)i / (double)kSampleRate;
-        g_tickWave[i] = (float)(0.6 * sin(kTwoPi * 1500.0 * t) * exp(-t / 0.002));
+        g_tickWave[i] = (float)(0.3 * sin(kTwoPi * 1500.0 * t) * exp(-t / 0.002));
     }
 }
 
@@ -2586,7 +2592,12 @@ static void tickRender() {
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore) {
     const long long t0 = g_tickSeq0.load(std::memory_order_acquire);
     if (t0 < 0) return;
-    const long long pos = (long long)seqBefore - t0;
+    // v7.0.0 dispatch rule: write the tick tickBase frames EARLY in the leg's
+    // stream. The ring's non-delay depth (tickBase) then cancels against the
+    // early write and the DAC fires the tick exactly delay_ms after the beat
+    // -- delay1_ms on leg1, delay2_ms on leg2, nothing else in the flam.
+    const long long pos = (long long)seqBefore - t0
+                        + (long long)g_leg[idx].tickBase;
     if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
     const size_t wn = g_tickWave.size();
     const int    ch = (idx == 0) ? kOutCh1 : 2;
@@ -2721,7 +2732,7 @@ static DWORD WINAPI pumpThread(LPVOID p) {
                 mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
             }
             if (g_tickOn.load(std::memory_order_relaxed))
-                tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, stream-aligned
+                tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, delay_ms dispatch
             const size_t dropped = L.out.pushOverwrite(chunk, n);
             if (dropped && L.streamSeeded)         // v6.4: passive evict = a seq skip
                 L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
@@ -5560,6 +5571,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         guiWatermark(g);
         EndPaint(w, &ps);
         return 0; }
+    case WM_ERASEBKGND: {
+        // v7.0.0 THE THEME-ERASE FIX: the class brush was g_brBg at
+        // registration -- but applyTheme() DELETES g_brBg and creates a new
+        // one, so after the first theme switch the class held a dead handle
+        // and DefWindowProc's erase washed the whole frame white on every
+        // theme press. The class brush is nullptr now; the frame's erase is
+        // answered HERE, from the LIVE g_brBg -- always the active theme.
+        RECT rc;
+        GetClientRect(w, &rc);
+        FillRect((HDC)wp, &rc, g_brBg);
+        return 1; }
     case WM_CTLCOLORBTN:
         // v6.6.7: RDW_ERASE|RDW_ALLCHILDREN (the white-flash fix) and every
         // InvalidateRect(..., TRUE) send the owner-drawn buttons a
@@ -5623,7 +5645,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DRAWITEM: {
         // v6.6.5: the whole button face is GDI+ -- antialiased rounded rects
         // and antialiased glyphs. The full item rect is still erased with the
-        // surface color first (the v6.6.4 white-corner fix).
+        // surface color first (the v6.6.4 white-corner fix). v7.0.0 polish:
+        // resting faces are TRANSPARENT -- the surface shows through, only
+        // border + text paint; fills remain for pressed feedback and state.
         const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
         HDC dc = d->hDC;
         const RECT rc = d->rcItem;
@@ -5660,11 +5684,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         if (guiIsToggle(id)) {
+            // v7.0.0 polish: OFF is a TRANSPARENT face -- border + text over
+            // the erased surface. The ON fill stays: it IS the state.
             const bool on = g_tog[id];
             Gdiplus::GraphicsPath* p = guiRoundPath(grc, 10);
-            Gdiplus::SolidBrush fb(GCol(on ? guic::cAccentDk : guic::cPanel2));
+            Gdiplus::SolidBrush fb(GCol(guic::cAccentDk));
             Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cLine), 1.0f);
-            g.FillPath(&fb, p);
+            if (on) g.FillPath(&fb, p);
             g.DrawPath(&pb, p);
             delete p;
             guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cDim,
@@ -5682,16 +5708,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 delete p;
                 guiAAString(g, dc, rc, "START ENGINE", guic::cOnText, g_fUIb, 0);
             } else if (st == 2) {
-                Gdiplus::SolidBrush fb(GCol(guic::cPanel2));
+                // v7.0.0 polish: transparent face -- the red border speaks.
                 Gdiplus::Pen        pb(GCol(guic::cStop), 1.0f);
-                g.FillPath(&fb, p);
                 g.DrawPath(&pb, p);
                 delete p;
                 guiAAString(g, dc, rc, "STOP ENGINE", guic::cStop, g_fUIb, 0);
             } else {
-                Gdiplus::SolidBrush fb(GCol(guic::cPanel2));
                 Gdiplus::Pen        pb(GCol(guic::cLine), 1.0f);
-                g.FillPath(&fb, p);
                 g.DrawPath(&pb, p);
                 delete p;
                 // v6.6.9: the transient says what the CLICK does -- starting
@@ -5704,12 +5727,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         bool accentBtn = false;
         for (int i = 0; i < 5; ++i)
             if (id == IDC_PRE_FLAT + i) accentBtn = (g_eqPreset == i);
+        // v7.0.0 polish: resting faces are TRANSPARENT -- border + text over
+        // the erased surface. Fills survive only where they mean something:
+        // the pressed feedback (cPanelHi) and the active EQ preset (cPanel2
+        // under the 2 px accent ring).
         Gdiplus::GraphicsPath* p = guiRoundPath(grc, accentBtn ? 11 : 6);
-        Gdiplus::SolidBrush fb(GCol(pressed ? guic::cPanelHi : guic::cPanel2));
+        if (pressed || accentBtn) {
+            Gdiplus::SolidBrush fb(GCol(pressed ? guic::cPanelHi : guic::cPanel2));
+            g.FillPath(&fb, p);
+        }
         Gdiplus::Pen        pb(GCol(accentBtn ? guic::cAccent :
                                     (pressed ? guic::cPanelHi : guic::cLine)),
                                accentBtn ? 2.0f : 1.0f);
-        g.FillPath(&fb, p);
         g.DrawPath(&pb, p);
         delete p;
         guiAAString(g, dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb, 0);
@@ -5763,15 +5792,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 }
                 tickRender();
-                // Tick beat zero = one second of capture time ahead. Both pumps
-                // reach the same capture-sequence position, so the ticks are
-                // born sample-aligned in STREAM time; any flam the ear hears is
-                // the legs' real depth difference -- what the test measures.
+                // Tick beat zero = one second of capture time ahead. Each pump
+                // writes the tick tickBase frames EARLY in its own stream, so
+                // after the ring depth the DAC fires it exactly delay1_ms /
+                // delay2_ms after the beat -- trim those knobs until the two
+                // speakers tick as one.
                 g_tickSeq0.store((long long)g_leg[0].captured.load(std::memory_order_relaxed)
                                  + (long long)kSampleRate, std::memory_order_release);
                 g_tickOn.store(true, std::memory_order_release);
                 SetDlgItemTextA(w, IDC_STATUS,
-                    "tempo tick: 120 bpm, 12 beats (6 s) -- both legs, same stream position");
+                    "tempo tick: 120 bpm, 12 beats (6 s) -- dispatch = delay1_ms / delay2_ms");
                 return 0; }
             case IDC_THEME: {                  // v7.0.0: cycle the eight themes
                 applyTheme(g_theme + 1);
@@ -5928,7 +5958,9 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
     if (!wc.hIcon) wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-    wc.hbrBackground = g_brBg;
+    wc.hbrBackground = nullptr;   // v7.0.0: the erase is ours (WM_ERASEBKGND above);
+                                  // a class-held brush would go stale the first time
+                                  // applyTheme() deletes + recreates g_brBg
     wc.lpszClassName = "twinspeak.control";
     RegisterClassA(&wc);
     RECT r = { 0, 0, KCLI_W, KCLI_H };
@@ -6316,6 +6348,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.targetFrames = std::max<size_t>(cfgFrames,
                             devPeriodFr + g_capBurstFrames + marginFr)
                          + L.delayFrames;
+        L.tickBase    = L.targetFrames - L.delayFrames;   // v7.0.0: the tick's
+        // dispatch anchor -- the non-delay depth this leg's tick must exit
+        // through so the DAC fires it exactly delay_ms after the beat
         L.raw.init(L.targetFrames * 4, kInCh);
         L.out.init(L.targetFrames + kRingSpareFrames, L.outCh);
         L.out.pushSilence(L.targetFrames);   // prefill so playbacks start smooth
