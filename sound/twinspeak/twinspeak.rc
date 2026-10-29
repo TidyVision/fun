@@ -1,4 +1,4 @@
-// twinspeak.rc -- v6.5.14: app icon + version info.
+// twinspeak.rc -- v6.5.15: app icon + version info.
 // Task Manager (and Explorer > Properties > Details) read FileDescription
 // below: "TwinSpeak". No windows.h include needed -- the VERSIONINFO forms
 // used here are RC syntax, not C macros, so both windres and zig rc accept
@@ -6,8 +6,8 @@
 1 ICON "twinspeak.ico"
 
 1 VERSIONINFO
-FILEVERSION     6,5,14,0
-PRODUCTVERSION  6,5,14,0
+FILEVERSION     6,5,15,0
+PRODUCTVERSION  6,5,15,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "twinspeak project"
             VALUE "FileDescription",  "TwinSpeak"
-            VALUE "FileVersion",      "6.5.14.0"
+            VALUE "FileVersion",      "6.5.15.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TwinSpeak"
-            VALUE "ProductVersion",   "6.5.14.0"
+            VALUE "ProductVersion",   "6.5.15.0"
         END
     END
     BLOCK "VarFileInfo"

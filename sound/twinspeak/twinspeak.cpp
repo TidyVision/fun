@@ -1,5 +1,21 @@
 // ============================================================================
-//  twinspeak v6.5.14 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.15 (field report: "when the DAC is yielded, the output devices
+//          aren't supposed to be changed to 100% by the program". The
+//          yield release dropped the DAC but kept the leg's endpoint-
+//          volume pin (IAudioEndpointVolume) alive, and pinCheckTick --
+//          the ~2 s watcher pass that enforces 100%/unmuted on out1/out2
+//          -- had no yield awareness. A leg with a live pin handle (e.g.
+//          after a WASAPI fallback earlier in the session) therefore had
+//          its Windows volume stomped to 100% every 2 s WHILE it sat
+//          released as the system's main device -- exactly the device
+//          whose slider belongs to the user. Two changes:
+//            the YIELD release now drops the endpoint-volume handle with
+//            the DAC (nothing of ours holds -- or touches -- the released
+//            device), and pinCheckTick skips a yielded leg outright.
+//            Re-pinning on yield RELEASE is unchanged: by then the default
+//            has moved away and twinspeak owns the device again.)
 //
 //  v6.5.14 (field directive: "make it so that if the main audio device is
 //          either output_device1 or output_device2 that the DAC shuts off
@@ -1625,6 +1641,11 @@ static void pinCheckTick() {
     // Leg fields (the old code wcslen'd Leg.id.wasapi while a reopen could
     // memcpy over it).
     for (int i = 0; i < 2; ++i) {
+        // v6.5.15: a yielded leg's device IS the Windows default render
+        // endpoint -- its volume slider belongs to the user, not to us.
+        // (The yield release already drops the handle; this skip is the
+        // belt to that suspenders.)
+        if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
         IAudioEndpointVolume* v = g_pin[i].vol;
         if (!v) continue;
         float s = 0.0f; BOOL m = FALSE;
@@ -3056,7 +3077,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.14 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3195,7 +3216,10 @@ static void writeTemplate(const char* path) {
         "; with nothing fighting it. The leg reopens by itself (chime + warden\n"
         "; re-arm included) the moment the default moves elsewhere. The log\n"
         "; announces both directions ('legN YIELD'); a yielded leg shows '----'\n"
-        "; on the devbuf line and a stale heartbeat, both BY DESIGN.\n"
+        "; on the devbuf line and a stale heartbeat, both BY DESIGN. While a\n"
+        "; leg is yielded the program touches NOTHING on that device -- its\n"
+        "; Windows volume (and mute) stay exactly where the user set them;\n"
+        "; the 100%% pin re-applies only when the leg reopens for twinspeak.\n"
         "yield_default = on\n"
         "\n"
         "; WDM-KS OUTPUT BACKEND (v6.3) -- the FlexASIO path, inside twinspeak.\n"
@@ -4216,7 +4240,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.14        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.15        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4525,13 +4549,21 @@ int main(int argc, char** argv) {
                         tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
                              "                            this leg's needle (\"%s\") -- releasing the DAC now so the\n"
                              "                            main device plays; it reopens the moment the default\n"
-                             "                            device moves elsewhere (yield_default = on)\n",
+                             "                            device moves elsewhere (yield_default = on);\n"
+                             "                            endpoint-volume pin released -- device volume stays yours\n",
                              i + 1, defName.c_str(), yneedle);
                         if (Y.backend == 1) ksCloseLeg(i);   // stops the pacer + pin
                         if (Y.dev.pContext) {
                             ma_device_uninit(&Y.dev);
                             memset(&Y.dev, 0, sizeof(Y.dev));
                         }
+                        // v6.5.15: drop the endpoint-volume pin WITH the DAC.
+                        // While this device is the system's main output its
+                        // volume is the user's; pinCheckTick must have nothing
+                        // to stomp 100%/unmuted onto. The normal reopen path
+                        // re-pins on yield release, when we own it again.
+                        if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
+                        g_pin[i].id.clear();
                         Y.lastReopenMs = nowMs;   // warden settle gates stay coherent
                     } else if (!mine && Y.yielded.exchange(false, std::memory_order_relaxed)) {
                         tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
