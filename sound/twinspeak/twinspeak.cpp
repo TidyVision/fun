@@ -1,5 +1,41 @@
 // ============================================================================
-//  twinspeak v6.6.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.6 (THREE USER-REPORTED FIXES + ONE MISSING BUTTON.
+//          (1) GHOST BORDERED BOX: the log pane carried WS_EX_CLIENTEDGE --
+//          the system's etched 3D border, drawn in the classic LIGHT 3D
+//          colors, which on a near-black UI glows like a ghost of a box.
+//          The edge is gone; the pane's frame is a 1px cLine rectangle the
+//          parent draws itself in WM_PAINT, just outside the child so
+//          WS_CLIPCHILDREN never clips it.
+//          (2) BOTTOM-RIGHT CLIPPING: the watermark was measured with the
+//          DEFAULT StringFormat but drawn NoWrap, and centered in a 22px
+//          strip -- one tight frame from the client edge. The pane gives
+//          4px back (log bottom 598 -> 594), the strip is 26px, and
+//          MeasureString now runs through the exact format the draw uses.
+//          (3) LAUNCH AT WINDOWS STARTUP: the Run-key toggle existed since
+//          v6.6.1 but only in the tray menu. The GUARDS page now carries a
+//          real pill wired to the same HKCU Run key, synced both ways.
+//          No engine DSP changed in this version: the sample path is
+//          byte-identical to v6.5.18.)
+//
+//  v6.6.5 (ANTIALIASED + CONDENSED. (1) GDI+ UI: every owner-drawn visual
+//          (tabs, buttons, toggle pills, START, the header, the watermark)
+//          now renders through GDI+ with SmoothingModeAntiAlias and
+//          TextRenderingHintAntiAliasGridFit -- smooth rounded rects, smooth
+//          glyphs, no jaggies. Links -lgdiplus.
+//          (2) CONDENSED GEOMETRY: client 880x620 (was 1000x750); 34px row
+//          pitch (was 38), slimmer tab strip (26px) and bottom bar (36px),
+//          compacted log pane; every page re-laid.
+//          (3) WHITE-FLASH FIX: the full tree is rendered into the window's
+//          still-hidden redirection surface before ShowWindow (RedrawWindow
+//          RDW_UPDATENOW + SW_SHOWNA) -- the first DWM frame is the finished
+//          dark UI, never one white frame.
+//          (4) WATERMARK v3: GDI+ Arial Bold with a TRUE vertical linear
+//          gradient brush (top orange -> bottom cyan), antialiased -- no more
+//          clip-path / pattern-brush scaffolding.
+//          No engine DSP changed in this version: the sample path is
+//          byte-identical to v6.5.18.)
 //
 //  v6.6.4 (FOUR USER-REPORTED FIXES, two machines agreeing for once:
 //          (1) CONSOLE GHOSTING -- FOR REAL THIS TIME: the log pane is
@@ -1038,6 +1074,7 @@
 #include <windows.h>
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
+#include <gdiplus.h>        // v6.6.5: antialiased owner-drawn UI (buttons, text, watermark)
 #include <mmsystem.h>
 #include <cstdio>
 #include <cstring>
@@ -3371,7 +3408,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4259,6 +4296,7 @@ enum {
     IDC_BE1, IDC_BE2, IDC_KSPF, IDC_KSPD,
     // page: sync & power
     IDC_TGL_CLOCK, IDC_TGL_DRIFTG, IDC_TGL_POWER, IDC_TGL_YIELD,
+    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill on the GUARDS page
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
     // page: center & volume
     IDC_TGL_CGATE, IDC_TGL_UPMIX, IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
@@ -4272,7 +4310,7 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fHead = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr, g_fWm = nullptr;
+                 g_fSml = nullptr, g_fMono = nullptr;
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -4288,6 +4326,7 @@ static std::string g_lastHealth;               // latest "out1 ..." health line
 static std::atomic<bool> g_logDirty{false};
 // v6.6.1: tray + startup
 static NOTIFYICONDATAA g_nid = {};
+static ULONG_PTR g_gdipToken = 0;             // v6.6.5: GDI+ session token
 static bool g_trayVisible = false;             // icon currently in the tray
 static bool g_trayHint    = false;             // one-time close balloon shown
 static bool g_startTray   = false;             // --tray: begin hidden in the tray
@@ -4328,101 +4367,102 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
-    g_fWm   = CreateFontA(-12, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, "Arial");
     g_brBg     = CreateSolidBrush(guic::cBg);
     g_brPanel  = CreateSolidBrush(guic::cPanel);
     g_brPanel2 = CreateSolidBrush(guic::cPanel2);
     g_brLog    = CreateSolidBrush(guic::cLogBg);
 }
 
-// ---- small drawing helpers -------------------------------------------------
-static void guiRoundRect(HDC dc, const RECT& rc, COLORREF border, COLORREF fill,
-                         int radius, int borderWidth) {
-    SetBkMode(dc, TRANSPARENT);
-    HPEN pen   = CreatePen(PS_SOLID, borderWidth, border);
-    HBRUSH br  = CreateSolidBrush(fill);
-    HGDIOBJ op = SelectObject(dc, pen);
-    HGDIOBJ ob = SelectObject(dc, br);
-    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(pen);
-    DeleteObject(br);
+// ---- v6.6.5 CONDENSED GEOMETRY: the whole frame is tighter -- client 880x620
+// (was 1000x750), 34px row pitch (was 38), slimmer bars everywhere.
+static const int COLA_X = 24, COLB_X = 460, LBL_W = 160, CTL_W = 200;
+static const int KCLI_W = 880, KCLI_H = 620;   // designed client size
+static const int KLOG_BOTTOM = 594;            // v6.6.6: log ends here; 26px watermark strip below
+static const int KPANEL_T = 66, KPANEL_B = 402; // page panel band
+static const int KHDR_Y = 94, KROW0 = 120;   // page header / first row / pitch
+
+// ---- small drawing helpers (v6.6.5: GDI+ -- everything the eye sees is AA) --
+static Gdiplus::Color GCol(COLORREF c, BYTE a = 255) {
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
 }
 
-static void guiText(HDC dc, const RECT& rc, const char* txt, COLORREF col,
-                    HFONT f, UINT flags) {
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, col);
-    SelectObject(dc, f);
-    DrawTextA(dc, txt, -1, (RECT*)&rc, flags | DT_NOPREFIX);
+// rounded-rect path out of four arcs -- the AA replacement for guiRoundRect
+static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& r, int rad) {
+    Gdiplus::GraphicsPath* p = new Gdiplus::GraphicsPath();
+    const int d = rad * 2;
+    p->AddArc(r.X, r.Y, d, d, 180, 90);
+    p->AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p->AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p->AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p->CloseFigure();
+    return p;
 }
 
-// ---- v6.6.4: the TidyVision watermark ---------------------------------------
-// Bottom-right, Arial, gradient-filled TOP orange -> BOTTOM cyan. Pure GDI:
-// the glyph outlines become a clip path (BeginPath/TextOut/EndPath +
-// SelectClipPath), then the clipped text is flooded with a pattern brush
-// built from a 1-pixel-WIDE 32bpp DIB holding the vertical gradient. No
-// msimg32 dependency.
-// v6.6.4 fixes: Arial (was Segoe UI), vertical gradient (was horizontal),
-// and the channel packing -- the RGB triplet was written with red/blue
-// swapped, which is why the orange end rendered YELLOW.
-static void guiWatermark(HDC dc) {
-    static const char* kWM = "Property of TidyVision - Copyright 2026-beyond";
-    const int len = (int)strlen(kWM);
-    HGDIOBJ of = SelectObject(dc, g_fWm);
-    SIZE sz;
-    GetTextExtentPoint32A(dc, kWM, len, &sz);
-    if (sz.cx <= 0 || sz.cy <= 0) { SelectObject(dc, of); return; }
-    // the 16px strip below the log pane (the pane ends at y=734, client=750);
-    // right edge aligns with the pane's right edge (x=984 on a 1000-wide client)
-    RECT crc = { 0, 0, 1000, 750 };
-    GetClientRect(WindowFromDC(dc), &crc);         // defensive: the size is locked
-    const int x = crc.right - 16 - sz.cx;
-    const int y = (734 + crc.bottom - sz.cy) / 2;
-    if (x < 0) { SelectObject(dc, of); return; }
-    // 1px-wide vertical gradient DIB: orange (255,138,42) top -> theme cyan (0,229,238) bottom
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = 1;
-    bi.bmiHeader.biHeight      = -sz.cy;           // top-down
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); SelectObject(dc, of); return; }
-    DWORD* px = (DWORD*)bits;
-    for (int i = 0; i < sz.cy; ++i) {
-        const float t = (sz.cy > 1) ? (float)i / (float)(sz.cy - 1) : 0.0f;
-        const BYTE r = (BYTE)(255.0f + (  0.0f - 255.0f) * t);
-        const BYTE g = (BYTE)(138.0f + (229.0f - 138.0f) * t);
-        const BYTE b = (BYTE)( 42.0f + (238.0f -  42.0f) * t);
-        px[i] = ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)b;   // 0x00BBGGRR: red in the HIGH byte
+static std::wstring guiWide(const char* s) {
+    std::wstring w;
+    if (s && *s) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+        if (n > 1) {
+            w.resize(n - 1);
+            MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+        }
     }
-    HBRUSH gb = CreatePatternBrush(bmp);
-    if (!gb) { DeleteObject(bmp); SelectObject(dc, of); return; }
-    // clip to the glyph outlines, then flood the clipped text with the gradient
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));          // mask color (any non-zero)
-    BeginPath(dc);
-    TextOutA(dc, x, y, kWM, len);
-    EndPath(dc);
-    SelectClipPath(dc, RGN_COPY);
-    POINT org; SetBrushOrgEx(dc, x, y, &org);      // anchor the gradient to the text
-    RECT tr = { x, y, x + sz.cx, y + sz.cy };
-    FillRect(dc, &tr, gb);
-    SetBrushOrgEx(dc, org.x, org.y, nullptr);
-    SelectClipRgn(dc, nullptr);
-    DeleteObject(gb);
-    DeleteObject(bmp);
-    SelectObject(dc, of);
+    return w;
+}
+
+// antialiased single-line text; align: 0 center, 1 left, 2 right
+static void guiAAString(Gdiplus::Graphics& g, HDC dc, const RECT& rc, const char* txt,
+                        COLORREF col, HFONT f, int align) {
+    const std::wstring wt = guiWide(txt);
+    if (wt.empty()) return;
+    Gdiplus::Font gf(dc, f);
+    Gdiplus::StringFormat sf;
+    sf.SetAlignment(align == 1 ? Gdiplus::StringAlignmentNear :
+                    align == 2 ? Gdiplus::StringAlignmentFar : Gdiplus::StringAlignmentCenter);
+    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoFitBlackBox);
+    sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    Gdiplus::SolidBrush br(GCol(col));
+    const Gdiplus::RectF rf((Gdiplus::REAL)rc.left, (Gdiplus::REAL)rc.top,
+                            (Gdiplus::REAL)(rc.right - rc.left), (Gdiplus::REAL)(rc.bottom - rc.top));
+    g.DrawString(wt.c_str(), (INT)wt.size(), &gf, rf, &sf, &br);
+}
+
+// ---- v6.6.5: the TidyVision watermark (GDI+) --------------------------------
+// Bottom-right, Arial Bold, antialiased, filled with a TRUE vertical linear
+// gradient brush (top orange -> bottom cyan). Drawn inside WM_PAINT, so it
+// never flickers. Replaces the v6.6.3/4 clip-path + pattern-brush build.
+static void guiWatermark(Gdiplus::Graphics& g) {
+    static const char*  kWM = "Property of TidyVision - Copyright 2026-beyond";
+    static const std::wstring wt = guiWide(kWM);
+    if (wt.empty() || !g_hwnd) return;
+    RECT crc = { 0, 0, 880, 620 };
+    GetClientRect(g_hwnd, &crc);
+    Gdiplus::FontFamily ff(L"Arial");
+    Gdiplus::Font f(&ff, 13, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    // v6.6.6: measure with the EXACT format the draw uses. The old code
+    // measured with the DEFAULT format (wrap on, black-box fit) but drew
+    // NoWrap -- on the tight 22px strip the disagreement showed as the
+    // bottom-right text clipped by the client edge.
+    Gdiplus::StringFormat sf;
+    sf.SetAlignment(Gdiplus::StringAlignmentNear);
+    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap |
+                      Gdiplus::StringFormatFlagsNoFitBlackBox);
+    const Gdiplus::RectF lay(0, 0, (Gdiplus::REAL)crc.right, (Gdiplus::REAL)crc.bottom);
+    Gdiplus::RectF mr(0, 0, 0, 0);
+    g.MeasureString(wt.c_str(), (INT)wt.size(), &f, lay, &sf, &mr);
+    if (mr.Width <= 0) return;
+    // centered in the strip below the log pane; right edge 14px off the client edge
+    const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - 14) - mr.Width;
+    const Gdiplus::REAL y = (Gdiplus::REAL)KLOG_BOTTOM + ((Gdiplus::REAL)(crc.bottom - KLOG_BOTTOM) - mr.Height) / 2.0f;
+    const Gdiplus::RectF tr(x, y, mr.Width, mr.Height);
+    Gdiplus::LinearGradientBrush lb(tr, GCol(RGB(255, 138, 42)),
+                                    GCol(RGB(0, 229, 238)), Gdiplus::LinearGradientModeVertical);
+    g.DrawString(wt.c_str(), (INT)wt.size(), &f, tr, &sf, &lb);
 }
 
 // ---- control factories -----------------------------------------------------
-static const int COLA_X = 36, COLB_X = 520, LBL_W = 186, CTL_W = 240;
 
 static void regPage(HWND h) { g_pageHw[g_tab].push_back(h); }
 
@@ -4470,7 +4510,7 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
         (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
         x, y, CTL_W, 220, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
-    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, 18);
+    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, 16);
     guiDarkCtl(h);
     regPage(h);
     return h;
@@ -4478,7 +4518,7 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
     HWND h = CreateWindowExA(0, TRACKBAR_CLASSA, nullptr,
-        WS_CHILD | WS_VISIBLE | TBS_HORZ, x, y, cw, 30, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+        WS_CHILD | WS_VISIBLE | TBS_HORZ, x, y, cw, 28, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, TBM_SETRANGE, TRUE, MAKELPARAM(lo, hi));
     guiDarkCtl(h);
     regPage(h);
@@ -4487,25 +4527,25 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
 
 // one ini row: label + edit box
 static void row(HWND w, int colX, int y, const char* label, int id, const char* val) {
-    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
-    mkEdit(w, id, colX + LBL_W + 8, y, CTL_W, 24, val);
+    mkLabel(w, 0, colX, y + 2, LBL_W, label, g_fUI);
+    mkEdit(w, id, colX + LBL_W + 6, y, CTL_W, 22, val);
 }
 
 // one ini row: label + ON/OFF pill
 static void tglRow(HWND w, int colX, int y, const char* label, int id, bool on) {
-    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
-    HWND b = mkBtn(w, id, colX + LBL_W + 8, y, 64, 24, "");
+    mkLabel(w, 0, colX, y + 2, LBL_W, label, g_fUI);
+    HWND b = mkBtn(w, id, colX + LBL_W + 6, y, 60, 22, "");
     regPage(b);                        // v6.6.2: the pill lives on THIS page
     g_tog[id] = on;
 }
 
 static void header(HWND w, int colX, int y, const char* txt) {
     static int hdrId = 600;
-    mkLabel(w, hdrId++, colX, y, 420, txt, g_fUIb);
+    mkLabel(w, hdrId++, colX, y, 400, txt, g_fUIb);
 }
 
 static void note(HWND w, int colX, int y, const char* txt, int lines) {
-    mkLabel(w, 0, colX, y, 430, txt, g_fSml, lines * 15 + 4);
+    mkLabel(w, 0, colX, y, 406, txt, g_fSml, lines * 15 + 4);
 }
 
 // ---- EQ slider mapping (freq and Q on log scales, gain linear) ------------
@@ -4907,65 +4947,66 @@ static void guiStopEngine() {
 }
 
 // ---- page building ----------------------------------------------------------
+static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
 static const int kTabW[6] = { 118, 100, 128, 152, 172, 128 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
-    mkLabel(w, 0, colX, y + 3, LBL_W, label, g_fUI);
-    HWND h = mkCombo(w, id, colX + LBL_W + 8, y, listOnly);
+    mkLabel(w, 0, colX, y + 2, LBL_W, label, g_fUI);
+    HWND h = mkCombo(w, id, colX + LBL_W + 6, y, listOnly);
     if (cur && cur[0]) SetWindowTextA(h, cur);
 }
 
 static void guiBuildPages(HWND w) {
     // ============ page 0: DEVICES ============
     g_tab = 0;
-    header(w, COLA_X, 100, "DEVICE NEEDLES (live list; the edit stays a free-text needle)");
-    comboRow(w, COLA_X, 128, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
-    comboRow(w, COLA_X, 166, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
-    comboRow(w, COLA_X, 204, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
-    row(w, COLA_X, 242, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 284, 150, 28, "REFRESH DEVICES");
+    header(w, COLA_X, KHDR_Y, "DEVICE NEEDLES (live list; the edit stays a free-text needle)");
+    comboRow(w, COLA_X, KROW0, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
+    comboRow(w, COLA_X, 154, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
+    comboRow(w, COLA_X, 188, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
+    row(w, COLA_X, 222, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 256, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
-    note(w, COLA_X, 326,
+    note(w, COLA_X, 292,
          "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
          "leg2 carries ONLY the center channel.\n"
          "volume_endpoint overrides which playback-side slider is the master volume.", 4);
-    header(w, COLB_X, 100, "GAINS (on the raw 8ch stream) + PIN MODES");
-    row(w, COLB_X, 128, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
-    row(w, COLB_X, 166, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
-    row(w, COLB_X, 204, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
-    row(w, COLB_X, 242, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
-    tglRow(w, COLB_X, 284, "lfe_fold (LFE onto FL/FR)", IDC_TGL_LFEFOLD, g_cfg.lfeFold);
-    tglRow(w, COLB_X, 322, "capture_exclusive", IDC_TGL_CAPEXCL, g_cfg.captureExclusive);
-    tglRow(w, COLB_X, 360, "exclusive (both legs)", IDC_TGL_EXCLUSIVE, g_cfg.exclusive);
-    tglRow(w, COLB_X, 398, "align_modes", IDC_TGL_ALIGN, g_cfg.alignModes);
+    header(w, COLB_X, KHDR_Y, "GAINS (on the raw 8ch stream) + PIN MODES");
+    row(w, COLB_X, KROW0, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
+    row(w, COLB_X, 154, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
+    row(w, COLB_X, 188, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
+    row(w, COLB_X, 222, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 260, "lfe_fold (LFE onto FL/FR)", IDC_TGL_LFEFOLD, g_cfg.lfeFold);
+    tglRow(w, COLB_X, 294, "capture_exclusive", IDC_TGL_CAPEXCL, g_cfg.captureExclusive);
+    tglRow(w, COLB_X, 328, "exclusive (both legs)", IDC_TGL_EXCLUSIVE, g_cfg.exclusive);
+    tglRow(w, COLB_X, 362, "align_modes", IDC_TGL_ALIGN, g_cfg.alignModes);
 
     // ============ page 1: TIMING ============
     g_tab = 1;
-    header(w, COLA_X, 100, "DEVICE PERIODS (ms) -- keep the legs EQUAL");
-    row(w, COLA_X, 128, "out1ms", IDC_OUT1MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out1Ms); return std::string(b); }().c_str());
-    row(w, COLA_X, 166, "out2ms", IDC_OUT2MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out2Ms); return std::string(b); }().c_str());
-    row(w, COLA_X, 204, "cap_ms (capture burst)", IDC_CAPMS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.capMs); return std::string(b); }().c_str());
-    row(w, COLA_X, 242, "ring1_ms", IDC_RING1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring1Ms); return std::string(b); }().c_str());
-    row(w, COLA_X, 280, "ring2_ms", IDC_RING2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring2Ms); return std::string(b); }().c_str());
-    header(w, COLB_X, 100, "ALIGNMENT (bit-exact ring delay) + PINS");
-    row(w, COLB_X, 128, "delay1_ms", IDC_DELAY1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay1Ms); return std::string(b); }().c_str());
-    row(w, COLB_X, 166, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
-    tglRow(w, COLB_X, 204, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
-    tglRow(w, COLB_X, 242, "pin_outputs (100% / unmuted)", IDC_TGL_PINOUT, g_cfg.pinOutputs);
-    note(w, COLB_X, 284,
+    header(w, COLA_X, KHDR_Y, "DEVICE PERIODS (ms) -- keep the legs EQUAL");
+    row(w, COLA_X, KROW0, "out1ms", IDC_OUT1MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out1Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 154, "out2ms", IDC_OUT2MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out2Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 188, "cap_ms (capture burst)", IDC_CAPMS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.capMs); return std::string(b); }().c_str());
+    row(w, COLA_X, 222, "ring1_ms", IDC_RING1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring1Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 256, "ring2_ms", IDC_RING2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring2Ms); return std::string(b); }().c_str());
+    header(w, COLB_X, KHDR_Y, "ALIGNMENT (bit-exact ring delay) + PINS");
+    row(w, COLB_X, KROW0, "delay1_ms", IDC_DELAY1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay1Ms); return std::string(b); }().c_str());
+    row(w, COLB_X, 154, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 188, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
+    tglRow(w, COLB_X, 222, "pin_outputs (100% / unmuted)", IDC_TGL_PINOUT, g_cfg.pinOutputs);
+    note(w, COLB_X, 262,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
          "EARLY leg. The banner prints both est paths; the health line's 'drift'\n"
          "column already includes your delay (it IS the alignment, not a fault).", 4);
 
     // ============ page 2: TRANSPORT ============
     g_tab = 2;
-    header(w, COLA_X, 100, "OUTPUT TRANSPORT PER LEG");
-    comboRow(w, COLA_X, 128, "backend1 (leg1)", IDC_BE1, true, g_cfg.backend1.c_str());
-    comboRow(w, COLA_X, 166, "backend2 (leg2)", IDC_BE2, true, g_cfg.backend2.c_str());
-    row(w, COLA_X, 204, "ks_period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
-    row(w, COLA_X, 242, "ks_periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
-    note(w, COLB_X, 104,
+    header(w, COLA_X, KHDR_Y, "OUTPUT TRANSPORT PER LEG");
+    comboRow(w, COLA_X, KROW0, "backend1 (leg1)", IDC_BE1, true, g_cfg.backend1.c_str());
+    comboRow(w, COLA_X, 154, "backend2 (leg2)", IDC_BE2, true, g_cfg.backend2.c_str());
+    row(w, COLA_X, 188, "ks_period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
+    row(w, COLA_X, 222, "ks_periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
+    note(w, COLB_X, 96,
          "wasapi -- the proven path: miniaudio, exclusive WaveRT event mode.\n\n"
          "ks -- the FlexASIO-grade path: a direct kernel-streaming render pin,\n"
          "the WaveRT looped buffer as the device's own DMA memory, paced\n"
@@ -4979,33 +5020,34 @@ static void guiBuildPages(HWND w) {
 
     // ============ page 3: SYNC + POWER ============
     g_tab = 3;
-    header(w, COLA_X, 100, "GUARDS");
-    tglRow(w, COLA_X, 128, "clock_sync (ASIO replay/drop rules)", IDC_TGL_CLOCK, g_cfg.clockSync);
-    tglRow(w, COLA_X, 166, "drift_guard (auto re-pin)", IDC_TGL_DRIFTG, g_cfg.driftGuard);
-    tglRow(w, COLA_X, 204, "power_guard (sleep survival)", IDC_TGL_POWER, g_cfg.powerGuard);
-    tglRow(w, COLA_X, 242, "yield_default (release a leg that IS the default)", IDC_TGL_YIELD, g_cfg.yieldDefault);
-    header(w, COLB_X, 100, "DRIFT WARDEN NUMBERS");
-    row(w, COLB_X, 128, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
-    row(w, COLB_X, 166, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
-    row(w, COLB_X, 204, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
-    note(w, COLB_X, 246,
+    header(w, COLA_X, KHDR_Y, "GUARDS");
+    tglRow(w, COLA_X, KROW0, "clock_sync (ASIO replay/drop rules)", IDC_TGL_CLOCK, g_cfg.clockSync);
+    tglRow(w, COLA_X, 154, "drift_guard (auto re-pin)", IDC_TGL_DRIFTG, g_cfg.driftGuard);
+    tglRow(w, COLA_X, 188, "power_guard (sleep survival)", IDC_TGL_POWER, g_cfg.powerGuard);
+    tglRow(w, COLA_X, 222, "yield_default (release a leg that IS the default)", IDC_TGL_YIELD, g_cfg.yieldDefault);
+    tglRow(w, COLA_X, 256, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());   // v6.6.6
+    header(w, COLB_X, KHDR_Y, "DRIFT WARDEN NUMBERS");
+    row(w, COLB_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
+    row(w, COLB_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
+    row(w, COLB_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
+    note(w, COLB_X, 230,
          "drift_correct_ms: trigger distance from the calibrated baseline.\n"
          "drift_interval_ms: minimum spacing between corrections (2000..60000).\n"
          "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
 
     // ============ page 4: CENTER + VOLUME ============
     g_tab = 4;
-    header(w, COLA_X, 100, "CENTER PRESENCE + CUES");
-    tglRow(w, COLA_X, 128, "center_gate (ch3 zero -> keep-alive only)", IDC_TGL_CGATE, g_cfg.centerGate);
-    tglRow(w, COLA_X, 166, "center_upmix_guard (stereo-upmix mute)", IDC_TGL_UPMIX, g_cfg.centerUpmixGuard);
-    tglRow(w, COLA_X, 204, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
-    tglRow(w, COLA_X, 242, "background (console runs only)", IDC_TGL_BG, g_cfg.background);
-    header(w, COLB_X, 100, "VOLUME + LEVELS");
-    tglRow(w, COLB_X, 128, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
-    row(w, COLB_X, 166, "keepalive_hz", IDC_KAHZ, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveHz); return std::string(b); }().c_str());
-    row(w, COLB_X, 204, "keepalive_gain", IDC_KAGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveGain); return std::string(b); }().c_str());
-    row(w, COLB_X, 242, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
-    note(w, COLB_X, 284,
+    header(w, COLA_X, KHDR_Y, "CENTER PRESENCE + CUES");
+    tglRow(w, COLA_X, KROW0, "center_gate (ch3 zero -> keep-alive only)", IDC_TGL_CGATE, g_cfg.centerGate);
+    tglRow(w, COLA_X, 154, "center_upmix_guard (stereo-upmix mute)", IDC_TGL_UPMIX, g_cfg.centerUpmixGuard);
+    tglRow(w, COLA_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
+    tglRow(w, COLA_X, 222, "background (console runs only)", IDC_TGL_BG, g_cfg.background);
+    header(w, COLB_X, KHDR_Y, "VOLUME + LEVELS");
+    tglRow(w, COLB_X, KROW0, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
+    row(w, COLB_X, 154, "keepalive_hz", IDC_KAHZ, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveHz); return std::string(b); }().c_str());
+    row(w, COLB_X, 188, "keepalive_gain", IDC_KAGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveGain); return std::string(b); }().c_str());
+    row(w, COLB_X, 222, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    note(w, COLB_X, 264,
          "The keep-alive tone keeps the center speaker awake; if the S5 still\n"
          "sleeps, raise keepalive_gain to 0.03..0.05 (still inaudible at 40 Hz).\n"
          "In this window the log lives in the pane below -- background = on\n"
@@ -5013,16 +5055,16 @@ static void guiBuildPages(HWND w) {
 
     // ============ page 5: CENTER EQ ============
     g_tab = 5;
-    tglRow(w, COLA_X, 122, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
+    tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
     for (int i = 0; i < 5; ++i)
-        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 96, 160, 88, 30, kEqPre[i].name));
-    mkLabel(w, IDC_LBL_FREQ, COLA_X, 220, 430, "PEAK FREQUENCY", g_fUIb);
-    mkSlider(w, IDC_SLD_FREQ, COLA_X, 244, 430, 0, 1000);
-    mkLabel(w, IDC_LBL_GAIN, COLA_X, 292, 430, "BOOST", g_fUIb);
-    mkSlider(w, IDC_SLD_GAIN, COLA_X, 316, 430, -24, 24);
-    mkLabel(w, IDC_LBL_Q, COLA_X, 364, 430, "SHARPNESS (Q)", g_fUIb);
-    mkSlider(w, IDC_SLD_Q, COLA_X, 388, 430, 0, 1000);
-    note(w, COLB_X, 108,
+        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 82, 148, 78, 26, kEqPre[i].name));
+    mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
+    mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_GAIN, COLA_X, 276, 400, -24, 24);
+    mkLabel(w, IDC_LBL_Q, COLA_X, 312, 400, "SHARPNESS (Q)", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_Q, COLA_X, 330, 400, 0, 1000);
+    note(w, COLB_X, 96,
          "One peaking band on ch3, applied inside the engine's out2 mix path --\n"
          "out2 ONLY. The mains (out1) are never touched.\n\n"
          "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
@@ -5035,23 +5077,25 @@ static void guiBuildPages(HWND w) {
 }
 
 static void guiBuildControls(HWND w) {
-    // bottom bar -- always visible
-    mkBtn(w, IDC_START, 16, 478, 150, 46, "");
-    mkBtn(w, IDC_APPLY, 180, 478, 170, 46, "APPLY + RESTART");
-    mkBtn(w, IDC_SAVE, 364, 478, 130, 46, "SAVE INI");
+    // bottom bar -- always visible (v6.6.5: slimmer, tighter)
+    mkBtn(w, IDC_START, 14, 414, 140, 36, "");
+    mkBtn(w, IDC_APPLY, 162, 414, 150, 36, "APPLY + RESTART");
+    mkBtn(w, IDC_SAVE, 320, 414, 120, 36, "SAVE INI");
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD | WS_VISIBLE,
-                              16, 534, 968, 18, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
+                              14, 458, 852, 16, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    HWND log = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+    // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
+    // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
+    HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        16, 560, 968, 174, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        14, 480, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     guiDarkCtl(log);
     // tab strip
-    int tx = 16;
+    int tx = 14;
     for (int i = 0; i < 6; ++i) {
-        mkBtn(w, IDC_TAB0 + i, tx, 46, kTabW[i], 30, kTabNames[i]);
-        tx += kTabW[i] + 6;
+        mkBtn(w, IDC_TAB0 + i, tx, 34, kTabW[i], 26, kTabNames[i]);
+        tx += kTabW[i] + 4;
     }
     guiBuildPages(w);
 }
@@ -5152,7 +5196,8 @@ static bool guiIsToggle(int id) {
         case IDC_TGL_LFEFOLD: case IDC_TGL_CAPEXCL: case IDC_TGL_EXCLUSIVE:
         case IDC_TGL_ALIGN: case IDC_TGL_OUT2FIRST: case IDC_TGL_PINOUT:
         case IDC_TGL_CLOCK: case IDC_TGL_DRIFTG: case IDC_TGL_POWER:
-        case IDC_TGL_YIELD: case IDC_TGL_CGATE: case IDC_TGL_UPMIX:
+        case IDC_TGL_YIELD: case IDC_TGL_STARTUP:   // v6.6.6: the startup pill
+        case IDC_TGL_CGATE: case IDC_TGL_UPMIX:
         case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES: case IDC_TGL_BG:
         case IDC_TGL_EQ:
             return true;
@@ -5171,17 +5216,27 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
-        const RECT panel = { 12, 84, 988, 468 };
+        const RECT panel = { 12, KPANEL_T, 866, KPANEL_B };
         FillRect(dc, &panel, g_brPanel);
         FrameRect(dc, &panel, g_brPanel2);
-        const RECT hdr = { 18, 8, 420, 42 };
-        guiText(dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        const std::string verLine = "v6.6.4  |  " + g_guiIniPath;
-        const RECT ver = { 300, 14, 984, 38 };
-        guiText(dc, ver, verLine.c_str(), guic::cDim, g_fSml,
-                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        guiWatermark(dc);                                 // v6.6.3: bottom-right
+        // v6.6.5: header + version + watermark are GDI+ -- antialiased glyphs
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        {   // v6.6.6: the pane's own frame -- a 1px cLine rectangle just
+            // outside the child. The old WS_EX_CLIENTEDGE etched edge was
+            // drawn in the classic LIGHT 3D system colors: on the dark UI
+            // it read as a ghost bordered box around the log.
+            Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);
+            g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
+        }
+        const RECT hdr = { 18, 6, 420, 40 };
+        guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
+        char vbuf[640];
+        snprintf(vbuf, sizeof(vbuf), "v6.6.6  |  %s", g_guiIniPath.c_str());
+        const RECT ver = { 300, 12, 866, 36 };
+        guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
+        guiWatermark(g);
         EndPaint(w, &ps);
         return 0; }
     case WM_CTLCOLORSTATIC: {
@@ -5236,70 +5291,94 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, guic::cText);
         return (LRESULT)g_brPanel2; }
     case WM_DRAWITEM: {
+        // v6.6.5: the whole button face is GDI+ -- antialiased rounded rects
+        // and antialiased glyphs. The full item rect is still erased with the
+        // surface color first (the v6.6.4 white-corner fix).
         const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
         HDC dc = d->hDC;
         const RECT rc = d->rcItem;
         const int id = (int)d->CtlID;
         char txt[128];
         GetWindowTextA(d->hwndItem, txt, sizeof(txt));
-        // v6.6.4 WHITE-BORDER FIX: WS_CLIPCHILDREN means the parent never
-        // paints under its children, so the square corners of rcItem outside
-        // the rounded button face held UNINITIALIZED (white) pixels. Erase
-        // the full item with the surface the button sits on first: the tab
-        // strip and START/APPLY/SAVE bar sit on the window base, everything
-        // else (toggles, EQ presets, REFRESH) sits on the page panel.
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+        const bool pressed = (d->itemState & ODS_SELECTED) != 0;
         const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
                               (id >= IDC_START && id <= IDC_SAVE));
-        FillRect(dc, &rc, onPage ? g_brPanel : g_brBg);
-        SetBkMode(dc, TRANSPARENT);
-        const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        {   // erase the square corners with the surface the button sits on
+            Gdiplus::SolidBrush eb(GCol(onPage ? guic::cPanel : guic::cBg));
+            g.FillRectangle(&eb, grc);
+        }
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
             const bool act = (id - IDC_TAB0) == g_tab;
-            RECT fr = rc; fr.bottom -= 3;
-            guiRoundRect(dc, fr, act ? guic::cAccentDk : guic::cLine,
-                         act ? guic::cPanelHi : guic::cPanel, 8, 1);
+            const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
+            Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
+            Gdiplus::SolidBrush fb(GCol(act ? guic::cPanelHi : guic::cPanel));
+            Gdiplus::Pen        pb(GCol(act ? guic::cAccentDk : guic::cLine), 1.0f);
+            g.FillPath(&fb, p);
+            g.DrawPath(&pb, p);
+            delete p;
             if (act) {
-                const RECT bar = { rc.left + 8, rc.bottom - 4, rc.right - 8, rc.bottom - 1 };
-                HBRUSH b = CreateSolidBrush(guic::cAccent);
-                FillRect(dc, &bar, b);
-                DeleteObject(b);
+                Gdiplus::SolidBrush ab(GCol(guic::cAccent));
+                g.FillRectangle(&ab, grc.X + 7, grc.Y + grc.Height - 4, grc.Width - 14, 3);
             }
-            guiText(dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            guiAAString(g, dc, rc, txt, act ? guic::cAccent : guic::cDim, g_fUIb, 0);
             return TRUE;
         }
         if (guiIsToggle(id)) {
             const bool on = g_tog[id];
-            guiRoundRect(dc, rc, on ? guic::cAccent : guic::cLine,
-                         on ? guic::cAccentDk : guic::cPanel2, 12, 1);
-            guiText(dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cDim,
-                    g_fUIb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Gdiplus::GraphicsPath* p = guiRoundPath(grc, 10);
+            Gdiplus::SolidBrush fb(GCol(on ? guic::cAccentDk : guic::cPanel2));
+            Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cLine), 1.0f);
+            g.FillPath(&fb, p);
+            g.DrawPath(&pb, p);
+            delete p;
+            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cDim,
+                        g_fUIb, 0);
             return TRUE;
         }
         if (id == IDC_START) {
             const int st = g_engState.load();
+            Gdiplus::GraphicsPath* p = guiRoundPath(grc, 8);
             if (st == 0) {
-                guiRoundRect(dc, rc, guic::cAccent, pressed ? guic::cAccentDk : guic::cAccent, 10, 1);
-                guiText(dc, rc, "START ENGINE", guic::cOnText, g_fUIb,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                Gdiplus::SolidBrush fb(GCol(pressed ? guic::cAccentDk : guic::cAccent));
+                Gdiplus::Pen        pb(GCol(guic::cAccent), 1.0f);
+                g.FillPath(&fb, p);
+                g.DrawPath(&pb, p);
+                delete p;
+                guiAAString(g, dc, rc, "START ENGINE", guic::cOnText, g_fUIb, 0);
             } else if (st == 2) {
-                guiRoundRect(dc, rc, guic::cStop, guic::cPanel2, 10, 1);
-                guiText(dc, rc, "STOP ENGINE", guic::cStop, g_fUIb,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                Gdiplus::SolidBrush fb(GCol(guic::cPanel2));
+                Gdiplus::Pen        pb(GCol(guic::cStop), 1.0f);
+                g.FillPath(&fb, p);
+                g.DrawPath(&pb, p);
+                delete p;
+                guiAAString(g, dc, rc, "STOP ENGINE", guic::cStop, g_fUIb, 0);
             } else {
-                guiRoundRect(dc, rc, guic::cLine, guic::cPanel2, 10, 1);
-                guiText(dc, rc, st == 1 ? "STARTING..." : "STOPPING...", guic::cDim,
-                        g_fUIb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                Gdiplus::SolidBrush fb(GCol(guic::cPanel2));
+                Gdiplus::Pen        pb(GCol(guic::cLine), 1.0f);
+                g.FillPath(&fb, p);
+                g.DrawPath(&pb, p);
+                delete p;
+                guiAAString(g, dc, rc, st == 1 ? "STARTING..." : "STOPPING...", guic::cDim,
+                            g_fUIb, 0);
             }
             return TRUE;
         }
         bool accentBtn = false;
         for (int i = 0; i < 5; ++i)
             if (id == IDC_PRE_FLAT + i) accentBtn = (g_eqPreset == i);
-        guiRoundRect(dc, rc, accentBtn ? guic::cAccent : (pressed ? guic::cPanelHi : guic::cLine),
-                     pressed ? guic::cPanelHi : guic::cPanel2, accentBtn ? 14 : 8, accentBtn ? 2 : 1);
-        guiText(dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Gdiplus::GraphicsPath* p = guiRoundPath(grc, accentBtn ? 11 : 6);
+        Gdiplus::SolidBrush fb(GCol(pressed ? guic::cPanelHi : guic::cPanel2));
+        Gdiplus::Pen        pb(GCol(accentBtn ? guic::cAccent :
+                                    (pressed ? guic::cPanelHi : guic::cLine)),
+                               accentBtn ? 2.0f : 1.0f);
+        g.FillPath(&fb, p);
+        g.DrawPath(&pb, p);
+        delete p;
+        guiAAString(g, dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb, 0);
         return TRUE; }
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
@@ -5307,6 +5386,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (guiIsToggle(id)) {
             g_tog[id] = !g_tog[id];
             guiRepaint(w, id);          // v6.6.1: the pill repaints itself
+            if (id == IDC_TGL_STARTUP) {         // v6.6.6: the pill IS the Run key
+                startupSet(g_tog[id]);
+                SetDlgItemTextA(w, IDC_STATUS, g_tog[id]
+                    ? "startup: twinspeak will run at sign-in (hidden in the tray)"
+                    : "startup entry removed");
+            }
             return 0;
         }
         if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) { guiShowPage(w, id - IDC_TAB0); return 0; }
@@ -5320,6 +5405,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             case IDM_TRAY_AUTORUN: {
                 const bool on = !startupEnabled();
                 startupSet(on);
+                g_tog[IDC_TGL_STARTUP] = on;     // v6.6.6: keep the pill in sync
+                guiRepaint(w, IDC_TGL_STARTUP);
                 SetDlgItemTextA(w, IDC_STATUS, on
                     ? "startup: twinspeak will run at sign-in (hidden in the tray)"
                     : "startup entry removed");
@@ -5367,11 +5454,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0; }
     case WM_GETMINMAXINFO: {
-        // v6.6.3 polish: the layout is hand-placed at fixed coordinates and
-        // there is no WM_SIZE reflow -- a resized window only broke it (the
-        // report of overlapping buttons was exactly that). Lock the frame to
-        // the designed size; min == max == no resizing at all.
-        RECT r = { 0, 0, 1000, 750 };
+        // v6.6.3 polish, v6.6.5 size: the layout is hand-placed at fixed
+        // coordinates and there is no WM_SIZE reflow -- lock the frame to the
+        // designed 880x620 client; min == max == no resizing at all.
+        RECT r = { 0, 0, KCLI_W, KCLI_H };
         AdjustWindowRect(&r, kGuiFrame, FALSE);
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
@@ -5475,6 +5561,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
     guiMakeGdi();
+    // v6.6.5: GDI+ session for the antialiased owner-drawn UI + watermark
+    {
+        Gdiplus::GdiplusStartupInput sin_;
+        Gdiplus::GdiplusStartup(&g_gdipToken, &sin_, nullptr);
+    }
     g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
     WNDCLASSA wc = {};
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -5486,7 +5577,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     wc.hbrBackground = g_brBg;
     wc.lpszClassName = "twinspeak.control";
     RegisterClassA(&wc);
-    RECT r = { 0, 0, 1000, 750 };
+    RECT r = { 0, 0, KCLI_W, KCLI_H };
     AdjustWindowRect(&r, kGuiFrame, FALSE);
     // v6.6.1 STALE-PAINT FIX: WS_EX_COMPOSITED was deferring child repaints
     // (the "only updates after a minimize" bug) and the frame invalidated
@@ -5511,6 +5602,13 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
     guiFillCombos(g_hwnd);
+    // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the window's (still
+    // hidden) redirection surface now -- parent erase + paint, every child
+    // paint, every owner-draw -- so the first frame DWM ever composites is
+    // the finished dark UI. Showing with SW_SHOWNA then costs no extra
+    // activate/erase cycle: one white frame becomes zero white frames.
+    RedrawWindow(g_hwnd, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
     if (g_startTray) {
         // --tray: straight to the tray (the startup path). The balloon shows
@@ -5518,7 +5616,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         trayAdd(true);
         tlog("[twinspeak] gui           : running in the tray -- double-click the icon to open.\n");
     } else {
-        ShowWindow(g_hwnd, SW_SHOW);
+        ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
     }
     tlog("[twinspeak] gui           : control window up -- ini at %s\n", iniPath.c_str());
     tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
@@ -5530,6 +5628,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     KillTimer(g_hwnd, 1);
     if (g_engState.load() != 0) guiStopEngine();
+    if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }   // v6.6.5
     if (mutex) CloseHandle(mutex);
     return 0;
 }
@@ -6022,7 +6121,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.4        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
