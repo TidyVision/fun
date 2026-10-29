@@ -1,5 +1,24 @@
 // ============================================================================
-//  twinspeak v6.6.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.3 (TIDYVISION BRANDING + SCROLL-GHOST FIX. (1) CONSOLE TEXT PERSISTS
+//          WHILE SCROLLING: the log pane's WM_CTLCOLOREDIT answered with
+//          SetBkMode(TRANSPARENT) -- but a multiline EDIT scrolls by blitting
+//          the existing rows and repainting only the newly exposed line(s),
+//          so the repainted glyphs were drawn OVER the previous frame's
+//          leftovers and old text bled through "persisting" during scroll.
+//          The pane (and every edit + combo list) now answers with OPAQUE
+//          and a bk color matching its background brush: every painted row
+//          erases beneath itself. (2) WATERMARK: "Property of TidyVision -
+//          Copyright 2026-beyond" sits bottom-right, gradient-filled
+//          orange->cyan (glyph clip path + gradient pattern brush, pure
+//          GDI). (3) BRANDING: window title is now "TidyVision TwinSpeak:
+//          Control Panel"; the in-window header, tray tip, balloon title and
+//          the second-instance MessageBox follow. (4) SIZE LOCK: the layout
+//          is hand-placed with no WM_SIZE reflow, so WM_GETMINMAXINFO now
+//          pins the frame to its designed 1000x750 client -- resizing can
+//          no longer break the layout. No engine DSP changed in this
+//          version: the sample path is byte-identical to v6.5.18.)
 //
 //  v6.6.2 (LAYOUT REPAIRS, same two bugs the user saw in v6.6.0/6.6.1:
 //          (1) BUTTONS OVERLAPPING ACROSS TABS: mkBtn() was the only control
@@ -3331,7 +3350,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4232,7 +4251,7 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fHead = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr;
+                 g_fSml = nullptr, g_fMono = nullptr, g_fWm = nullptr;
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -4282,6 +4301,9 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+    g_fWm   = CreateFontA(-12, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     g_brBg     = CreateSolidBrush(guic::cBg);
     g_brPanel  = CreateSolidBrush(guic::cPanel);
     g_brPanel2 = CreateSolidBrush(guic::cPanel2);
@@ -4309,6 +4331,63 @@ static void guiText(HDC dc, const RECT& rc, const char* txt, COLORREF col,
     SetTextColor(dc, col);
     SelectObject(dc, f);
     DrawTextA(dc, txt, -1, (RECT*)&rc, flags | DT_NOPREFIX);
+}
+
+// ---- v6.6.3: the TidyVision watermark ---------------------------------------
+// Bottom-right, gradient-filled text (orange -> cyan). Pure GDI: the glyphs
+// become a clip path (BeginPath/TextOut/EndPath + SelectClipPath), then the
+// clipped region is filled with a pattern brush built from a 1-pixel-tall
+// 32bpp DIB holding the horizontal gradient. No msimg32 dependency.
+static void guiWatermark(HDC dc) {
+    static const char* kWM = "Property of TidyVision - Copyright 2026-beyond";
+    const int len = (int)strlen(kWM);
+    HGDIOBJ of = SelectObject(dc, g_fWm);
+    SIZE sz;
+    GetTextExtentPoint32A(dc, kWM, len, &sz);
+    if (sz.cx <= 0) { SelectObject(dc, of); return; }
+    // the 16px strip below the log pane (the pane ends at y=734, client=750);
+    // right edge aligns with the pane's right edge (x=984 on a 1000-wide client)
+    RECT crc = { 0, 0, 1000, 750 };
+    GetClientRect(WindowFromDC(dc), &crc);         // defensive: the size is locked
+    const int x = crc.right - 16 - sz.cx;
+    const int y = (734 + crc.bottom - sz.cy) / 2;
+    if (x < 0) { SelectObject(dc, of); return; }
+    // 1px-tall gradient DIB: orange (255,138,42) -> theme cyan (0,229,238)
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = sz.cx;
+    bi.bmiHeader.biHeight      = -1;               // top-down
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); SelectObject(dc, of); return; }
+    DWORD* px = (DWORD*)bits;
+    for (int i = 0; i < sz.cx; ++i) {
+        const float t = (sz.cx > 1) ? (float)i / (float)(sz.cx - 1) : 0.0f;
+        const BYTE r = (BYTE)(255.0f + (  0.0f - 255.0f) * t);
+        const BYTE g = (BYTE)(138.0f + (229.0f - 138.0f) * t);
+        const BYTE b = (BYTE)( 42.0f + (238.0f -  42.0f) * t);
+        px[i] = ((DWORD)b << 16) | ((DWORD)g << 8) | (DWORD)r;   // 0x00BBGGRR
+    }
+    HBRUSH gb = CreatePatternBrush(bmp);
+    if (!gb) { DeleteObject(bmp); SelectObject(dc, of); return; }
+    // clip to the glyph outlines, then flood the clipped text with the gradient
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));          // mask color (any non-zero)
+    BeginPath(dc);
+    TextOutA(dc, x, y, kWM, len);
+    EndPath(dc);
+    SelectClipPath(dc, RGN_COPY);
+    POINT org; SetBrushOrgEx(dc, x, y, &org);      // anchor the gradient to the text
+    RECT tr = { x, y, x + sz.cx, y + sz.cy };
+    FillRect(dc, &tr, gb);
+    SetBrushOrgEx(dc, org.x, org.y, nullptr);
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(gb);
+    DeleteObject(bmp);
+    SelectObject(dc, of);
 }
 
 // ---- control factories -----------------------------------------------------
@@ -5016,12 +5095,12 @@ static void trayAdd(bool hint) {
     g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
                                     IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
-    lstrcpynA(g_nid.szTip, "twinspeak control", (int)sizeof(g_nid.szTip));
+    lstrcpynA(g_nid.szTip, "TidyVision TwinSpeak", (int)sizeof(g_nid.szTip));
     g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
     if (g_trayVisible && hint && !g_trayHint) {
         g_trayHint = true;
         g_nid.uFlags       = NIF_INFO;
-        lstrcpynA(g_nid.szInfoTitle, "twinspeak", (int)sizeof(g_nid.szInfoTitle));
+        lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
         lstrcpynA(g_nid.szInfo,
                   "Still running -- the engine stays up.\n"
                   "Double-click this icon to reopen the window; "
@@ -5065,12 +5144,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         FillRect(dc, &panel, g_brPanel);
         FrameRect(dc, &panel, g_brPanel2);
         const RECT hdr = { 18, 8, 420, 42 };
-        guiText(dc, hdr, "TWINSPEAK CONTROL", guic::cAccent, g_fHead,
+        guiText(dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        const std::string verLine = "v6.6.2  |  " + g_guiIniPath;
+        const std::string verLine = "v6.6.3  |  " + g_guiIniPath;
         const RECT ver = { 300, 14, 984, 38 };
         guiText(dc, ver, verLine.c_str(), guic::cDim, g_fSml,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        guiWatermark(dc);                                 // v6.6.3: bottom-right
         EndPaint(w, &ps);
         return 0; }
     case WM_CTLCOLORSTATIC: {
@@ -5089,17 +5169,28 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, guic::cDim);
         return (LRESULT)g_brPanel; }
     case WM_CTLCOLOREDIT: {
+        // v6.6.3 SCROLL-GHOST FIX: a multiline EDIT scrolls by blitting the
+        // existing rows and repainting only the newly exposed line(s). With
+        // SetBkMode(TRANSPARENT) the repainted glyphs are drawn OVER whatever
+        // pixels the blit left behind -- old text bleeds through and "persists"
+        // while scrolling. OPAQUE + a bk color matching the background brush
+        // makes every painted row erase beneath itself. Statics keep
+        // TRANSPARENT (they never scroll and must blend with the panel).
         HDC dc = (HDC)wp;
-        SetBkMode(dc, TRANSPARENT);
+        SetBkMode(dc, OPAQUE);
         if (GetDlgCtrlID((HWND)lp) == IDC_LOG) {   // the pane: soft cyan on near-black
+            SetBkColor(dc, guic::cLogBg);
             SetTextColor(dc, guic::cLog);
             return (LRESULT)g_brLog;
         }
+        SetBkColor(dc, guic::cPanel2);
         SetTextColor(dc, guic::cText);
         return (LRESULT)g_brPanel2; }
     case WM_CTLCOLORLISTBOX: {
+        // same reasoning as WM_CTLCOLOREDIT: dropdowns scroll too
         HDC dc = (HDC)wp;
-        SetBkMode(dc, TRANSPARENT);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, guic::cPanel2);
         SetTextColor(dc, guic::cText);
         return (LRESULT)g_brPanel2; }
     case WM_DRAWITEM: {
@@ -5224,6 +5315,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             guiRepaintPresets(w);                  // v6.6.1: highlight -> CUSTOM
         }
         return 0; }
+    case WM_GETMINMAXINFO: {
+        // v6.6.3 polish: the layout is hand-placed at fixed coordinates and
+        // there is no WM_SIZE reflow -- a resized window only broke it (the
+        // report of overlapping buttons was exactly that). Lock the frame to
+        // the designed size; min == max == no resizing at all.
+        RECT r = { 0, 0, 1000, 750 };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
+        return 0; }
     case WM_TIMER: {
         if (g_logDirty.exchange(false)) {
             EnterCriticalSection(&g_logCS);
@@ -5316,7 +5418,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
             Sleep(50);
         }
         MessageBoxA(nullptr, "twinspeak is already running.\n\nStop the running copy first:\n  taskkill /IM twinspeak.exe",
-                    "twinspeak control", MB_ICONINFORMATION);
+                    "TidyVision TwinSpeak", MB_ICONINFORMATION);
         CloseHandle(mutex);
         return 1;
     }
@@ -5341,7 +5443,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // WS_CLIPCHILDREN -- the parent never paints over its children and every
     // visual state change invalidates the exact child (see guiRepaint). The
     // window starts HIDDEN; --tray leaves it in the tray, otherwise it shows.
-    g_hwnd = CreateWindowExA(0, "twinspeak.control", "twinspeak control -- v6.6.2",
+    g_hwnd = CreateWindowExA(0, "twinspeak.control", "TidyVision TwinSpeak: Control Panel",
                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
@@ -5869,7 +5971,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.3        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
