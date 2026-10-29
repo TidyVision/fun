@@ -1,5 +1,28 @@
 // ============================================================================
-//  twinspeak v6.5.13 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.5.14 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.5.14 (field directive: "make it so that if the main audio device is
+//          either output_device1 or output_device2 that the DAC shuts off
+//          immediately to let the main device play" + field finding
+//          "setting the buffer size to a reasonable value like 128 minimum
+//          helped a lot". Two changes:
+//            DAC YIELD (yield_default, default ON) -- Windows' default
+//            render endpoint is re-enumerated every health tick; the moment
+//            it is (or becomes) one of the leg devices, THAT leg's DAC is
+//            released the same second: the KS pin closes / the WASAPI device
+//            uninitializes, the pump parks, and nothing of twinspeak's
+//            holds the hardware -- the app playing to the default device
+//            owns it outright. When the default moves elsewhere the leg
+//            reopens through the watchdog path (chime + warden baseline
+//            re-arm included). The watchdog, collapse sentinel, stall
+//            resync, deep resync and warden corrections all skip a yielded
+//            leg -- its stale heartbeat is a deliberate release, not a
+//            fault. Reaction time: one health tick (<= 1 s).
+//            KS BITE FIELD NOTE -- bites under 128 frames now print a
+//            startup note: the lapse guard's lap window shrinks with the
+//            loop, and sub-128 loops (64) buzzed in the field; 128+ is the
+//            steady zone. A note, not a clamp -- the bite stays the user's
+//            call.)
 //
 //  v6.5.13 (field report: "sometimes I eventually get this reverberated
 //          sawing sound that mixes in with the audio" -- the KS looped
@@ -1050,6 +1073,12 @@ struct Config {
     // lags again. No host meter sees that layer; a scheduled reopen is
     // the one reset that re-primes it (brief gap, warden re-arms ~9 s).
     unsigned    deepResyncMin   = 0;
+    // v6.5.14 DAC YIELD: when the Windows default render endpoint is one of
+    // the leg devices, that leg's DAC is released immediately (KS pin
+    // closed / WASAPI device freed, pump parked) so the app playing to the
+    // default device owns the hardware; the leg reopens through the
+    // watchdog path when the default moves elsewhere.
+    bool        yieldDefault    = true;
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
@@ -1325,6 +1354,11 @@ struct Leg {
     // (backend1/backend2); a KS open failure leaves the WASAPI path in place.
     int                 backend = 0;
     KsOut               ks;
+    // v6.5.14: this leg's DAC is released to the Windows default render
+    // device (yield_default): device closed, pump parked; the watchdog,
+    // collapse sentinel, stall resync, deep resync and warden all skip it.
+    // Cleared + reopened through the watchdog path when the default moves.
+    std::atomic<bool>   yielded{false};
     // ---- v6.4 DRIFT WARDEN: frame-interval ledger ---------------------------
     // The OUT ring's seqTail (above) IS this leg's stream position: the
     // capture sequence number of its play boundary. Pops, gated drops and
@@ -2123,6 +2157,9 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         // (capture-side evictions are counted in 'drop' and the sequence
         // ledger advances with them); a rebuild follows on resume.
         if (g_powerPark.load(std::memory_order_relaxed)) continue;
+        // v6.5.14: DAC yielded to the Windows default device -- park the pump
+        // exactly like the suspend park: nothing feeds a device we released.
+        if (L.yielded.load(std::memory_order_relaxed)) continue;
 
         // drain raw -> master volume -> mute/mix -> out ring (push all).
         // The ring headroom absorbs the normal pop/burst sawtooth; real
@@ -3019,7 +3056,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.5.13 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.5.14 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3151,6 +3188,16 @@ static void writeTemplate(const char* path) {
         "; allow one deliberately). off = classic console run, Ctrl+C to stop.\n"
         "background = off\n"
         "\n"
+        "; DAC YIELD (v6.5.14): when the WINDOWS DEFAULT render endpoint is (or\n"
+        "; becomes) one of the leg devices below, that leg's DAC is released\n"
+        "; immediately -- the KS pin closes / the WASAPI device frees, the pump\n"
+        "; parks -- so the app playing to the default device owns the hardware\n"
+        "; with nothing fighting it. The leg reopens by itself (chime + warden\n"
+        "; re-arm included) the moment the default moves elsewhere. The log\n"
+        "; announces both directions ('legN YIELD'); a yielded leg shows '----'\n"
+        "; on the devbuf line and a stale heartbeat, both BY DESIGN.\n"
+        "yield_default = on\n"
+        "\n"
         "; WDM-KS OUTPUT BACKEND (v6.3) -- the FlexASIO path, inside twinspeak.\n"
         "; backend1 / backend2 route each leg through Kernel Streaming instead of\n"
         "; WASAPI: a direct render pin on the device's wave filter (KsCreatePin),\n"
@@ -3164,7 +3211,9 @@ static void writeTemplate(const char* path) {
         ";   backendN = ks      WDM-KS, lowest latency, 256-sample switches\n"
         "; ks_period_frames = the buffer-switch size in SAMPLES (256 @ 48 kHz =\n"
         "; one bite every 5.33 ms; 96 = one bite every 2 ms -- smaller bites\n"
-        "; shrink the KS ring floor too). ks_periods = the looped buffer size\n"
+        "; shrink the KS ring floor too; v6.5.14 field note: 128 MINIMUM paces\n"
+        "; much steadier -- the lapse guard's lap window shrinks with the loop\n"
+        "; and sub-128 loops buzzed in the field). ks_periods = the looped buffer size\n"
         "; around it: 2 = the write lead is one period (lowest latency, the pump\n"
         "; must never miss a deadline), 3 = one extra period of grace\n"
         "; (recommended), up to 8 -- a 1 in the ini clamps to 2 with a log line\n"
@@ -3391,6 +3440,7 @@ static bool loadIni(const char* path) {
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
+        else if (key == "yield_default")     g_cfg.yieldDefault    = !isOff(val); // v6.5.14
         else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
     }
     fclose(f);
@@ -3431,6 +3481,12 @@ static bool loadIni(const char* path) {
              "                            the buffer the moment the pacer hiccups), above 8 just wastes RAM\n",
              g_cfg.ksPeriods, g_cfg.ksPeriods < 2 ? 2u : 8u);
         g_cfg.ksPeriods = g_cfg.ksPeriods < 2 ? 2 : 8;
+    }
+    if (g_cfg.ksPeriodFrames < 128) {   // v6.5.14: field note, NOT a clamp
+        tlog("[twinspeak] config        : ks_period_frames %u -- field note: bites under 128 frames pace on\n"
+             "                            the edge (the lapse-guard lap window shrinks with the loop and\n"
+             "                            64-frame loops buzzed in the field); 128+ is the steady zone\n",
+             g_cfg.ksPeriodFrames);
     }
     if (g_cfg.driftCorrectMs < 2.0f)   g_cfg.driftCorrectMs = 2.0f;
     if (g_cfg.driftCorrectMs > 500.0f) g_cfg.driftCorrectMs = 500.0f;
@@ -3491,6 +3547,27 @@ static bool pickDevice(ma_context* ctx, ma_device_type type, const std::string& 
     return true;
 }
 
+// v6.5.14: the friendly name of the CURRENT default render endpoint, via a
+// LIVE re-enumeration (ma_context_enumerate_devices re-walks the endpoints
+// on every call, so a default-device switch is visible immediately; the
+// cached ma_context_get_devices list is not). Consumed by the health loop's
+// DAC-yield check.
+struct YieldEnum { std::string defName; };
+static ma_bool32 yieldEnumCb(ma_context*, ma_device_type deviceType,
+                             const ma_device_info* pInfo, void* pUserData) {
+    if (deviceType != ma_device_type_playback) return MA_TRUE;
+    YieldEnum* d = (YieldEnum*)pUserData;
+    if (pInfo->isDefault && d->defName.empty()) d->defName = pInfo->name;
+    return MA_TRUE;
+}
+static bool defaultRenderName(ma_context* ctx, std::string* outName) {
+    YieldEnum d;
+    if (ma_context_enumerate_devices(ctx, yieldEnumCb, &d) != MA_SUCCESS) return false;
+    if (d.defName.empty()) return false;
+    *outName = d.defName;
+    return true;
+}
+
 // ---------------------------------------------------------- device init -----
 static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
                           ma_uint32 periodMs, bool wantExcl) {
@@ -3523,14 +3600,15 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 // (fresh endpoint id -- a replug re-attaches), first in its previous share
 // mode, then shared. Called once per second while the heartbeat is stale;
 // retries are silent until the state changes or the reopen succeeds.
-static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs) {
+static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
+                          const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
     static unsigned long long lastLog[2] = { 0, 0 };
     const unsigned long long now = GetTickCount64();
     L.lastReopenMs = now;   // v6.4: the drift warden pauses while a leg settles
     if (now - lastLog[idx] >= 10000) {
-        tlog( "[twinspeak] leg%d WATCHDOG : device thread silent >5 s -- reopening \"%s\"\n",
-                idx + 1, L.name.c_str());
+        tlog( "[twinspeak] leg%d WATCHDOG : %s -- reopening \"%s\"\n",
+                idx + 1, why, L.name.c_str());
         lastLog[idx] = now;
     }
     const char* needle = (idx == 0) ? g_cfg.outputDevice1.c_str() : g_cfg.outputDevice2.c_str();
@@ -4138,7 +4216,7 @@ int main(int argc, char** argv) {
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.5.13        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.5.14        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -4247,6 +4325,11 @@ int main(int argc, char** argv) {
     tlog("[twinspeak] start order   : %s\n",
            g_cfg.out2First ? "out2 (center) FIRST -- its pump is created first and runs at the higher priority; out1 follows"
                            : "out1 first, then out2 (out2_first = off)");
+    tlog("[twinspeak] dac yield     : %s -- the leg whose device IS the Windows default render endpoint\n"
+           "                            is released the same second (KS pin closed / WASAPI device freed,\n"
+           "                            pump parked) so the main device plays untouched; it reopens the\n"
+           "                            moment the default moves elsewhere (yield_default)\n",
+           g_cfg.yieldDefault ? "ON" : "off");
     if (g_cfg.chimes) {
         float cgp = g_cfg.chimeGain; if (cgp < 0.0f) cgp = 0.0f; if (cgp > 1.0f) cgp = 1.0f;
         tlog("[twinspeak] chimes        : ON -- CenterFold signature, modernized: low-treble TRIANGLE blips\n"
@@ -4406,9 +4489,60 @@ int main(int argc, char** argv) {
         // by definition -- do NOT storm reopen attempts at a device the OS
         // is putting to sleep; the resume path rebuilds everything.
         if (nowMs - g_bootMs > 3000 && !g_powerPark.load(std::memory_order_relaxed)) {
-            if (nowMs - hbOutGet(1) > 5000) tryRestartLeg(1, &ctx, periodMs2);
-            if (nowMs - hbOutGet(0) > 5000) tryRestartLeg(0, &ctx, periodMs1);
+            if (nowMs - hbOutGet(1) > 5000 && !g_leg[1].yielded.load(std::memory_order_relaxed))
+                tryRestartLeg(1, &ctx, periodMs2);
+            if (nowMs - hbOutGet(0) > 5000 && !g_leg[0].yielded.load(std::memory_order_relaxed))
+                tryRestartLeg(0, &ctx, periodMs1);
             if (nowMs - g_hbCap.load(std::memory_order_relaxed) > 5000) tryRestartCap(&ctx);
+        }
+        // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
+        // Field directive: "if the main audio device is either output_device1
+        // or output_device2 that the DAC shuts off immediately to let the
+        // main device play." The default render endpoint is re-enumerated
+        // every tick; a needle match releases THAT leg's DAC the same
+        // second (KS: pin closed + pacer stopped; WASAPI: device freed) --
+        // nothing of ours holds the hardware, so the app playing to the
+        // default device owns it outright. When the default moves elsewhere
+        // the leg reopens through the watchdog path (chime + baseline
+        // re-arm included). While yielded: the pump parks (the raw ring
+        // overflows harmlessly, exactly like the suspend park), the
+        // watchdog skips the leg (the stale heartbeat is a deliberate
+        // release, not a fault), the collapse sentinel / stall resync /
+        // deep resync / warden corrections all hold off, and the devbuf
+        // line prints '----'. Reaction time: one health tick (<= 1 s).
+        if (g_cfg.yieldDefault && !g_powerPark.load(std::memory_order_relaxed)) {
+            std::string defName;
+            if (defaultRenderName(&ctx, &defName)) {
+                for (int i = 0; i < 2; ++i) {
+                    const char* yneedle = (i == 0) ? g_cfg.outputDevice1.c_str()
+                                                   : g_cfg.outputDevice2.c_str();
+                    if (!yneedle[0]) continue;
+                    Leg& Y = g_leg[i];
+                    const bool mine = containsCI(defName, yneedle);
+                    if (mine && !Y.yielded.load(std::memory_order_relaxed)) {
+                        Y.yielded.store(true, std::memory_order_relaxed);
+                        stallSec[i] = 0;
+                        tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
+                             "                            this leg's needle (\"%s\") -- releasing the DAC now so the\n"
+                             "                            main device plays; it reopens the moment the default\n"
+                             "                            device moves elsewhere (yield_default = on)\n",
+                             i + 1, defName.c_str(), yneedle);
+                        if (Y.backend == 1) ksCloseLeg(i);   // stops the pacer + pin
+                        if (Y.dev.pContext) {
+                            ma_device_uninit(&Y.dev);
+                            memset(&Y.dev, 0, sizeof(Y.dev));
+                        }
+                        Y.lastReopenMs = nowMs;   // warden settle gates stay coherent
+                    } else if (!mine && Y.yielded.exchange(false, std::memory_order_relaxed)) {
+                        tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
+                             "                            -- reopening (\"%s\")\n",
+                             i + 1, Y.name.c_str());
+                        Y.lastReopenMs = nowMs;
+                        tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2,
+                                      "yield release (default device moved away)");
+                    }
+                }
+            }
         }
         // ---- v6.5.2 power guard: resume rebuild + collapse sentinel ----
         if (g_cfg.powerGuard && g_powerWoken.exchange(false)) {
@@ -4417,8 +4551,13 @@ int main(int argc, char** argv) {
                  "                            (a post-sleep stream is never trusted: the field log\n"
                  "                            shows an S5 consuming at ~42%% with a fresh heartbeat)\n");
             tryRestartCap(&ctx);
-            tryRestartLeg(1, &ctx, periodMs2);   // center first -- out2_first symmetry
-            tryRestartLeg(0, &ctx, periodMs1);
+            // v6.5.14: a yielded leg STAYS released (its device is ours by
+            // choice, not broken); the yield check above re-evaluates the
+            // default every tick and reopens it when the default moves.
+            if (!g_leg[1].yielded.load(std::memory_order_relaxed))
+                tryRestartLeg(1, &ctx, periodMs2);   // center first -- out2_first symmetry
+            if (!g_leg[0].yielded.load(std::memory_order_relaxed))
+                tryRestartLeg(0, &ctx, periodMs1);
             wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
             colStreak0 = 0; colStreak1 = 0;
         }
@@ -4430,8 +4569,12 @@ int main(int argc, char** argv) {
         // and any driver reset that leaves a bogus-rate thread running.
         if (g_cfg.powerGuard && !g_powerPark.load(std::memory_order_relaxed)
             && nowMs - g_bootMs > 30000) {
-            colStreak0 = (off0 > kCollapsePpm || off0 < -kCollapsePpm) ? colStreak0 + 1 : 0;
-            colStreak1 = (off1 > kCollapsePpm || off1 < -kCollapsePpm) ? colStreak1 + 1 : 0;
+            // v6.5.14: a yielded leg's off meter reads garbage by design
+            // (captured grows, popped is frozen) -- it must not fire this.
+            colStreak0 = (!g_leg[0].yielded.load(std::memory_order_relaxed)
+                          && (off0 > kCollapsePpm || off0 < -kCollapsePpm)) ? colStreak0 + 1 : 0;
+            colStreak1 = (!g_leg[1].yielded.load(std::memory_order_relaxed)
+                          && (off1 > kCollapsePpm || off1 < -kCollapsePpm)) ? colStreak1 + 1 : 0;
             if (colStreak0 >= 2 || colStreak1 >= 2) {
                 const int li = (colStreak0 >= 2) ? 0 : 1;
                 const long bad = (li == 0) ? off0 : off1;
@@ -4476,6 +4619,10 @@ int main(int argc, char** argv) {
         if (driftBaseOK && !g_powerPark.load(std::memory_order_relaxed)) {
             for (int i = 0; i < 2; ++i) {
                 Leg& SLeg = g_leg[i];
+                if (SLeg.yielded.load(std::memory_order_relaxed)) {   // v6.5.14: released by choice
+                    stallSec[i] = 0;
+                    continue;
+                }
                 const unsigned long long undPrev = (i == 0) ? u00 : u10;
                 const unsigned long long undNow =
                     SLeg.und.load(std::memory_order_relaxed);
@@ -4517,7 +4664,8 @@ int main(int argc, char** argv) {
         // the usual baseline-invalidation, so the warden re-arms ~9 s
         // later and the delay calibration carries across untouched.
         if (g_cfg.deepResyncMin && driftBaseOK
-            && !g_powerPark.load(std::memory_order_relaxed)) {
+            && !g_powerPark.load(std::memory_order_relaxed)
+            && !g_leg[1].yielded.load(std::memory_order_relaxed)) {
             if (deepLastMs == 0)
                 deepLastMs = nowMs;
             else if (nowMs - deepLastMs >= (unsigned long long)g_cfg.deepResyncMin * 60000ULL) {
