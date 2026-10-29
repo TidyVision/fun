@@ -1,5 +1,28 @@
 // ============================================================================
-//  twinspeak v6.6.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v6.6.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v6.6.8 (FINAL POLISH: the engine swallows its switches, the sliders go
+//          dark. (1) TEN SWITCHES INTEGRATED: capture_exclusive, exclusive,
+//          align_modes, clock_sync, drift_guard, power_guard, yield_default,
+//          center_gate, center_upmix_guard and background are no longer
+//          settings -- they are the design. Every one is hardcoded ON: the
+//          ini keys are gone from the template and from guiSaveIni (old
+//          inis still load; their lines are read and ignored), the UI pills
+//          are gone, and the fields stay in Config as always-on defaults
+//          the controls can never touch. The page-0 column keeps only
+//          lfe_fold; page 3 (GUARDS -> OTHER) keeps the startup pill and
+//          the SYNC numbers; page 4 keeps chimes. Tabs: SYNC + POWER ->
+//          OTHER; headers: GUARDS -> OTHER, DRIFT WARDEN NUMBERS -> SYNC,
+//          CENTER PRESENCE + CUES -> CENTER CUES.
+//          (2) EQ SLIDERS OWNER-DRAWN: the stock TRACKBAR_CLASSA erased
+//          and repainted through the LIGHT theme parts on every pass --
+//          under DarkMode_Explorer the control still flashed white before
+//          the dark chrome landed. The three EQ sliders are now a tiny
+//          custom control that never erases (WM_ERASEBKGND -> 1) and paints
+//          its groove + thumb GDI+ opaque on g_brPanel; mouse drag reports
+//          through the same WM_HSCROLL the trackbar used, so TBM_GETPOS/
+//          TBM_SETPOS became sldGetPos/sldSetPos and nothing else moved.
+//          No engine DSP changed: byte-identical to v6.5.18.)
 //
 //  v6.6.7 (THE GHOST CORNERS, SECOND ROUND. The screenshot showed every
 //          owner-drawn button with bright gray arcs on its rounded corners
@@ -1052,10 +1075,14 @@
 //      delay1_ms/delay2_ms = the leg's ring target grown by whole ms -- the
 //      samples exit later, bit for bit; no pitch path can exist.
 //
-//  WASAPI exclusive is ON by default (and on by default in the shipped ini
-//  since v3.1's field confirmation): exclusive bypasses the Windows volume
-//  slider, which is why volume_follow + pin_outputs exist. align_modes
-//  still forces both legs to agree on the share mode.
+//  v6.6.8: WASAPI exclusive is INTEGRATED -- both legs open exclusive
+//  together (a driver refusal reopens BOTH shared so device buffering stays
+//  identical) and the VAC capture pin is taken exclusive with a logged
+//  shared fallback. Exclusive bypasses the Windows volume slider, which is
+//  why volume_follow + pin_outputs exist. There is no ini key and no UI
+//  pill: the share-mode design is part of the engine. The same is true for
+//  clock_sync, drift_guard, power_guard, yield_default, center_gate,
+//  center_upmix_guard, background -- all always on (v6.6.8).
 //
 //  Config (twinspeak.ini, next to the exe -- or pass a path):
 //      out1ms = 5            ; WASAPI period, leg1 (v6.0 default)
@@ -1065,13 +1092,11 @@
 //      delay1_ms = 0         ; v6.1: bit-exact ring delay per leg (the EARLY
 //      delay2_ms = 0         ;        leg takes the delay; see template)
 //      cap_ms = 5            ; capture burst period
-//      exclusive = on        ; both-or-neither WASAPI exclusive attempt
-//      align_modes = on      ; force both legs into the same share mode
+//      ; v6.6.8: exclusive / capture_exclusive / align_modes / clock_sync /
+//      ; drift_guard / power_guard / yield_default / center_gate /
+//      ; center_upmix_guard / background are INTEGRATED (always on) -- old
+//      ; inis that still carry the keys load cleanly, values ignored.
 //      lfe_fold = on         ; LFE folded onto FL/FR at gain_lfe (confirmed)
-//      clock_sync = on       ; v6.0 device-master replay/drop discipline
-//      center_gate = on          ; v6.1: ch3 silent -> out2 = keep-alive only
-//      center_upmix_guard = on   ; v6.1: ch3 == a*ch1+b*ch2 (stereo upmix)
-//                                ;       -> muted (Windows fills FC for you)
 //      input_device   = Line 1
 //      output_device1 = Realtek
 //      output_device2 = Xtream
@@ -1255,11 +1280,11 @@ struct Config {
     float       ring2Ms        = -1.0f;
     float       legacyBufferMs = 10.0f;   // only used if outXms absent from ini
     float       capMs          = 5.0f;    // v3.6: capture burst period (decoupled)
-    bool        captureExclusive = true;  // v3.6: exclusive VAC capture pin attempt
+    bool        captureExclusive = true;  // v6.6.8: INTEGRATED -- always on
     bool        haveOut1       = false;
     bool        haveOut2       = false;
-    bool        exclusive      = false;   // v3: default OFF (volume + alignment)
-    bool        alignModes     = true;    // both legs same share mode
+    bool        exclusive      = true;    // v6.6.8: INTEGRATED -- always on (v3 default was off)
+    bool        alignModes     = true;    // v6.6.8: INTEGRATED -- always on
     bool        lfeFold        = true;    // v3.1: user-confirmed routing (LFE onto FL/FR)
     std::string inputDevice;
     std::string outputDevice1;
@@ -1280,20 +1305,24 @@ struct Config {
     float       centerEqFreq   = 1800.0f; // peak frequency (Hz, clamped 20..20000)
     float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
     float       centerEqQ      = 0.8f;    // peak Q (clamped 0.1..10)
-    bool        clockSync      = true;    // v6.0: device-master replay/drop discipline
+    bool        clockSync      = true;    // v6.0 device-master replay/drop discipline
                                           // (replaces v5.0's auto_resync / resampler)
+                                          // v6.6.8: INTEGRATED -- always on
     float       delay1Ms       = 0.0f;    // v6.1: bit-exact ring delay per leg
     float       delay2Ms       = 0.0f;    //       (the EARLY leg takes the delay)
     bool        centerGate     = true;    // v6.1: ch3 digital-zero -> out2 keep-alive only
+                                          //       v6.6.8: INTEGRATED -- always on
     bool        centerUpmixGuard = true;  // v6.1: ch3 == a*ch1+b*ch2 (Windows fills FC
                                           //       for stereo sources) -> block muted
+                                          // v6.6.8: INTEGRATED -- always on
     bool        volumeFollow   = true;   // v3.8: Line 1 endpoint volume drives both legs
     bool        pinOutputs     = true;   // v3.8: out1/out2 endpoints pinned 100%/unmuted
     bool        out2First      = true;   // v3.8: center leg opens and starts first
     float       keepaliveHz    = 40.0f;  // v3.9: out2 keep-alive tone (5..2000 Hz)
     float       keepaliveGain  = 0.01f;  // v3.9: out2 keep-alive amplitude (0..0.25)
-    bool        background     = false;  // v6.2: detach the console after a
+    bool        background     = true;   // v6.2: detach the console after a
                                           //       successful start; log to file
+                                          // v6.6.8: INTEGRATED -- always on
     bool        chimes         = true;   // v6.2: CenterFold signature, modernized
     float       chimeGain      = 0.4f;   // v6.2: chime blip peak (0..1)
     // v6.3 WDM-KS output backend, per leg. "wasapi" = the v6.2 path
@@ -1310,6 +1339,7 @@ struct Config {
     // v6.4 drift warden: the frame-interval ledger is ALWAYS on (it only
     // observes); drift_guard switches the automatic re-pin on top of it.
     bool        driftGuard     = true;   // auto re-pin at >= drift_correct_ms
+                                          // v6.6.8: INTEGRATED -- always on
     float       driftCorrectMs = 10.0f;  // trigger distance from the baseline (ms)
     // v6.5.8: minimum spacing between warden corrections -- was the hardcoded
     // kWardenMinIntervalMs = 30000. Lower it for tighter pinning on
@@ -1327,15 +1357,14 @@ struct Config {
     // closed / WASAPI device freed, pump parked) so the app playing to the
     // default device owns the hardware; the leg reopens through the
     // watchdog path when the default moves elsewhere.
-    // v6.5.17: default OFF. The machinery is now opt-in via the ini key
-    // (yield_default = on) so a stock build runs the pre-v6.5.14 behavior
-    // and the field crackle report can be A/B-tested against it cleanly.
-    bool        yieldDefault    = false;
+    // v6.5.17: default OFF. v6.6.8: the A/B test is over -- yield_default is
+    // INTEGRATED (always on); the ini key and the UI pill are gone.
+    bool        yieldDefault    = true;   // v6.6.8: INTEGRATED -- always on (v6.5.17 default was off)
     // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
     // the pumps; resume rebuilds capture + both legs; a sentinel reopens
     // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
     // stream ticks at a bogus rate with a FRESH heartbeat -- the silence
-    // watchdog cannot see it). off = exact v6.5.1 behavior.
+    // watchdog cannot see it). v6.6.8: INTEGRATED -- always on.
     bool        powerGuard     = true;
 };
 static Config g_cfg;
@@ -3423,7 +3452,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v6.6.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v6.6.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3441,12 +3470,6 @@ static void writeTemplate(const char* path) {
         "; port that clamp doubles every window; the WaveRT port driver (VAC\n"
         "; Control Panel) unlocks the real 5 ms.\n"
         "cap_ms = 5\n"
-        "\n"
-        "; CAPTURE pin mode: exclusive = take the VAC recording pin WASAPI-\n"
-        "; exclusive (on a WaveRT port this is the direct cyclic-buffer path,\n"
-        "; ~10 ms cable->app). If the pin refuses (engine holds it, WaveCyclic\n"
-        "; port, format mismatch) twinspeak falls back to shared and says so.\n"
-        "capture_exclusive = on\n"
         "\n"
         "; Out RING depth per leg, in ms. The ring target is FLOORED at the FULL\n"
         "; device buffer (2 periods) + a FULL capture burst + 4 ms regardless of\n"
@@ -3475,15 +3498,13 @@ static void writeTemplate(const char* path) {
         "delay1_ms = 0\n"
         "delay2_ms = 0\n"
         "\n"
-        "; WASAPI exclusive output (kernel WaveRT path: no engine, no\n"
-        "; enhancements, ~10 ms less device buffering). Bypasses the Windows\n"
-        "; volume slider. If either driver refuses, align_modes reopens BOTH\n"
-        "; legs as shared automatically, so device buffering stays identical.\n"
-        "exclusive = on\n"
-        "\n"
-        "; Force both legs into the same share mode (recommended -- mixed modes\n"
-        "; are exactly what made out2 lag out1 in v2). off = per-leg fallback.\n"
-        "align_modes = on\n"
+        "; v6.6.8: exclusive (WASAPI, both legs), capture_exclusive and\n"
+        "; align_modes are part of the engine now -- ALWAYS ON, no ini key.\n"
+        "; Both legs open WASAPI-exclusive together (a driver refusal reopens\n"
+        "; BOTH shared so device buffering stays identical) and the VAC capture\n"
+        "; pin is taken exclusive with a logged shared fallback. Exclusive\n"
+        "; bypasses the Windows volume slider -- that is what volume_follow\n"
+        "; and pin_outputs exist for.\n"
         "\n"
         "; Fold the cable's LFE onto FL/FR at gain_lfe -- the CONFIRMED routing\n"
         "; (\"LFE is mixed fully into the left and right channels\"). The sub is\n"
@@ -3562,33 +3583,18 @@ static void writeTemplate(const char* path) {
         "chimes = on\n"
         "chime_gain = 0.4\n"
         "\n"
-        "; BACKGROUND (v6.2): background = on runs twinspeak as a background\n"
-        "; process. The console detaches AFTER a successful startup (a failed\n"
-        "; start keeps the window so you can read the error) and everything --\n"
-        "; banner, sync lines, health line -- is logged to twinspeak.log next\n"
-        "; to this ini (health line every 10 s in the file). Stop a background\n"
-        "; run with:   taskkill /IM twinspeak.exe\n"
+        "; v6.6.8: background is part of the engine now -- ALWAYS ON. The\n"
+        "; console detaches after a successful start and everything logs to\n"
+        "; twinspeak.log next to this ini. Stop a background run with:\n"
+        ";   taskkill /IM twinspeak.exe\n"
         "; Start it visible anyway with:   twinspeak --foreground\n"
-        "; A second instance is refused (single-instance lock; add --multi to\n"
-        "; allow one deliberately). off = classic console run, Ctrl+C to stop.\n"
-        "background = off\n"
         "\n"
-        "; DAC YIELD (v6.5.14): when the WINDOWS DEFAULT render endpoint is (or\n"
-        "; becomes) one of the leg devices below, that leg's DAC is released\n"
-        "; immediately -- the KS pin closes / the WASAPI device frees, the pump\n"
-        "; parks -- so the app playing to the default device owns the hardware\n"
-        "; with nothing fighting it. The leg reopens by itself (chime + warden\n"
-        "; re-arm included) once the default moves elsewhere AND the device is\n"
-        "; QUIET: if another app's audio session is still active on it (the\n"
-        "; app has not finished re-routing), the release holds until the app\n"
-        "; is done -- re-grabbing the DAC under a live stream doubles the\n"
-        "; audio and can wedge the other app. The log\n"
-        "; announces both directions ('legN YIELD'); a yielded leg shows '----'\n"
-        "; on the devbuf line and a stale heartbeat, both BY DESIGN. While a\n"
-        "; leg is yielded the program touches NOTHING on that device -- its\n"
-        "; Windows volume (and mute) stay exactly where the user set them;\n"
-        "; the 100%% pin re-applies only when the leg reopens for twinspeak.\n"
-        "yield_default = on\n"
+        "; v6.6.8: yield_default is part of the engine now -- ALWAYS ON: when\n"
+        "; the WINDOWS DEFAULT render endpoint is (or becomes) one of\n"
+        "; twinspeak's leg devices, that leg's DAC is released so the app\n"
+        "; playing to the default owns the hardware; the leg reopens by\n"
+        "; itself once the default moves elsewhere AND the device is QUIET\n"
+        "; (the log announces both directions -- 'legN YIELD').\n"
         "\n"
         "; WDM-KS OUTPUT BACKEND (v6.3) -- the FlexASIO path, inside twinspeak.\n"
         "; backend1 / backend2 route each leg through Kernel Streaming instead of\n"
@@ -3641,9 +3647,7 @@ static void writeTemplate(const char* path) {
         "; one-shot hint prints the value -- enable Clock Correction for the\n"
         "; cable in the VAC Control Panel and trim it until 'off' reads ~0; a\n"
         "; bit-exact path + a corrected cable clock = a silent path forever.\n"
-        "; clock_sync = off disables BOTH rules (A/B only: shortfall pads\n"
-        "; silence, excess evicts at the ring cap).\n"
-        "clock_sync = on\n"
+        "; v6.6.8: clock_sync is part of the engine now -- ALWAYS ON.\n"
         "\n"
         "; DRIFT WARDEN (v6.4) -- the timestamp system. Every capture burst is\n"
         "; stamped into a frame-interval ledger: each leg tracks the capture\n"
@@ -3675,9 +3679,8 @@ static void writeTemplate(const char* path) {
         ";     the log then proves exactly that.\n"
         ";   * a correction is a skip or a stutter of drift_correct_ms at most\n"
         ";     (rate-limited): that is the price of re-pinning a bit-exact path.\n"
-        "; drift_guard = off keeps the ledger + the drift column but disables\n"
-        "; the automatic re-pin (observe-only).\n"
-        "drift_guard = on\n"
+        "; v6.6.8: drift_guard is part of the engine now -- ALWAYS ON (the\n"
+        "; ledger + the drift column were never optional anyway).\n"
         "drift_correct_ms = 10\n"
         "\n"
         "; drift_interval_ms (v6.5.8, default retuned in v6.5.10): minimum\n"
@@ -3733,7 +3736,7 @@ static void writeTemplate(const char* path) {
         "; whose measured clock offset ('off') leaves +-10%% for 2 s is reopened\n"
         "; fresh -- that catches the degraded sleep-ENTRY window too, which\n"
         "; fires before the suspend broadcast. Every action is logged.\n"
-        "power_guard = on\n"
+        "; v6.6.8: power_guard is part of the engine now -- ALWAYS ON.\n"
         "\n"
         "; CENTER PRESENCE (v6.1) -- out2 plays the center channel ONLY while it\n"
         "; is genuinely present. Two gates, both default ON:\n"
@@ -3751,10 +3754,8 @@ static void writeTemplate(const char* path) {
         ";     center speaker stays on keep-alive only. Genuine 5.1 center is an\n"
         ";     INDEPENDENT track and never matches; it always passes. The health\n"
         ";     line counts guarded blocks ('cm') -- with real 5.1 content it\n"
-        ";     must read 0. Set center_upmix_guard = off only if it ever mutes\n"
-        ";     genuine center dialogue (the log names the fitted gains).\n"
-        "center_gate = on\n"
-        "center_upmix_guard = on\n"
+        ";     must read 0. v6.6.8: center_gate and center_upmix_guard are\n"
+        ";     part of the engine now -- ALWAYS ON.\n"
         "\n"
         "; ROUTING GUARANTEE (zero duplication, by construction):\n"
         ";   out1 gets ONLY ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE)\n"
@@ -3849,10 +3850,16 @@ static bool loadIni(const char* path) {
         else if (key == "ring1_ms")     { g_cfg.ring1Ms = (float)atof(val.c_str()); }
         else if (key == "ring2_ms")     { g_cfg.ring2Ms = (float)atof(val.c_str()); }
         else if (key == "cap_ms")            { g_cfg.capMs = (float)atof(val.c_str()); }
-        else if (key == "capture_exclusive") { g_cfg.captureExclusive = !isOff(val); }
         else if (key == "buffer_size")  { g_cfg.legacyBufferMs = (float)atof(val.c_str()); }
-        else if (key == "exclusive")    { g_cfg.exclusive = !isOff(val); }
-        else if (key == "align_modes")  { g_cfg.alignModes = !isOff(val); }
+        // v6.6.8: ten switches are now part of the engine itself -- always on,
+        // no ini override, no UI pill. Old inis that still carry the keys load
+        // cleanly: the lines are read and deliberately ignored.
+        else if (key == "capture_exclusive" || key == "exclusive" ||
+                 key == "align_modes"       || key == "clock_sync" ||
+                 key == "auto_resync"       || key == "drift_guard" ||
+                 key == "power_guard"       || key == "yield_default" ||
+                 key == "center_gate"       || key == "center_upmix_guard" ||
+                 key == "background") { }
         else if (key == "lfe_fold")     { g_cfg.lfeFold = !isOff(val); }
         else if (key == "input_device")   g_cfg.inputDevice = val;
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
@@ -3865,31 +3872,23 @@ static bool loadIni(const char* path) {
         else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
         else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
         else if (key == "center_eq_q")    g_cfg.centerEqQ    = (float)atof(val.c_str());
-        else if (key == "clock_sync")     g_cfg.clockSync = !isOff(val);
-        else if (key == "auto_resync")    g_cfg.clockSync = !isOff(val);  // v3.7-v5.0 key alias
         else if (key == "delay1_ms")      g_cfg.delay1Ms = (float)atof(val.c_str());
         else if (key == "delay2_ms")      g_cfg.delay2Ms = (float)atof(val.c_str());
-        else if (key == "center_gate")        g_cfg.centerGate      = !isOff(val);
-        else if (key == "center_upmix_guard") g_cfg.centerUpmixGuard = !isOff(val);
         else if (key == "volume_follow")  g_cfg.volumeFollow = !isOff(val);
         else if (key == "pin_outputs")    g_cfg.pinOutputs   = !isOff(val);
         else if (key == "out2_first")     g_cfg.out2First    = !isOff(val);
         else if (key == "volume_endpoint") g_cfg.volumeEndpoint = val;
         else if (key == "keepalive_hz")   g_cfg.keepaliveHz   = (float)atof(val.c_str());
         else if (key == "keepalive_gain") g_cfg.keepaliveGain = (float)atof(val.c_str());
-        else if (key == "background")     g_cfg.background    = !isOff(val);   // v6.2
         else if (key == "chimes")         g_cfg.chimes        = !isOff(val);   // v6.2
         else if (key == "chime_gain")     g_cfg.chimeGain     = (float)atof(val.c_str()); // v6.2
         else if (key == "backend1")       g_cfg.backend1      = lower(val);    // v6.3
         else if (key == "backend2")       g_cfg.backend2      = lower(val);    // v6.3
         else if (key == "ks_period_frames") g_cfg.ksPeriodFrames = (unsigned)atoi(val.c_str()); // v6.3
         else if (key == "ks_periods")      g_cfg.ksPeriods      = (unsigned)atoi(val.c_str()); // v6.3
-        else if (key == "drift_guard")      g_cfg.driftGuard     = !isOff(val);  // v6.4
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
-        else if (key == "yield_default")     g_cfg.yieldDefault    = !isOff(val); // v6.5.14
-        else if (key == "power_guard")      g_cfg.powerGuard     = !isOff(val);  // v6.5.2
     }
     fclose(f);
     cfgSanitize();
@@ -4303,19 +4302,18 @@ enum {
     // page: devices
     IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
-    IDC_TGL_LFEFOLD, IDC_TGL_CAPEXCL, IDC_TGL_EXCLUSIVE, IDC_TGL_ALIGN,
+    IDC_TGL_LFEFOLD,
     // page: timing
     IDC_OUT1MS, IDC_OUT2MS, IDC_CAPMS, IDC_RING1, IDC_RING2,
     IDC_DELAY1, IDC_DELAY2, IDC_TGL_OUT2FIRST, IDC_TGL_PINOUT,
     // page: transport
     IDC_BE1, IDC_BE2, IDC_KSPF, IDC_KSPD,
     // page: sync & power
-    IDC_TGL_CLOCK, IDC_TGL_DRIFTG, IDC_TGL_POWER, IDC_TGL_YIELD,
-    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill on the GUARDS page
+    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (page is OTHER since v6.6.8)
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
     // page: center & volume
-    IDC_TGL_CGATE, IDC_TGL_UPMIX, IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
-    IDC_TGL_BG, IDC_KAHZ, IDC_KAGAIN, IDC_CHIMGAIN,
+    IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
+    IDC_KAHZ, IDC_KAGAIN, IDC_CHIMGAIN,
     // page: center eq
     IDC_TGL_EQ, IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS, IDC_PRE_WARM,
     IDC_PRE_CIN, IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
@@ -4356,7 +4354,7 @@ static void trayRemove();
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
 static const char* kTabNames[6] = {
-    "DEVICES", "TIMING", "TRANSPORT", "SYNC + POWER", "CENTER + VOLUME", "CENTER EQ"
+    "DEVICES", "TIMING", "TRANSPORT", "OTHER", "CENTER + VOLUME", "CENTER EQ"
 };
 
 // v6.6.4: the title bar carries ONLY the close button. No maximize (the
@@ -4537,11 +4535,127 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
     return h;
 }
 
+// ---- v6.6.8: the EQ sliders are owner-drawn ---------------------------------
+// Stock TRACKBAR_CLASSA erased and repainted through the LIGHT theme parts on
+// every pass -- even under DarkMode_Explorer the control flashed white before
+// the dark chrome landed (the parent's RDW_ERASE passes made it visible).
+// Ours never erases (WM_ERASEBKGND -> 1) and paints groove + thumb GDI+
+// opaque on the panel brush: a white frame cannot exist. The mouse drag
+// reports through the SAME WM_HSCROLL the trackbar used, so the parent's
+// handling did not change at all.
+struct Sld { int lo, hi, pos; bool drag; };
+static std::map<HWND, Sld> g_sld;
+
+static int sldGetPos(HWND h) {
+    const auto it = g_sld.find(h);
+    return it != g_sld.end() ? it->second.pos : 0;
+}
+static void sldSetPos(HWND h, int p, bool redraw) {
+    const auto it = g_sld.find(h);
+    if (it == g_sld.end()) return;
+    if (p < it->second.lo) p = it->second.lo;
+    if (p > it->second.hi) p = it->second.hi;
+    it->second.pos = p;
+    if (redraw) InvalidateRect(h, nullptr, FALSE);
+}
+
+static void sldPaint(HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc;
+    GetClientRect(h, &rc);
+    FillRect(dc, &rc, g_brPanel);          // exact opaque pixels FIRST (v6.6.7 rule)
+    const Sld& s = g_sld[h];
+    const int x0 = 10, x1 = rc.right - 10;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const float t  = (s.hi > s.lo) ? (float)(s.pos - s.lo) / (float)(s.hi - s.lo) : 0.0f;
+    const int   tx = x0 + (int)(t * (x1 - x0) + 0.5f);
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    {   // groove: full travel, then the traveled part in accent
+        Gdiplus::GraphicsPath* p = guiRoundPath(Gdiplus::Rect(x0, cy - 3, x1 - x0, 6), 3);
+        Gdiplus::SolidBrush gb(GCol(guic::cLine));
+        g.FillPath(&gb, p);
+        delete p;
+        if (tx > x0) {
+            Gdiplus::GraphicsPath* f = guiRoundPath(Gdiplus::Rect(x0, cy - 3, tx - x0, 6), 3);
+            Gdiplus::SolidBrush fb(GCol(guic::cAccentDk));
+            g.FillPath(&fb, f);
+            delete f;
+        }
+    }
+    {   // thumb: rounded grip, accent border while dragging
+        Gdiplus::GraphicsPath* p = guiRoundPath(Gdiplus::Rect(tx - 7, cy - 11, 14, 22), 6);
+        Gdiplus::SolidBrush fb(GCol(s.drag ? guic::cPanelHi : guic::cPanel2));
+        Gdiplus::Pen        pb(GCol(s.drag ? guic::cAccent : guic::cLine), 1.0f);
+        g.FillPath(&fb, p);
+        g.DrawPath(&pb, p);
+        delete p;
+    }
+    EndPaint(h, &ps);
+}
+
+static void sldUpdateFromX(HWND h, Sld& s, LPARAM lp) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    const int x0 = 10, x1 = rc.right - 10;
+    int x = (short)LOWORD(lp);
+    if (x < x0) x = x0;
+    if (x > x1) x = x1;
+    s.pos = s.lo + (int)((float)(x - x0) * (float)(s.hi - s.lo) / (float)(x1 - x0) + 0.5f);
+    InvalidateRect(h, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    Sld& s = g_sld[h];
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;                      // the white flash cannot exist here
+    case WM_LBUTTONDOWN:
+        SetCapture(h);
+        s.drag = true;
+        sldUpdateFromX(h, s, lp);
+        SendMessageA(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, s.pos), (LPARAM)h);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (s.drag && GetCapture() == h) {
+            sldUpdateFromX(h, s, lp);
+            SendMessageA(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, s.pos), (LPARAM)h);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        s.drag = false;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP:
+        if (s.drag) {
+            s.drag = false;
+            ReleaseCapture();
+            InvalidateRect(h, nullptr, FALSE);
+            SendMessageA(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, s.pos), (LPARAM)h);
+        }
+        return 0;
+    case WM_PAINT:
+        sldPaint(h);
+        return 0;
+    }
+    return DefWindowProcA(h, m, wp, lp);
+}
+
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
-    HWND h = CreateWindowExA(0, TRACKBAR_CLASSA, nullptr,
-        WS_CHILD | WS_VISIBLE | TBS_HORZ, x, y, cw, 28, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
-    SendMessageA(h, TBM_SETRANGE, TRUE, MAKELPARAM(lo, hi));
-    guiDarkCtl(h);
+    static bool sldClass = false;      // registered once
+    if (!sldClass) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc   = sldProc;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = "ts_slider";
+        RegisterClassA(&wc);
+        sldClass = true;
+    }
+    HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE,
+                             x, y, cw, 28, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    g_sld[h] = { lo, hi, lo, false };
+    InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
     regPage(h);
     return h;
 }
@@ -4593,9 +4707,9 @@ static const EqPre kEqPre[5] = {
 
 static void guiUpdateEqLabels(HWND w) {
     char b[96];
-    const int pf = (int)SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_GETPOS, 0, 0);
-    const int pg = (int)SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_GETPOS, 0, 0);
-    const int pq = (int)SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_GETPOS, 0, 0);
+    const int pf = sldGetPos(GetDlgItem(w, IDC_SLD_FREQ));
+    const int pg = sldGetPos(GetDlgItem(w, IDC_SLD_GAIN));
+    const int pq = sldGetPos(GetDlgItem(w, IDC_SLD_Q));
     const float f = posToFreq(pf), g = pg * 0.5f, q = posToQ(pq);
     if (f >= 1000.0f) snprintf(b, sizeof(b), "PEAK FREQUENCY     %.2f kHz", f / 1000.0f);
     else              snprintf(b, sizeof(b), "PEAK FREQUENCY     %.0f Hz", f);
@@ -4608,9 +4722,9 @@ static void guiUpdateEqLabels(HWND w) {
 
 static void guiApplyPreset(HWND w, int i) {
     g_tog[IDC_TGL_EQ] = kEqPre[i].on;
-    SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_SETPOS, TRUE, (LPARAM)freqToPos(kEqPre[i].f));
-    SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_SETPOS, TRUE, (LPARAM)(int)(kEqPre[i].g * 2.0f));
-    SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_SETPOS, TRUE, (LPARAM)qToPos(kEqPre[i].q));
+    sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(kEqPre[i].f), TRUE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(kEqPre[i].g * 2.0f), TRUE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(kEqPre[i].q), TRUE);
     g_eqPreset = i;
     guiUpdateEqLabels(w);
     guiRepaint(w, IDC_TGL_EQ);   // v6.6.1: preset + toggle pills repaint themselves
@@ -4674,22 +4788,12 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "drift_interval_ms") { snprintf(b, 64, "%u", g_cfg.driftIntervalMs); return b; }
     else if (key == "deep_resync_min")   { snprintf(b, 64, "%u", g_cfg.deepResyncMin); return b; }
     else if (key == "buffer_size")       { snprintf(b, 64, "%g", g_cfg.legacyBufferMs); return b; }
-    else if (key == "capture_exclusive") return boolText(g_cfg.captureExclusive);
-    else if (key == "exclusive")         return boolText(g_cfg.exclusive);
-    else if (key == "align_modes")       return boolText(g_cfg.alignModes);
     else if (key == "lfe_fold")          return boolText(g_cfg.lfeFold);
     else if (key == "center_eq")         return boolText(g_cfg.centerEq);
-    else if (key == "clock_sync")        return boolText(g_cfg.clockSync);
-    else if (key == "center_gate")       return boolText(g_cfg.centerGate);
-    else if (key == "center_upmix_guard")return boolText(g_cfg.centerUpmixGuard);
     else if (key == "volume_follow")     return boolText(g_cfg.volumeFollow);
     else if (key == "pin_outputs")       return boolText(g_cfg.pinOutputs);
     else if (key == "out2_first")        return boolText(g_cfg.out2First);
-    else if (key == "background")        return boolText(g_cfg.background);
     else if (key == "chimes")            return boolText(g_cfg.chimes);
-    else if (key == "drift_guard")       return boolText(g_cfg.driftGuard);
-    else if (key == "yield_default")     return boolText(g_cfg.yieldDefault);
-    else if (key == "power_guard")       return boolText(g_cfg.powerGuard);
     else if (key == "input_device")      return g_cfg.inputDevice;
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
@@ -4701,16 +4805,16 @@ static std::string cfgValueText(const std::string& key) {
 
 // every key the window can write, in canonical order (for appending)
 static const char* kIniKeys[] = {
-    "out1ms", "out2ms", "cap_ms", "capture_exclusive", "ring1_ms", "ring2_ms",
-    "delay1_ms", "delay2_ms", "exclusive", "align_modes", "lfe_fold",
+    "out1ms", "out2ms", "cap_ms", "ring1_ms", "ring2_ms",
+    "delay1_ms", "delay2_ms", "lfe_fold",
     "input_device", "output_device1", "output_device2",
     "gain_l", "gain_r", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "volume_follow", "volume_endpoint", "pin_outputs", "out2_first",
-    "keepalive_hz", "keepalive_gain", "chimes", "chime_gain", "background",
-    "yield_default", "backend1", "backend2", "ks_period_frames", "ks_periods",
-    "clock_sync", "drift_guard", "drift_correct_ms", "drift_interval_ms",
-    "deep_resync_min", "center_gate", "center_upmix_guard", "power_guard",
+    "keepalive_hz", "keepalive_gain", "chimes", "chime_gain",
+    "backend1", "backend2", "ks_period_frames", "ks_periods",
+    "drift_correct_ms", "drift_interval_ms",
+    "deep_resync_min",
 };
 
 // v6.6.0: write twinspeak.ini WITHOUT destroying it. Every line that is not a
@@ -4784,9 +4888,8 @@ static void cfgFromControls(HWND w) {
     g_cfg.gainLfe   = editFloat(w, IDC_GAIN_LFE, 0.4f);
     g_cfg.gainCenter= editFloat(w, IDC_GAIN_CTR, 1.0f);
     g_cfg.lfeFold          = g_tog[IDC_TGL_LFEFOLD];
-    g_cfg.captureExclusive = g_tog[IDC_TGL_CAPEXCL];
-    g_cfg.exclusive        = g_tog[IDC_TGL_EXCLUSIVE];
-    g_cfg.alignModes       = g_tog[IDC_TGL_ALIGN];
+    // v6.6.8: captureExclusive / exclusive / alignModes are integrated -- the
+    // struct defaults (all on) are final; no control can change them.
     g_cfg.out1Ms   = editFloat(w, IDC_OUT1MS, 1.0f);
     g_cfg.out2Ms   = editFloat(w, IDC_OUT2MS, 1.0f);
     g_cfg.capMs    = editFloat(w, IDC_CAPMS,  1.0f);
@@ -4800,25 +4903,20 @@ static void cfgFromControls(HWND w) {
     g_cfg.backend2 = editStr(w, IDC_BE2);
     g_cfg.ksPeriodFrames = (unsigned)editFloat(w, IDC_KSPF, 256);
     g_cfg.ksPeriods      = (unsigned)editFloat(w, IDC_KSPD, 3);
-    g_cfg.clockSync   = g_tog[IDC_TGL_CLOCK];
-    g_cfg.driftGuard  = g_tog[IDC_TGL_DRIFTG];
-    g_cfg.powerGuard  = g_tog[IDC_TGL_POWER];
-    g_cfg.yieldDefault= g_tog[IDC_TGL_YIELD];
+    // v6.6.8: clockSync / driftGuard / powerGuard / yieldDefault integrated.
     g_cfg.driftCorrectMs  = editFloat(w, IDC_DCORR, 10.0f);
     g_cfg.driftIntervalMs = (unsigned)editFloat(w, IDC_DINTERVAL, 5000);
     g_cfg.deepResyncMin   = (unsigned)editFloat(w, IDC_DEEPRESYNC, 0);
-    g_cfg.centerGate      = g_tog[IDC_TGL_CGATE];
-    g_cfg.centerUpmixGuard= g_tog[IDC_TGL_UPMIX];
+    // v6.6.8: centerGate / centerUpmixGuard / background integrated.
     g_cfg.volumeFollow    = g_tog[IDC_TGL_VOLFOLLOW];
     g_cfg.chimes          = g_tog[IDC_TGL_CHIMES];
-    g_cfg.background      = g_tog[IDC_TGL_BG];
     g_cfg.keepaliveHz     = editFloat(w, IDC_KAHZ, 40.0f);
     g_cfg.keepaliveGain   = editFloat(w, IDC_KAGAIN, 0.01f);
     g_cfg.chimeGain       = editFloat(w, IDC_CHIMGAIN, 0.4f);
     g_cfg.centerEq       = g_tog[IDC_TGL_EQ];
-    g_cfg.centerEqFreq   = posToFreq((int)SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_GETPOS, 0, 0));
-    g_cfg.centerEqGain   = (int)SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_GETPOS, 0, 0) * 0.5f;
-    g_cfg.centerEqQ      = posToQ((int)SendMessageA(GetDlgItem(w, IDC_SLD_Q), TBM_GETPOS, 0, 0));
+    g_cfg.centerEqFreq   = posToFreq(sldGetPos(GetDlgItem(w, IDC_SLD_FREQ)));
+    g_cfg.centerEqGain   = sldGetPos(GetDlgItem(w, IDC_SLD_GAIN)) * 0.5f;
+    g_cfg.centerEqQ      = posToQ(sldGetPos(GetDlgItem(w, IDC_SLD_Q)));
 }
 
 static void controlsFromCfg(HWND w) {
@@ -4832,9 +4930,6 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.gainLfe);    SetDlgItemTextA(w, IDC_GAIN_LFE, b);
     snprintf(b, 64, "%g", g_cfg.gainCenter); SetDlgItemTextA(w, IDC_GAIN_CTR, b);
     g_tog[IDC_TGL_LFEFOLD]    = g_cfg.lfeFold;
-    g_tog[IDC_TGL_CAPEXCL]    = g_cfg.captureExclusive;
-    g_tog[IDC_TGL_EXCLUSIVE]  = g_cfg.exclusive;
-    g_tog[IDC_TGL_ALIGN]      = g_cfg.alignModes;
     snprintf(b, 64, "%g", g_cfg.out1Ms);  SetDlgItemTextA(w, IDC_OUT1MS, b);
     snprintf(b, 64, "%g", g_cfg.out2Ms);  SetDlgItemTextA(w, IDC_OUT2MS, b);
     snprintf(b, 64, "%g", g_cfg.capMs);   SetDlgItemTextA(w, IDC_CAPMS, b);
@@ -4848,25 +4943,18 @@ static void controlsFromCfg(HWND w) {
     SetDlgItemTextA(w, IDC_BE2, g_cfg.backend2.c_str());
     snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); SetDlgItemTextA(w, IDC_KSPF, b);
     snprintf(b, 64, "%u", g_cfg.ksPeriods);      SetDlgItemTextA(w, IDC_KSPD, b);
-    g_tog[IDC_TGL_CLOCK]  = g_cfg.clockSync;
-    g_tog[IDC_TGL_DRIFTG] = g_cfg.driftGuard;
-    g_tog[IDC_TGL_POWER]  = g_cfg.powerGuard;
-    g_tog[IDC_TGL_YIELD]  = g_cfg.yieldDefault;
     snprintf(b, 64, "%g", g_cfg.driftCorrectMs);   SetDlgItemTextA(w, IDC_DCORR, b);
     snprintf(b, 64, "%u", g_cfg.driftIntervalMs);  SetDlgItemTextA(w, IDC_DINTERVAL, b);
     snprintf(b, 64, "%u", g_cfg.deepResyncMin);    SetDlgItemTextA(w, IDC_DEEPRESYNC, b);
-    g_tog[IDC_TGL_CGATE]      = g_cfg.centerGate;
-    g_tog[IDC_TGL_UPMIX]      = g_cfg.centerUpmixGuard;
     g_tog[IDC_TGL_VOLFOLLOW]  = g_cfg.volumeFollow;
     g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
-    g_tog[IDC_TGL_BG]         = g_cfg.background;
     snprintf(b, 64, "%g", g_cfg.keepaliveHz);    SetDlgItemTextA(w, IDC_KAHZ, b);
     snprintf(b, 64, "%g", g_cfg.keepaliveGain);  SetDlgItemTextA(w, IDC_KAGAIN, b);
     snprintf(b, 64, "%g", g_cfg.chimeGain);      SetDlgItemTextA(w, IDC_CHIMGAIN, b);
     g_tog[IDC_TGL_EQ] = g_cfg.centerEq;
-    SendMessageA(GetDlgItem(w, IDC_SLD_FREQ), TBM_SETPOS, TRUE, (LPARAM)freqToPos(g_cfg.centerEqFreq));
-    SendMessageA(GetDlgItem(w, IDC_SLD_GAIN), TBM_SETPOS, TRUE, (LPARAM)(int)(g_cfg.centerEqGain * 2.0f));
-    SendMessageA(GetDlgItem(w, IDC_SLD_Q),    TBM_SETPOS, TRUE, (LPARAM)qToPos(g_cfg.centerEqQ));
+    sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(g_cfg.centerEqFreq), FALSE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(g_cfg.centerEqGain * 2.0f), FALSE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(g_cfg.centerEqQ), FALSE);
     g_eqPreset = -1;   // custom unless the values match a preset exactly
     for (int i = 0; i < 5; ++i) {
         if (g_cfg.centerEq     == kEqPre[i].on &&
@@ -4992,15 +5080,14 @@ static void guiBuildPages(HWND w) {
          "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
          "leg2 carries ONLY the center channel.\n"
          "volume_endpoint overrides which playback-side slider is the master volume.", 4);
-    header(w, COLB_X, KHDR_Y, "GAINS (on the raw 8ch stream) + PIN MODES");
+    header(w, COLB_X, KHDR_Y, "GAINS (on the raw 8ch stream)");
     row(w, COLB_X, KROW0, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
     row(w, COLB_X, 188, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
     row(w, COLB_X, 222, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 260, "lfe_fold (LFE onto FL/FR)", IDC_TGL_LFEFOLD, g_cfg.lfeFold);
-    tglRow(w, COLB_X, 294, "capture_exclusive", IDC_TGL_CAPEXCL, g_cfg.captureExclusive);
-    tglRow(w, COLB_X, 328, "exclusive (both legs)", IDC_TGL_EXCLUSIVE, g_cfg.exclusive);
-    tglRow(w, COLB_X, 362, "align_modes", IDC_TGL_ALIGN, g_cfg.alignModes);
+    // v6.6.8: capture_exclusive / exclusive / align_modes pills are gone --
+    // the share-mode design is part of the engine now (always on).
 
     // ============ page 1: TIMING ============
     g_tab = 1;
@@ -5039,15 +5126,13 @@ static void guiBuildPages(HWND w) {
          "A driver refusal falls back to WASAPI exclusive automatically and\n"
          "the log says so. twinspeak --list-ks shows every KS filter.", 13);
 
-    // ============ page 3: SYNC + POWER ============
+    // ============ page 3: OTHER ============
     g_tab = 3;
-    header(w, COLA_X, KHDR_Y, "GUARDS");
-    tglRow(w, COLA_X, KROW0, "clock_sync (ASIO replay/drop rules)", IDC_TGL_CLOCK, g_cfg.clockSync);
-    tglRow(w, COLA_X, 154, "drift_guard (auto re-pin)", IDC_TGL_DRIFTG, g_cfg.driftGuard);
-    tglRow(w, COLA_X, 188, "power_guard (sleep survival)", IDC_TGL_POWER, g_cfg.powerGuard);
-    tglRow(w, COLA_X, 222, "yield_default (release a leg that IS the default)", IDC_TGL_YIELD, g_cfg.yieldDefault);
-    tglRow(w, COLA_X, 256, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());   // v6.6.6
-    header(w, COLB_X, KHDR_Y, "DRIFT WARDEN NUMBERS");
+    header(w, COLA_X, KHDR_Y, "OTHER");
+    tglRow(w, COLA_X, KROW0, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());   // v6.6.6
+    // v6.6.8: clock_sync / drift_guard / power_guard / yield_default pills are
+    // gone -- all four guards are part of the engine now (always on).
+    header(w, COLB_X, KHDR_Y, "SYNC");
     row(w, COLB_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
     row(w, COLB_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
@@ -5058,11 +5143,10 @@ static void guiBuildPages(HWND w) {
 
     // ============ page 4: CENTER + VOLUME ============
     g_tab = 4;
-    header(w, COLA_X, KHDR_Y, "CENTER PRESENCE + CUES");
-    tglRow(w, COLA_X, KROW0, "center_gate (ch3 zero -> keep-alive only)", IDC_TGL_CGATE, g_cfg.centerGate);
-    tglRow(w, COLA_X, 154, "center_upmix_guard (stereo-upmix mute)", IDC_TGL_UPMIX, g_cfg.centerUpmixGuard);
-    tglRow(w, COLA_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
-    tglRow(w, COLA_X, 222, "background (console runs only)", IDC_TGL_BG, g_cfg.background);
+    header(w, COLA_X, KHDR_Y, "CENTER CUES");
+    tglRow(w, COLA_X, KROW0, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
+    // v6.6.8: center_gate / center_upmix_guard / background pills are gone --
+    // all three are part of the engine now (always on).
     header(w, COLB_X, KHDR_Y, "VOLUME + LEVELS");
     tglRow(w, COLB_X, KROW0, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
     row(w, COLB_X, 154, "keepalive_hz", IDC_KAHZ, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveHz); return std::string(b); }().c_str());
@@ -5071,8 +5155,8 @@ static void guiBuildPages(HWND w) {
     note(w, COLB_X, 264,
          "The keep-alive tone keeps the center speaker awake; if the S5 still\n"
          "sleeps, raise keepalive_gain to 0.03..0.05 (still inaudible at 40 Hz).\n"
-         "In this window the log lives in the pane below -- background = on\n"
-         "only affects --console runs.", 4);
+         "In this window the log lives in the pane below -- background mode is\n"
+         "built in now (always on) and only shapes --console runs.", 4);
 
     // ============ page 5: CENTER EQ ============
     g_tab = 5;
@@ -5214,12 +5298,10 @@ static void guiRestoreWindow() {
 // ---- the window procedure ---------------------------------------------------
 static bool guiIsToggle(int id) {
     switch (id) {
-        case IDC_TGL_LFEFOLD: case IDC_TGL_CAPEXCL: case IDC_TGL_EXCLUSIVE:
-        case IDC_TGL_ALIGN: case IDC_TGL_OUT2FIRST: case IDC_TGL_PINOUT:
-        case IDC_TGL_CLOCK: case IDC_TGL_DRIFTG: case IDC_TGL_POWER:
-        case IDC_TGL_YIELD: case IDC_TGL_STARTUP:   // v6.6.6: the startup pill
-        case IDC_TGL_CGATE: case IDC_TGL_UPMIX:
-        case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES: case IDC_TGL_BG:
+        case IDC_TGL_LFEFOLD:
+        case IDC_TGL_OUT2FIRST: case IDC_TGL_PINOUT:
+        case IDC_TGL_STARTUP:   // v6.6.6: the startup pill
+        case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES:
         case IDC_TGL_EQ:
             return true;
     }
@@ -5254,7 +5336,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 6, 420, 40 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v6.6.7  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v6.6.8  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 12, 866, 36 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -6153,7 +6235,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v6.6.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v6.6.8        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
