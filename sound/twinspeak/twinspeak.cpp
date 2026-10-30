@@ -1,27 +1,26 @@
 // ============================================================================
-//  twinspeak v7.0.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
-//  v7.0.6 (TRUE GPU + ATOMIC PAGE SWITCH + THE 1PX CLIP, DEAD. (1) The tab
-//          strip renders on a real Direct3D 11 device now: a D2D 1.1 device
-//          context draws the halo/faces/borders as GPU geometry and the
-//          labels as DirectWrite glyphs, and the frame reaches the screen
-//          through a DXGI FLIP-model swap chain Present -- no GDI copy, no
-//          BitBlt, DWM composites the backbuffer directly (bitblt swap
-//          chain and the v7.0.4 GDI+ pass remain as cascading fallbacks;
-//          the chosen path is logged once). (2) Switching tabs no longer
-//          flashes a blank page for a frame: the hide/show passes run with
-//          the frame frozen (SetRedraw) and ONE synchronous RedrawWindow
-//          lands the finished page -- no fade on the content, it shows
-//          immediately; the tab buttons keep their 170 ms fade. (3) The
-//          owner-drawn buttons render into a buffer one pixel wider/taller
-//          than the item rect before the single blit -- the extra column/
-//          row absorbs the border stroke's outer antialiasing half that a
-//          DC-sized surface clipped away, so the bottom/right edges read
-//          full again. (4) CINEMA retired: four EQ presets, uniform,
-//          spanning the sliders' 400 px exactly. (5) The title bar follows
-//          the theme: dark themes keep the dark caption, light themes get
-//          a light one. No engine DSP changed in this version: the audio
-//          path is byte-identical to v7.0.5.)
+//  v7.0.7 (THE TAB STRIP STOPS FIGHTING ITSELF. Field: theme clicks left the
+//          tabbar in the old colors, the tab buttons flickered and the CPU
+//          still worked for its frames. Root: v7.0.6's FLIP-model swap chain
+//          on a CHILD window keeps its front buffer alive at DWM while the
+//          per-paint GDI FillRect kept drawing into the same HWND's
+//          redirection surface -- GDI and flip presentation on one HWND do
+//          not mix, so frames alternated (the flicker), theme repaints lost
+//          to the stale flip frame (the stuck colors) and the churn burned
+//          CPU. v7.0.7: bitblt-model swap chain (DXGI_SWAP_EFFECT_DISCARD)
+//          -- DEFINED GDI interop, no persistent front buffer, still 100%
+//          GPU-rasterized; Present(0,0) so synchronous repaints never block
+//          on vsync; the per-paint GDI fill is a ONE-TIME pre-present cover;
+//          ONE cached brush with SetColor per draw replaces ~16 brush
+//          allocations per frame; the six labels are widened once; per-
+//          primitive antialiasing is explicit; applyTheme invalidates the
+//          strip directly so the tabbar ALWAYS follows the theme; the 250 ms
+//          status setter only touches the STATIC on real text changes. The
+//          D3D11 + D2D 1.1 + DirectWrite stack is untouched. No engine DSP
+//          changed in this version: the audio path is byte-identical to
+//          v7.0.6.)
 //
 //  v7.0.5 (THE STRIP RENDERS ON THE GPU. The tab strip -- halo, faces,
 //          borders -- now draws through Direct2D: a DC render target backed
@@ -1234,7 +1233,8 @@
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
 #include <gdiplus.h>        // v6.6.5: antialiased owner-drawn UI (buttons, text, watermark)
-#include <d2d1_1.h>         // v7.0.6: TRUE GPU strip (D3D11 + DXGI flip swap chain + D2D 1.1)
+#include <d2d1_1.h>         // v7.0.6: TRUE GPU strip (D3D11 + DXGI swap chain + D2D 1.1;
+                            // v7.0.7: bitblt-model presentation, no flip on child windows)
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dwrite.h>         // v7.0.6: GPU glyphs for the strip labels
@@ -3719,7 +3719,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4761,6 +4761,14 @@ static void applyTheme(int i) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
         RedrawWindow(g_hwnd, nullptr, nullptr,
                      RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
+        // v7.0.7: the strip gets its OWN explicit invalidate on top of the
+        // RDW_ALLCHILDREN pass. v7.0.6's field report ("when I click on the
+        // theme button, the tabbar doesn't update its color") came from the
+        // flip chain outvoting the repaint -- with the bitblt chain the
+        // explicit invalidate makes sure the strip's WM_PAINT always runs
+        // and the GPU pass redraws from the LIVE guic:: colors.
+        if (HWND ts = GetDlgItem(g_hwnd, IDC_TABSTRIP))
+            InvalidateRect(ts, nullptr, FALSE);
         guiCaptionTheme(t.bg);      // v7.0.6: the caption follows the theme
     }
 }
@@ -5601,18 +5609,20 @@ static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad
 static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
 static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 
-// ---- v7.0.6: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
+// ---- v7.0.7: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
 // v7.0.5's DC render target still copied through GDI at EndDraw and could
-// silently land on WARP -- "nothing goes to the GPU". Now the strip renders
+// silently land on WARP -- "nothing goes to the GPU". The strip still renders
 // for real: a D3D11 device (hardware first, WARP fallback for RDP/VM), a
 // D2D 1.1 device context drawing the halo/faces/borders as GPU geometry,
-// labels as DirectWrite glyphs ON the GPU, and the frame reaching the
-// screen through a flip-model DXGI swap chain Present -- no GDI copy, no
-// BitBlt; DWM composites the backbuffer directly. Fallbacks cascade:
-// flip rejected -> bitblt swap chain; the whole GPU stack unavailable ->
-// the v7.0.4 GDI+ pass verbatim. The chosen path is logged once. The
-// interface IIDs are spelled out literally -- no __uuidof dependency, every
-// toolchain in build.sh links identically.
+// labels as DirectWrite glyphs ON the GPU -- but v7.0.7 PRESENTS through a
+// bitblt-model swap chain, because v7.0.6's flip model on a CHILD window
+// fought GDI for the same HWND's pixels: the tab buttons flickered, theme
+// repaints lost to the stale flip front buffer and the CPU burned on the
+// churn. Bitblt model: defined GDI interop, GPU-rasterized frame, one GPU
+// blit at Present. The whole GPU stack unavailable -> the v7.0.4 GDI+ pass
+// verbatim. The chosen path is logged once. The interface IIDs are spelled
+// out literally -- no __uuidof dependency, every toolchain in build.sh links
+// identically.
 static ID2D1Factory1*        g_d2dFactory = nullptr;  // lazily created, once
 static ID3D11Device*         g_d3d11      = nullptr;
 static IDXGISwapChain1*      g_swap       = nullptr;
@@ -5621,11 +5631,25 @@ static ID2D1DeviceContext*   g_dctx       = nullptr;
 static ID2D1Bitmap1*         g_target     = nullptr;
 static IDWriteFactory*       g_dwf        = nullptr;
 static IDWriteTextFormat*    g_dwfTab     = nullptr;
+static ID2D1SolidColorBrush* g_d2dBr      = nullptr;  // v7.0.7: ONE cached brush
 static HDC                   g_stripDc    = nullptr;  // GDI+ fallback buffer
 static HBITMAP               g_stripBm    = nullptr;
 static HBITMAP               g_stripBmOld = nullptr;
 static int                   g_stripW = 0, g_stripH = 0;
 static bool                  g_gpuDead = false, g_gpuLogged = false;
+static bool                  g_gpuPainted = false;    // v7.0.7: first-present flag
+static std::wstring          g_tabWide[6];            // v7.0.7: labels widened once
+// v7.0.7: the swap chain is the BITBLT model (DXGI_SWAP_EFFECT_DISCARD), not
+// flip. v7.0.6 proved why on real hardware: a flip-model chain on a CHILD
+// window keeps its front buffer alive at DWM while GDI keeps drawing into the
+// same HWND's redirection surface -- and GDI + flip presentation on one HWND
+// do not mix. Every theme click repainted the strip with GDI-legal frames
+// that the stale flip frame simply outvoted ("tabbar doesn't update its
+// color"), and the two surfaces alternated on screen ("tab buttons
+// flicker") while device-churn + vsync-blocked Presents burned CPU. Bitblt
+// model has DEFINED GDI interop, no persistent front buffer, and still
+// rasterizes 100% on the GPU -- D3D11 geometry + DirectWrite glyphs in VRAM,
+// Present = one GPU blit into DWM's surface.
 static const IID kTSIID_ID2D1Factory1 =
     { 0xbb12d362, 0xdaee, 0x4b9a, { 0xaa, 0x1d, 0x14, 0xba, 0x40, 0x1c, 0xfa, 0x1f } };
 static const IID kTSIID_IDXGIDevice =
@@ -5676,12 +5700,14 @@ static bool guiStripBufEnsure(HWND w, int nw, int nh) {
 }
 
 // the GPU stack, built once: D3D11 -> DXGI device/adapter/factory -> D2D 1.1
-// device context -> swap chain (flip model first, bitblt fallback) ->
-// backbuffer target -> DirectWrite tab format. Any failure tears the stack
-// down, marks g_gpuDead and hands the strip to the GDI+ pass for good.
+// device context -> swap chain (bitblt model, see the g_tabWide block) ->
+// backbuffer target -> cached brush -> DirectWrite tab format. Any failure
+// tears the stack down, marks g_gpuDead and hands the strip to the GDI+
+// pass for good.
 static void guiStripGpuRelease() {
     if (g_target) { g_target->Release(); g_target = nullptr; }
     if (g_dctx)   { g_dctx->Release();   g_dctx   = nullptr; }
+    if (g_d2dBr)  { g_d2dBr->Release();  g_d2dBr  = nullptr; }  // v7.0.7
     if (g_swap)   { g_swap->Release();   g_swap   = nullptr; }
     if (g_dwfTab) { g_dwfTab->Release(); g_dwfTab = nullptr; }
     if (g_d2dDev) { g_d2dDev->Release(); g_d2dDev = nullptr; }
@@ -5726,26 +5752,29 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
               SUCCEEDED(g_d2dFactory->CreateDevice(xd, &g_d2dDev)) &&
               SUCCEEDED(g_d2dDev->CreateDeviceContext(
                   D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_dctx));
-    bool flip = false;
-    if (ok) {
+    if (ok) {   // v7.0.7: the flip variable is gone -- bitblt model only
         g_dctx->SetDpi(96.0f, 96.0f);    // DIPs == pixels: the geometry is authored in px
+        g_dctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);  // v7.0.7: explicit AA
         g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        // v7.0.7: bitblt model, ONE buffer, Present(0,0). See the block
+        // comment at g_tabWide: flip on a child window fought GDI for the
+        // HWND's pixels (flicker, stale theme colors, CPU churn). Bitblt is
+        // the model every child-window D3D surface uses -- deterministic,
+        // GDI-legal, and the rendering itself stays on the GPU.
         DXGI_SWAP_CHAIN_DESC1 sd = {};
         sd.Width      = (UINT)cw;
         sd.Height     = (UINT)ch;
         sd.Format     = DXGI_FORMAT_B8G8R8A8_UNORM;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage    = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount    = 2;
-        sd.SwapEffect     = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;   // true DWM composition
+        sd.BufferCount    = 1;
+        sd.SwapEffect     = DXGI_SWAP_EFFECT_DISCARD;
         hr = xf->CreateSwapChainForHwnd(g_d3d11, w, &sd, nullptr, nullptr, &g_swap);
-        flip = SUCCEEDED(hr);
-        if (!flip) {                     // driver refuses flip on a child window
-            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-            sd.BufferCount = 1;
-            hr = xf->CreateSwapChainForHwnd(g_d3d11, w, &sd, nullptr, nullptr, &g_swap);
-        }
         ok = SUCCEEDED(hr) && g_swap != nullptr;
+    }
+    if (ok && !g_d2dBr) {                // v7.0.7: ONE brush, SetColor per draw
+        ok = SUCCEEDED(g_dctx->CreateSolidColorBrush(
+                D2D1::ColorF(0, 0, 0, 0), &g_d2dBr)) && g_d2dBr != nullptr;
     }
     if (ok) {                            // backbuffer -> D2D target bitmap
         IDXGISurface* s = nullptr;
@@ -5791,8 +5820,8 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
     if (!ok) { guiStripGpuRelease(); g_gpuDead = true; return false; }
     if (!g_gpuLogged) {
         g_gpuLogged = true;
-        tlog("[twinspeak] gui           : tab strip on GPU -- Direct2D 1.1 / DXGI swap chain (%s%s)\n",
-             flip ? "flip model" : "bitblt model", warp ? ", WARP adapter" : "");
+        tlog("[twinspeak] gui           : tab strip on GPU -- Direct2D 1.1 / DXGI swap chain (bitblt model%s)\n",
+             warp ? ", WARP adapter" : "");
     }
     return true;
 }
@@ -5816,16 +5845,23 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int cw = rc.right, ch = rc.bottom;
         if (cw <= 0 || ch <= 0) { EndPaint(w, &ps); return 0; }
         const double fs = guiTabFade();
-        // v7.0.6 GPU PASS: halo, faces and borders as Direct2D 1.1 geometry
+        // v7.0.7 GPU PASS: halo, faces and borders as Direct2D 1.1 geometry
         // and the labels as DirectWrite glyphs, all on the swap chain's
-        // backbuffer -- presented by Present(), never copied by GDI.
+        // backbuffer -- presented by Present(), never copied by GDI. The
+        // per-paint GDI FillRect of v7.0.6 is GONE: once the GPU stack owns
+        // the window, nothing but the swap chain ever draws to it (the
+        // flip-era GDI mixing was the flicker). One one-time fill covers the
+        // pre-first-present frame only.
         bool gpu = guiStripGpuEnsure(w, cw, ch);
+        if (gpu && !g_gpuPainted) {
+            FillRect(dc, &rc, g_brBg);   // exactly once: cover the pre-present frame
+            g_gpuPainted = true;
+        }
         if (gpu) {
-            FillRect(dc, &rc, g_brBg);   // first frame: the redirection surface
-                                         // gets real pixels before any Present
+            #define TSBRCOL(col, a) do { \
+                g_d2dBr->SetColor(D2Col((col), (BYTE)(a))); } while (0)
             g_dctx->BeginDraw();
             g_dctx->Clear(D2Col(guic::cBg, 255));
-            ID2D1SolidColorBrush* br = nullptr;
             {   // THE HALO: three nested bands burning OUTWARD from the
                 // selected tab's face (identical geometry to the GDI+ pass).
                 int fxs = KSTRIP_PAD;
@@ -5840,12 +5876,8 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     const D2D1_ROUNDED_RECT rr = {
                         D2D1_RECT_F{ fx - s, fy - s, fx + fw + s, fy + fh + s },
                         6.0f + s, 6.0f + s };
-                    br = nullptr;
-                    if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
-                            D2Col(guic::cAccent, (BYTE)(al[k] * fs)), &br)) && br) {
-                        g_dctx->DrawRoundedRectangle(rr, br, wd[k]);
-                        br->Release();
-                    }
+                    TSBRCOL(guic::cAccent, al[k] * fs);
+                    g_dctx->DrawRoundedRectangle(rr, g_d2dBr, wd[k]);
                 }
             }
             for (int i = 0, ix = KSTRIP_PAD; i < 6; ix += kTabW[i] + 4, ++i) {
@@ -5856,46 +5888,41 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     D2D1_RECT_F{ (float)ix + 1.0f, (float)KSTRIP_FACE_Y + 1.0f,
                                  (float)ix + kTabW[i] - 1.0f,
                                  (float)KSTRIP_FACE_Y + 22.0f }, 6.0f, 6.0f };
-                br = nullptr;
-                if (act && SUCCEEDED(g_dctx->CreateSolidColorBrush(
-                        D2Col(guic::cPanelHi, (BYTE)(255 * fs)), &br)) && br) {
-                    g_dctx->FillRoundedRectangle(rr, br);
-                    br->Release();
-                }
-                br = nullptr;
-                if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
-                        D2Col(guic::cLine, 255), &br)) && br) {
-                    g_dctx->DrawRoundedRectangle(rr, br, 1.0f);
-                    br->Release();
-                }
                 if (act) {
-                    br = nullptr;
-                    if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
-                            D2Col(guic::cAccent, (BYTE)(255 * fs)), &br)) && br) {
-                        g_dctx->DrawRoundedRectangle(rr, br, 1.0f);
-                        br->Release();
-                    }
+                    TSBRCOL(guic::cPanelHi, 255 * fs);
+                    g_dctx->FillRoundedRectangle(rr, g_d2dBr);
+                }
+                TSBRCOL(guic::cLine, 255);
+                g_dctx->DrawRoundedRectangle(rr, g_d2dBr, 1.0f);
+                if (act) {
+                    TSBRCOL(guic::cAccent, 255 * fs);
+                    g_dctx->DrawRoundedRectangle(rr, g_d2dBr, 1.0f);
                 }
             }
             for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
                 // THE LABELS: DirectWrite glyphs on the GPU. ClearType, same
                 // center/center layout and same color math as the GDI+ pass.
+                // v7.0.7: the wide strings are built once, the brush is the
+                // shared cached one -- zero per-frame allocations.
                 const bool act = (i == g_tab);
-                br = nullptr;
-                if (SUCCEEDED(g_dctx->CreateSolidColorBrush(D2Col(
-                        act ? guiLerpRGB(guic::cDim, guic::cAccent, fs)
-                            : guic::cDim, 255), &br)) && br) {
-                    const std::wstring nm = guiWide(kTabNames[i]);
-                    const D2D1_RECT_F tr = {
-                        (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
-                        (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
-                    g_dctx->DrawText(nm.c_str(), (UINT32)nm.size(), g_dwfTab, tr, br);
-                    br->Release();
-                }
+                if (g_tabWide[i].empty()) g_tabWide[i] = guiWide(kTabNames[i]);
+                TSBRCOL(act ? guiLerpRGB(guic::cDim, guic::cAccent, fs)
+                            : guic::cDim, 255);
+                const D2D1_RECT_F tr = {
+                    (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
+                    (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
+                g_dctx->DrawText(g_tabWide[i].c_str(),
+                                 (UINT32)g_tabWide[i].size(), g_dwfTab, tr, g_d2dBr);
             }
+            #undef TSBRCOL
             const HRESULT ehr = g_dctx->EndDraw(nullptr, nullptr);
             if (SUCCEEDED(ehr)) {
-                g_swap->Present(1, 0);   // vsync -- DWM takes it from here
+                // v7.0.7: Present(0, 0) -- no vsync wait. A UI repaint must
+                // never block: Present(1,0) stalled every synchronous
+                // RedrawWindow (theme click, tab click) for up to a frame
+                // inside the message handler. The DWM composes at its own
+                // rate regardless; the blit is one 830x36 GPU copy.
+                g_swap->Present(0, 0);
             } else {
                 // device lost: tear the stack down; this frame falls through
                 // to the GDI+ pass so the strip never shows garbage, and the
@@ -6181,7 +6208,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 0, 420, 32 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.6  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.7  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 8, 866, 30 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -6553,7 +6580,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             s += eb;
         }
         if (!g_lastHealth.empty()) { s += "   |   "; s += g_lastHealth; }
-        SetDlgItemTextA(w, IDC_STATUS, s.c_str());
+        // v7.0.7: WM_SETTEXT repaints a STATIC even when the text is
+        // identical -- 4 idle repaints a second for nothing. Set only on
+        // change; the task-manager CPU line stays at the engine's floor.
+        static std::string s_lastStatus;
+        if (s != s_lastStatus) {
+            s_lastStatus = s;
+            SetDlgItemTextA(w, IDC_STATUS, s.c_str());
+        }
         return 0; }
     case WM_APP + 2:                                   // engine thread ended
         guiRepaint(w, IDC_START);                      // v6.6.1
@@ -7216,7 +7250,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
