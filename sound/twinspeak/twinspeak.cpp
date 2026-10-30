@@ -1,5 +1,27 @@
 // ============================================================================
-//  twinspeak v7.0.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v7.0.6 (TRUE GPU + ATOMIC PAGE SWITCH + THE 1PX CLIP, DEAD. (1) The tab
+//          strip renders on a real Direct3D 11 device now: a D2D 1.1 device
+//          context draws the halo/faces/borders as GPU geometry and the
+//          labels as DirectWrite glyphs, and the frame reaches the screen
+//          through a DXGI FLIP-model swap chain Present -- no GDI copy, no
+//          BitBlt, DWM composites the backbuffer directly (bitblt swap
+//          chain and the v7.0.4 GDI+ pass remain as cascading fallbacks;
+//          the chosen path is logged once). (2) Switching tabs no longer
+//          flashes a blank page for a frame: the hide/show passes run with
+//          the frame frozen (SetRedraw) and ONE synchronous RedrawWindow
+//          lands the finished page -- no fade on the content, it shows
+//          immediately; the tab buttons keep their 170 ms fade. (3) The
+//          owner-drawn buttons render into a buffer one pixel wider/taller
+//          than the item rect before the single blit -- the extra column/
+//          row absorbs the border stroke's outer antialiasing half that a
+//          DC-sized surface clipped away, so the bottom/right edges read
+//          full again. (4) CINEMA retired: four EQ presets, uniform,
+//          spanning the sliders' 400 px exactly. (5) The title bar follows
+//          the theme: dark themes keep the dark caption, light themes get
+//          a light one. No engine DSP changed in this version: the audio
+//          path is byte-identical to v7.0.5.)
 //
 //  v7.0.5 (THE STRIP RENDERS ON THE GPU. The tab strip -- halo, faces,
 //          borders -- now draws through Direct2D: a DC render target backed
@@ -1212,7 +1234,10 @@
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
 #include <gdiplus.h>        // v6.6.5: antialiased owner-drawn UI (buttons, text, watermark)
-#include <d2d1.h>           // v7.0.5: GPU-rendered tab strip (Direct2D DC render target)
+#include <d2d1_1.h>         // v7.0.6: TRUE GPU strip (D3D11 + DXGI flip swap chain + D2D 1.1)
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dwrite.h>         // v7.0.6: GPU glyphs for the strip labels
 #include <mmsystem.h>
 #include <cstdio>
 #include <cstring>
@@ -3694,7 +3719,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4519,7 +4544,7 @@ static void printLegDevice(int idx) {
 //   * APPLY+RESTART saves the ini and cycles the engine in one click;
 //     SAVE writes twinspeak.ini in place, preserving every comment line
 //     (values are spliced into the existing lines; new keys are appended).
-//   * CENTER EQ presets: FLAT / DIALOGUE / BASS / WARMTH / CINEMA -- one
+//   * CENTER EQ presets: FLAT / DIALOGUE / BASS / WARMTH -- one
 //     click sets the peaking filter (and FLAT turns the EQ off). Moving a
 //     slider by hand marks the section CUSTOM.
 //   * Device pickers are populated by live WASAPI enumeration (the same
@@ -4605,7 +4630,7 @@ enum {
     IDC_KAHZ, IDC_KAGAIN, IDC_CHIMGAIN,
     // page: center eq
     IDC_TGL_EQ, IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS, IDC_PRE_WARM,
-    IDC_PRE_CIN, IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
+    IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
     IDC_LBL_FREQ, IDC_LBL_GAIN, IDC_LBL_Q,
 };
 
@@ -4692,6 +4717,28 @@ static void guiMakeGdi() {
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
 }
 
+// v7.0.6: the title bar follows the theme -- dark themes keep the dark
+// caption (DWMWA_USE_IMMERSIVE_DARK_MODE, 1903 spelling 20 / 1809 spelling
+// 19, best effort), light themes get the light one. The split is the theme
+// background's luminance: <50% = dark. The strip itself already paints from
+// the live theme colors, so bar + caption now move together.
+typedef HRESULT (WINAPI *TS_DWMSET)(HWND, DWORD, LPCVOID, DWORD);
+static void guiCaptionTheme(COLORREF bg) {
+    static TS_DWMSET fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        if (dwm) fn = (TS_DWMSET)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    }
+    if (!fn || !g_hwnd) return;
+    const int lum = 30 * GetRValue(bg) + 59 * GetGValue(bg) + 11 * GetBValue(bg);
+    const BOOL v = (lum < 12800) ? TRUE : FALSE;
+    fn(g_hwnd, 20, &v, sizeof(v));
+    fn(g_hwnd, 19, &v, sizeof(v));
+    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+}
+
 // v7.0.0: live theme switch -- copy the record into the guic:: globals, rebuild
 // the four GDI brushes, repaint the whole frame (children included, erase +
 // paint in one pass -- the v6.6.5 white-frame technique). No restart, no leak:
@@ -4714,6 +4761,7 @@ static void applyTheme(int i) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
         RedrawWindow(g_hwnd, nullptr, nullptr,
                      RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
+        guiCaptionTheme(t.bg);      // v7.0.6: the caption follows the theme
     }
 }
 
@@ -5028,12 +5076,11 @@ static float posToQ(int p) { return (float)(0.1 * pow(100.0, (double)p / 1000.0)
 
 // ---- the built-in presets ---------------------------------------------------
 struct EqPre { const char* name; bool on; float f, g, q; };
-static const EqPre kEqPre[5] = {
+static const EqPre kEqPre[4] = {
     { "FLAT",     false, 1800, 4.0f, 0.8f },   // EQ off -- bit-exact out2
     { "DIALOGUE", true,  1800, 4.0f, 0.8f },   // presence/intelligibility bump
     { "BASS",     true,    90, 6.0f, 0.7f },   // low-end weight on the center
     { "WARMTH",   true,   250, 3.0f, 0.9f },   // chest/vocal body
-    { "CINEMA",   true,  2000, 5.0f, 0.7f },   // bright, forward dialogue
 };
 
 static void guiUpdateEqLabels(HWND w) {
@@ -5289,7 +5336,7 @@ static void controlsFromCfg(HWND w) {
     sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(g_cfg.centerEqGain * 2.0f), FALSE);
     sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(g_cfg.centerEqQ), FALSE);
     g_eqPreset = -1;   // custom unless the values match a preset exactly
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (g_cfg.centerEq     == kEqPre[i].on &&
             fabsf(g_cfg.centerEqFreq - kEqPre[i].f) < 1.0f &&
             fabsf(g_cfg.centerEqGain - kEqPre[i].g) < 0.26f &&
@@ -5498,8 +5545,10 @@ static void guiBuildPages(HWND w) {
     // ============ page 5: CENTER EQ ============
     g_tab = 5;
     tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
-    for (int i = 0; i < 5; ++i)
-        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 82, 148, 78, 26, kEqPre[i].name));
+    // v7.0.6: CINEMA is retired; the four remaining presets are uniform and
+    // span the sliders' 400 px exactly -- 4 x 97 px faces + 3 x 4 px gaps.
+    for (int i = 0; i < 4; ++i)
+        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 101, 148, 97, 26, kEqPre[i].name));
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
@@ -5552,33 +5601,48 @@ static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad
 static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
 static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 
-// ---- v7.0.5: Direct2D -- the strip's animation renders on the GPU -----------
-// The halo bands, faces and borders are GPU geometry now: a DC render target
-// (D2D1_RENDER_TARGET_TYPE_DEFAULT = Direct3D-backed, with an automatic
-// software fallback baked in) draws into the strip's PERSISTENT 32bpp buffer
-// via BindDC, the labels stay GDI+ glyphs on that same buffer, and ONE opaque
-// blit presents everything. Nothing here is allocated per frame in steady
-// state -- a 16 ms fade tick is pure geometry + blit. If D2D cannot start
-// (missing d2d1.dll, exotic session) or EndDraw reports a lost device, the
-// proven GDI+ path below runs untouched: same buffer, same pixels, same
-// blit. The factory IID is spelled out literally -- no __uuidof dependency,
-// every toolchain in build.sh links it the same way.
-static ID2D1Factory*        g_d2dFactory = nullptr;  // lazily created, once
-static ID2D1DCRenderTarget* g_d2dRt      = nullptr;  // GPU (or soft) target
-static HDC                  g_stripDc    = nullptr;  // persistent buffer DC
-static HBITMAP              g_stripBm    = nullptr;  // persistent buffer
-static HBITMAP              g_stripBmOld = nullptr;
-static int                  g_stripW = 0, g_stripH = 0;
-static bool                 g_d2dDead = false;       // D2D failed for good
-static const IID kTSIID_ID2D1Factory =
-    { 0x06152247, 0x6f50, 0x465a, { 0x92, 0x45, 0x11, 0x84, 0xfd, 0x3b, 0x84, 0x38 } };
+// ---- v7.0.6: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
+// v7.0.5's DC render target still copied through GDI at EndDraw and could
+// silently land on WARP -- "nothing goes to the GPU". Now the strip renders
+// for real: a D3D11 device (hardware first, WARP fallback for RDP/VM), a
+// D2D 1.1 device context drawing the halo/faces/borders as GPU geometry,
+// labels as DirectWrite glyphs ON the GPU, and the frame reaching the
+// screen through a flip-model DXGI swap chain Present -- no GDI copy, no
+// BitBlt; DWM composites the backbuffer directly. Fallbacks cascade:
+// flip rejected -> bitblt swap chain; the whole GPU stack unavailable ->
+// the v7.0.4 GDI+ pass verbatim. The chosen path is logged once. The
+// interface IIDs are spelled out literally -- no __uuidof dependency, every
+// toolchain in build.sh links identically.
+static ID2D1Factory1*        g_d2dFactory = nullptr;  // lazily created, once
+static ID3D11Device*         g_d3d11      = nullptr;
+static IDXGISwapChain1*      g_swap       = nullptr;
+static ID2D1Device*          g_d2dDev     = nullptr;
+static ID2D1DeviceContext*   g_dctx       = nullptr;
+static ID2D1Bitmap1*         g_target     = nullptr;
+static IDWriteFactory*       g_dwf        = nullptr;
+static IDWriteTextFormat*    g_dwfTab     = nullptr;
+static HDC                   g_stripDc    = nullptr;  // GDI+ fallback buffer
+static HBITMAP               g_stripBm    = nullptr;
+static HBITMAP               g_stripBmOld = nullptr;
+static int                   g_stripW = 0, g_stripH = 0;
+static bool                  g_gpuDead = false, g_gpuLogged = false;
+static const IID kTSIID_ID2D1Factory1 =
+    { 0xbb12d362, 0xdaee, 0x4b9a, { 0xaa, 0x1d, 0x14, 0xba, 0x40, 0x1c, 0xfa, 0x1f } };
+static const IID kTSIID_IDXGIDevice =
+    { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
+static const IID kTSIID_IDXGIFactory2 =
+    { 0x50c83a1c, 0xe072, 0x4c48, { 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0x46, 0xe2 } };
+static const IID kTSIID_IDXGISurface =
+    { 0xcaf1c7ad, 0xeb31, 0x4269, { 0x92, 0xc5, 0xe4, 0xf4, 0x5b, 0xad, 0x81, 0x55 } };
+static const IID kTSIID_IDWriteFactory =
+    { 0xac338524, 0x30fa, 0x4a5e, { 0x9a, 0x6c, 0x8c, 0xc0, 0x38, 0xf3, 0x58, 0x5b } };
 
 static D2D1_COLOR_F D2Col(COLORREF c, BYTE a) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
                         GetBValue(c) / 255.0f, a / 255.0f);
 }
 
-// the persistent strip buffer: one 32bpp top-down DIB, rebuilt only when the
+// the GDI+ fallback buffer: one 32bpp top-down DIB, rebuilt only when the
 // strip's client size actually changes (it is 830x36 for the app's lifetime).
 static bool guiStripBufEnsure(HWND w, int nw, int nh) {
     if (g_stripDc && nw == g_stripW && nh == g_stripH) return true;
@@ -5611,30 +5675,124 @@ static bool guiStripBufEnsure(HWND w, int nw, int nh) {
     return true;
 }
 
-// the D2D target: factory + DC render target, both lazy and cached. A failure
-// here is permanent (g_d2dDead) -- the GDI+ fallback owns the strip forever.
-static bool guiStripD2dEnsure() {
-    if (g_d2dDead) return false;
+// the GPU stack, built once: D3D11 -> DXGI device/adapter/factory -> D2D 1.1
+// device context -> swap chain (flip model first, bitblt fallback) ->
+// backbuffer target -> DirectWrite tab format. Any failure tears the stack
+// down, marks g_gpuDead and hands the strip to the GDI+ pass for good.
+static void guiStripGpuRelease() {
+    if (g_target) { g_target->Release(); g_target = nullptr; }
+    if (g_dctx)   { g_dctx->Release();   g_dctx   = nullptr; }
+    if (g_swap)   { g_swap->Release();   g_swap   = nullptr; }
+    if (g_dwfTab) { g_dwfTab->Release(); g_dwfTab = nullptr; }
+    if (g_d2dDev) { g_d2dDev->Release(); g_d2dDev = nullptr; }
+    if (g_d3d11)  { g_d3d11->Release();  g_d3d11  = nullptr; }
+}
+
+static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
+    if (g_gpuDead) return false;
+    if (g_dctx) return true;
     if (!g_d2dFactory) {
         D2D1_FACTORY_OPTIONS fo = {};
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                                     kTSIID_ID2D1Factory, &fo,
+                                     kTSIID_ID2D1Factory1, &fo,
                                      (void**)&g_d2dFactory))) {
             g_d2dFactory = nullptr;
-            g_d2dDead = true;
+            g_gpuDead = true;
             return false;
         }
     }
-    if (!g_d2dRt) {
-        const D2D1_RENDER_TARGET_PROPERTIES p =
-            D2D1::RenderTargetProperties(
-                D2D1_RENDER_TARGET_TYPE_DEFAULT,          // GPU first
+    UINT dfl = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    const D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_1,
+                                      D3D_FEATURE_LEVEL_11_0,
+                                      D3D_FEATURE_LEVEL_10_1 };
+    D3D_FEATURE_LEVEL flGot = D3D_FEATURE_LEVEL_9_1;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, dfl,
+                                   fls, 3, D3D11_SDK_VERSION,
+                                   &g_d3d11, &flGot, nullptr);
+    bool warp = false;
+    if (FAILED(hr)) {                    // no hardware D3D (VM / RDP session)
+        warp = true;
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, dfl,
+                               fls, 3, D3D11_SDK_VERSION,
+                               &g_d3d11, &flGot, nullptr);
+    }
+    if (FAILED(hr)) { guiStripGpuRelease(); g_gpuDead = true; return false; }
+    IDXGIDevice*  xd = nullptr;
+    IDXGIAdapter* xa = nullptr;
+    IDXGIFactory2* xf = nullptr;
+    bool ok = SUCCEEDED(g_d3d11->QueryInterface(kTSIID_IDXGIDevice, (void**)&xd)) &&
+              xd && SUCCEEDED(xd->GetAdapter(&xa)) && xa &&
+              SUCCEEDED(xa->GetParent(kTSIID_IDXGIFactory2, (void**)&xf)) && xf &&
+              SUCCEEDED(g_d2dFactory->CreateDevice(xd, &g_d2dDev)) &&
+              SUCCEEDED(g_d2dDev->CreateDeviceContext(
+                  D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_dctx));
+    bool flip = false;
+    if (ok) {
+        g_dctx->SetDpi(96.0f, 96.0f);    // DIPs == pixels: the geometry is authored in px
+        g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        DXGI_SWAP_CHAIN_DESC1 sd = {};
+        sd.Width      = (UINT)cw;
+        sd.Height     = (UINT)ch;
+        sd.Format     = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage    = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount    = 2;
+        sd.SwapEffect     = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;   // true DWM composition
+        hr = xf->CreateSwapChainForHwnd(g_d3d11, w, &sd, nullptr, nullptr, &g_swap);
+        flip = SUCCEEDED(hr);
+        if (!flip) {                     // driver refuses flip on a child window
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            sd.BufferCount = 1;
+            hr = xf->CreateSwapChainForHwnd(g_d3d11, w, &sd, nullptr, nullptr, &g_swap);
+        }
+        ok = SUCCEEDED(hr) && g_swap != nullptr;
+    }
+    if (ok) {                            // backbuffer -> D2D target bitmap
+        IDXGISurface* s = nullptr;
+        if (SUCCEEDED(g_swap->GetBuffer(0, kTSIID_IDXGISurface, (void**)&s)) && s) {
+            const D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                                   D2D1_ALPHA_MODE_PREMULTIPLIED));
-        if (FAILED(g_d2dFactory->CreateDCRenderTarget(&p, &g_d2dRt))) {
-            g_d2dRt = nullptr;
-            return false;
-        }
+            ok = SUCCEEDED(g_dctx->CreateBitmapFromDxgiSurface(s, &bp, &g_target));
+            s->Release();
+            if (ok) g_dctx->SetTarget(g_target);
+        } else ok = false;
+    }
+    if (ok && !g_dwfTab) {               // DirectWrite: Segoe UI Semibold in
+        if (SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,   // GDI px semantics
+                                          kTSIID_IDWriteFactory, (IUnknown**)&g_dwf))) {
+            HDC sdc = GetDC(nullptr);
+            const int dpi = GetDeviceCaps(sdc, LOGPIXELSY);
+            ReleaseDC(nullptr, sdc);
+            const float px = 13.0f * 96.0f / (float)(dpi > 0 ? dpi : 96);
+            ok = SUCCEEDED(g_dwf->CreateTextFormat(
+                    L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    px, L"", &g_dwfTab));
+            if (ok) {
+                g_dwfTab->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                g_dwfTab->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                g_dwfTab->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                const DWRITE_TRIMMING tr = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+                IDWriteInlineObject* sign = nullptr;
+                if (SUCCEEDED(g_dwf->CreateEllipsisTrimmingSign(g_dwfTab, &sign)) && sign) {
+                    g_dwfTab->SetTrimming(&tr, sign);
+                    sign->Release();
+                } else {
+                    g_dwfTab->SetTrimming(&tr, nullptr);
+                }
+            }
+        } else ok = false;
+    }
+    if (xa) xa->Release();
+    if (xf) xf->Release();
+    if (xd) xd->Release();
+    if (!ok) { guiStripGpuRelease(); g_gpuDead = true; return false; }
+    if (!g_gpuLogged) {
+        g_gpuLogged = true;
+        tlog("[twinspeak] gui           : tab strip on GPU -- Direct2D 1.1 / DXGI swap chain (%s%s)\n",
+             flip ? "flip model" : "bitblt model", warp ? ", WARP adapter" : "");
     }
     return true;
 }
@@ -5656,26 +5814,20 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         HDC dc = BeginPaint(w, &ps);
         RECT rc; GetClientRect(w, &rc);
         const int cw = rc.right, ch = rc.bottom;
-        if (cw <= 0 || ch <= 0 || !guiStripBufEnsure(w, cw, ch)) {
-            EndPaint(w, &ps);
-            return 0;
-        }
-        HDC buf = g_stripDc;
+        if (cw <= 0 || ch <= 0) { EndPaint(w, &ps); return 0; }
         const double fs = guiTabFade();
-        // v7.0.5 GPU PASS: halo, faces and borders as Direct2D rounded rects
-        // on the persistent buffer. Same geometry, same alphas, same order
-        // as the GDI+ pass below -- the eye sees one image either way.
-        bool gpu = guiStripD2dEnsure();
+        // v7.0.6 GPU PASS: halo, faces and borders as Direct2D 1.1 geometry
+        // and the labels as DirectWrite glyphs, all on the swap chain's
+        // backbuffer -- presented by Present(), never copied by GDI.
+        bool gpu = guiStripGpuEnsure(w, cw, ch);
         if (gpu) {
-            GdiFlush();
-            gpu = SUCCEEDED(g_d2dRt->BindDC(buf, &rc));
-        }
-        if (gpu) {
-            g_d2dRt->BeginDraw();
-            g_d2dRt->Clear(D2Col(guic::cBg, 255));
+            FillRect(dc, &rc, g_brBg);   // first frame: the redirection surface
+                                         // gets real pixels before any Present
+            g_dctx->BeginDraw();
+            g_dctx->Clear(D2Col(guic::cBg, 255));
             ID2D1SolidColorBrush* br = nullptr;
             {   // THE HALO: three nested bands burning OUTWARD from the
-                // selected tab's face (identical to the GDI+ bands).
+                // selected tab's face (identical geometry to the GDI+ pass).
                 int fxs = KSTRIP_PAD;
                 for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
                 const float fx = (float)fxs, fy = (float)KSTRIP_FACE_Y;
@@ -5689,49 +5841,72 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                         D2D1_RECT_F{ fx - s, fy - s, fx + fw + s, fy + fh + s },
                         6.0f + s, 6.0f + s };
                     br = nullptr;
-                    if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                    if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
                             D2Col(guic::cAccent, (BYTE)(al[k] * fs)), &br)) && br) {
-                        g_d2dRt->DrawRoundedRectangle(rr, br, wd[k]);
+                        g_dctx->DrawRoundedRectangle(rr, br, wd[k]);
                         br->Release();
                     }
                 }
             }
             for (int i = 0, ix = KSTRIP_PAD; i < 6; ix += kTabW[i] + 4, ++i) {
                 const bool act = (i == g_tab);
-                // the face path is the 1 px inset rounded rect (guiRoundPath
+                // the face rect is the 1 px inset rounded rect (guiRoundPath
                 // convention) -- the centered stroke stays fully inside.
                 const D2D1_ROUNDED_RECT rr = {
                     D2D1_RECT_F{ (float)ix + 1.0f, (float)KSTRIP_FACE_Y + 1.0f,
                                  (float)ix + kTabW[i] - 1.0f,
                                  (float)KSTRIP_FACE_Y + 22.0f }, 6.0f, 6.0f };
                 br = nullptr;
-                if (act && SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                if (act && SUCCEEDED(g_dctx->CreateSolidColorBrush(
                         D2Col(guic::cPanelHi, (BYTE)(255 * fs)), &br)) && br) {
-                    g_d2dRt->FillRoundedRectangle(rr, br);
+                    g_dctx->FillRoundedRectangle(rr, br);
                     br->Release();
                 }
                 br = nullptr;
-                if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
                         D2Col(guic::cLine, 255), &br)) && br) {
-                    g_d2dRt->DrawRoundedRectangle(rr, br, 1.0f);
+                    g_dctx->DrawRoundedRectangle(rr, br, 1.0f);
                     br->Release();
                 }
                 if (act) {
                     br = nullptr;
-                    if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                    if (SUCCEEDED(g_dctx->CreateSolidColorBrush(
                             D2Col(guic::cAccent, (BYTE)(255 * fs)), &br)) && br) {
-                        g_d2dRt->DrawRoundedRectangle(rr, br, 1.0f);
+                        g_dctx->DrawRoundedRectangle(rr, br, 1.0f);
                         br->Release();
                     }
                 }
             }
-            gpu = SUCCEEDED(g_d2dRt->EndDraw(nullptr, nullptr));
-            if (!gpu) {                    // device lost: rebuild on next paint
-                g_d2dRt->Release();
-                g_d2dRt = nullptr;
+            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+                // THE LABELS: DirectWrite glyphs on the GPU. ClearType, same
+                // center/center layout and same color math as the GDI+ pass.
+                const bool act = (i == g_tab);
+                br = nullptr;
+                if (SUCCEEDED(g_dctx->CreateSolidColorBrush(D2Col(
+                        act ? guiLerpRGB(guic::cDim, guic::cAccent, fs)
+                            : guic::cDim, 255), &br)) && br) {
+                    const std::wstring nm = guiWide(kTabNames[i]);
+                    const D2D1_RECT_F tr = {
+                        (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
+                        (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
+                    g_dctx->DrawText(nm.c_str(), (UINT32)nm.size(), g_dwfTab, tr, br);
+                    br->Release();
+                }
+            }
+            const HRESULT ehr = g_dctx->EndDraw(nullptr, nullptr);
+            if (SUCCEEDED(ehr)) {
+                g_swap->Present(1, 0);   // vsync -- DWM takes it from here
+            } else {
+                // device lost: tear the stack down; this frame falls through
+                // to the GDI+ pass so the strip never shows garbage, and the
+                // next paint rebuilds the GPU stack.
+                gpu = false;
+                guiStripGpuRelease();
             }
         }
         if (!gpu) {   // v6.6.5/7.0.4 LEGACY PASS: identical pixels, software
+            if (!guiStripBufEnsure(w, cw, ch)) { EndPaint(w, &ps); return 0; }
+            HDC buf = g_stripDc;
             FillRect(buf, &rc, g_brBg);
             Gdiplus::Graphics g(buf);
             g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -5768,23 +5943,13 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g.DrawPath(&ab, p);
                 }
                 delete p;
-            }
-        }
-        // THE LABELS: GDI+ glyphs on the same buffer for BOTH paths (font,
-        // hinting and color math are byte-identical to v7.0.4).
-        {
-            Gdiplus::Graphics g(buf);
-            g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
-                const bool act = (i == g_tab);
                 const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
                 guiAAString(g, buf, trc, kTabNames[i],
                             act ? guiLerpRGB(guic::cDim, guic::cAccent, fs) : guic::cDim,
                             g_fUIb, 0);
             }
+            BitBlt(dc, 0, 0, cw, ch, buf, 0, 0, SRCCOPY);
         }
-        // ONE buffer, ONE blit -- unchanged since v7.0.4.
-        BitBlt(dc, 0, 0, cw, ch, buf, 0, 0, SRCCOPY);
         EndPaint(w, &ps);
         return 0; }
     }
@@ -5834,14 +5999,23 @@ static void guiBuildControls(HWND w) {
 }
 
 static void guiShowPage(HWND w, int p) {
+    // v7.0.6: the page switch is ATOMIC. The old hide-then-show let the
+    // exposed parent rects hit the screen between the two ShowWindow passes
+    // -- one frame of blank background before the new page's children
+    // painted ("flashes blank until the next frame"). WM_SETREDRAW freezes the
+    // frame through both passes, and ONE synchronous RedrawWindow walks
+    // parent + children afterwards -- the screen only ever shows the
+    // finished page, immediately, with NO fade on the content (the tab
+    // buttons keep theirs; that is the animation the user wants).
+    SendMessageA(w, WM_SETREDRAW, FALSE, 0);   // v7.0.6: freeze (no MFC SetRedraw in Win32)
     for (int i = 0; i < 6; ++i)
         for (size_t k = 0; k < g_pageHw[i].size(); ++k)
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
+    SendMessageA(w, WM_SETREDRAW, TRUE, 0);
     g_tab = p;
-    // v7.0.4: the selected tab FADES IN, and ONLY the strip repaints. The
-    // frame is never invalidated for a tab change anymore -- nothing on it
-    // depends on g_tab (the halo lives in the strip's own buffer), so nothing
-    // else on the window can flicker during the animation.
+    RedrawWindow(w, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    // v7.0.4/v7.0.5: the selected tab FADES IN, and ONLY the strip animates.
     g_tabAnimStart = GetTickCount64();
     // v7.0.5: 1 ms system timer resolution for the life of the animation. A
     // 16 ms WM_TIMER otherwise lands on the ~15.6 ms default tick and the
@@ -5861,9 +6035,41 @@ static void guiRepaint(HWND w, int id) {
     if (HWND h = GetDlgItem(w, id)) InvalidateRect(h, nullptr, TRUE);
 }
 static void guiRepaintPresets(HWND w) {
-    static const int ids[5] = { IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS,
-                                IDC_PRE_WARM, IDC_PRE_CIN };
-    for (int i = 0; i < 5; ++i) guiRepaint(w, ids[i]);
+    static const int ids[4] = { IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS,
+                                IDC_PRE_WARM };
+    for (int i = 0; i < 4; ++i) guiRepaint(w, ids[i]);
+}
+
+// ---- v7.0.6: the button render buffer (THE 1PX CLIP FIX) --------------------
+// One shared memory surface, grown to the largest button seen. Every owner-
+// drawn button paints into it with one spare pixel column on the right and
+// one spare row at the bottom -- the gutter absorbs the border stroke's
+// outer antialiasing half that a DC-sized surface clipped away (the "clipped
+// by exactly 1 px on the bottom right" report) -- and the finished face
+// lands on the screen as ONE opaque blit cropped to the item rect.
+static HDC     g_btnDc    = nullptr;
+static HBITMAP g_btnBm    = nullptr, g_btnBmOld = nullptr;
+static int     g_btnW = 0, g_btnH = 0;
+static HDC guiBtnBufEnsure(int w, int h) {
+    if (g_btnDc && w + 1 <= g_btnW && h + 1 <= g_btnH) return g_btnDc;
+    if (g_btnBmOld) {
+        SelectObject(g_btnDc, g_btnBmOld);
+        DeleteObject(g_btnBm);
+        g_btnBm = nullptr; g_btnBmOld = nullptr;
+    }
+    if (g_btnDc) { DeleteDC(g_btnDc); g_btnDc = nullptr; }
+    HDC sdc = GetDC(nullptr);
+    g_btnDc = CreateCompatibleDC(sdc);
+    g_btnBm = CreateCompatibleBitmap(sdc, w + 1, h + 1);   // the +1: the AA gutter
+    ReleaseDC(nullptr, sdc);
+    if (!g_btnDc || !g_btnBm) {
+        if (g_btnDc) { DeleteDC(g_btnDc); g_btnDc = nullptr; }
+        if (g_btnBm) { DeleteObject(g_btnBm); g_btnBm = nullptr; }
+        return nullptr;
+    }
+    g_btnBmOld = (HBITMAP)SelectObject(g_btnDc, g_btnBm);
+    g_btnW = w + 1; g_btnH = h + 1;
+    return g_btnDc;
 }
 
 // ---- v6.6.1: "Run at Windows startup" (HKCU Run key, no shell:startup hack)
@@ -5975,7 +6181,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 0, 420, 32 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.5  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.6  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 8, 866, 30 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -6059,9 +6265,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // resting faces are TRANSPARENT -- the surface shows through, only
         // border + text paint; fills remain for pressed feedback and state.
         const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
-        HDC dc = d->hDC;
         const RECT rc = d->rcItem;
         const int id = (int)d->CtlID;
+        // v7.0.6 THE 1PX CLIP FIX: the button paints into the shared buffer
+        // (one spare column/row on the right/bottom -- see guiBtnBufEnsure)
+        // and lands as ONE blit cropped to the item rect. Borders are full
+        // on all four sides again; if the buffer cannot be had, dc falls
+        // back to the item DC and paints the old (clipped) way.
+        const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
+        HDC dc = guiBtnBufEnsure(bw, bh);
+        if (!dc) dc = d->hDC;
         char txt[128];
         GetWindowTextA(d->hwndItem, txt, sizeof(txt));
         const bool pressed = (d->itemState & ODS_SELECTED) != 0;
@@ -6102,6 +6315,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // every theme; ON keeps the accent.
             guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cText,
                         g_fUIb, 0);
+            if (dc != d->hDC)
+                BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
             return TRUE;
         }
         if (id == IDC_START) {
@@ -6129,10 +6344,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 guiAAString(g, dc, rc, st == 1 ? "STOP" : "STOPPING...", guic::cDim,
                             g_fUIb, 0);
             }
+            if (dc != d->hDC)
+                BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
             return TRUE;
         }
         bool accentBtn = false;
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 4; ++i)
             if (id == IDC_PRE_FLAT + i) accentBtn = (g_eqPreset == i);
         // v7.0.0 polish: resting faces are TRANSPARENT -- border + text over
         // the erased surface. Fills survive only where they mean something:
@@ -6149,6 +6366,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.DrawPath(&pb, p);
         delete p;
         guiAAString(g, dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb, 0);
+        if (dc != d->hDC)
+            BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
@@ -6251,7 +6470,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             case IDC_PRE_DLG:   guiApplyPreset(w, 1); return 0;
             case IDC_PRE_BASS:  guiApplyPreset(w, 2); return 0;
             case IDC_PRE_WARM:  guiApplyPreset(w, 3); return 0;
-            case IDC_PRE_CIN:   guiApplyPreset(w, 4); return 0;
         }
         break; }
     case WM_HSCROLL: {
@@ -6447,14 +6665,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) { if (mutex) CloseHandle(mutex); return 1; }
-    {   // dark title bar (1809+), best effort
-        HMODULE dw = LoadLibraryA("dwmapi.dll");
-        if (dw) {
-            typedef HRESULT (WINAPI *DSWAFN)(HWND, DWORD, LPCVOID, DWORD);
-            DSWAFN d = (DSWAFN)GetProcAddress(dw, "DwmSetWindowAttribute");
-            if (d) { BOOL t = TRUE; d(g_hwnd, 20, &t, sizeof(t)); }
-        }
-    }
+    guiCaptionTheme(kThemes[g_theme].bg);   // v7.0.6: the caption follows the ini's theme
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
@@ -7005,7 +7216,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.5        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
