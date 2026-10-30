@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,13 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.3  the titlebar is GDI+: ONE Gdiplus::Graphics paints the whole
+//            bar -- the face is a subtle top-lit vertical gradient of the
+//            theme bg, the bottom edge + close hover face + Marlett X are
+//            GDI+ fills with grayscale AA, the glyph brightens to the
+//            accent on hover, and "TwinSpeak" keeps its blue->teal
+//            gradient but LIFTED (the very-dark-blue top stop vanished
+//            against the dark themes). DSP byte-identical to v7.1.2.
 //    v7.1.2  tab labels SMOOTH: the label layer + both strip passes render
 //            grayscale-antialiased (AntiAliasGridFit; the DirectWrite
 //            fallback went GRAYSCALE) -- soft like the buttons, still
@@ -2497,7 +2504,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3475,43 +3482,74 @@ static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
 }
 // Paints the bar straight to the screen with GetWindowDC -- usable from any
 // context (theme click, WM_NCPAINT, hover), never needs an invalidate.
+// v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
+// let one GDI+ guest draw the title; v7.1.3 hands every pixel to a SINGLE
+// Gdiplus::Graphics -- the face is a subtle top-lit vertical gradient (the
+// theme bg lifted toward white, melting back down to cBg by the bottom
+// edge), the 1px bottom edge, the close hover face and the Marlett X are
+// GDI+ fills, all text renders AntiAliasGridFit (grayscale AA, same family
+// as the buttons since v7.1.2), and the close glyph brightens to the theme
+// accent while hovered.
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
     HDC dc = GetWindowDC(w);
     RECT wr; GetWindowRect(w, &wr);
     const int ww = wr.right - wr.left;
-    const RECT bar = { 0, 0, ww, kCapH };
-    FillRect(dc, &bar, g_brBg);
-    const RECT ln = { 0, kCapH - 1, ww, kCapH };          // 1px bottom edge: chrome, not dead space
-    FillRect(dc, &ln, g_brPanel2);
+    const Gdiplus::RectF bar(0.0f, 0.0f, (Gdiplus::REAL)ww, (Gdiplus::REAL)kCapH);
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    // the face: the theme bg with a light touch at the top -- depth without
+    // inventing a color the theme does not own (guiLerpRGB toward white).
+    const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), 0.07);
+    Gdiplus::LinearGradientBrush face(
+        bar, Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
+             Gdiplus::Color(255, GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg)),
+        Gdiplus::LinearGradientModeVertical);
+    g.FillRectangle(&face, bar);
+    // 1px bottom edge: chrome, not dead space (same cPanel2 as v7.0.9).
+    const Gdiplus::RectF ln(0.0f, (Gdiplus::REAL)(kCapH - 1), (Gdiplus::REAL)ww, 1.0f);
+    Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
+                                             GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
+    g.FillRectangle(&edge, ln);
+    // the close slot: hover face + the Marlett glyph, both GDI+ now -- the
+    // glyph is grayscale-antialiased (smooth like every other glyph in the
+    // app) and warms to the theme accent under the mouse.
     const RECT cl = guiCapCloseRect(w);
-    if (g_capHot) { RECT hf = cl; FillRect(dc, &hf, g_brPanel2); }
-    // v7.1.0 THE BAR'S TITLE: "TwinSpeak" on the left, filled with a TRUE
-    // vertical linear gradient -- very dark blue (top) -> teal (bottom) --
-    // same LinearGradientBrush technique as the watermark. GDI+ on the
-    // window DC; antialias grid-fit keeps the glyphs clean at 14 px.
+    const Gdiplus::RectF cx((Gdiplus::REAL)cl.left, (Gdiplus::REAL)cl.top,
+                            (Gdiplus::REAL)(cl.right - cl.left), (Gdiplus::REAL)(cl.bottom - cl.top));
+    if (g_capHot) {
+        Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
+                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
+        g.FillRectangle(&hf, cx);
+    }
+    if (g_fCapX) {
+        Gdiplus::Font xf(dc, g_fCapX);
+        const COLORREF xcol = g_capHot ? guic::cAccent : guic::cText;
+        Gdiplus::SolidBrush xb(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)));
+        Gdiplus::StringFormat sx;
+        sx.SetAlignment(Gdiplus::StringAlignmentCenter);
+        sx.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        sx.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        g.DrawString(L"r", 1, &xf, cx, &sx, &xb);   // Marlett 'r' = the close X
+    }
+    // v7.1.0/v7.1.3 THE BAR'S TITLE: "TwinSpeak" on the left, filled with a
+    // TRUE vertical linear gradient. The v7.1.0 stops were too dark for the
+    // dark themes -- the very-dark-blue top stop (8,16,54) read as BLACK and
+    // the top half of the glyphs vanished (field: "I don't see the brighter
+    // titlebar text"). Lifted: clear blue top -> bright teal bottom.
     if (g_fTitle) {
-        Gdiplus::Graphics g(dc);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         Gdiplus::Font tf(dc, g_fTitle);
         const Gdiplus::RectF tr(12.0f, 3.0f, 220.0f, (Gdiplus::REAL)(kCapH - 7));
-        // the gradient spans the text line itself: very dark blue top,
-        // teal bottom. Left-aligned, vertically centered in the bar.
         Gdiplus::LinearGradientBrush gb(
-            tr, Gdiplus::Color(255, 8, 16, 54),    // very dark blue, top
-                Gdiplus::Color(255, 0, 130, 130),  // teal, bottom
+            tr, Gdiplus::Color(255, 52, 100, 215),   // clear blue, top (was 8,16,54 -- invisible)
+                Gdiplus::Color(255, 0, 190, 195),    // bright teal, bottom
             Gdiplus::LinearGradientModeVertical);
         Gdiplus::StringFormat sf;
         sf.SetAlignment(Gdiplus::StringAlignmentNear);
         sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
         g.DrawString(kCapTitle, -1, &tf, tr, &sf, &gb);
-    }
-    if (g_fCapX) {
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, guic::cText);
-        SelectObject(dc, g_fCapX);
-        DrawTextA(dc, "r", 1, (RECT*)&cl, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
     ReleaseDC(w, dc);
 }
@@ -5066,7 +5104,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.2  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.3  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     guiWatermark(g);
@@ -6210,7 +6248,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.3        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
