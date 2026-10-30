@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,15 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.9  SAVE BUTTON + TAB WIDTH TRIM: the EQ slots keep left-click =
+//            apply, but the save path leaves the hidden right-click -- a
+//            SAVE TO SLOT button sits on the CENTER EQ page: click a slot
+//            to arm it (the face stays accented while you tweak), adjust
+//            the sliders, press the button and the curve + the EQ pill
+//            land in the armed slot, ini spliced at once; right-click
+//            still saves for the fast path. The tab faces come back to
+//            +4 px (160 -> 164) -- 168 overflowed the strip's right pad.
+//            DSP byte-identical to v7.1.4.
 //    v7.1.8  TITLEBAR FLICKER GONE + THE X IS BACK + MORE THEMES + EQ SLOTS:
 //            the bar renders into a memory buffer and lands as ONE blit --
 //            no intermediate state for DWM to sample, so the title text and
@@ -34,8 +43,8 @@
 //            become FIVE USER SAVE SLOTS -- left-click applies, right-click
 //            saves the sliders + pill into the slot and splices the ini
 //            (eq_slotN_on/freq/gain/q), slot 1 ships reserved with 387 Hz /
-//            +3.5 dB / Q 0.30; the tab faces widen +8 px (160 -> 168) to
-//            fill more of the strip. DSP byte-identical to v7.1.4.
+//            +3.5 dB / Q 0.30; the tab faces widen (160 -> 168) to fill
+//            more of the strip. DSP byte-identical to v7.1.4.
 //    v7.1.7  UI RESTRUCTURE, the field's wordlist: FIVE tabs (DEVICES |
 //            TIMING | TRANSPORT | SETTINGS | CENTER EQ) -- OTHER merged
 //            away, its startup pill and its SYNC column (drift trio) now
@@ -2612,7 +2621,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2702,9 +2711,11 @@ static void writeTemplate(const char* path) {
         "center_eq_freq = 1800\n"
         "center_eq_gain = 4.0\n"
         "center_eq_q = 0.8\n"
-        "; v7.1.8 EQ SAVE SLOTS: five user slots replace the old built-in\n"
-        "; presets. Left-click a slot applies it; right-click saves the\n"
-        "; current sliders + the EQ pill into it (and splices this file).\n"
+        "; v7.1.9 EQ SAVE SLOTS: five user slots replace the old built-in\n"
+        "; presets. Left-click a slot applies it AND arms it; adjust the\n"
+        "; sliders, press SAVE TO SLOT on the CENTER EQ page and the curve\n"
+        "; + the EQ pill land in the armed slot (right-click a slot saves\n"
+        "; straight into it) -- either way this file is spliced at once.\n"
         "; Slot 1 ships reserved with the dialogue curve below; a freq of 0\n"
         "; marks an empty slot.\n"
         "eq_slot1_on = on\n"
@@ -3552,6 +3563,7 @@ enum {
     IDC_TGL_EQ,
     IDC_SLOT1, IDC_SLOT2, IDC_SLOT3, IDC_SLOT4, IDC_SLOT5,   // v7.1.8: save slots
                                                              // (IDC_PRE_FLAT..IDC_PRE_WARM retired)
+    IDC_EQSAVE,                 // v7.1.9: SAVE TO SLOT (writes the armed slot)
     IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
     IDC_LBL_FREQ, IDC_LBL_GAIN, IDC_LBL_Q,
 };
@@ -3586,6 +3598,9 @@ static COLORREF guiLerpRGB(COLORREF a, COLORREF b, double t) {
 }
 static std::map<int, bool> g_tog;            // toggle button states
 static int       g_eqSlot        = -1;         // v7.1.8: active save slot (-1 = custom)
+static int       g_eqSel         = -1;         // v7.1.9: ARMED save target -- the slot
+                                               // SAVE TO SLOT writes into; survives
+                                               // slider tweaks (g_eqSlot does not)
 static std::vector<HWND> g_pageHw[5];          // children per page (show/hide)
 static HANDLE    g_engThread     = nullptr;
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
@@ -4296,11 +4311,16 @@ static void guiUpdateEqLabels(HWND w) {
 }
 
 static void guiApplySlot(HWND w, int i) {
-    if (g_cfg.eqSlotF[i] <= 0.0f) {   // empty slot -- nothing saved there yet
-        char b[96];
-        snprintf(b, sizeof(b), "slot %d is empty -- right-click it to save the current curve",
+    g_eqSel = i;                      // v7.1.9: an arm is a click away -- the
+                                      // slot stays the SAVE TO SLOT target even
+                                      // after the sliders move (g_eqSlot drops)
+    if (g_cfg.eqSlotF[i] <= 0.0f) {   // empty slot -- arm it, keep the sliders
+        char b[128];
+        snprintf(b, sizeof(b),
+                 "slot %d is empty -- set the curve, then press SAVE TO SLOT",
                  i + 1);
         guiSetStatus(w, b);
+        guiRepaintSlots(w);
         return;
     }
     g_tog[IDC_TGL_EQ] = g_cfg.eqSlotOn[i];
@@ -4313,8 +4333,10 @@ static void guiApplySlot(HWND w, int i) {
     guiRepaintSlots(w);
 }
 
-// right-click a slot: the sliders' current curve + the EQ pill land in the
-// slot and the ini is spliced at once (v7.1.8; same model as the theme click).
+// right-click a slot (or the SAVE TO SLOT button): the sliders' current
+// curve + the EQ pill land in the slot and the ini is spliced at once
+// (v7.1.8; same model as the theme click). v7.1.9: the button saves the
+// ARMED slot -- clicking a slot arms it and survives slider tweaks.
 static void guiSaveSlot(HWND w, int i) {
     g_cfg.eqSlotOn[i] = g_tog[IDC_TGL_EQ];
     g_cfg.eqSlotF[i]  = posToFreq(sldGetPos(GetDlgItem(w, IDC_SLD_FREQ)));
@@ -4326,6 +4348,7 @@ static void guiSaveSlot(HWND w, int i) {
     g_cfg.centerEqGain = g_cfg.eqSlotG[i];
     g_cfg.centerEqQ    = g_cfg.eqSlotQ[i];
     g_eqSlot = i;
+    g_eqSel  = i;
     const bool ok = guiSaveIni();
     guiUpdateEqLabels(w);
     guiRepaint(w, IDC_TGL_EQ);
@@ -4709,10 +4732,10 @@ static void guiStopEngine() {
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
 // v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
 // (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
-// v7.1.8: the five faces widen +8 px each (160 -> 168) -- they fill more of
-// the client; 5 x 168 + 4 x 4 gaps + 5 px left pad ends at 861, and the
-// strip grows to 866 so the selected face's 5 px halo still fits inside.
-static const int kTabW[5] = { 168, 168, 168, 168, 168 };
+// v7.1.8: the faces widened to 168; v7.1.9 trims to +4 px (164) -- 168
+// overflowed the strip's right pad. 5 x 164 + 4 x 4 gaps + 5 px left pad
+// ends at 841; the 866 px strip keeps the halo and a calm right margin.
+static const int kTabW[5] = { 164, 164, 164, 164, 164 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -4812,12 +4835,15 @@ static void guiBuildPages(HWND w) {
     tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
     // v7.1.8: the four built-in presets are GONE -- five user save slots,
     // uniform like they were: 5 x 76 px faces + 4 x 5 px gaps span the
-    // sliders' 400 px exactly. Left-click applies; right-click saves.
+    // sliders' 400 px exactly. Left-click applies AND arms; the SAVE TO
+    // SLOT button (column B) writes the armed slot (v7.1.9).
     for (int i = 0; i < 5; ++i) {
         char nm[16];
         snprintf(nm, sizeof(nm), "SLOT %d", i + 1);
         regPage(mkBtn(w, IDC_SLOT1 + i, COLA_X + i * 81, 148, 76, 26, nm));
     }
+    HWND sv = mkBtn(w, IDC_EQSAVE, COLB_X, 66, 150, 26, "SAVE TO SLOT");
+    regPage(sv);                       // v7.1.9: page 4 only
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
@@ -4830,10 +4856,12 @@ static void guiBuildPages(HWND w) {
          "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
          "EQs (Equalizer APO and friends) can never see this stream. The\n"
          "boost lives here instead.\n\n"
-         "SLOTS: left-click applies a slot; right-click saves the sliders\n"
-         "+ the EQ pill into it (ini updated at once). Slot 1 ships with\n"
-         "387 Hz / +3.5 dB / Q 0.30. The pill above is the off switch --\n"
-         "EQ off = the bit-exact path.\n\n"
+         "SLOTS: left-click applies a slot and ARMS it -- the face stays\n"
+         "accented while you tweak. Adjust the sliders, press SAVE TO SLOT\n"
+         "and the curve + the EQ pill land in the armed slot (ini updated\n"
+         "at once). Right-click a slot saves straight into it. Slot 1\n"
+         "ships with 387 Hz / +3.5 dB / Q 0.30. The pill above is the off\n"
+         "switch -- EQ off = the bit-exact path.\n\n"
          "The boost stacks with gain_center; the mix clamps at full scale,\n"
          "so loud center peaks may clip first -- lower gain_center if they\n"
          "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 13);
@@ -5654,7 +5682,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.8  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.9  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -5910,7 +5938,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         bool accentBtn = false;
         for (int i = 0; i < 5; ++i)
-            if (id == IDC_SLOT1 + i) accentBtn = (g_eqSlot == i);
+            if (id == IDC_SLOT1 + i) accentBtn = (g_eqSlot == i || g_eqSel == i);
         // v7.0.0 polish: resting faces are TRANSPARENT -- border + text over
         // the erased surface. Fills survive only where they mean something:
         // the pressed feedback (cPanelHi) and the active EQ preset (cPanel2
@@ -6066,6 +6094,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 return 0; }
             case IDC_REFRESH:   guiFillCombos(w);     return 0;
+            case IDC_EQSAVE: {                   // v7.1.9: save the ARMED slot
+                if (g_eqSel >= 0 && g_eqSel < 5) guiSaveSlot(w, g_eqSel);
+                else guiSetStatus(w,
+                     "no slot armed -- click a slot first, then SAVE TO SLOT");
+                return 0; }
             case IDC_SLOT1: case IDC_SLOT2: case IDC_SLOT3:
             case IDC_SLOT4: case IDC_SLOT5:           // v7.1.8: apply the slot
                 guiApplySlot(w, id - IDC_SLOT1);      return 0;
@@ -6979,7 +7012,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.8        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.9        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
