@@ -14,109 +14,33 @@
 //      +--> leg2.raw ring --> pump 2 (FIRST + higher priority)
 //             gates: ch3 zero -> nothing; ch3 == Windows stereo-upmix
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
-//             + 40 Hz @ 0.1% keep-alive at the device layer (v7.1.12)
+//             + 40 Hz @ 1% keep-alive at the device layer
 //    playback callbacks = the ASIO buffer switch: gated excess drop +
 //    last-buffer replay. WASAPI exclusive is INTEGRATED (v6.6.8): both legs
 //    open exclusive together (shared fallback reopens BOTH), capture pin
 //    exclusive with logged fallback. Exclusive bypasses the volume slider --
 //    hence volume_follow + pin_outputs. clock_sync, drift_guard, power_guard,
 //    yield_default, center_gate, center_upmix_guard, background: always on.
-//    Drift corrections: the warden (baseline at seconds 5..9, >=
-//    drift_correct_ms held 3 s, drift_interval_ms spacing) plus a
-//    FIRST-SECOND fast tier at 10x that cadence (v7.1.14).
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.1.17 THE ACTIVATION GHOST, EXORCISED + SQUARE, PINNED: the field
-//            clicked out and back and met the CLASSIC frame -- the real
-//            window title, the icon, the caption buttons, the blue
-//            active-window accent border -- painted over our bar. Why:
-//            v7.1.16 removed the region (the shadow killer), but a region
-//            was ALSO suppressing ALL DWM non-client rendering; unshaped,
-//            the WS_CAPTION window's real 31 px NC strip gets DWM's
-//            STANDARD caption composed into it on every activation
-//            change. The cure is the borderless recipe: WM_NCCALCSIZE
-//            now eats the WHOLE frame -- the client IS the window
-//            (KCLI_W x (KCLI_H + kCapH)), the bar is the client's top
-//            31 px, and DWM's frame renderer has NO non-client area to
-//            paint into. Caption + thickframe styles stay (with the
-//            extend-frame 1 px pin) so the all-directions DWM shadow
-//            still triggers. Children ride kCapH down once at build; the
-//            frame pass shifts kCapH; the bar band is copied into the
-//            frame buffer so the one-blit paint covers everything; the
-//            drag area answers HTCAPTION explicitly; the X's guards move
-//            from negative-y to the strip band; SC_SIZE is refused. The
-//            corner preference is DWMWCP_DONOTROUND -- square on Win10
-//            AND Win11, per the field's ask. GUI-only; DSP
-//            byte-identical to v7.1.4.
-//    v7.1.16 THE REGION THAT ATE THE SHADOW + THE STACK THAT FITS: the
-//            field's "I still don't see a drop shadow" was our own log
-//            line talking -- "a shaped window cannot carry the DWM
-//            shadow". Attr 33 (corner preference) is Win11-only; on the
-//            field's Win10 it failed and v7.1.0's fallback shaped the
-//            window with a GDI region -- and Windows refuses the DWM
-//            window shadow for ANY region-shaped window, so every fix
-//            since (v7.1.11's restore, v7.1.15's extend-frame +
-//            NCRENDERING ON pins) was revoked by our own region lines
-//            later. The region fallback is GONE -- the window is never
-//            shaped again; Win10 keeps square corners and gets the full
-//            all-directions shadow back. And the page-4 stack now fits:
-//            the SAVE TO SLOT note hung 28 px past the panel bottom,
-//            across the action row (the arithmetic was unwinnable -- 45
-//            px of button+note vs 44 px of panel); the sliders ride up
-//            8 px, the button rises to 354, the note is one line ending
-//            at the panel edge. GUI-only; DSP byte-identical to v7.1.4.
-//    v7.1.15 GUI POLISH, THE FIELD'S FOUR: the center-EQ note carried
-//            17 text rows in a 13-row box -- the STATIC clipped its
-//            own tail; re-wrapped short, full height, nothing cuts
-//            off. SAVE TO SLOT moved from column B to right below
-//            the sliders with its own line ("makes sure this slot's
-//            current modifications persist across sessions"). The
-//            ON/OFF pills re-inked: ON = full accent face + the
-//            dark on-accent ink (the old bright-on-accentDk label
-//            measured ~3.3:1), OFF border steps cLine -> cDim so the
-//            pill reads on every theme. The window shadow is
-//            EXPLICIT: DwmExtendFrameIntoClientArea 1 px +
-//            NCRENDERING_POLICY = ON -- the documented triggers a
-//            corner preference alone does not guarantee. Plus the
-//            settings page's keep-alive note says 40 Hz @ 0.1% now
-//            (stale since v7.1.12). GUI-only; DSP byte-identical
+//    v7.1.17 THE FRAME THAT CANNOT FLASH: the XP-caption artifact is
+//            structural, so the fix is structural -- WM_NCCALCSIZE now
+//            returns the whole window as client (the v7.0.9 top-inset kept
+//            a real NC strip, and GDI could still classic-paint it on
+//            drag/activate). There is no non-client area left: no message
+//            path can ever paint a caption that is not ours. The bar is
+//            the client's top 31 px (every child coordinate keeps its
+//            meaning -- the helpers add kCapH at creation, the frame paint
+//            shifts by kCapH); drag answers HTCAPTION explicitly; the DWM
+//            owns the frame again -- its own Win10 drop shadow, nothing
+//            fighting it, corners pinned SQUARE (DWMWCP_DONOTROUND); the
+//            v7.1.0 rounding region is gone (a region-shaped window
+//            cannot carry the DWM shadow). Plus the reconstructed
+//            v7.1.14-16 work: the first-second FAST TIER (warden at 10x
+//            cadence against the delay model), the CENTER EQ page stack
+//            (SAVE TO SLOT below the sliders + note, description never
+//            cuts off), and the ON/OFF pill contrast. DSP byte-identical
 //            to v7.1.4.
-//    v7.1.14 THE FIRST SECOND AT 10X: v7.1.13's snap is REVERTED -- the
-//            field still measured the start offset with it in. Instead,
-//            the drift CORRECTION itself runs ten times faster for the
-//            first 1000 ms of a run, then returns to its normal speed.
-//            The warden's steady-state gates (baseline armed at seconds
-//            5..9, |err| >= drift_correct_ms held 3 s, corrections 5 s
-//            apart) are all wide open exactly when the tick test looks,
-//            so the fast tier samples the ledger every 100 ms against
-//            the ini's own delay model, decides in 3 fast windows
-//            (300 ms instead of 3 s), and re-fires every 500 ms (instead
-//            of 5 s) with the warden's own bit-exact skip/replay-pad
-//            table -- the startup residual is re-pinned before the
-//            baseline can absorb it. Same trigger distance as the
-//            warden; hardcoded (no ini key, no UI). Transport-level
-//            only; DSP byte-identical to v7.1.4.
-//    v7.1.12 KEEP-ALIVE RETUNE: the out2 keep-alive tone is back at 40 Hz
-//            and up to 0.001 (-60 dBFS) -- the field's call: 1 Hz @ 0.0001
-//            (-80 dBFS) was too little for some amps' sleep timers. Still
-//            BUILT IN (no ini key, no UI), still post-mix at the device
-//            layer -- it can never enter the capture stream OBS records.
-//            The cycle table shrinks to 1200 samples (48000/40); the sum
-//            path is table-length agnostic and unchanged.
-//    v7.1.11 THE RESTART IS CLEAN AND THE LEGS OPEN TOGETHER: guiStopEngine
-//            raises the stop gap ITSELF (the engine's health loop slept a
-//            full second before noticing -- APPLY+RESTART played program
-//            audio through the stop, the silent gap never arrived; the
-//            loop now polls g_run every 50 ms); the start-align's first-
-//            switch stamps are PERIOD-CORRECTED (the first callback fires
-//            one device period after the DAC began eating, and the two
-//            legs' periods differ -- the raw gap carried a P1-P2 bias and
-//            leg1 landed late until the warden reeled it in); the DWM's
-//            all-directions window shadow is back (NCRENDERING_POLICY =
-//            DISABLED was killing it, leaving the thin bottom-right
-//            CS_DROPSHADOW); the tick test logs a per-leg census at the
-//            natural end (the center-missing witness); tabs land on +7 px
-//            (167). DSP byte-identical to v7.1.4.
 //    v7.1.10 ONE ACCENT, +6 px TABS: the slot selection collapses to ONE
 //            variable -- v7.1.9's armed target and exact-match highlight
 //            were separate and could light TWO slot faces at once; now a
@@ -466,21 +390,19 @@ static constexpr int      kOutCh2        = 2;      // leg2: stereo center speake
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
 
-// output2 keep-alive tone: 40 Hz at 0.1% gain (0.001, ~-60 dBFS) summed onto
-// BOTH channels at the DEVICE layer -- every frame, silence or not, underrun
-// or not, phase-continuous. Rendered from a precomputed cycle table (1200
-// samples = exactly one 40 Hz cycle @ 48 kHz) instead of calling sin() per
-// frame. v7.1.7: BUILT IN -- the ini keys and UI rows are gone. v7.1.12:
-// retuned from 1 Hz @ 0.0001 (~-80 dBFS) to the field's 40 Hz @ 0.001 --
-// the old wobble was too little for some amps' sleep timers, and 40 Hz is
-// still below what any small center driver reproduces at -60 dBFS.
-// POST-MIX by construction: the tone is summed in the leg2 OUTPUT callbacks,
-// after the mix, so it can never enter the capture stream an OBS
-// display-capture records.
+// output2 keep-alive tone: 1 Hz at 0.01% gain (0.0001, ~-80 dBFS, far below
+// hearing) summed onto BOTH channels at the DEVICE layer -- every frame,
+// silence or not, underrun or not, phase-continuous. Rendered from a
+// precomputed 48000-sample cycle table (48000/1 = exactly one cycle) instead
+// of calling sin() per frame. v7.1.7: BUILT IN -- the ini keys and UI rows
+// are gone (the field never needed to move them; 1 Hz wobble holds every
+// amp awake and is inaudible on any driver). POST-MIX by construction: the
+// tone is summed in the leg2 OUTPUT callbacks, after the mix, so it can
+// never enter the capture stream an OBS display-capture records.
 static constexpr double   kTwoPi             = 6.283185307179586;
-static constexpr unsigned kKeepAliveTableMax = 48000;  // headroom (40 Hz needs 1200)
-static constexpr float    kKeepAliveHz       = 40.0f;   // v7.1.12: was 1 Hz
-static constexpr float    kKeepAliveGain     = 0.001f;  // v7.1.12: was 0.0001
+static constexpr unsigned kKeepAliveTableMax = 48000;  // one 1 Hz cycle @ 48 kHz
+static constexpr float    kKeepAliveHz       = 1.0f;    // v7.1.7: built in
+static constexpr float    kKeepAliveGain     = 0.0001f; // v7.1.7: built in
 static float              g_kaHz   = kKeepAliveHz;
 static float              g_kaGain = kKeepAliveGain;
 static unsigned           g_kaLen  = 48000;   // samples per cycle: round(48000 / g_kaHz)
@@ -509,17 +431,17 @@ static constexpr size_t   kKsMarginFrames     = 48;     // 1 ms above (bite + bu
 // exceeds 100 ms of in-place replay.
 static constexpr unsigned kWardenStreakNeeded  = 3;
 static constexpr size_t   kWardenMaxPadFrames  = 4800;   // 100 ms @ 48 kHz
-
-// v7.1.14 FIRST-SECOND FAST TIER: the drift corrector at 10x the warden's
-// cadence, for the first 1000 ms of a run only. Same trigger distance the
-// warden uses (drift_correct_ms), same bit-exact skip/replay-pad table --
-// ten times the speed: 100 ms ledger samples (the health tick is 1000 ms),
-// a 3-window decision (300 ms instead of 3 s), 500 ms spacing (instead of
-// drift_interval_ms). Hardcoded: no ini key, no UI.
-static constexpr unsigned kFastTierMs        = 1000;  // the fast lane's whole life
-static constexpr unsigned kFastTierPollMs    = 100;   // ledger sample cadence (10x the tick)
-static constexpr unsigned kFastTierStreak    = 3;     // fast windows before a fire
-static constexpr unsigned kFastTierSpacingMs = 500;   // drift_interval_ms / 10
+// v7.1.14 FIRST-SECOND FAST TIER: the calibrated baseline needs 5-9 s of
+// settled ledger; the ears do not. For the first kFastTierMs of a run the
+// warden works against the DELAY MODEL -- the steady-state inter-speaker
+// offset of the calibrated path is -(delay1_ms - delay2_ms), exactly where
+// the ledger must land -- polling every kFastTierPollMs (ten times the
+// health cadence). Timing policy ONLY: the audio path stays memcpy, the
+// DSP is byte-identical; only the pacing decisions run earlier and faster.
+static constexpr unsigned kFastTierMs        = 1000;  // fast-tier window after start
+static constexpr unsigned kFastTierPollMs    = 100;   // ledger cadence inside it (10x)
+static constexpr unsigned kFastTierStreak    = 3;     // windows held before a fast re-pin
+static constexpr unsigned kFastTierSpacingMs = 500;   // minimum spacing between fast re-pins
 
 struct Config {
     float       out1Ms         = 5.0f;
@@ -572,8 +494,7 @@ struct Config {
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
     // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
-    // kKeepAliveGain, 40 Hz @ 0.001 since v7.1.12) -- no struct fields, no
-    // ini key, no UI.
+    // kKeepAliveGain, 1 Hz @ 0.0001) -- no struct fields, no ini key, no UI.
     bool        background     = true;   // v6.2: detach the console after a
                                           //       successful start; log to file
                                           // v6.6.8: INTEGRATED -- always on
@@ -1733,19 +1654,6 @@ static std::atomic<unsigned long long> g_tickEndMs{0};   // wall time the 4 s ru
 static std::vector<float>     g_tickWave;          // ONE pre-rendered tick (48 kHz mono)
 static constexpr size_t kTickPeriod = 24000;       // 500 ms @ 48 kHz = 120 bpm
 static constexpr size_t kTickCount  = 8;           // 8 beats = 4 s, then it stops
-// v7.1.11 TICK CENSUS: chunks each leg's pump actually stamped with tick
-// samples. The center-missing field report needs a witness: if leg2's
-// count is 0 the dispatch never reached its pump (seq window); if it is
-// ~8+ the samples left the pump and the loss is device-side.
-static std::atomic<unsigned long long> g_tickWrites[2] = {};   // pump-thread only
-static void tickCensusLog() {
-    tlog("[twinspeak] tick test     : census -- leg1 stamped %llu chunks, leg2 %llu\n"
-         "                            (8 beats in 500 us pump cycles -> a healthy leg reads\n"
-         "                            dozens; a leg at 0 never saw the window, a leg with\n"
-         "                            counts but no sound loses it past the pump)\n",
-         (unsigned long long)g_tickWrites[0].load(std::memory_order_relaxed),
-         (unsigned long long)g_tickWrites[1].load(std::memory_order_relaxed));
-}
 
 static void tickRender() {
     if (!g_tickWave.empty()) return;
@@ -1769,13 +1677,11 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
     if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
     const size_t wn = g_tickWave.size();
     const int    ch = (idx == 0) ? kOutCh1 : 2;
-    bool stamped = false;   // v7.1.11 census: did THIS chunk carry samples?
     for (size_t i = 0; i < n; ++i) {
         const long long t = pos + (long long)i;
         if (t >= (long long)(kTickCount * kTickPeriod)) break;
         const size_t ph = (size_t)t % kTickPeriod;
         if (ph >= wn) continue;
-        stamped = true;
         const float s = g_tickWave[ph];
         float* o = chunk + i * (size_t)ch;
         // v7.0.0: the tick channels -- leg1: FL, FR, LFE (FC is DRIVEN
@@ -1791,7 +1697,6 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
             o[c] = v;
         }
     }
-    if (stamped) g_tickWrites[idx].fetch_add(1, std::memory_order_relaxed);
 }
 
 // ----------------------------------------------------------------- pumps ----
@@ -2885,11 +2790,10 @@ static void writeTemplate(const char* path) {
         "; endpoint volumes are pinned 100%% / unmuted while the engine runs.\n"
         "out2_first = on\n"
         "\n"
-        "; KEEP-ALIVE (BUILT IN -- no keys, no UI): out2 sums a sine on\n"
+        "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI): out2 sums a sine on\n"
         "; both channels every frame (silence or not) so the center device\n"
-        "; never sees digital silence. 40 Hz @ 0.001 (-60 dBFS, v7.1.12 --\n"
-        "; was 1 Hz @ 0.0001, too little for some amps' sleep timers), still\n"
-        "; below hearing, and a wobble every amp's sleep timer treats as signal.\n"
+        "; never sees digital silence. 1 Hz @ 0.0001 (-80 dBFS) -- far below\n"
+        "; hearing, and a wobble every amp's sleep timer treats as signal.\n"
         "; The watchdog reopens out2 automatically whenever it comes back.\n"
         "; POST-MIX: the tone and the chime are summed in the out2 OUTPUT\n"
         "; callbacks, after the mix -- they never enter the capture stream an\n"
@@ -3028,11 +2932,6 @@ static void writeTemplate(const char* path) {
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
         "drift_interval_ms = 5000\n"
-        "\n"
-        "; v7.1.14: the FIRST SECOND of every run corrects at 10x this\n"
-        "; cadence -- 100 ms ledger samples, a 300 ms decision, 500 ms\n"
-        "; spacing, hardcoded -- against the ini's own delay model, so a\n"
-        "; startup residual is re-pinned before the baseline can absorb it.\n"
         "\n"
         "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
         "; thread starves (an interrupt storm, a 100%% CPU hog), the shortfall\n"
@@ -3816,25 +3715,30 @@ static const char* kTabNames[5] = {
 };
 
 // v6.6.4: only a close button -- fixed-size layout, close already hides to the
-// tray. v7.0.9: the caption itself is custom (see kCapH below). v7.1.17: the
-// window is the borderless-with-shadow recipe -- caption + thickframe styles
-// stay so DWM keeps drawing the all-directions shadow, but WM_NCCALCSIZE
-// eats the whole frame, so there is no NC area and no standard caption;
-// the bar answers its own HTCAPTION drag (WM_NCHITTEST).
-static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME;
+// tray. v7.0.9: the caption itself is custom; WS_CAPTION stays so the DWM
+// keeps treating this as a framed window (taskbar, Alt+Space, the sysmenu).
+// v7.1.17 THE FRAME THAT CANNOT FLASH: every artifact since v7.0.9 (the
+// first-drag XP bar, the activate-time recolor, v7.1.16's classic caption on
+// drag) came through ONE door -- the window had a REAL non-client area (the
+// v7.0.9 top inset kept a genuine NC strip), and whenever GDI decided to
+// classic-paint that strip (drag start, activation, NC recalcs), the XP-era
+// caption won the race no matter how many messages we swallowed. The strip
+// no longer exists: WM_NCCALCSIZE returns the WHOLE window as client, so
+// there is no NC pixel anywhere for any frame painter to draw into. The bar
+// is the client's top 31 px -- ours forever, structurally. The DWM owns the
+// frame chrome again: it composites its own Win10 drop shadow around the
+// window rect (a region-shaped window cannot carry it -- v7.1.0's rounding
+// region is gone), and the corners are pinned SQUARE (DWMWCP_DONOTROUND;
+// pre-Win11 ignores the call and is square anyway).
+static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
 
-// v7.0.9 THE CUSTOM TITLEBAR: the DWM caption is gone entirely (its text, its
-// close button, and the dark->light recolor that never took until a DWM
-// round-trip). The top 31 px strip of the window is our own bar: theme colors
-// painted directly, so a theme click recolors it the same instant as the
-// client. v7.1.17: WM_NCCALCSIZE eats the ENTIRE frame -- the client IS the
-// window rect, the bar is the client's top kCapH strip, and DWM's frame
-// renderer has no non-client area to paint its standard caption into (the
-// activation ghost). Children ride kCapH down once at build (see
-// guiCreateRealWindow); the frame pass paints kCapH lower (see guiPaintFrame).
-// DWM's own frame drawing is left ENABLED (v7.1.11: DISABLED killed the
-// window shadow; the shadow is the point) -- there is simply no NC area
-// left for it to draw a caption into.
+// v7.0.9 THE CUSTOM TITLEBAR (v7.1.17: now a client strip): the top 31 px of
+// the CLIENT is our own bar -- theme colors painted directly, so a theme
+// click recolors it the same instant as the rest of the client. Drag answers
+// HTCAPTION explicitly (WM_NCHITTEST); the close slot answers HTCLIENT so
+// its clicks, hover and leave tracking stay ours. Child coordinates keep
+// their old content-space meaning: the creation helpers add kCapH and the
+// frame paint shifts by kCapH -- no layout literal moved.
 static const int  kCapH = 31;
 static bool       g_capHot = false;   // mouse over the close glyph
 static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
@@ -4041,8 +3945,8 @@ static void applyTheme(int i) {
 // (was 1000x750), 34px row pitch (was 38), slimmer bars everywhere.
 static const int COLA_X = 24, COLB_X = 460, LBL_W = 160, CTL_W = 200;
 static const int KCLI_W = 880, KCLI_H = 620;   // designed client size
-static const int KLOG_BOTTOM = 594 + 31;       // v7.1.17: client == window now; the log pane's bottom edge (was client 594)
-static const int KPANEL_T = 66 + 31, KPANEL_B = 402 + 31; // v7.1.17: page panel band (was client 66..402)
+static const int KLOG_BOTTOM = 594;            // v6.6.6: log ends here; 26px watermark strip below
+static const int KPANEL_T = 66, KPANEL_B = 402; // page panel band
 static const int KHDR_Y = 94, KROW0 = 120;   // page header / first row / pitch
 
 // ---- small drawing helpers (v6.6.5: GDI+ -- everything the eye sees is AA) --
@@ -4132,8 +4036,10 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     const Gdiplus::RectF& mr = mrCached;
     if (mr.Width <= 0) return;
     // centered in the strip below the log pane; right edge 14px off the client edge
+    // v7.1.17: content space sits kCapH lower inside the client.
     const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - 14) - mr.Width;
-    const Gdiplus::REAL y = (Gdiplus::REAL)KLOG_BOTTOM + ((Gdiplus::REAL)(crc.bottom - KLOG_BOTTOM) - mr.Height) / 2.0f;
+    const Gdiplus::REAL y = (Gdiplus::REAL)(KLOG_BOTTOM + kCapH)
+                          + ((Gdiplus::REAL)(crc.bottom - (KLOG_BOTTOM + kCapH)) - mr.Height) / 2.0f;
     const Gdiplus::RectF tr(x, y, mr.Width, mr.Height);
     Gdiplus::LinearGradientBrush lb(tr, GCol(RGB(255, 138, 42)),
                                     GCol(RGB(0, 229, 238)), Gdiplus::LinearGradientModeVertical);
@@ -4201,6 +4107,7 @@ static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
 }
 
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
+    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
@@ -4209,6 +4116,7 @@ static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT
 }
 
 static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
+    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
     HWND h = CreateWindowExA(0, "EDIT", val,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4222,6 +4130,7 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
     // NOTE: deliberately NOT regPage()d here -- the tab strip and the
     // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
     // presets, REFRESH) are registered by their builders (v6.6.2).
+    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4230,6 +4139,7 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
 }
 
 static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
+    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
         (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
@@ -4376,6 +4286,7 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
+    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
     static bool sldClass = false;      // registered once
     if (!sldClass) {
         WNDCLASSA wc = {};
@@ -4813,7 +4724,7 @@ static void guiAppendLog(const std::string& s) {
 // invalidated in the same breath; the next WM_PAINT lands it as one blit.
 static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
-    const RECT sr = { 14, 458 + kCapH, 866, 476 + kCapH };   // v7.1.17: the band rides kCapH with the frame pass
+    const RECT sr = { 14, 458 + kCapH, 866, 476 + kCapH };   // v7.1.17: +kCapH
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -4860,13 +4771,6 @@ static void guiStopEngine() {
     if (st == 0 || st == 3) return;
     g_engState.store(3);
     if (g_hwnd) guiRepaint(g_hwnd, IDC_START);
-    // v7.1.11 THE STOP GAP STARTS HERE: the callbacks used to keep playing
-    // the program until the ENGINE thread noticed g_run (its health loop
-    // sleeps a full second) -- an APPLY+RESTART kept the audio running for
-    // up to a second and the designed silent gap never arrived. Setting
-    // the flag HERE silences the legs the instant the GUI decides to stop;
-    // engineMain's own store still re-arms the gap for a console CTRL+C.
-    g_stopSilence.store(true, std::memory_order_relaxed);
     g_run.store(false);
     if (g_engThread) {
         WaitForSingleObject(g_engThread, 10000);
@@ -4881,10 +4785,10 @@ static void guiStopEngine() {
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
 // v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
 // (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
-// v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 went to
-// 166; v7.1.11 lands on the field's final call: +7 px (167). 5 x 167 +
-// 4 x 4 gaps + 5 px left pad ends at 856 inside the 866 px strip.
-static const int kTabW[5] = { 167, 167, 167, 167, 167 };
+// v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 lands
+// on the field's sweet spot: +6 px (166). 5 x 166 + 4 x 4 gaps + 5 px
+// left pad ends at 851 inside the 866 px strip -- halo fits, no overflow.
+static const int kTabW[5] = { 166, 166, 166, 166, 166 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -4973,78 +4877,56 @@ static void guiBuildPages(HWND w) {
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
     note(w, COLB_X, 226,
-         "The keep-alive tone is BUILT IN (40 Hz @ 0.1%): out2 never sees\n"
+         "The keep-alive tone is BUILT IN (1 Hz @ 0.01%): out2 never sees\n"
          "digital silence, so the center speaker stays awake. POST-MIX: the\n"
          "tone and the chime are summed in the out2 OUTPUT callbacks, after\n"
          "the mix -- they never enter the stream an OBS capture records.\n"
          "The log lives in the pane below; background mode is built in.", 5);
 
     // ============ page 4: CENTER EQ ============
+    // v7.1.15/16 THE TIGHTENED STACK: the sliders rise to a 52 px pitch
+    // (labels 196/248/300, tracks 214/266/318), SAVE TO SLOT lands BELOW
+    // them (354..380, the sliders' own 400 px width) with its one-line
+    // note right under it -- the whole stack ends at the panel edge, the
+    // action row at 414 keeps its clearance, nothing overlaps. The right
+    // column's description moved up to the panel top and got a rect sized
+    // for its wrapped line count, so it never cuts off mid-sentence.
     g_tab = 4;
     tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
     // v7.1.8: the four built-in presets are GONE -- five user save slots,
     // uniform like they were: 5 x 76 px faces + 4 x 5 px gaps span the
     // sliders' 400 px exactly. Left-click applies AND arms; the SAVE TO
-    // SLOT button (below the sliders since v7.1.15) writes the armed slot
-    // (v7.1.9).
+    // SLOT button below the sliders writes the armed slot (v7.1.9).
     for (int i = 0; i < 5; ++i) {
         char nm[16];
         snprintf(nm, sizeof(nm), "SLOT %d", i + 1);
         regPage(mkBtn(w, IDC_SLOT1 + i, COLA_X + i * 81, 148, 76, 26, nm));
     }
-    // v7.1.15: SAVE TO SLOT lives under the sliders now (was column B,
-    // detached from what it saves) -- the button sits directly beneath
-    // the curve it writes, with its own one-line description.
-    // v7.1.16 THE OVERLAP: that note shipped as a 2-row box carrying ONE
-    // line -- 396..430 on a page panel that then ended at 402 -- so
-    // it hung 28 px past the panel and lay across the STOP / APPLY +
-    // RESTART / SAVE INI row at 414 (the STATIC is built after the bottom
-    // bar, so it painted OVER the buttons' tops). And the arithmetic was
-    // unwinnable as the column stood: the sliders end at 358, the panel
-    // leaves 44 px, and button (26) + note (19) need 45. The whole stack
-    // tightens: the three slider groups ride up 8 px (labels 196/248/300,
-    // sliders 214/266/318, ending at 346), the button rises to 354..380,
-    // and the description is ONE line (383..402) ending at the panel
-    // edge. Nothing crosses 402; nothing touches the action row.
-    HWND sv = mkBtn(w, IDC_EQSAVE, COLA_X, 354, 400, 26, "SAVE TO SLOT");
-    regPage(sv);                       // v7.1.9: page 4 only
-    note(w, COLA_X, 383,
-         "makes sure this slot's current modifications persist across sessions.", 1);
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 196, 400, "PEAK FREQUENCY", g_fUIb, 16);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 214, 400, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 248, 400, "BOOST", g_fUIb, 16);
     mkSlider(w, IDC_SLD_GAIN, COLA_X, 266, 400, -24, 24);
     mkLabel(w, IDC_LBL_Q, COLA_X, 300, 400, "SHARPNESS (Q)", g_fUIb, 16);
     mkSlider(w, IDC_SLD_Q, COLA_X, 318, 400, 0, 1000);
-    // v7.1.15 THE NOTE THAT ATE ITS OWN TAIL: the old note carried 17
-    // text rows inside a 13-row box -- a STATIC renders every line it
-    // is handed and simply stops at the control's bottom edge, so the
-    // final paragraphs were cut off. The text is re-wrapped to lines a
-    // 406 px column can never wrap (all <= 57 chars) and the control is
-    // sized for the TRUE row count. Nothing clips.
-    note(w, COLB_X, 66,
-         "One peaking band on ch3, applied inside the engine's\n"
-         "out2 mix path -- out2 ONLY. The mains (out1) are never\n"
-         "touched.\n"
-         "\n"
-         "A KS/WaveRT leg bypasses the Windows audio engine, so\n"
-         "system-wide EQs (Equalizer APO and friends) can never\n"
-         "see this stream. The boost lives here instead.\n"
-         "\n"
-         "SLOTS: left-click applies a slot and ARMS it -- the\n"
-         "face stays accented while you tweak. Adjust the\n"
-         "sliders, press SAVE TO SLOT and the curve + the EQ pill\n"
-         "land in the armed slot (ini updated at once). SAVE TO\n"
-         "SLOT makes sure this slot's current modifications\n"
-         "persist across sessions. Right-click a slot saves\n"
-         "straight into it. Slot 1 ships with 387 Hz / +3.5 dB /\n"
-         "Q 0.30. The pill above is the off switch -- EQ off =\n"
-         "the bit-exact path.\n"
-         "\n"
-         "The boost stacks with gain_center; the mix clamps at\n"
-         "full scale, so loud center peaks may clip first --\n"
-         "lower gain_center if they do. Keep-alive and chime are\n"
-         "NOT equalized (UI cues, not dialogue).", 22);
+    HWND sv = mkBtn(w, IDC_EQSAVE, COLA_X, 354, 400, 26, "SAVE TO SLOT");
+    regPage(sv);                       // page 4 only
+    note(w, COLA_X, 383,
+         "makes sure this slot's current modifications persist across sessions.", 1);
+    note(w, COLB_X, 74,
+         "One peaking band on ch3, applied inside the engine's out2 mix path --\n"
+         "out2 ONLY. The mains (out1) are never touched.\n\n"
+         "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
+         "EQs (Equalizer APO and friends) can never see this stream. The\n"
+         "boost lives here instead.\n\n"
+         "SLOTS: left-click applies a slot and ARMS it -- the face stays\n"
+         "accented while you tweak. Adjust the sliders, press SAVE TO SLOT\n"
+         "and the curve + the EQ pill land in the armed slot (ini updated\n"
+         "at once). Right-click a slot saves straight into it. Slot 1\n"
+         "ships with 387 Hz / +3.5 dB / Q 0.30. The pill above is the off\n"
+         "switch -- EQ off = the bit-exact path.\n\n"
+         "The boost stacks with gain_center; the mix clamps at full scale,\n"
+         "so loud center peaks may clip first -- lower gain_center if they\n"
+         "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 20);
 }
 
 // ---- v7.0.4: the tab strip is ONE custom control ----------------------------
@@ -5517,7 +5399,7 @@ static void guiMakeTabStrip(HWND w) {
         reg = true;
     }
     CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
-                    KSTRIP_X, KSTRIP_Y, KSTRIP_W, KSTRIP_H, w,
+                    KSTRIP_X, KSTRIP_Y + kCapH, KSTRIP_W, KSTRIP_H, w,
                     (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
 }
 
@@ -5535,13 +5417,13 @@ static void guiBuildControls(HWND w) {
     // no erase-then-draw flicker four times a second). Writers go through
     // guiSetStatus, which invalidates the status band of the frame.
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              14, 458, 852, 16, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
+                              14, 458 + kCapH, 852, 16, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        14, 480, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        14, 480 + kCapH, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
@@ -5708,106 +5590,41 @@ static void trayBalloon(const char* text) {
 // so nothing takes a taskbar slot; the moment the panel opens it gets its
 // taskbar button (and Alt-Tab entry) so it can be seen and reached like any
 // window; closing hides it and the button goes away -- the tray icon remains.
-// v7.1.17: one child, one ride down. The client ate the frame (WM_NCCALCSIZE),
-// so the design children -- laid out for a client that started kCapH below the
-// window top -- shift once, right after the build, and land where they always
-// were on screen.
-static BOOL CALLBACK tsShiftChild(HWND c, LPARAM lp) {
-    HWND p = GetParent(c);
-    RECT r; GetWindowRect(c, &r);
-    POINT pt = { r.left, r.top };
-    ScreenToClient(p, &pt);
-    SetWindowPos(c, nullptr, pt.x, pt.y + (int)lp, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    return TRUE;
-}
-
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
-    // v7.1.17: the client IS the window (WM_NCCALCSIZE eats the frame) --
-    // the design client is KCLI_W x (KCLI_H + kCapH): the old 620-tall
-    // client rides kCapH down inside it, the bar is its top 31 px band.
-    RECT r = { 0, 0, KCLI_W, KCLI_H + kCapH };
-    AdjustWindowRect(&r, kGuiFrame, FALSE);
+    // v7.1.17: the client IS the window (WM_NCCALCSIZE answers 0) -- create
+    // it at the exact final size: the designed 880x620 content + the 31 px
+    // bar on top. No AdjustWindowRect: there is no frame to reserve space
+    // for, and the DWM shadow is drawn OUTSIDE the window rect.
+    const int kww = KCLI_W, kwh = KCLI_H + kCapH;
     g_hwnd = CreateWindowExA(0, "twinspeak.control",
                              "TidyVision TwinSpeak: Control Panel",
                              kGuiFrame | WS_CLIPCHILDREN,
-                             CW_USEDEFAULT, CW_USEDEFAULT,
-                             r.right - r.left, r.bottom - r.top,
+                             CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
-    // v7.0.9 THE CUSTOM TITLEBAR / v7.1.16 THE UNSHAPED WINDOW (as always)
-    {
+    {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
+        // The window keeps WS_CAPTION and carries NO region, so the DWM
+        // composites its standard Win10 drop shadow around the window rect
+        // -- the same shadow every default white/black titlebar window
+        // gets. Corners are pinned SQUARE (Win11 rounds by default; the
+        // call fails harmlessly pre-Win11, which is square anyway). No
+        // NCRENDERING override, no extend-frame: the frame painter has no
+        // NC area to paint, and the shadow does not need either.
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
-        bool rounded = false;
         if (dwmSet) {
-            // v7.1.11: the NCRENDERING_POLICY = DISABLED call is GONE -- it
-            // killed the DWM's own window shadow (the all-four-directions
-            // one a captioned window gets on Win10), leaving only the thin
-            // menu-style CS_DROPSHADOW on the bottom-right. The policy now
-            // stays ENABLED so DWM draws the full shadow again.
-            // v7.1.17 SQUARE, PINNED: the field wants a square window.
-            // DWMWCP_DONOTROUND on Win11 (Win10 fails the attribute
-            // harmlessly and is square already); the shadow does not care
-            // either way -- it rides on the frame styles + extend-frame.
-            const int round = 1; // DWMWCP_DONOTROUND
-            rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                                       &round, sizeof(round)));
-            // v7.1.15/16 THE SHADOW PINS: DWMWA_NCRENDERING_POLICY = ENABLED
-            // and the frame extended into the client by 1 px -- the two
-            // documented triggers, SET instead of hoped for. They were
-            // never the problem and never the cure: the field's shadow was
-            // being revoked by our own window REGION, see below.
-            const int ncrOn = 2;   // DWMNCRP_ENABLED
-            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrOn, sizeof(ncrOn));
-            typedef HRESULT (WINAPI *TS_DWMEA)(HWND, LPCVOID);
-            const TS_DWMEA dwmExt = (TS_DWMEA)GetProcAddress(
-                LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
-            if (dwmExt) {
-                struct TSMargins { int cxLeft, cxRight, cyTop, cyBottom; } m = { 1, 1, 1, 1 };
-                dwmExt(g_hwnd, &m);
-            }
+            const int square = 1;   // DWMWCP_DONOTROUND
+            dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                   &square, sizeof(square));
         }
-        // v7.1.16 THE REGION THAT ATE THE SHADOW -- the post-mortem. The
-        // field's "I don't see a drop shadow anymore" was true since
-        // v7.1.0, and every run our own log confessed: "a shaped window
-        // cannot carry the DWM shadow". DWMWA_WINDOW_CORNER_PREFERENCE is
-        // Win11-only; on the field's Win10 it fails, v7.1.0's fallback
-        // shaped the window with a CreateRoundRectRgn GDI region -- and
-        // Windows refuses to draw the DWM window shadow for ANY
-        // region-shaped window, whatever the NCRENDERING policy says. The
-        // v7.1.11 restore and the v7.1.15 pins above set the right state
-        // and the region revoked it lines later, every version since
-        // v7.1.0. The fallback is GONE: the window is NEVER shaped again.
-        // Win10 keeps square corners and gets the full all-directions DWM
-        // shadow back; Win11 gets the same square corners via DONOTROUND.
-        tlog("[twinspeak] gui           : window shadow -- extend-frame 1 px + NCRENDERING ON%s\n",
-             rounded ? " + corner preference DONOTROUND (square)"
-                     : " (square corners: pre-Win11, window UNSHAPED so DWM keeps the shadow)");
-    }
-    // v7.0.9: re-measure the NCCALCSIZE client and resize once -- v7.1.17:
-    // the client IS the window and the design is EXACTLY KCLI_W x
-    // (KCLI_H + kCapH) again.
-    {
-        RECT rc; GetClientRect(g_hwnd, &rc);
-        if (rc.right != KCLI_W || rc.bottom != KCLI_H + kCapH)
-            SetWindowPos(g_hwnd, nullptr, 0, 0,
-                         (r.right - r.left) + (KCLI_W - rc.right),
-                         (r.bottom - r.top) + ((KCLI_H + kCapH) - rc.bottom),
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
     guiFillCombos(g_hwnd);
-    // v7.1.17: the client is the WHOLE window now -- the old client origin
-    // sat kCapH down it, so every child rides kCapH down ONCE, right here,
-    // and keeps its exact on-window position. Done before the first render
-    // so the v6.6.5 white-flash pass paints the finished layout.
-    EnumChildWindows(g_hwnd, tsShiftChild, kCapH);
     // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
     // redirection surface now, so the first frame DWM composites is the
     // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
@@ -5904,14 +5721,14 @@ static bool guiFrameBufEnsure(int w, int h) {
 // as the no-buffer fallback). Header text is gone in v7.0.9: the custom
 // titlebar replaced it.
 static void guiPaintFrame(HDC dc, int cw, int ch) {
+    // v7.1.17: the client's top kCapH rows are the bar (painted separately);
+    // every frame-paint coordinate below shifts by kCapH -- the layout
+    // literals keep their content-space meaning.
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
-    const RECT panel = { 12, KPANEL_T, 866, KPANEL_B };
+    const RECT panel = { 12, KPANEL_T + kCapH, 866, KPANEL_B + kCapH };
     FillRect(dc, &panel, g_brPanel);
     FrameRect(dc, &panel, g_brPanel2);
-    // v7.1.17: every literal below is the OLD client coordinate + kCapH --
-    // the client is the whole window now and the frame pass paints kCapH
-    // lower so nothing moves on screen.
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
@@ -5930,7 +5747,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    const RECT kbr = { 14, KLOG_BOTTOM, 552, KCLI_H + kCapH };
+    const RECT kbr = { 14, KLOG_BOTTOM + kCapH, 552, KCLI_H + kCapH };
     guiAAString(g, dc, kbr,
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
@@ -5970,18 +5787,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_NCCALCSIZE:
-        // v7.1.17 THE CLIENT EATS THE FRAME: return 0 with the rect
-        // untouched -- the client IS the window rect. The old top += kCapH
-        // strip was the window's ONLY non-client area, and on every
-        // activation change DWM composed its STANDARD caption into it (the
-        // real title, the icon, the caption buttons, the blue accent
-        // border) straight over our bar -- the ghost the field saw on
-        // click-out/click-back once v7.1.16 removed the region (a region
-        // suppresses ALL DWM NC rendering; an unshaped window does not).
-        // With no NC area at all there is nothing for DWM's frame renderer
-        // to paint into. The caption + thickframe styles stay (with the
-        // extend-frame 1 px pin) so the all-directions DWM shadow still
-        // triggers -- the documented borderless-with-shadow recipe.
+        // v7.1.17 THE STRUCTURAL FIX: when wParam is TRUE, return 0 -- the
+        // client area is the WHOLE window. The v7.0.9 top-inset kept a real
+        // NC strip (top + the old frame edges), and GDI could still
+        // classic-paint it on drag start / activation / NC recalcs -- that
+        // was the XP caption, no matter how many messages we swallowed.
+        // With the client covering everything there is no NC area for ANY
+        // frame painter to draw into: the custom bar is the only chrome
+        // that can ever appear. (wParam FALSE: DefWindowProc.)
         if (wp) return 0;
         break;
     case 0x00AE:   // WM_NCUAHDRAWCAPTION (undocumented)
@@ -6001,17 +5814,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         guiPaintBar(w);
         return DefWindowProcA(w, msg, wp, -1);
     case WM_NCHITTEST: {
-        // v7.1.17: the strip is CLIENT area now -- DefWindowProc would
-        // answer HTCLIENT for every point in the window, so the bar owns
-        // its NC answers HERE: the drag area is HTCAPTION (drag + the
-        // WS_SYSMENU right-click menu, exactly what the caption style gave
-        // the old NC strip), and the close slot stays HTCLIENT so its
-        // clicks land as WM_LBUTTONDOWN and we own the hover state.
+        // v7.1.17: the bar is CLIENT pixels now, so the drag answer is
+        // EXPLICIT (DefWindowProc's frame logic no longer owns any strip).
+        // Top 31 px: the close slot stays HTCLIENT (clicks + hover stay
+        // ours), everything else is HTCAPTION -- drag, snap, Alt+Space and
+        // the WS_SYSMENU right-click all work through it. Below the bar:
+        // DefWindowProc (HTCLIENT everywhere, the window is fixed-size).
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT wr; GetWindowRect(w, &wr);
-        const int wx = pt.x - wr.left, wy = pt.y - wr.top;
-        if (wy >= 0 && wy < kCapH) {
-            if (wx >= (wr.right - wr.left) - 46) return HTCLIENT;
+        if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH) {
+            if (pt.x - wr.left >= (wr.right - wr.left) - 46)
+                return HTCLIENT;
             return HTCAPTION;
         }
         break; }
@@ -6026,24 +5839,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // (watermark gone), GDI+ rebuilt it, and DWM sampled the blank strip
         // on every tab click / theme press. The full face is rendered into
         // the buffer and lands as ONE blit; no intermediate state exists.
-        // v7.1.17: the client is the WHOLE window now, so the buffer must
-        // also cover the bar's band: guiPaintBar renders + blits the bar
-        // (window coords, unchanged), the frame pass paints kCapH lower,
-        // and the bar's fresh buffer is copied over the top band before the
-        // ONE blit -- every pixel of the window covered, no garbage band.
-        guiPaintBar(w);
         RECT crc; GetClientRect(w, &crc);
         const int cw = crc.right, ch = crc.bottom;
         if (guiFrameBufEnsure(cw, ch)) {
             guiPaintFrame(g_frmDc, cw, ch);
-            BitBlt(g_frmDc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);
             BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                    g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
         } else {
             guiPaintFrame(dc, cw, ch);   // no buffer: draw straight (old path)
-            guiPaintBar(w);              // re-claim the bar band the fill crossed
         }
+        // v7.1.17: the bar is the client's top strip -- every WM_PAINT that
+        // can touch rows 0..31 re-lands it in the same breath (one buffered
+        // blit), so no client-side repaint can ever wipe it.
+        guiPaintBar(w);
         EndPaint(w, &ps);
         return 0; }
     case WM_ERASEBKGND:
@@ -6139,25 +5948,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
         if (guiIsToggle(id)) {
-            // v7.0.0 polish: OFF is a TRANSPARENT face -- border + text over
-            // the erased surface. The ON fill stays: it IS the state.
-            // v7.1.15 CONTRAST: the field could not read the states --
-            // ON's bright accent text on the accentDk face measures
-            // ~3.3:1 (DARK CYAN), the muddiest label on the page. ON is
-            // now a FULL accent face with the theme's dark on-accent ink
-            // (cOnText): ~11:1, and a filled pill reads as a switch, not
-            // a label. OFF keeps its transparent face but the border
-            // steps up from cLine (near-invisible on the dark themes) to
-            // cDim so the pill itself is visible in every theme.
+            // v7.1.15 THE PILL CONTRAST FIX: the ON face is the theme's
+            // ACCENT with the on-text color (white on every theme) -- the
+            // old dark cAccentDk fill + cAccent text read as one muddy
+            // blob on the dark themes. OFF stays the transparent face:
+            // border + full text color.
             const bool on = g_tog[id];
             Gdiplus::GraphicsPath* p = guiRoundPath(grc, 10);
-            Gdiplus::SolidBrush fb(GCol(guic::cAccent));
-            Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cDim), 1.0f);
-            if (on) g.FillPath(&fb, p);
+            Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cLine), 1.0f);
+            if (on) {
+                Gdiplus::SolidBrush fb(GCol(pressed ? guic::cAccentDk : guic::cAccent));
+                g.FillPath(&fb, p);
+            }
             g.DrawPath(&pb, p);
             delete p;
-            // v7.0.0: OFF reads in full text color -- cDim washed out on
-            // every theme; v7.1.15: ON reads in cOnText on the accent face.
             guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cOnText : guic::cText,
                         g_fUIb, 0);
             if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
@@ -6236,36 +6040,24 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
-    case WM_SYSCOMMAND:
-        // v7.1.17: WS_THICKFRAME (the shadow recipe's frame style) makes
-        // the system menu offer Size -- and the layout is hand-placed at
-        // fixed coordinates. Size/Maximize are answered with nothing;
-        // Move, Close and everything else behave as before.
-        switch (wp & 0xFFF0) {
-        case SC_SIZE: case SC_MAXIMIZE: return 0; }
-        break;
     case WM_LBUTTONDOWN: {
-        // v7.1.17: the bar is CLIENT area now, so strip clicks arrive with
-        // y in [0, kCapH) (they used to be negative -- the strip lay above
-        // the old client origin). The close slot is the only HTCLIENT
-        // ground in the strip (WM_NCHITTEST); clicks inside it close --
-        // which hides to the tray, engine stays up.
+        // v7.1.17: the bar is client pixels -- the close slot arrives with
+        // client coords y 0..kCapH (the legacy negative-y NC path is kept
+        // as insurance). A click there closes -- which hides to the tray,
+        // engine stays up.
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        if (cy < kCapH) {
-            RECT cl = guiCapCloseRect(w);
+        RECT cl = guiCapCloseRect(w);   // client == window rect now
+        if ((cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right) || cy < 0) {
             if (cx >= cl.left && cx < cl.right) PostMessageA(w, WM_CLOSE, 0, 0);
             return 0;
         }
         break; }
     case WM_MOUSEMOVE: {
-        // hover feedback for the bar's X (client ground since v7.1.17 --
-        // y in [0, kCapH)); TrackMouseEvent arms the leave
+        // hover feedback for the bar's X; TrackMouseEvent arms the leave
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        bool hot = false;
-        if (cy >= 0 && cy < kCapH) {
-            RECT cl = guiCapCloseRect(w);
-            hot = (cx >= cl.left && cx < cl.right);
-        }
+        RECT cl = guiCapCloseRect(w);   // client == window rect now
+        const bool hot = (cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right)
+                      || (cy < 0 && cx >= cl.left && cx < cl.right);   // legacy NC path
         if (hot != g_capHot) {
             g_capHot = hot;
             if (hot) { TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, w, 0 }; TrackMouseEvent(&t); }
@@ -6341,7 +6133,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                                  + (long long)kSampleRate, std::memory_order_release);
                 g_tickEndMs.store(GetTickCount64() + 1000ULL + 4000ULL,
                                   std::memory_order_relaxed);
-                g_tickWrites[0].store(0); g_tickWrites[1].store(0);   // v7.1.11 census
                 g_tickOn.store(true, std::memory_order_release);
                 SetDlgItemTextA(w, IDC_TICK, "STOP TICK TEST");
                 guiSetStatus(w,
@@ -6401,16 +6192,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break; }
     case WM_GETMINMAXINFO: {
-        // v6.6.3 polish, v6.6.5 size: the layout is hand-placed at fixed
-        // coordinates and there is no WM_SIZE reflow -- lock the frame to
-        // the designed window. v7.1.17: the client IS the window, and the
-        // design client is KCLI_W x (KCLI_H + kCapH) -- the old 620-tall
-        // client rides kCapH down inside it. min == max == no resizing.
-        RECT r = { 0, 0, KCLI_W, KCLI_H + kCapH };
-        AdjustWindowRect(&r, kGuiFrame, FALSE);
+        // v6.6.3 polish, v6.6.5 size; v7.1.17: the client IS the window --
+        // the frame is the designed 880x620 content plus the 31 px bar.
+        // min == max == no resizing at all.
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
-        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
-        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
+        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = KCLI_W;
+        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH;
         return 0; }
     case WM_TIMER: {
         // v7.0.3: timer 2 drives the tab fade-in; ONLY the strip repaints
@@ -6442,7 +6229,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g_tickEndMs.store(0, std::memory_order_relaxed);
                 SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
                 guiSetStatus(w, "tempo tick: finished");
-                tickCensusLog();                     // v7.1.11: the witness line
             }
         } else {
             const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
@@ -6787,6 +6573,78 @@ int main(int argc, char** argv) {
     return rc;
 }
 
+// v7.1.14: the re-pin itself, shared by the baseline warden and the
+// first-second fast tier -- the identical bit-exact skip / replay-pad
+// paths (the audio data is not touched; only ring positions move), only
+// the log's tag differs ("drift warden" / "fast tier  "). Returns true
+// when a correction landed.
+static bool wardenRepin(double err, double driftNow, double refMs, const char* tag) {
+    const long long errFr = (long long)(err * 48.0);
+    const long long dpt0 = (long long)g_leg[0].out.count() - (long long)g_leg[0].targetFrames;
+    const long long dpt1 = (long long)g_leg[1].out.count() - (long long)g_leg[1].targetFrames;
+    bool did = false;
+    if (err > 0 && dpt1 > 0) {          // leg2 late: give the excess back
+        Leg& W = g_leg[1];
+        size_t x = (size_t)(errFr < dpt1 ? errFr : dpt1);
+        const size_t lvl = W.out.count();
+        if (x > lvl) x = lvl;
+        if (x) {
+            W.out.discardOldest(x);     // seqTail advances: a true skip
+            W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
+            tlog("[twinspeak] %s : leg2 re-pinned -- skipped %llu fr (%.1f ms) of excess;\n"
+                 "                            drift %+.1f ms -> back toward model/baseline %+.1f ms\n",
+                 tag, (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
+                 driftNow, refMs);
+            did = true;
+        }
+    } else if (err > 0 && dpt0 < 0) {   // leg1 early: hold it (in-place replay)
+        Leg& W = g_leg[0];
+        size_t x = (size_t)(-errFr < -dpt0 ? (size_t)(-errFr) : (size_t)(-dpt0));
+        if (x > kWardenMaxPadFrames) x = kWardenMaxPadFrames;
+        if (x) {
+            W.padFrames.fetch_add(x, std::memory_order_relaxed);
+            W.wardenPads.fetch_add(1, std::memory_order_relaxed);
+            tlog("[twinspeak] %s : leg1 re-pinned -- replay-padded %llu fr (%.1f ms);\n"
+                 "                            drift %+.1f ms -> back toward model/baseline %+.1f ms\n",
+                 tag, (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
+                 driftNow, refMs);
+            did = true;
+        }
+    } else if (err < 0 && dpt0 > 0) {   // leg1 late: give the excess back
+        Leg& W = g_leg[0];
+        size_t x = (size_t)(-errFr < dpt0 ? (size_t)(-errFr) : (size_t)dpt0);
+        const size_t lvl = W.out.count();
+        if (x > lvl) x = lvl;
+        if (x) {
+            W.out.discardOldest(x);
+            W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
+            tlog("[twinspeak] %s : leg1 re-pinned -- skipped %llu fr (%.1f ms) of excess;\n"
+                 "                            drift %+.1f ms -> back toward model/baseline %+.1f ms\n",
+                 tag, (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
+                 driftNow, refMs);
+            did = true;
+        }
+    } else if (err < 0 && dpt1 < 0) {   // leg2 early: hold it
+        Leg& W = g_leg[1];
+        size_t x = (size_t)(-errFr < -dpt1 ? (size_t)(-errFr) : (size_t)(-dpt1));
+        if (x > kWardenMaxPadFrames) x = kWardenMaxPadFrames;
+        if (x) {
+            W.padFrames.fetch_add(x, std::memory_order_relaxed);
+            W.wardenPads.fetch_add(1, std::memory_order_relaxed);
+            tlog("[twinspeak] %s : leg2 re-pinned -- replay-padded %llu fr (%.1f ms);\n"
+                 "                            drift %+.1f ms -> back toward model/baseline %+.1f ms\n",
+                 tag, (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
+                 driftNow, refMs);
+            did = true;
+        }
+    }
+    if (!did)
+        tlog("[twinspeak] %s : drift %+.1f ms vs model/baseline %+.1f ms, but neither ring holds\n"
+             "                            the excess (depth d0 %+lld / d1 %+lld fr) -- nothing host-side to re-pin\n",
+             tag, driftNow, refMs, dpt0, dpt1);
+    return did;
+}
+
 static int engineMain(const std::string& iniPath, bool fgForce,
                       bool allowMulti, bool guiMode) {
     (void)allowMulti;   // the lock is the caller's business
@@ -6823,7 +6681,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_qpcBoot = c;
     }
 
-    // keep-alive cycle table (BUILT IN -- 40 Hz @ 0.001 since v7.1.12, no ini, no UI)
+    // keep-alive cycle table (v7.1.7: BUILT IN -- 1 Hz @ 0.0001, no ini, no UI)
     g_kaHz = kKeepAliveHz;
     g_kaGain = kKeepAliveGain;
     g_kaLen = (unsigned)((double)kSampleRate / (double)g_kaHz + 0.5);
@@ -7213,24 +7071,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
             Sleep(1);
         }
-        const unsigned long long au0raw = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
-        const unsigned long long au1raw = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
-        // v7.1.11 PERIOD BIAS: the first callback fires one device period
-        // AFTER the DAC truly began eating -- miniaudio primes the device
-        // buffer, the driver consumes that prime, THEN the first event
-        // lands. The two legs' negotiated periods differ, so the raw gap
-        // carries a (P1 - P2) bias: the aligner padded the wrong amount
-        // (or the wrong leg) and the field heard leg1 arrive late on every
-        // start/apply+restart until the warden reeled it in. Compare the
-        // TRUE eat-starts: stamp minus this leg's own period. KS legs are
-        // left alone -- their pacing thread writes the first period itself,
-        // there is no prime for the DAC to eat first.
-        long long au0 = (long long)au0raw, au1 = (long long)au1raw;
-        if (g_leg[0].backend != 1 && g_periodFrames[0])
-            au0 -= (long long)((double)g_periodFrames[0] * 1e6 / (double)kSampleRate);
-        if (g_leg[1].backend != 1 && g_periodFrames[1])
-            au1 -= (long long)((double)g_periodFrames[1] * 1e6 / (double)kSampleRate);
-        if (!au0raw || !au1raw) {
+        const unsigned long long au0 = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
+        const unsigned long long au1 = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
+        if (!au0 || !au1) {
             tlog("[twinspeak] start align  : a leg never handed in its first buffer switch --\n"
                  "                            alignment skipped (the watchdog owns a dead leg)\n");
         } else {
@@ -7257,152 +7100,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     E.padFrames.fetch_add((size_t)gapFr, std::memory_order_relaxed);
                     tlog("[twinspeak] start align  : leg%d began eating %lld us before leg%d -- replay-padded\n"
                          "                            %lld fr (%.2f ms)%s so both legs open their stream on the\n"
-                         "                            same instant; the ledger starts ON the calibrated baseline\n"
-                         "                            (v7.1.11: stamps are period-corrected -- %zu / %zu fr)\n",
+                         "                            same instant; the ledger starts ON the calibrated baseline\n",
                          earlyIdx + 1, gapAbs, 2 - earlyIdx, gapFr,
                          (double)gapFr * 1000.0 / (double)kSampleRate,
-                         clipped ? " (clipped to the safe pad)" : "",
-                         g_periodFrames[0], g_periodFrames[1]);
+                         clipped ? " (clipped to the safe pad)" : "");
                 } else {
                     tlog("[twinspeak] start align  : stagger %lld us, but no silence prefill left to pad inside --\n"
                          "                            the early leg already plays; leaving it to the warden\n", gapAbs);
                 }
             }
         }
-    }
-
-    // v7.1.14 FIRST-SECOND FAST TIER -- the drift correction at 10x speed,
-    // for exactly one second, then back to normal. The warden is the only
-    // steady-state drift corrector and every one of its gates is wide open
-    // when the tick test looks: the baseline arms at seconds 5..9, the
-    // trigger is |err| >= drift_correct_ms held 3 s, corrections space 5 s
-    // apart. A start residual that survives the start align (the stamp
-    // model's error: a driver priming its WaveRT buffer differently, a pad
-    // clipped to the safe headroom, a burst the trim line ate) sits in
-    // that unguarded window, the baseline then ABSORBS it, and the flam
-    // is on the tick forever. So: for the first 1000 ms of a run
-    // (hardcoded -- no ini key, no UI) the corrector runs the warden's own
-    // bit-exact table at ten times the cadence -- sample every 100 ms
-    // (the health tick is 1000 ms), decide in 3 fast windows (300 ms
-    // instead of 3 s), re-fire every 500 ms (drift_interval_ms / 10
-    // instead of 5 s) -- against the ini's own delay model,
-    // -(delay1 - delay2) ms: the reading a truly synced pair settles at,
-    // since a deeper ring holds its play boundary back. Trigger distance
-    // is unchanged: the same |err| >= drift_correct_ms the warden uses --
-    // same threshold, ten times the speed. After 1000 ms this loop exits,
-    // the engine returns to the normal 1 s health tick, and the warden
-    // calibrates its baseline at seconds 5..9 ON the corrected path.
-    // Transport-level only: ring skips and in-place replay pads, never a
-    // resampled sample.
-    if (g_cfg.clockSync && g_cfg.driftGuard) {
-        // both ledgers must carry real sequence first (bounded: a starved
-        // leg is watchdog territory)
-        const unsigned long long ftWait0 = GetTickCount64();
-        for (;;) {
-            if (g_leg[0].out.seqTail.load(std::memory_order_acquire) > 0
-             && g_leg[1].out.seqTail.load(std::memory_order_acquire) > 0) break;
-            if (!g_run.load(std::memory_order_relaxed)) break;
-            if (GetTickCount64() - ftWait0 > 500) break;
-            Sleep(2);
-        }
-        const double modelMs = -(double)(g_cfg.delay1Ms - g_cfg.delay2Ms);
-        const unsigned long long ft0 = GetTickCount64();
-        int streak = 0, fires = 0;
-        unsigned long long lastFireMs = 0;
-        while (g_run.load(std::memory_order_relaxed)
-               && GetTickCount64() - ft0 < kFastTierMs) {
-            const long long s0 = (long long)g_leg[0].out.seqTail.load(std::memory_order_acquire);
-            const long long s1 = (long long)g_leg[1].out.seqTail.load(std::memory_order_acquire);
-            double err = 0.0;
-            if (s0 > 0 && s1 > 0) {
-                err = (double)(s0 - s1) / 48.0 - modelMs;
-                if (err >= g_cfg.driftCorrectMs || err <= -g_cfg.driftCorrectMs) ++streak;
-                else streak = 0;
-            } else streak = 0;
-            const unsigned long long nowMs = GetTickCount64();
-            if (streak >= (int)kFastTierStreak && nowMs - lastFireMs >= kFastTierSpacingMs) {
-                const long long errFr = (long long)(err * 48.0);
-                const long long dpt0 = (long long)g_leg[0].out.count() - (long long)g_leg[0].targetFrames;
-                const long long dpt1 = (long long)g_leg[1].out.count() - (long long)g_leg[1].targetFrames;
-                bool did = false;
-                if (err > 0 && dpt1 > 0) {          // leg2 late: give the real excess back
-                    Leg& W = g_leg[1];
-                    long long x = errFr < dpt1 ? errFr : dpt1;
-                    const long long lvl = (long long)W.out.count();
-                    if (x > lvl) x = lvl;
-                    if (x > 0) {
-                        W.out.discardOldest((size_t)x);   // seqTail advances: a true skip
-                        W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-                        tlog("[twinspeak] fast tier    : leg2 re-pinned -- skipped %lld fr (%.1f ms) of the\n"
-                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
-                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
-                        did = true;
-                    }
-                } else if (err > 0 && dpt0 < 0) {   // leg1 early: hold it (in-place replay)
-                    Leg& W = g_leg[0];
-                    long long x = -errFr < -dpt0 ? -errFr : -dpt0;
-                    const long long head = (long long)g_capBurstFrames
-                                         + (long long)g_periodFrames[0] - 96;
-                    if (x > head) x = head;
-                    if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
-                    if (x > 0) {
-                        W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
-                        W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-                        tlog("[twinspeak] fast tier    : leg1 re-pinned -- replay-padded %lld fr (%.1f ms) of the\n"
-                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
-                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
-                        did = true;
-                    }
-                } else if (err < 0 && dpt0 > 0) {   // leg1 late: give the real excess back
-                    Leg& W = g_leg[0];
-                    long long x = -errFr < dpt0 ? -errFr : dpt0;
-                    const long long lvl = (long long)W.out.count();
-                    if (x > lvl) x = lvl;
-                    if (x > 0) {
-                        W.out.discardOldest((size_t)x);
-                        W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-                        tlog("[twinspeak] fast tier    : leg1 re-pinned -- skipped %lld fr (%.1f ms) of the\n"
-                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
-                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
-                        did = true;
-                    }
-                } else if (err < 0 && dpt1 < 0) {   // leg2 early: hold it
-                    Leg& W = g_leg[1];
-                    long long x = -errFr < -dpt1 ? -errFr : -dpt1;
-                    const long long head = (long long)g_capBurstFrames
-                                         + (long long)g_periodFrames[1] - 96;
-                    if (x > head) x = head;
-                    if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
-                    if (x > 0) {
-                        W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
-                        W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-                        tlog("[twinspeak] fast tier    : leg2 re-pinned -- replay-padded %lld fr (%.1f ms) of the\n"
-                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
-                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
-                        did = true;
-                    }
-                }
-                if (did) {
-                    ++fires;
-                    lastFireMs = nowMs;
-                    tlog("[twinspeak] fast tier    : fired at %llu ms -- 10x cadence (%u ms samples, %u ms\n"
-                         "                            spacing); the warden takes over at the normal speed now\n",
-                         nowMs - ft0, kFastTierPollMs, kFastTierSpacingMs);
-                } else {
-                    lastFireMs = nowMs;   // nothing safe to correct: back off one spacing
-                }
-                streak = 0;
-            }
-            Sleep(kFastTierPollMs);
-        }
-        if (fires)
-            tlog("[twinspeak] fast tier    : first second done -- %d correction(s); returning to the\n"
-                 "                            normal cadence (the baseline arms at seconds 5..9 ON this\n"
-                 "                            corrected path)\n", fires);
-        else
-            tlog("[twinspeak] fast tier    : first second clean -- drift held within %.0f ms of the\n"
-                 "                            delay model; nothing to correct, the normal warden cadence\n"
-                 "                            resumes\n", g_cfg.driftCorrectMs);
     }
 
     // v3.8: volume/pin watcher -- 25 ms volume poll, 2 s output pin re-check.
@@ -7475,6 +7182,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            FIFO) -- a flat drift column with audible drift = device silicon, and this\n"
            "                            log proves it.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
+    tlog("[twinspeak] fast tier    : %s -- the first %u ms of a run pin the legs against the delay model\n"
+           "                            (-(delay1_ms - delay2_ms)) at %u ms cadence -- the baseline takes 5-9 s\n"
+           "                            to calibrate, the ears do not wait; same bit-exact re-pin, sooner.\n",
+           g_cfg.driftGuard ? "ON" : "off (drift_guard = off)",
+           kFastTierMs, kFastTierPollMs);
     tlog("[twinspeak] power guard   : %s -- suspend parks the pumps, resume rebuilds capture + both\n"
            "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
            "                            fresh. The v6.5.1 field log: an S5 came back from sleep at ~42%%\n"
@@ -7640,12 +7352,48 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     long prevDom = 0;
     unsigned stallSec[2] = { 0, 0 };   // v6.5.11: consecutive starved seconds per leg
     unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
+    // ---- v7.1.14 FIRST-SECOND FAST TIER -------------------------------------
+    // The baseline warden cannot act before second 9; the first second is
+    // exactly when the two legs can come up misaligned. This pre-loop polls
+    // the ledger every kFastTierPollMs for the first kFastTierMs of the run
+    // and re-pins against the DELAY MODEL -- the steady-state offset of the
+    // calibrated path, -(delay1_ms - delay2_ms) -- with the same bit-exact
+    // re-pin wardenRepin applies. Trigger: |drift - model| >=
+    // drift_correct_ms held for kFastTierStreak consecutive windows, spaced
+    // >= kFastTierSpacingMs apart. Both legs must actually be playing (fresh
+    // heartbeats, live ledger, no suspend park); any miss just skips the
+    // window. After this loop the normal 1 s health loop takes over and the
+    // baseline calibration (seconds 5..9) measures the pinned path.
+    unsigned long long fastLastMs = 0;
+    int fastStreak = 0;
+    if (g_cfg.driftGuard) {
+        const double modelMs = -(double)g_cfg.delay1Ms + (double)g_cfg.delay2Ms;
+        while (g_run.load() && GetTickCount64() - g_bootMs < kFastTierMs) {
+            Sleep(kFastTierPollMs);
+            const unsigned long long nowF = GetTickCount64();
+            if (nowF - g_bootMs >= kFastTierMs) break;
+            if (g_powerPark.load(std::memory_order_relaxed)) { fastStreak = 0; continue; }
+            const long long fs0 = (long long)g_leg[0].out.seqTail.load(std::memory_order_relaxed);
+            const long long fs1 = (long long)g_leg[1].out.seqTail.load(std::memory_order_relaxed);
+            if (fs0 <= 0 || fs1 <= 0
+                || nowF - hbOutGet(0) > 2000 || nowF - hbOutGet(1) > 2000)
+                continue;                       // a leg not up yet: nothing to pin
+            const double driftF = (double)(fs0 - fs1) / 48.0;
+            const double errF = driftF - modelMs;
+            if (errF >= g_cfg.driftCorrectMs || errF <= -g_cfg.driftCorrectMs) {
+                if (++fastStreak >= (int)kFastTierStreak
+                    && nowF - fastLastMs >= kFastTierSpacingMs) {
+                    fastStreak = 0;
+                    fastLastMs = nowF;
+                    wardenRepin(errF, driftF, modelMs, "fast tier  ");
+                }
+            } else {
+                fastStreak = 0;
+            }
+        }
+    }
     while (g_run.load()) {
-        // v7.1.11: poll g_run every 50 ms inside the 1 s health tick -- the
-        // old bare Sleep(1000) delayed the whole shutdown sequence by up to
-        // a second (the silence the field never heard on APPLY+RESTART).
-        for (int w = 0; w < 20 && g_run.load(); ++w) Sleep(50);
-        if (!g_run.load()) break;
+        Sleep(1000);
         ++sec;
         // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 over the
         // last second (both counters integrate the real clocks; bursts and
@@ -7984,69 +7732,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     if (wardenStreak >= (int)kWardenStreakNeeded) {
                         wardenStreak = 0;
                         wardenLastMs = nowMs;
-                        const long long errFr = (long long)(err * 48.0);
-                        const long long dpt0 = (long long)g_leg[0].out.count() - (long long)g_leg[0].targetFrames;
-                        const long long dpt1 = (long long)g_leg[1].out.count() - (long long)g_leg[1].targetFrames;
-                        bool did = false;
-                        if (err > 0 && dpt1 > 0) {          // leg2 late: give the excess back
-                            Leg& W = g_leg[1];
-                            size_t x = (size_t)(errFr < dpt1 ? errFr : dpt1);
-                            const size_t lvl = W.out.count();
-                            if (x > lvl) x = lvl;
-                            if (x) {
-                                W.out.discardOldest(x);     // seqTail advances: a true skip
-                                W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-                                tlog("[twinspeak] drift warden : leg2 re-pinned -- skipped %llu fr (%.1f ms) of excess;\n"
-                                     "                            drift %+.1f ms -> back toward baseline %+.1f ms\n",
-                                     (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
-                                     driftMs, driftBase);
-                                did = true;
-                            }
-                        } else if (err > 0 && dpt0 < 0) {   // leg1 early: hold it (in-place replay)
-                            Leg& W = g_leg[0];
-                            size_t x = (size_t)(-errFr < -dpt0 ? (size_t)(-errFr) : (size_t)(-dpt0));
-                            if (x > kWardenMaxPadFrames) x = kWardenMaxPadFrames;
-                            if (x) {
-                                W.padFrames.fetch_add(x, std::memory_order_relaxed);
-                                W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-                                tlog("[twinspeak] drift warden : leg1 re-pinned -- replay-padded %llu fr (%.1f ms);\n"
-                                     "                            drift %+.1f ms -> back toward baseline %+.1f ms\n",
-                                     (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
-                                     driftMs, driftBase);
-                                did = true;
-                            }
-                        } else if (err < 0 && dpt0 > 0) {   // leg1 late: give the excess back
-                            Leg& W = g_leg[0];
-                            size_t x = (size_t)(-errFr < dpt0 ? (size_t)(-errFr) : (size_t)dpt0);
-                            const size_t lvl = W.out.count();
-                            if (x > lvl) x = lvl;
-                            if (x) {
-                                W.out.discardOldest(x);
-                                W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-                                tlog("[twinspeak] drift warden : leg1 re-pinned -- skipped %llu fr (%.1f ms) of excess;\n"
-                                     "                            drift %+.1f ms -> back toward baseline %+.1f ms\n",
-                                     (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
-                                     driftMs, driftBase);
-                                did = true;
-                            }
-                        } else if (err < 0 && dpt1 < 0) {   // leg2 early: hold it
-                            Leg& W = g_leg[1];
-                            size_t x = (size_t)(-errFr < -dpt1 ? (size_t)(-errFr) : (size_t)(-dpt1));
-                            if (x > kWardenMaxPadFrames) x = kWardenMaxPadFrames;
-                            if (x) {
-                                W.padFrames.fetch_add(x, std::memory_order_relaxed);
-                                W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-                                tlog("[twinspeak] drift warden : leg2 re-pinned -- replay-padded %llu fr (%.1f ms);\n"
-                                     "                            drift %+.1f ms -> back toward baseline %+.1f ms\n",
-                                     (unsigned long long)x, (double)x * 1000.0 / (double)kSampleRate,
-                                     driftMs, driftBase);
-                                did = true;
-                            }
-                        }
-                        if (!did)
-                            tlog("[twinspeak] drift warden : drift %+.1f ms vs baseline %+.1f ms, but neither ring holds\n"
-                                 "                            the excess (depth d0 %+lld / d1 %+lld fr) -- nothing host-side to re-pin\n",
-                                 driftMs, driftBase, dpt0, dpt1);
+                        wardenRepin(err, driftMs, driftBase, "drift warden");
                     }
                 } else {
                     wardenStreak = 0;
