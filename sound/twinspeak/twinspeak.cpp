@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,18 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.6  TRAY-FIRST START: a --tray (startup) launch builds NO control
+//            window at all -- an invisible tray-owner window (same class,
+//            never shown) carries the tray icon and the second-instance
+//            messages; the panel is built ON DEMAND at the first icon
+//            click / menu Open / second-instance ask, and carries
+//            WS_EX_TOOLWINDOW: no taskbar button, no Alt-Tab entry. A
+//            boot pop is structurally impossible -- there is no window
+//            to show -- and the app lives only in the system tray. The
+//            engine auto-start runs straight from the ini (no controls
+//            exist yet); the buffered boot log flushes into the pane
+//            when the panel first opens. DSP byte-identical to v7.1.4
+//            (and to every 7.1.5 build).
 //    v7.1.5  field fixes: THE BOOT POP (a duplicate --tray launch signaled
 //            WM_APP+4 and forced the hidden startup window on screen --
 //            --tray duplicates now exit silently, manual ones still come
@@ -45,7 +57,8 @@
 //            window) now identifies boot twins: they exit silently, a
 //            plain winner inside the logon window runs as the startup
 //            instance, and a --tray twin yields boot ownership (WM_APP+5)
-//            instead of letting the window pop; MOUSE INPUT SPACING (the
+//            instead of letting the window pop; MOUSE INPUT
+//            SPACING (the
 //            UI thread stops queueing behind the engine's helpers at
 //            HIGHEST priority, the watermark measure is cached, and the
 //            status paint pauses mid-drag); CTRL+TAB / CTRL+SHIFT+TAB
@@ -2557,7 +2570,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2888,9 +2901,10 @@ static void writeTemplate(const char* path) {
         "gui_theme = 0\n"
         "\n"
         "; v7.1.2: startup_engine = when the startup launch (--tray, the\n"
-        "; sign-in path) opens the window hidden in the tray, the engine\n"
-        "; starts BY ITSELF -- no START press needed. off = the old behavior\n"
-        "; (the engine waits for START).\n"
+        "; sign-in path) starts TRAY-ONLY (v7.1.6: no window exists until\n"
+        "; you click the tray icon), the engine starts BY ITSELF -- no\n"
+        "; START press needed. off = the old behavior (the engine waits\n"
+        "; for START).\n"
         "startup_engine = on\n");
     fclose(f);
 }
@@ -3502,6 +3516,14 @@ static bool g_userShown   = false;             // v7.1.5: the USER opened the wi
                                                // (tray dbl-click / menu / second
                                                // instance) -- startup shows and the
                                                // boot yield never set it
+// v7.1.6 TRAY-FIRST: the invisible tray-owner window. A --tray (startup)
+// launch builds NO control window at all -- this surrogate (same window
+// class, never shown) carries the tray icon and the second-instance
+// messages, so a boot pop is structurally impossible: there is no window
+// to show. The real control panel is built on demand (guiCreateRealWindow)
+// the first time the user clicks the icon, opens the tray menu, or a
+// second instance asks for the window.
+static HWND g_trayWnd = nullptr;
 static UINT g_taskbarCreated = 0;              // explorer restart re-adds the icon
 
 // v7.1.5 THE BOOT POP, round two: a plain (no --tray) duplicate. Windows'
@@ -3543,6 +3565,7 @@ static void guiRepaint(HWND w, int id);
 static void guiRepaintPresets(HWND w);
 static void trayAdd(bool hint);
 static void trayRemove();
+static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on demand
 // v6.6.1 tray context-menu commands
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
@@ -4308,6 +4331,12 @@ static std::string editStr(HWND w, int id) {
 }
 
 static void cfgFromControls(HWND w) {
+    // v7.1.6 TRAY-FIRST: a tray-only start runs the engine straight from the
+    // ini (g_cfg as loaded) -- no window, no controls exist yet. Every start
+    // path that lands here without the control window simply keeps g_cfg;
+    // when the window is built later, controlsFromCfg fills the controls
+    // from the same g_cfg, so START in the window still edits what runs.
+    if (!w || !GetDlgItem(w, IDC_INDEV)) return;
     g_cfg.inputDevice    = editStr(w, IDC_INDEV);
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
@@ -4455,6 +4484,20 @@ static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
     const RECT sr = { 14, 458, 866, 476 };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
+}
+
+// v7.1.6 TRAY-FIRST: the one-and-only ring drain, used by the 250 ms tick
+// AND by guiCreateRealWindow. While the window does not exist (tray-only)
+// NOBODY drains: the ring buffers the whole boot log (capped at 64 KB like
+// always); the first drain after the window opens lands it in the pane at
+// once -- nothing the engine said before the first click is lost.
+static void guiFlushLogRing() {
+    if (!g_logDirty.exchange(false)) return;
+    EnterCriticalSection(&g_logCS);
+    const std::string chunk = g_logRing;
+    g_logRing.clear();
+    LeaveCriticalSection(&g_logCS);
+    if (!chunk.empty()) guiAppendLog(chunk);
 }
 
 static DWORD WINAPI guiEngineThread(LPVOID) {
@@ -5268,7 +5311,91 @@ static void trayAdd(bool hint) {
         Shell_NotifyIconA(NIM_MODIFY, &g_nid);
     }
 }
+// v7.1.6 TRAY-FIRST: a balloon with caller-supplied text. The boot balloon
+// says "running in the tray" ("still running" reads wrong when nothing was
+// ever open); the close balloon stays trayAdd's own one-time hint.
+static void trayBalloon(const char* text) {
+    if (!g_trayVisible) return;
+    g_nid.uFlags       = NIF_INFO;
+    lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
+    lstrcpynA(g_nid.szInfo, text, (int)sizeof(g_nid.szInfo));
+    g_nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
+// ---- v7.1.6 TRAY-FIRST: the deferred control window -------------------------
+// A --tray (startup) launch builds NOTHING but the invisible tray owner; the
+// real panel is constructed HERE, on demand: the first tray double-click,
+// "Open twinspeak" in the tray menu, or a second instance's "come up".
+// The same sequence the boot path used to run at sign-in runs exactly once,
+// in the same order, so the finished UI still paints before it is ever
+// shown (the v6.6.5 white-flash trick is preserved: create hidden, render
+// the whole tree into the redirection surface, show after).
+// The window carries WS_EX_TOOLWINDOW: no taskbar button, no Alt-Tab entry
+// -- the app lives in the system tray, period; the panel is a visitor.
+static bool guiCreateRealWindow() {
+    if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
+    HINSTANCE hi = GetModuleHandleA(nullptr);
+    RECT r = { 0, 0, KCLI_W, KCLI_H };
+    AdjustWindowRect(&r, kGuiFrame, FALSE);
+    g_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW, "twinspeak.control",
+                             "TidyVision TwinSpeak: Control Panel",
+                             kGuiFrame | WS_CLIPCHILDREN,
+                             CW_USEDEFAULT, CW_USEDEFAULT,
+                             r.right - r.left, r.bottom - r.top,
+                             nullptr, nullptr, hi, nullptr);
+    if (!g_hwnd) return false;
+    // v7.0.9 THE CUSTOM TITLEBAR / v7.1.0 ROUNDED WINDOW (as always)
+    {
+        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+        const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+            LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+        bool rounded = false;
+        if (dwmSet) {
+            const int off = 1;   // DWMNCRP_DISABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof(off));
+            const int round = 2; // DWMWCP_ROUND
+            rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                                       &round, sizeof(round)));
+        }
+        if (!rounded) g_winRegionFallback = true;
+    }
+    // v7.0.9: re-measure the NCCALCSIZE-inset client and resize once -- the
+    // design client is EXACTLY 880x620 again.
+    {
+        RECT rc; GetClientRect(g_hwnd, &rc);
+        if (rc.right != KCLI_W || rc.bottom != KCLI_H)
+            SetWindowPos(g_hwnd, nullptr, 0, 0,
+                         (r.right - r.left) + (KCLI_W - rc.right),
+                         (r.bottom - r.top) + (KCLI_H - rc.bottom),
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    // v7.1.0: the Win10 round-rect region fallback (final size known now).
+    if (g_winRegionFallback) {
+        RECT wr; GetWindowRect(g_hwnd, &wr);
+        HRGN rg = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1, 16, 16);
+        if (rg) SetWindowRgn(g_hwnd, rg, FALSE);
+    }
+    guiBuildControls(g_hwnd);
+    controlsFromCfg(g_hwnd);
+    guiShowPage(g_hwnd, 0);
+    guiFillCombos(g_hwnd);
+    // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
+    // redirection surface now, so the first frame DWM composites is the
+    // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
+    RedrawWindow(g_hwnd, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
+    SetTimer(g_hwnd, 1, 250, nullptr);
+    // the whole boot log -- everything the engine said while tray-only --
+    // lands in the pane in one flush, oldest first, nothing lost.
+    guiFlushLogRing();
+    tlog("[twinspeak] gui           : control window up -- ini at %s\n", g_guiIniPath.c_str());
+    return true;
+}
+
 static void guiRestoreWindow() {
+    // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
+    // tray menu, second instance); every later ask just shows it.
+    if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
@@ -5315,7 +5442,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.5  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.6  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -5356,10 +5483,13 @@ static bool guiIsToggle(int id) {
 }
 
 static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
-    // v6.6.1: explorer restarted -- the tray icon vanished; re-add it when the
-    // window is hidden (a visible window re-adds its icon on first close).
+    // v6.6.1: explorer restarted -- the tray icon vanished; re-add it. v7.1.6
+    // TRAY-FIRST: re-add ALWAYS (trayRemove + trayAdd): the icon owner may be
+    // the invisible tray window (no control window exists yet), and explorer
+    // lost every icon anyway -- a fresh NIM_ADD is the only thing that works.
     if (g_taskbarCreated && msg == g_taskbarCreated) {
-        if (!IsWindowVisible(g_hwnd)) trayAdd(false);
+        trayRemove();
+        trayAdd(false);
         return 0;
     }
     switch (msg) {
@@ -5786,13 +5916,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
             }
         }
-        if (g_logDirty.exchange(false)) {
-            EnterCriticalSection(&g_logCS);
-            const std::string chunk = g_logRing;
-            g_logRing.clear();
-            LeaveCriticalSection(&g_logCS);
-            if (!chunk.empty()) guiAppendLog(chunk);
-        }
+        guiFlushLogRing();                               // v7.1.6: one shared drain
         static const char* stName[4] = { "engine stopped", "engine started",
                                          "engine RUNNING", "engine stopping..." };
         // v7.0.0: "engine starting..." renamed "engine started" -- the label
@@ -5947,10 +6071,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // Run-key --tray instance to the mutex shows its window and lets the real
     // startup twin die silently -- the boot pop, from the other direction.
     // Inside the logon window, with startup_engine opted in, a plain launch
-    // IS the startup path: run it exactly like --tray (hidden, engine on).
+    // IS the startup path: run it exactly like --tray (tray-only, engine on,
+    // no window built at all).
     if (!startTray && g_cfg.startupEngine && withinLogonWindow(kBootWindowMs)) {
         tlog("[twinspeak] gui           : plain launch inside the logon window -- running it as the\n");
-        tlog("                            startup instance (hidden in the tray, startup engine)\n");
+        tlog("                            startup instance (tray-only, startup engine)\n");
         startTray    = true;
         g_startTray  = true;
     }
@@ -5973,71 +6098,6 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                                   // applyTheme() deletes + recreates g_brBg
     wc.lpszClassName = "twinspeak.control";
     RegisterClassA(&wc);
-    RECT r = { 0, 0, KCLI_W, KCLI_H };
-    AdjustWindowRect(&r, kGuiFrame, FALSE);
-    // v6.6.1 STALE-PAINT FIX: WS_EX_COMPOSITED deferred child repaints and
-    // the frame invalidated only itself. WS_CLIPCHILDREN instead: the parent
-    // never paints over its children; every state change invalidates the
-    // exact child (see guiRepaint). Starts HIDDEN (tray launch).
-    g_hwnd = CreateWindowExA(0, "twinspeak.control", "TidyVision TwinSpeak: Control Panel",
-                             kGuiFrame | WS_CLIPCHILDREN,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
-                             nullptr, nullptr, wc.hInstance, nullptr);
-    if (!g_hwnd) { if (mutex) CloseHandle(mutex); return 1; }
-    // v7.0.9 THE CUSTOM TITLEBAR, part 2: DWM's own caption drawing is
-    // switched off (DWMWA_NCRENDERING_POLICY -> DWMNCRP_DISABLED) so its
-    // text/buttons/dark-light recolor can never fight the bar we paint.
-    // v7.1.0 ROUNDED WINDOW: DWMWA_WINDOW_CORNER_PREFERENCE -> DWMWCP_ROUND
-    // (Win11) -- DWM clips the window to a rounded rect with ANTIALIASED
-    // corners, the only true-AA rounding a plain HWND can get. On Win10 the
-    // attribute is unknown and the call fails -> a GDI round-rect region as
-    // the flat-edged fallback (same shape, aliased -- regions cannot AA).
-    {
-        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
-        const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
-            LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
-        bool rounded = false;
-        if (dwmSet) {
-            const int off = 1;   // DWMNCRP_DISABLED
-            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof(off));
-            const int round = 2; // DWMWCP_ROUND
-            rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                                       &round, sizeof(round)));
-        }
-        if (!rounded) {
-            // applied after the re-measure below (the region wants the final
-            // window size); flagged here so the fallback runs exactly once.
-            g_winRegionFallback = true;
-        }
-    }
-    // v7.0.9: the NCCALCSIZE top inset (kCapH) replaced the system caption;
-    // its height differs from kCapH by a couple px per OS, so re-measure the
-    // client and resize once -- the design client is EXACTLY 880x620 again.
-    {
-        RECT rc; GetClientRect(g_hwnd, &rc);
-        if (rc.right != KCLI_W || rc.bottom != KCLI_H)
-            SetWindowPos(g_hwnd, nullptr, 0, 0,
-                         (r.right - r.left) + (KCLI_W - rc.right),
-                         (r.bottom - r.top) + (KCLI_H - rc.bottom),
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    // v7.1.0: the Win10 region fallback -- the window is final-sized now, so
-    // the round-rect region matches it exactly. SetWindowRgn owns the HRGN.
-    if (g_winRegionFallback) {
-        RECT wr; GetWindowRect(g_hwnd, &wr);
-        HRGN rg = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1, 16, 16);
-        if (rg) SetWindowRgn(g_hwnd, rg, FALSE);
-    }
-    guiBuildControls(g_hwnd);
-    controlsFromCfg(g_hwnd);
-    guiShowPage(g_hwnd, 0);
-    guiFillCombos(g_hwnd);
-    // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
-    // redirection surface now, so the first frame DWM composites is the
-    // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
-    RedrawWindow(g_hwnd, nullptr, nullptr,
-                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
-    SetTimer(g_hwnd, 1, 250, nullptr);
     // v7.1.5 THE INPUT PRIORITY: the message-loop thread ran at NORMAL while
     // the engine's helpers (health loop, volume watcher) and the RT audio
     // threads share the process -- under load the UI thread got the scraps
@@ -6047,26 +6107,46 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // sits above priority 15), so the DSP path keeps every cycle it owns.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (g_startTray) {
-        // --tray: straight to the tray (the startup path). The balloon shows
-        // once so a boot-time launch is not a silent process.
-        trayAdd(true);
-        tlog("[twinspeak] gui           : running in the tray -- double-click the icon to open.\n");
+        // v7.1.6 TRAY-FIRST: the startup launch builds NO control window at
+        // all. The old path created the full 880x620 panel HIDDEN and trusted
+        // every guard to keep it hidden -- and boot machinery still found a
+        // way to pop it (two rounds of gates, the field still saw the window).
+        // Now there is nothing to pop: an invisible top-level window of the
+        // same class owns the tray icon and the second-instance messages;
+        // the real panel is built the first time the user clicks the icon
+        // (guiCreateRealWindow, on demand). FindWindowA-based duplicate
+        // detection still works -- the surrogate carries the class.
+        g_trayWnd = CreateWindowExA(0, "twinspeak.control", "TidyVision TwinSpeak: Tray",
+                                    WS_OVERLAPPED, 0, 0, 0, 0,
+                                    nullptr, nullptr, wc.hInstance, nullptr);
+        if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
+        g_hwnd = g_trayWnd;
+        trayAdd(false);
+        trayBalloon("Running in the tray -- the engine is starting.\n"
+                    "Double-click the icon to open the control panel; "
+                    "right-click for Start/Stop and Exit.");
+        tlog("[twinspeak] gui           : tray-only start -- no window exists; double-click the tray icon\n");
+        tlog("                            to build and open the control panel (no taskbar button).\n");
         // v7.1.2 STARTUP ENGINE: the startup launch is the boot path -- the
         // user signs in and the splitter must simply be running. With
-        // startup_engine on (the default) the engine starts here, exactly
-        // as if START was pressed: cfg from the fresh controls, ini saved,
-        // worker thread up. (A missing key parses as ON; explicit off
-        // restores the old wait-for-START behavior.)
+        // startup_engine on (the default) the engine starts here, straight
+        // from the ini (no controls exist yet -- cfgFromControls keeps g_cfg).
+        // (A missing key parses as ON; explicit off restores the old
+        // wait-for-START behavior.)
         if (g_cfg.startupEngine) {
             tlog("[twinspeak] gui           : startup launch -- auto-starting the engine (startup_engine).\n");
             guiStartEngine(g_hwnd);
         }
     } else {
+        // the double-click path: build the panel, show it (guiCreateRealWindow
+        // renders the whole tree into the hidden redirection surface first --
+        // the v6.6.5 white-flash trick -- so SW_SHOWNA lands one finished
+        // frame, no activate/erase cycle).
+        if (!guiCreateRealWindow()) { if (mutex) CloseHandle(mutex); return 1; }
         ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
+        tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
+        tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
-    tlog("[twinspeak] gui           : control window up -- ini at %s\n", iniPath.c_str());
-    tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
-    tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
         // v7.1.5 CTRL+TAB cycles pages: Ctrl+Tab = next, Ctrl+Shift+Tab =
@@ -6125,8 +6205,10 @@ int main(int argc, char** argv) {
             tlog("usage: twinspeak [--list] [--list-ks] [--ini path] [--foreground] [--multi]\n"
                  "  (no args)     the control window -- every ini option + START/STOP + live log\n"
                  "                (closing it hides to the TRAY; the engine stays up)\n"
-                 "  --tray        the control window, already hidden in the tray\n"
-                 "                (this is what the tray's 'Run at Windows startup' writes)\n"
+                 "  --tray        straight to the system tray -- NO window exists until you\n"
+                 "                click the tray icon (never a taskbar button; this is what\n"
+                 "                the tray's 'Run at Windows startup' writes -- use it for\n"
+                 "                Task Scheduler sign-in tasks too)\n"
                  "  --list        show every WASAPI endpoint (the usual device needles)\n"
                  "  --list-ks     show every WDM-KS render filter with its pins/formats (v6.3)\n"
                  "  --foreground  ignore background = on for this run (keep the console)\n"
@@ -6676,7 +6758,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.5        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
