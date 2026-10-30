@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.12 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -14,7 +14,7 @@
 //      +--> leg2.raw ring --> pump 2 (FIRST + higher priority)
 //             gates: ch3 zero -> nothing; ch3 == Windows stereo-upmix
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
-//             + 40 Hz @ 1% keep-alive at the device layer
+//             + 40 Hz @ 0.1% keep-alive at the device layer (v7.1.12)
 //    playback callbacks = the ASIO buffer switch: gated excess drop +
 //    last-buffer replay. WASAPI exclusive is INTEGRATED (v6.6.8): both legs
 //    open exclusive together (shared fallback reopens BOTH), capture pin
@@ -23,6 +23,13 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.12 KEEP-ALIVE RETUNE: the out2 keep-alive tone is back at 40 Hz
+//            and up to 0.001 (-60 dBFS) -- the field's call: 1 Hz @ 0.0001
+//            (-80 dBFS) was too little for some amps' sleep timers. Still
+//            BUILT IN (no ini key, no UI), still post-mix at the device
+//            layer -- it can never enter the capture stream OBS records.
+//            The cycle table shrinks to 1200 samples (48000/40); the sum
+//            path is table-length agnostic and unchanged.
 //    v7.1.11 THE RESTART IS CLEAN AND THE LEGS OPEN TOGETHER: guiStopEngine
 //            raises the stop gap ITSELF (the engine's health loop slept a
 //            full second before noticing -- APPLY+RESTART played program
@@ -386,19 +393,21 @@ static constexpr int      kOutCh2        = 2;      // leg2: stereo center speake
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
 
-// output2 keep-alive tone: 1 Hz at 0.01% gain (0.0001, ~-80 dBFS, far below
-// hearing) summed onto BOTH channels at the DEVICE layer -- every frame,
-// silence or not, underrun or not, phase-continuous. Rendered from a
-// precomputed 48000-sample cycle table (48000/1 = exactly one cycle) instead
-// of calling sin() per frame. v7.1.7: BUILT IN -- the ini keys and UI rows
-// are gone (the field never needed to move them; 1 Hz wobble holds every
-// amp awake and is inaudible on any driver). POST-MIX by construction: the
-// tone is summed in the leg2 OUTPUT callbacks, after the mix, so it can
-// never enter the capture stream an OBS display-capture records.
+// output2 keep-alive tone: 40 Hz at 0.1% gain (0.001, ~-60 dBFS) summed onto
+// BOTH channels at the DEVICE layer -- every frame, silence or not, underrun
+// or not, phase-continuous. Rendered from a precomputed cycle table (1200
+// samples = exactly one 40 Hz cycle @ 48 kHz) instead of calling sin() per
+// frame. v7.1.7: BUILT IN -- the ini keys and UI rows are gone. v7.1.12:
+// retuned from 1 Hz @ 0.0001 (~-80 dBFS) to the field's 40 Hz @ 0.001 --
+// the old wobble was too little for some amps' sleep timers, and 40 Hz is
+// still below what any small center driver reproduces at -60 dBFS.
+// POST-MIX by construction: the tone is summed in the leg2 OUTPUT callbacks,
+// after the mix, so it can never enter the capture stream an OBS
+// display-capture records.
 static constexpr double   kTwoPi             = 6.283185307179586;
-static constexpr unsigned kKeepAliveTableMax = 48000;  // one 1 Hz cycle @ 48 kHz
-static constexpr float    kKeepAliveHz       = 1.0f;    // v7.1.7: built in
-static constexpr float    kKeepAliveGain     = 0.0001f; // v7.1.7: built in
+static constexpr unsigned kKeepAliveTableMax = 48000;  // headroom (40 Hz needs 1200)
+static constexpr float    kKeepAliveHz       = 40.0f;   // v7.1.12: was 1 Hz
+static constexpr float    kKeepAliveGain     = 0.001f;  // v7.1.12: was 0.0001
 static float              g_kaHz   = kKeepAliveHz;
 static float              g_kaGain = kKeepAliveGain;
 static unsigned           g_kaLen  = 48000;   // samples per cycle: round(48000 / g_kaHz)
@@ -479,7 +488,8 @@ struct Config {
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
     // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
-    // kKeepAliveGain, 1 Hz @ 0.0001) -- no struct fields, no ini key, no UI.
+    // kKeepAliveGain, 40 Hz @ 0.001 since v7.1.12) -- no struct fields, no
+    // ini key, no UI.
     bool        background     = true;   // v6.2: detach the console after a
                                           //       successful start; log to file
                                           // v6.6.8: INTEGRATED -- always on
@@ -2658,7 +2668,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.12 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2791,10 +2801,11 @@ static void writeTemplate(const char* path) {
         "; endpoint volumes are pinned 100%% / unmuted while the engine runs.\n"
         "out2_first = on\n"
         "\n"
-        "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI): out2 sums a sine on\n"
+        "; KEEP-ALIVE (BUILT IN -- no keys, no UI): out2 sums a sine on\n"
         "; both channels every frame (silence or not) so the center device\n"
-        "; never sees digital silence. 1 Hz @ 0.0001 (-80 dBFS) -- far below\n"
-        "; hearing, and a wobble every amp's sleep timer treats as signal.\n"
+        "; never sees digital silence. 40 Hz @ 0.001 (-60 dBFS, v7.1.12 --\n"
+        "; was 1 Hz @ 0.0001, too little for some amps' sleep timers), still\n"
+        "; below hearing, and a wobble every amp's sleep timer treats as signal.\n"
         "; The watchdog reopens out2 automatically whenever it comes back.\n"
         "; POST-MIX: the tone and the chime are summed in the out2 OUTPUT\n"
         "; callbacks, after the mix -- they never enter the capture stream an\n"
@@ -5727,7 +5738,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.11  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.12  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -6588,7 +6599,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_qpcBoot = c;
     }
 
-    // keep-alive cycle table (v7.1.7: BUILT IN -- 1 Hz @ 0.0001, no ini, no UI)
+    // keep-alive cycle table (BUILT IN -- 40 Hz @ 0.001 since v7.1.12, no ini, no UI)
     g_kaHz = kKeepAliveHz;
     g_kaGain = kKeepAliveGain;
     g_kaLen = (unsigned)((double)kSampleRate / (double)g_kaHz + 0.5);
@@ -7075,7 +7086,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.11       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.12       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
