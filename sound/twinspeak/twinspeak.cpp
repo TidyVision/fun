@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,15 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.4  fixes + keyboard: the GDI+ bar's gray hairline edges are gone
+//            (integer fills + 1px overscan, no shape AA on the bar -- the
+//            AA boundary blend against the stale pixels was the gray);
+//            the title text is THEME-AWARE: plain caption color on light
+//            themes, a cyan-gray vertical gradient on dark ones; keyboard
+//            + Tab work (IsDialogMessage, WS_TABSTOP sliders, arrows
+//            adjust the focused slider, dashed focus rings on buttons and
+//            sliders); CS_DROPSHADOW on the window. DSP byte-identical
+//            to v7.1.3.
 //    v7.1.3  the titlebar is GDI+: ONE Gdiplus::Graphics paints the whole
 //            bar -- the face is a subtle top-lit vertical gradient of the
 //            theme bg, the bottom edge + close hover face + Marlett X are
@@ -2504,7 +2513,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3490,38 +3499,48 @@ static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
 // GDI+ fills, all text renders AntiAliasGridFit (grayscale AA, same family
 // as the buttons since v7.1.2), and the close glyph brightens to the theme
 // accent while hovered.
+// v7.1.4 THE GRAY HAIRLINES: shape antialiasing on integer-aligned fills
+// let the face/edge rectangles pick up half-coverage boundary pixels -- a
+// 1px gray line on some edges (the AA blend against whatever sat under
+// the bar). The fills now go through the INTEGER FillRectangle overloads
+// with a 1px overscan, and SmoothingMode stays OFF for shapes (the Marlett
+// X is TEXT -- its grayscale AA comes from the text hint, untouched).
+// v7.1.4 THEME-AWARE TITLE: the hard-coded blue->teal gradient is retired.
+// Light themes read "TwinSpeak" in the plain caption text color (the
+// normal look); dark themes get a CYAN-GRAY vertical gradient (cyan-tinted
+// gray, light at the top -> slate at the bottom), keyed to the theme by
+// the bg's luminance instead of hard-coded stops.
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
     HDC dc = GetWindowDC(w);
     RECT wr; GetWindowRect(w, &wr);
     const int ww = wr.right - wr.left;
-    const Gdiplus::RectF bar(0.0f, 0.0f, (Gdiplus::REAL)ww, (Gdiplus::REAL)kCapH);
     Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // the face: the theme bg with a light touch at the top -- depth without
     // inventing a color the theme does not own (guiLerpRGB toward white).
+    // Integer fill + overscan: every bar pixel is covered exactly once, no
+    // boundary blend, no gray hairline.
     const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), 0.07);
     Gdiplus::LinearGradientBrush face(
-        bar, Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
-             Gdiplus::Color(255, GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg)),
+        Gdiplus::Rect(0, 0, ww + 1, kCapH + 1),
+        Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
+        Gdiplus::Color(255, GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg)),
         Gdiplus::LinearGradientModeVertical);
-    g.FillRectangle(&face, bar);
+    g.FillRectangle(&face, -1, -1, ww + 2, kCapH + 2);
     // 1px bottom edge: chrome, not dead space (same cPanel2 as v7.0.9).
-    const Gdiplus::RectF ln(0.0f, (Gdiplus::REAL)(kCapH - 1), (Gdiplus::REAL)ww, 1.0f);
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-    g.FillRectangle(&edge, ln);
-    // the close slot: hover face + the Marlett glyph, both GDI+ now -- the
+    g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
+    // the close slot: hover face + the Marlett glyph, both GDI+ -- the
     // glyph is grayscale-antialiased (smooth like every other glyph in the
     // app) and warms to the theme accent under the mouse.
     const RECT cl = guiCapCloseRect(w);
-    const Gdiplus::RectF cx((Gdiplus::REAL)cl.left, (Gdiplus::REAL)cl.top,
-                            (Gdiplus::REAL)(cl.right - cl.left), (Gdiplus::REAL)(cl.bottom - cl.top));
     if (g_capHot) {
         Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                               GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-        g.FillRectangle(&hf, cx);
+        g.FillRectangle(&hf, (INT)cl.left, (INT)cl.top, (INT)(cl.right - cl.left),
+                        (INT)(cl.bottom - cl.top));
     }
     if (g_fCapX) {
         Gdiplus::Font xf(dc, g_fCapX);
@@ -3531,25 +3550,31 @@ static void guiPaintBar(HWND w) {
         sx.SetAlignment(Gdiplus::StringAlignmentCenter);
         sx.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sx.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        const Gdiplus::RectF cx((Gdiplus::REAL)cl.left, (Gdiplus::REAL)cl.top,
+                                (Gdiplus::REAL)(cl.right - cl.left), (Gdiplus::REAL)(cl.bottom - cl.top));
         g.DrawString(L"r", 1, &xf, cx, &sx, &xb);   // Marlett 'r' = the close X
     }
-    // v7.1.0/v7.1.3 THE BAR'S TITLE: "TwinSpeak" on the left, filled with a
-    // TRUE vertical linear gradient. The v7.1.0 stops were too dark for the
-    // dark themes -- the very-dark-blue top stop (8,16,54) read as BLACK and
-    // the top half of the glyphs vanished (field: "I don't see the brighter
-    // titlebar text"). Lifted: clear blue top -> bright teal bottom.
+    // the product name, theme-aware (see the v7.1.4 note above).
     if (g_fTitle) {
+        const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
+                            GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma
         Gdiplus::Font tf(dc, g_fTitle);
         const Gdiplus::RectF tr(12.0f, 3.0f, 220.0f, (Gdiplus::REAL)(kCapH - 7));
-        Gdiplus::LinearGradientBrush gb(
-            tr, Gdiplus::Color(255, 52, 100, 215),   // clear blue, top (was 8,16,54 -- invisible)
-                Gdiplus::Color(255, 0, 190, 195),    // bright teal, bottom
-            Gdiplus::LinearGradientModeVertical);
         Gdiplus::StringFormat sf;
         sf.SetAlignment(Gdiplus::StringAlignmentNear);
         sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        g.DrawString(kCapTitle, -1, &tf, tr, &sf, &gb);
+        if (dark) {
+            Gdiplus::LinearGradientBrush gb(
+                tr, Gdiplus::Color(255, 160, 200, 205),   // cyan gray, light -- top
+                    Gdiplus::Color(255, 108, 134, 140),   // slate cyan gray -- bottom
+                Gdiplus::LinearGradientModeVertical);
+            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &gb);
+        } else {
+            Gdiplus::SolidBrush nb(Gdiplus::Color(255, GetRValue(guic::cText),
+                                                  GetGValue(guic::cText), GetBValue(guic::cText)));
+            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &nb);
+        }
     }
     ReleaseDC(w, dc);
 }
@@ -3829,6 +3854,11 @@ static void sldPaint(HWND h) {
         g.DrawPath(&pb, p);
         delete p;
     }
+    if (GetFocus() == h) {   // v7.1.4: the keyboard focus cue -- dashed accent ring
+        Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
+        fp.SetDashStyle(Gdiplus::DashStyleDash);
+        g.DrawRectangle(&fp, Gdiplus::Rect(4, 3, rc.right - rc.left - 8, rc.bottom - rc.top - 6));
+    }
     EndPaint(h, &ps);
 }
 
@@ -3850,6 +3880,7 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 1;                      // the white flash cannot exist here
     case WM_LBUTTONDOWN:
         SetCapture(h);
+        SetFocus(h);                   // v7.1.4: a click gives the slider keyboard focus
         s.drag = true;
         sldUpdateFromX(h, s, lp);
         SendMessageA(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, s.pos), (LPARAM)h);
@@ -3875,6 +3906,30 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_PAINT:
         sldPaint(h);
         return 0;
+    // v7.1.4 KEYBOARD: the slider is a first-class tab stop. Arrows adjust
+    // the value (DLGC_WANTARROWS keeps them away from IsDialogMessage's
+    // focus logic); focus paints the dashed ring in sldPaint.
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_KEYDOWN: {
+        int step = (s.hi > s.lo) ? (s.hi - s.lo) / 50 : 1;
+        if (step < 1) step = 1;
+        int np = s.pos;
+        if      (wp == VK_LEFT || wp == VK_DOWN) np = s.pos - step;
+        else if (wp == VK_RIGHT || wp == VK_UP)  np = s.pos + step;
+        else break;
+        if (np < s.lo) np = s.lo;
+        if (np > s.hi) np = s.hi;
+        if (np != s.pos) {
+            s.pos = np;
+            InvalidateRect(h, nullptr, FALSE);
+            SendMessageA(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, s.pos), (LPARAM)h);
+        }
+        return 0; }
     }
     return DefWindowProcA(h, m, wp, lp);
 }
@@ -3889,7 +3944,7 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
         RegisterClassA(&wc);
         sldClass = true;
     }
-    HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE,
+    HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP,   // v7.1.4: a tab stop
                              x, y, cw, 28, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     g_sld[h] = { lo, hi, lo, false };
     InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
@@ -5104,7 +5159,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.3  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.4  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     guiWatermark(g);
@@ -5291,6 +5346,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // every theme; ON keeps the accent.
             guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cText,
                         g_fUIb, 0);
+            if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
+                Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
+                fp.SetDashStyle(Gdiplus::DashStyleDash);
+                g.DrawRectangle(&fp, Gdiplus::Rect(2, 2, bw - 4, bh - 4));
+            }
             if (dc != d->hDC)
                 BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
             return TRUE;
@@ -5319,6 +5379,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 // the engine is already stoppable, so the label reads STOP.
                 guiAAString(g, dc, rc, st == 1 ? "STOP" : "STOPPING...", guic::cDim,
                             g_fUIb, 0);
+            }
+            if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
+                Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
+                fp.SetDashStyle(Gdiplus::DashStyleDash);
+                g.DrawRectangle(&fp, Gdiplus::Rect(2, 2, bw - 4, bh - 4));
             }
             if (dc != d->hDC)
                 BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
@@ -5349,6 +5414,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.DrawPath(&pb, p);
         delete p;
         guiAAString(g, dc, rc, txt, accentBtn ? guic::cAccent : guic::cText, g_fUIb, 0);
+        if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
+            Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
+            fp.SetDashStyle(Gdiplus::DashStyleDash);
+            g.DrawRectangle(&fp, Gdiplus::Rect(2, 2, bw - 4, bh - 4));
+        }
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
@@ -5652,7 +5722,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
     WNDCLASSA wc = {};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;   // v7.1.4: the window gets its drop shadow back
     wc.lpfnWndProc = guiWndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
@@ -5751,6 +5821,13 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
+        // v7.1.4 KEYBOARD + TAB: IsDialogMessage drives the whole child tree --
+        // Tab / Shift+Tab cycle the tab stops (buttons, pills, edits, combos
+        // and now the sliders), Space activates the focused button, and the
+        // keys a control claims via WM_GETDLGCODE (the sliders' arrows) are
+        // delivered to it. Hidden pages are skipped (visibility-checked
+        // navigation), so the tab ring follows the open page.
+        if (g_hwnd && IsWindow(g_hwnd) && IsDialogMessageA(g_hwnd, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
@@ -6248,7 +6325,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.3        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.4        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
