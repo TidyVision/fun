@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.16 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -26,6 +26,23 @@
 //    FIRST-SECOND fast tier at 10x that cadence (v7.1.14).
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.16 THE REGION THAT ATE THE SHADOW + THE STACK THAT FITS: the
+//            field's "I still don't see a drop shadow" was our own log
+//            line talking -- "a shaped window cannot carry the DWM
+//            shadow". Attr 33 (corner preference) is Win11-only; on the
+//            field's Win10 it failed and v7.1.0's fallback shaped the
+//            window with a GDI region -- and Windows refuses the DWM
+//            window shadow for ANY region-shaped window, so every fix
+//            since (v7.1.11's restore, v7.1.15's extend-frame +
+//            NCRENDERING ON pins) was revoked by our own region lines
+//            later. The region fallback is GONE -- the window is never
+//            shaped again; Win10 keeps square corners and gets the full
+//            all-directions shadow back. And the page-4 stack now fits:
+//            the SAVE TO SLOT note hung 28 px past the panel bottom,
+//            across the action row (the arithmetic was unwinnable -- 45
+//            px of button+note vs 44 px of panel); the sliders ride up
+//            8 px, the button rises to 354, the note is one line ending
+//            at the panel edge. GUI-only; DSP byte-identical to v7.1.4.
 //    v7.1.15 GUI POLISH, THE FIELD'S FOUR: the center-EQ note carried
 //            17 text rows in a 13-row box -- the STATIC clipped its
 //            own tail; re-wrapped short, full height, nothing cuts
@@ -2713,7 +2730,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3786,11 +3803,12 @@ static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
 // round-trip). The top 31 px strip of the window is our own bar: theme colors
 // painted directly, so a theme click recolors it the same instant as the
 // client. WM_NCCALCSIZE insets the client top by kCapH -- every child
-// coordinate keeps its old meaning. DWM's own frame drawing is switched off
-// (DWMNCRP_DISABLED, set in guiMain) so nothing fights the bar.
+// coordinate keeps its old meaning. DWM's own frame drawing is left at the
+// window-style default (v7.1.11: an explicit NCRENDERING DISABLED here killed
+// the window shadow) -- the bar defends itself message-by-message instead
+// (WM_NCPAINT, NCACTIVATE lParam -1, the 0x00AE/0x00AF swallow).
 static const int  kCapH = 31;
 static bool       g_capHot = false;   // mouse over the close glyph
-static bool       g_winRegionFallback = false;   // v7.1.0: no DWM rounding -> GDI region
 static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
 static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
     RECT wr; GetWindowRect(w, &wr);
@@ -4939,7 +4957,8 @@ static void guiBuildPages(HWND w) {
     // v7.1.8: the four built-in presets are GONE -- five user save slots,
     // uniform like they were: 5 x 76 px faces + 4 x 5 px gaps span the
     // sliders' 400 px exactly. Left-click applies AND arms; the SAVE TO
-    // SLOT button (column B) writes the armed slot (v7.1.9).
+    // SLOT button (below the sliders since v7.1.15) writes the armed slot
+    // (v7.1.9).
     for (int i = 0; i < 5; ++i) {
         char nm[16];
         snprintf(nm, sizeof(nm), "SLOT %d", i + 1);
@@ -4948,16 +4967,27 @@ static void guiBuildPages(HWND w) {
     // v7.1.15: SAVE TO SLOT lives under the sliders now (was column B,
     // detached from what it saves) -- the button sits directly beneath
     // the curve it writes, with its own one-line description.
-    HWND sv = mkBtn(w, IDC_EQSAVE, COLA_X, 366, 400, 26, "SAVE TO SLOT");
+    // v7.1.16 THE OVERLAP: that note shipped as a 2-row box carrying ONE
+    // line -- 396..430 on a page panel that ends at KPANEL_B = 402 -- so
+    // it hung 28 px past the panel and lay across the STOP / APPLY +
+    // RESTART / SAVE INI row at 414 (the STATIC is built after the bottom
+    // bar, so it painted OVER the buttons' tops). And the arithmetic was
+    // unwinnable as the column stood: the sliders end at 358, the panel
+    // leaves 44 px, and button (26) + note (19) need 45. The whole stack
+    // tightens: the three slider groups ride up 8 px (labels 196/248/300,
+    // sliders 214/266/318, ending at 346), the button rises to 354..380,
+    // and the description is ONE line (383..402) ending at the panel
+    // edge. Nothing crosses 402; nothing touches the action row.
+    HWND sv = mkBtn(w, IDC_EQSAVE, COLA_X, 354, 400, 26, "SAVE TO SLOT");
     regPage(sv);                       // v7.1.9: page 4 only
-    note(w, COLA_X, 396,
-         "makes sure this slot's current modifications persist across sessions.", 2);
-    mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
-    mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
-    mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
-    mkSlider(w, IDC_SLD_GAIN, COLA_X, 276, 400, -24, 24);
-    mkLabel(w, IDC_LBL_Q, COLA_X, 312, 400, "SHARPNESS (Q)", g_fUIb, 16);
-    mkSlider(w, IDC_SLD_Q, COLA_X, 330, 400, 0, 1000);
+    note(w, COLA_X, 383,
+         "makes sure this slot's current modifications persist across sessions.", 1);
+    mkLabel(w, IDC_LBL_FREQ, COLA_X, 196, 400, "PEAK FREQUENCY", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_FREQ, COLA_X, 214, 400, 0, 1000);
+    mkLabel(w, IDC_LBL_GAIN, COLA_X, 248, 400, "BOOST", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_GAIN, COLA_X, 266, 400, -24, 24);
+    mkLabel(w, IDC_LBL_Q, COLA_X, 300, 400, "SHARPNESS (Q)", g_fUIb, 16);
+    mkSlider(w, IDC_SLD_Q, COLA_X, 318, 400, 0, 1000);
     // v7.1.15 THE NOTE THAT ATE ITS OWN TAIL: the old note carried 17
     // text rows inside a 13-row box -- a STATIC renders every line it
     // is handed and simply stops at the control's bottom edge, so the
@@ -5662,7 +5692,7 @@ static bool guiCreateRealWindow() {
                              r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
-    // v7.0.9 THE CUSTOM TITLEBAR / v7.1.0 ROUNDED WINDOW (as always)
+    // v7.0.9 THE CUSTOM TITLEBAR / v7.1.16 THE UNSHAPED WINDOW (as always)
     {
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
@@ -5673,18 +5703,15 @@ static bool guiCreateRealWindow() {
             // killed the DWM's own window shadow (the all-four-directions
             // one a captioned window gets on Win10), leaving only the thin
             // menu-style CS_DROPSHADOW on the bottom-right. The policy now
-            // stays USEWINDOWSTYLE so DWM draws the full shadow again.
+            // stays ENABLED so DWM draws the full shadow again.
             const int round = 2; // DWMWCP_ROUND
             rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
                                        &round, sizeof(round)));
-            // v7.1.15 THE SHADOW, EXPLICIT: the field lost the drop shadow
-            // again -- corner preference + USEWINDOWSTYLE alone do not
-            // guarantee it once WM_NCCALCSIZE eats the side frames. The two
-            // documented shadow triggers are SET here instead of hoped
-            // for: DWMWA_NCRENDERING_POLICY = ENABLED, and the frame
-            // extended into the client by 1 px -- invisible on a fully
-            // custom-painted client, but it makes DWM commit to the full
-            // window shadow on Win10 and Win11 alike.
+            // v7.1.15/16 THE SHADOW PINS: DWMWA_NCRENDERING_POLICY = ENABLED
+            // and the frame extended into the client by 1 px -- the two
+            // documented triggers, SET instead of hoped for. They were
+            // never the problem and never the cure: the field's shadow was
+            // being revoked by our own window REGION, see below.
             const int ncrOn = 2;   // DWMNCRP_ENABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrOn, sizeof(ncrOn));
             typedef HRESULT (WINAPI *TS_DWMEA)(HWND, LPCVOID);
@@ -5695,11 +5722,22 @@ static bool guiCreateRealWindow() {
                 dwmExt(g_hwnd, &m);
             }
         }
-        if (!rounded) g_winRegionFallback = true;
+        // v7.1.16 THE REGION THAT ATE THE SHADOW -- the post-mortem. The
+        // field's "I don't see a drop shadow anymore" was true since
+        // v7.1.0, and every run our own log confessed: "a shaped window
+        // cannot carry the DWM shadow". DWMWA_WINDOW_CORNER_PREFERENCE is
+        // Win11-only; on the field's Win10 it fails, v7.1.0's fallback
+        // shaped the window with a CreateRoundRectRgn GDI region -- and
+        // Windows refuses to draw the DWM window shadow for ANY
+        // region-shaped window, whatever the NCRENDERING policy says. The
+        // v7.1.11 restore and the v7.1.15 pins above set the right state
+        // and the region revoked it lines later, every version since
+        // v7.1.0. The fallback is GONE: the window is NEVER shaped again.
+        // Win10 keeps square corners and gets the full all-directions DWM
+        // shadow back; Win11 still rounds, via the corner preference.
         tlog("[twinspeak] gui           : window shadow -- extend-frame 1 px + NCRENDERING ON%s\n",
-             g_winRegionFallback
-                 ? " (region fallback: a shaped window cannot carry the DWM shadow)"
-                 : " + corner preference ROUND");
+             rounded ? " + corner preference ROUND"
+                     : " (square corners: pre-Win11, window UNSHAPED so DWM keeps the shadow)");
     }
     // v7.0.9: re-measure the NCCALCSIZE-inset client and resize once -- the
     // design client is EXACTLY 880x620 again.
@@ -5710,12 +5748,6 @@ static bool guiCreateRealWindow() {
                          (r.right - r.left) + (KCLI_W - rc.right),
                          (r.bottom - r.top) + (KCLI_H - rc.bottom),
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    // v7.1.0: the Win10 round-rect region fallback (final size known now).
-    if (g_winRegionFallback) {
-        RECT wr; GetWindowRect(g_hwnd, &wr);
-        HRGN rg = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1, 16, 16);
-        if (rg) SetWindowRgn(g_hwnd, rg, FALSE);
     }
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
@@ -5828,7 +5860,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.15  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.16  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -7318,7 +7350,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.15       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.16       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
