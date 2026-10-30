@@ -27,10 +27,10 @@
 //            window at all -- an invisible tray-owner window (same class,
 //            never shown) carries the tray icon and the second-instance
 //            messages; the panel is built ON DEMAND at the first icon
-//            click / menu Open / second-instance ask, and carries
-//            WS_EX_TOOLWINDOW: no taskbar button, no Alt-Tab entry. A
+//            click / menu Open / second-instance ask -- a normal window
+//            with a taskbar button while open, nothing while hidden. A
 //            boot pop is structurally impossible -- there is no window
-//            to show -- and the app lives only in the system tray. The
+//            to show -- and at rest the app lives only in the tray. The
 //            engine auto-start runs straight from the ini (no controls
 //            exist yet); the buffered boot log flushes into the pane
 //            when the panel first opens. DSP byte-identical to v7.1.4
@@ -5330,14 +5330,16 @@ static void trayBalloon(const char* text) {
 // in the same order, so the finished UI still paints before it is ever
 // shown (the v6.6.5 white-flash trick is preserved: create hidden, render
 // the whole tree into the redirection surface, show after).
-// The window carries WS_EX_TOOLWINDOW: no taskbar button, no Alt-Tab entry
-// -- the app lives in the system tray, period; the panel is a visitor.
+// The panel is a NORMAL top-level window: while tray-only nothing is shown
+// so nothing takes a taskbar slot; the moment the panel opens it gets its
+// taskbar button (and Alt-Tab entry) so it can be seen and reached like any
+// window; closing hides it and the button goes away -- the tray icon remains.
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
     RECT r = { 0, 0, KCLI_W, KCLI_H };
     AdjustWindowRect(&r, kGuiFrame, FALSE);
-    g_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW, "twinspeak.control",
+    g_hwnd = CreateWindowExA(0, "twinspeak.control",
                              "TidyVision TwinSpeak: Control Panel",
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT,
