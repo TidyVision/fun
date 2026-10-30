@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,13 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.2  tab labels SMOOTH: the label layer + both strip passes render
+//            grayscale-antialiased (AntiAliasGridFit; the DirectWrite
+//            fallback went GRAYSCALE) -- soft like the buttons, still
+//            cText-bright on the dark themes. STARTUP ENGINE: the startup
+//            launch (--tray) now starts the engine by itself
+//            (startup_engine, default on; off = wait for START). DSP
+//            byte-identical to v7.1.1.
 //    v7.1.1  tab labels are the BUTTONS' pixels: GDI+ single-bit grid-fit
 //            (the exact WM_DRAWITEM renderer) into a transparent ARGB layer
 //            uploaded as a D2D bitmap over the GPU geometry -- DirectWrite
@@ -349,6 +356,11 @@ struct Config {
                                           // v6.6.8: INTEGRATED -- always on
     bool        chimes         = true;   // v6.2: CenterFold signature, modernized
     float       chimeGain      = 0.4f;   // v6.2: chime blip peak (0..1)
+    // v7.1.2 STARTUP ENGINE: a startup launch (--tray, the sign-in path) is
+    // the boot path -- the user signs in and the splitter must simply be
+    // running. Default ON: the engine starts by itself, exactly as if START
+    // was pressed. off = the old behavior (START is yours to press).
+    bool        startupEngine  = true;
     // v6.3 per-leg backend: "wasapi" = miniaudio exclusive WaveRT event
     // mode; "ks" = direct kernel-streaming render pin + looped WaveRT buffer
     // paced against the mapped play-position register (below the audio
@@ -2485,7 +2497,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2813,7 +2825,13 @@ static void writeTemplate(const char* path) {
         "; v7.0.4: gui_theme = the control window's color theme (0..7), saved\n"
         "; automatically whenever the THEME button cycles it. 0 = DARK CYAN,\n"
         "; the classic. Delete the line to fall back to the default.\n"
-        "gui_theme = 0\n");
+        "gui_theme = 0\n"
+        "\n"
+        "; v7.1.2: startup_engine = when the startup launch (--tray, the\n"
+        "; sign-in path) opens the window hidden in the tray, the engine\n"
+        "; starts BY ITSELF -- no START press needed. off = the old behavior\n"
+        "; (the engine waits for START).\n"
+        "startup_engine = on\n");
     fclose(f);
 }
 
@@ -2936,6 +2954,7 @@ static bool loadIni(const char* path) {
             g_themeSaved = atoi(val.c_str());      // v7.0.4: theme persistence
             if (g_themeSaved < 0 || g_themeSaved > 7) g_themeSaved = 0;
         }
+        else if (key == "startup_engine") g_cfg.startupEngine = !isOff(val);   // v7.1.2
     }
     fclose(f);
     cfgSanitize();
@@ -3979,6 +3998,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "backend1")          return g_cfg.backend1;
     else if (key == "backend2")          return g_cfg.backend2;
     else if (key == "gui_theme")        { snprintf(b, 64, "%u", (unsigned)g_theme); return b; }
+    else if (key == "startup_engine")   return boolText(g_cfg.startupEngine);   // v7.1.2
     return "";
 }
 
@@ -3995,6 +4015,7 @@ static const char* kIniKeys[] = {
     "drift_correct_ms", "drift_interval_ms",
     "deep_resync_min",
     "gui_theme",                // v7.0.4: the GUI theme persists
+    "startup_engine",           // v7.1.2: the startup launch auto-starts the engine
 };
 
 // v6.6.0: write twinspeak.ini WITHOUT destroying it. Every line that is not a
@@ -4527,10 +4548,9 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
     if (ok) {   // v7.0.7: the flip variable is gone -- bitblt model only
         g_dctx->SetDpi(96.0f, 96.0f);    // DIPs == pixels: the geometry is authored in px
         g_dctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);  // v7.0.7: explicit AA
-        // v7.1.0: the tab labels render ALIASED (field request -- crisp
-        // pixel glyphs; ClearType's subpixel softness is retired here).
-        // The GDI+ fallback pass matches (SingleBitPerPixelGridFit).
-        g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_ALIASED);
+        // v7.1.2: the fallback text renders grayscale (was ALIASED v7.1.0 /
+        // CLEARTYPE v7.0.6) -- same smooth family as the label layer.
+        g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         // v7.0.7: bitblt model, ONE buffer, Present(0,0) -- see the g_tabWide
         // block: flip on a child window fought GDI for the HWND's pixels.
         DXGI_SWAP_CHAIN_DESC1 sd = {};
@@ -4598,15 +4618,18 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
     return true;
 }
 
-// ---- v7.1.1: the strip's LABEL LAYER -- the buttons' exact renderer ---------
+// ---- v7.1.2: the strip's LABEL LAYER -- smooth like the buttons ------------
 // The six labels are rasterized by the same code path as WM_DRAWITEM's
-// buttons (guiAAString on GDI+, single-bit grid-fit -- hard, hinted, aliased
-// pixels) into a transparent ARGB layer. The GPU pass uploads that layer as
-// a premultiplied D2D bitmap (no GDI touches the swap-chain HWND); the GDI+
-// legacy pass draws the same strings with the same hint directly. Both paths
-// now show the buttons' text look, byte for byte. Colors: inactive = cText
-// (the resting button color -- cDim washed out on the dark themes), active
-// ramps cText -> cAccent with the fade.
+// buttons (guiAAString on GDI+), with TextRenderingHintAntiAliasGridFit --
+// smooth, hinted, grayscale-antialiased glyphs (the buttons render with the
+// system default, which is the same smooth family). The layer is transparent
+// ARGB: grayscale AA writes proper per-pixel alpha, so it composites cleanly
+// over the GPU geometry -- ClearType could not (it needs an opaque
+// background). The GPU pass uploads the layer as a premultiplied D2D bitmap
+// (no GDI touches the swap-chain HWND); the GDI+ legacy pass draws the same
+// strings with the same hint directly. Colors: inactive = cText (the resting
+// button color -- cDim washed out on the dark themes), active ramps
+// cText -> cAccent with the fade.
 static Gdiplus::Bitmap*   g_lblBmp = nullptr;
 static Gdiplus::Graphics* g_lblG   = nullptr;
 static int                g_lblW = 0, g_lblH = 0;
@@ -4623,7 +4646,7 @@ static Gdiplus::Bitmap* guiStripLabelLayer(int cw, int ch, double fs, HDC dc) {
         if (!g_lblBmp || !g_lblG) { guiStripLabelsRelease(); return nullptr; }
         g_lblW = cw; g_lblH = ch;
     }
-    g_lblG->SetTextRenderingHint(Gdiplus::TextRenderingHintSingleBitPerPixelGridFit);
+    g_lblG->SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     g_lblG->Clear(Gdiplus::Color(0, 0, 0, 0));
     for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
         const bool act = (i == g_tab);
@@ -4706,15 +4729,14 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_dctx->DrawRoundedRectangle(rr, g_d2dBr, 1.0f);
                 }
             }
-            // v7.1.1 THE LABELS ARE THE BUTTONS' PIXELS: the labels are
-            // rasterized by the exact WM_DRAWITEM renderer (GDI+ single-bit
-            // grid-fit) into a transparent ARGB layer, uploaded as a
-            // premultiplied D2D bitmap and blended over the GPU geometry.
-            // D2D/DirectWrite has no grid-fit aliasing, so native text could
-            // never match the buttons -- borrowing their rasterizer does.
-            // Colors: inactive labels read cText now (the resting button
-            // color) -- cDim washed out on the dark themes; the active label
-            // ramps cText -> cAccent with the fade.
+            // v7.1.2 THE LABELS ARE SMOOTH: rasterized by the WM_DRAWITEM
+            // code path (guiAAString on GDI+, AntiAliasGridFit) into a
+            // transparent ARGB layer, uploaded as a premultiplied D2D bitmap
+            // and blended over the GPU geometry -- grayscale AA carries
+            // per-pixel alpha, so the glyphs composite cleanly and read as
+            // soft as the buttons. Colors: inactive labels read cText (the
+            // resting button color -- cDim washed out on the dark themes);
+            // the active label ramps cText -> cAccent with the fade.
             bool labelsDrawn = false;
             if (Gdiplus::Bitmap* lb = guiStripLabelLayer(cw, ch, fs, dc)) {
                 Gdiplus::BitmapData bd;
@@ -4770,9 +4792,9 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             FillRect(buf, &rc, g_brBg);
             Gdiplus::Graphics g(buf);
             g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            // v7.1.0: tab labels aliased here too -- the GPU pass's ALIASED
-            // mode and this hint render the same crisp glyphs.
-            g.SetTextRenderingHint(Gdiplus::TextRenderingHintSingleBitPerPixelGridFit);
+            // v7.1.2: tab labels smooth here too -- the GPU pass's label
+            // layer and this hint render the same antialiased glyphs.
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
             const double fs2 = fs;
             int fxs = KSTRIP_PAD;
             for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
@@ -4807,7 +4829,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 delete p;
                 const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
-                // v7.1.1: cText base -- same color math as the label layer
+                // v7.1.2: cText base -- same color math as the label layer
                 guiAAString(g, buf, trc, kTabNames[i],
                             act ? guiLerpRGB(guic::cText, guic::cAccent, fs) : guic::cText,
                             g_fUIb, 0);
@@ -5044,7 +5066,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.1  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.2  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     guiWatermark(g);
@@ -5673,6 +5695,16 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // once so a boot-time launch is not a silent process.
         trayAdd(true);
         tlog("[twinspeak] gui           : running in the tray -- double-click the icon to open.\n");
+        // v7.1.2 STARTUP ENGINE: the startup launch is the boot path -- the
+        // user signs in and the splitter must simply be running. With
+        // startup_engine on (the default) the engine starts here, exactly
+        // as if START was pressed: cfg from the fresh controls, ini saved,
+        // worker thread up. (A missing key parses as ON; explicit off
+        // restores the old wait-for-START behavior.)
+        if (g_cfg.startupEngine) {
+            tlog("[twinspeak] gui           : startup launch -- auto-starting the engine (startup_engine).\n");
+            guiStartEngine(g_hwnd);
+        }
     } else {
         ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
     }
@@ -6178,7 +6210,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.1        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.2        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
