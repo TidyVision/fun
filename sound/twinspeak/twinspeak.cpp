@@ -1,5 +1,18 @@
 // ============================================================================
-//  twinspeak v7.0.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v7.0.4 (THE STRIP OWNS THE TABS. v7.0.3's frame-painted halo still read
+//          as a detached box and the fade's full-frame repaints strobed
+//          everything else. The six tab BUTTONs are retired: ONE custom
+//          control (TidyTabStrip4) owns the whole strip -- the halo is
+//          three nested bands burning outward from the selected face IN the
+//          strip's own double-buffered surface, hugging the border with no
+//          dead zone, unclippable by construction. The fade repaints only
+//          the strip; the frame is never invalidated for a tab change, so
+//          nothing else can flicker. Header/version nudged up 6 px to
+//          clear the strip. THE THEME NOW PERSISTS: the new gui_theme ini
+//          key is loaded at boot and saved automatically on every THEME
+//          press (same save model as SAVE INI).)
 //
 //  v7.0.3 (THE GLOW, PERFECTED. (1) ROUNDED TAB REGIONS: each tab's window
 //          region is now its face shape -- WS_CLIPCHILDREN clips the frame's
@@ -3667,7 +3680,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3990,7 +4003,12 @@ static void writeTemplate(const char* path) {
         "; the center gates mute a block, the keep-alive is ALL that block\n"
         "; carries. The out2 pump also runs FIRST and at the higher priority\n"
         "; (out2_first): the center leg gets the freshest data and the most\n"
-        "; scheduling attention; delay1_ms/delay2_ms then trim the alignment.\n");
+        "; scheduling attention; delay1_ms/delay2_ms then trim the alignment.\n"
+        "\n"
+        "; v7.0.4: gui_theme = the control window's color theme (0..7), saved\n"
+        "; automatically whenever the THEME button cycles it. 0 = DARK CYAN,\n"
+        "; the classic. Delete the line to fall back to the default.\n"
+        "gui_theme = 0\n");
     fclose(f);
 }
 
@@ -4050,6 +4068,10 @@ static void cfgSanitize() {
     if (g_cfg.driftCorrectMs > 500.0f) g_cfg.driftCorrectMs = 500.0f;
 }
 
+// v7.0.4: the GUI theme persists across sessions -- loadIni (which runs long
+// before the GUI exists) parks the parsed gui_theme here; guiMakeGdi applies it.
+static int g_themeSaved = 0;
+
 static bool loadIni(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) return false;
@@ -4105,6 +4127,10 @@ static bool loadIni(const char* path) {
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
+        else if (key == "gui_theme") {
+            g_themeSaved = atoi(val.c_str());      // v7.0.4: theme persistence
+            if (g_themeSaved < 0 || g_themeSaved > 7) g_themeSaved = 0;
+        }
     }
     fclose(f);
     cfgSanitize();
@@ -4543,7 +4569,9 @@ namespace guic {
 
 // ---- control ids -----------------------------------------------------------
 enum {
-    IDC_TAB0 = 100,             // ..105: the six tabs
+    IDC_TABSTRIP = 96,          // v7.0.4: the whole strip is ONE custom control
+    IDC_TAB0 = 100,             // v7.0.4: retired (the strip owns the tabs) --
+                                // the ids stay reserved; nothing creates them
     IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
     IDC_LOG = 204, IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
     // page: devices
@@ -4646,7 +4674,7 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
-    applyTheme(0);   // v7.0.0: the theme owns the brushes now (theme 0 = DARK CYAN)
+    applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
 }
 
 // v7.0.0: live theme switch -- copy the record into the guic:: globals, rebuild
@@ -5087,6 +5115,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
     else if (key == "backend1")          return g_cfg.backend1;
     else if (key == "backend2")          return g_cfg.backend2;
+    else if (key == "gui_theme")        { snprintf(b, 64, "%u", (unsigned)g_theme); return b; }
     return "";
 }
 
@@ -5102,6 +5131,7 @@ static const char* kIniKeys[] = {
     "backend1", "backend2", "ks_period_frames", "ks_periods",
     "drift_correct_ms", "drift_interval_ms",
     "deep_resync_min",
+    "gui_theme",                // v7.0.4: the GUI theme persists
 };
 
 // v6.6.0: write twinspeak.ini WITHOUT destroying it. Every line that is not a
@@ -5473,6 +5503,136 @@ static void guiBuildPages(HWND w) {
          "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 12);
 }
 
+// ---- v7.0.4: the tab strip is ONE custom control ----------------------------
+// Six owner-drawn BUTTONs fought the system's clipping for three versions
+// (v7.0.0 burned the glow inward, v7.0.1 inset it, v7.0.2 moved it to the
+// frame, v7.0.3 rounded the child regions) and the glow always lost: a child
+// DC clips at the tab rect, the frame's WS_CLIPCHILDREN DC clips the other
+// way, and whatever survived read as a detached box around the tab. One
+// control now owns the whole strip: the halo is drawn around the selected
+// tab's face IN the strip's own double-buffered surface, so nothing can clip
+// it -- it hugs the border and burns outward on all four sides. The fade
+// repaints exactly this one small control (one erase, one buffer, one blit);
+// the frame is never invalidated for a tab change, so nothing else on the
+// window can flicker. That regression is structurally impossible now.
+static void guiShowPage(HWND w, int p);     // fwd: defined below
+
+// rounded-rect path with NO 1 px inset (guiRoundPath is the face variant);
+// the halo bands ride on exact offset curves of the face rect.
+static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad) {
+    Gdiplus::GraphicsPath* p = new Gdiplus::GraphicsPath();
+    const float d = rad * 2.0f;
+    p->AddArc(r.X, r.Y, d, d, 180, 90);
+    p->AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p->AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p->AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p->CloseFigure();
+    return p;
+}
+
+// strip-local geometry: the strip sits at (9, 28), each face 5 px in from the
+// left edge of its slot and 6 px down -- so a 5 px halo fits inside the
+// control on every side. Faces keep the exact positions (and the 23 px height
+// with its 3 px bottom notch) the old buttons had.
+static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
+static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
+
+static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;                       // the buffer covers every pixel opaquely
+    case WM_LBUTTONUP: {
+        const int x = (int)(short)LOWORD(lp);
+        for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i)
+            if (x >= fx && x < fx + kTabW[i]) {
+                if (i != g_tab) guiShowPage(GetParent(w), i);
+                return 0;
+            }
+        return 0; }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        RECT rc; GetClientRect(w, &rc);
+        // ONE buffer, ONE blit: bg, halo, faces, borders and labels land as a
+        // single opaque transfer -- no pass can ever be seen apart.
+        HDC     mdc = CreateCompatibleDC(dc);
+        HBITMAP mbm = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HBITMAP obm = (HBITMAP)SelectObject(mdc, mbm);
+        FillRect(mdc, &rc, g_brBg);
+        Gdiplus::Graphics g(mdc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        const double fs = guiTabFade();
+        {   // THE HALO: three nested bands burning OUTWARD from the selected
+            // tab's face -- the inner edge starts half a pixel off the border
+            // (it hugs, no dead zone), fading to nothing ~5 px out. Drawn
+            // first; the neighboring faces painted below cover the ~1 px
+            // bleed into their gaps.
+            int fxs = KSTRIP_PAD;
+            for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
+            const Gdiplus::RectF fr((Gdiplus::REAL)fxs,
+                                    (Gdiplus::REAL)KSTRIP_FACE_Y,
+                                    (Gdiplus::REAL)kTabW[g_tab], 23.0f);
+            const float mid[3] = { 1.35f, 2.90f, 4.40f };  // band centers, px off the face
+            const float wd [3] = { 1.70f, 1.40f, 1.60f };  // band widths
+            const BYTE  al [3] = { 80, 44, 22 };           // band strengths
+            for (int k = 0; k < 3; ++k) {
+                const float s = mid[k];
+                const Gdiplus::RectF e(fr.X - s, fr.Y - s,
+                                       fr.Width + 2.0f * s, fr.Height + 2.0f * s);
+                Gdiplus::GraphicsPath* bp = guiRoundPathRaw(e, 6.0f + s);
+                Gdiplus::Pen gp(GCol(guic::cAccent, (BYTE)(al[k] * fs)), wd[k]);
+                g.DrawPath(&gp, bp);
+                delete bp;
+            }
+        }
+        for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+            const bool act = (i == g_tab);
+            const Gdiplus::Rect fr(fx, KSTRIP_FACE_Y, kTabW[i], 23);
+            Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
+            if (act) {   // face + accent border ease in over the line border
+                Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs)));
+                g.FillPath(&fb, p);
+            }
+            Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
+            g.DrawPath(&pb, p);
+            if (act) {
+                Gdiplus::Pen ab(GCol(guic::cAccent, (BYTE)(255 * fs)), 1.0f);
+                g.DrawPath(&ab, p);
+            }
+            delete p;
+            const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+            guiAAString(g, mdc, trc, kTabNames[i],
+                        act ? guiLerpRGB(guic::cDim, guic::cAccent, fs) : guic::cDim,
+                        g_fUIb, 0);
+        }
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mdc, 0, 0, SRCCOPY);
+        SelectObject(mdc, obm);
+        DeleteObject(mbm);
+        DeleteDC(mdc);
+        EndPaint(w, &ps);
+        return 0; }
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+static void guiMakeTabStrip(HWND w) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSA wc = {};
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc   = tabStripProc;
+        wc.hInstance     = GetModuleHandleA(nullptr);
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = "TidyTabStrip4";
+        RegisterClassA(&wc);
+        reg = true;
+    }
+    CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
+                    KSTRIP_X, KSTRIP_Y, KSTRIP_W, KSTRIP_H, w,
+                    (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
+}
+
 static void guiBuildControls(HWND w) {
     // bottom bar -- always visible (v6.6.5: slimmer, tighter)
     mkBtn(w, IDC_START, 14, 414, 140, 36, "");
@@ -5492,22 +5652,9 @@ static void guiBuildControls(HWND w) {
         14, 480, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     guiDarkCtl(log);
-    // tab strip
-    int tx = 14;
-    for (int i = 0; i < 6; ++i) {
-        HWND ht = mkBtn(w, IDC_TAB0 + i, tx, 34, kTabW[i], 26, kTabNames[i]);
-        // v7.0.3 THE BOXINESS FIX: the tab's window REGION is its face shape.
-        // The frame paints the halo under WS_CLIPCHILDREN, which clips its DC
-        // out of the child's REGION -- not the square rect. Along the straight
-        // edges both clips agree (outward-only glow), but at every rounded
-        // corner the halo's shoulder crossed back inside the SQUARE rect and
-        // was guillotined along it: straight clip edges cutting a round burn.
-        // The region below is the face path's bounds + 1 px of antialias
-        // margin; the 3 px bottom notch stays outside it, free for the glow.
-        HRGN rg = CreateRoundRectRgn(0, 0, kTabW[i], 24, 13, 13);
-        SetWindowRgn(ht, rg, TRUE);
-        tx += kTabW[i] + 4;
-    }
+    // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
+    // six BUTTONs, their regions and the frame-painted halo are all retired.
+    guiMakeTabStrip(w);
     guiBuildPages(w);
 }
 
@@ -5516,17 +5663,13 @@ static void guiShowPage(HWND w, int p) {
         for (size_t k = 0; k < g_pageHw[i].size(); ++k)
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     g_tab = p;
-    // v7.0.3: the selected tab FADES IN instead of snapping on at the next
-    // paint. Anchor the clock here and let the 16 ms timer (WM_TIMER id 2)
-    // drive ~10 eased frames of halo + face + label; it kills itself and
-    // lands one final full-strength pass when the run completes.
+    // v7.0.4: the selected tab FADES IN, and ONLY the strip repaints. The
+    // frame is never invalidated for a tab change anymore -- nothing on it
+    // depends on g_tab (the halo lives in the strip's own buffer), so nothing
+    // else on the window can flicker during the animation.
     g_tabAnimStart = GetTickCount64();
     SetTimer(w, 2, 16, nullptr);
-    InvalidateRect(w, nullptr, TRUE);
-    // v6.6.1: tabs are owner-drawn children -- they own their own pixels and
-    // a parent-only invalidation never repaints them.
-    for (int i = 0; i < 6; ++i)
-        if (HWND h = GetDlgItem(w, IDC_TAB0 + i)) InvalidateRect(h, nullptr, TRUE);
+    if (HWND ts = GetDlgItem(w, IDC_TABSTRIP)) InvalidateRect(ts, nullptr, TRUE);
 }
 
 // ---- v6.6.1: repaint helpers -----------------------------------------------
@@ -5645,40 +5788,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);
             g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
         }
-        {   // v7.0.2: the selected tab's OUTWARD glow (see the child's
-            // WM_DRAWITEM note). Centered accent strokes on the tab's face
-            // path, widest + faintest first: WS_CLIPCHILDREN keeps this DC
-            // OUT of the child rects, so the inward half of every stroke is
-            // clipped away and exactly the outward half survives -- a halo
-            // that hugs the border and burns outward, never touching the
-            // face. Tab selection only changes through guiShowPage, which
-            // invalidates the frame, so the halo always repaints with it.
-            if (HWND th = GetDlgItem(w, IDC_TAB0 + g_tab)) {
-                RECT tr;
-                GetWindowRect(th, &tr);
-                MapWindowPoints(nullptr, w, (POINT*)&tr, 2);
-                const Gdiplus::Rect tfr(tr.left, tr.top, tr.right - tr.left,
-                                        tr.bottom - tr.top - 3);
-                Gdiplus::GraphicsPath* tp = guiRoundPath(tfr, 6);
-                // v7.0.3: the halo eases in with the tab fade (guiTabFade --
-                // 1.0 whenever no animation is running, so the settled look
-                // is byte-identical to v7.0.2's).
-                const double fs  = guiTabFade();
-                const BYTE  ga[3]  = { (BYTE)(26 * fs), (BYTE)(48 * fs),
-                                       (BYTE)(84 * fs) };    // alphas, widest first
-                const float gwd[3] = { 10.0f, 6.0f, 3.0f };
-                for (int k = 0; k < 3; ++k) {
-                    Gdiplus::Pen gp(GCol(guic::cAccent, ga[k]), gwd[k]);
-                    g.DrawPath(&gp, tp);
-                }
-                delete tp;
-            }
-        }
-        const RECT hdr = { 18, 6, 420, 40 };
+        // v7.0.4: the tab halo moved INTO the strip control (tabStripProc) --
+        // the frame no longer paints it, and a tab change no longer repaints
+        // the frame at all. The header/version sit a few px higher to clear
+        // the strip's top edge (the strip owns y 28..64).
+        const RECT hdr = { 18, 0, 420, 32 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.3  |  %s", g_guiIniPath.c_str());
-        const RECT ver = { 300, 12, 866, 36 };
+        snprintf(vbuf, sizeof(vbuf), "v7.0.4  |  %s", g_guiIniPath.c_str());
+        const RECT ver = { 300, 8, 866, 30 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
         EndPaint(w, &ps);
@@ -5772,6 +5890,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // REFRESH DEVICES button erased with the window background while
         // sitting ON the panel: a rectangle of the wrong color, and its
         // transparent face showed the wrong surface through.
+        // v7.0.4: the six tab BUTTONs are retired -- the strip control owns
+        // the tabs now (tabStripProc). WM_DRAWITEM only ever sees the
+        // remaining owner-drawn buttons; the retired IDC_TAB0..5 ids are
+        // kept in the onPage test below only as dead-code insurance.
         const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
                               id == IDC_START  || id == IDC_APPLY ||
                               id == IDC_SAVE   || id == IDC_TICK  ||
@@ -5786,59 +5908,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         const Gdiplus::Rect grc(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
-        if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) {
-            // v7.0.2: the selected tab GLOWS OUTWARD ONLY -- and the halo
-            // lives in the FRAME's WM_PAINT now, not here. The child DC
-            // clips at the tab rect, so a halo drawn inside the child can
-            // never leave it (v7.0.0 burned it inward, v7.0.1 inset it --
-            // both fought the clip). The parent's DC is clipped the other
-            // way: OUT of the child rects. Centered strokes on the tab path
-            // drawn there lose exactly their inward half to WS_CLIPCHILDREN
-            // -- the outward half IS the glow. This child paints only the
-            // face (active) and the bright 1 px border; resting tabs are
-            // transparent faces like every other button.
-            const bool act = (id - IDC_TAB0) == g_tab;
-            const Gdiplus::Rect fr(grc.X, grc.Y, grc.Width, grc.Height - 3);
-            // v7.0.3 THE FLICKER FIX: the whole tab renders into a memory DC
-            // and lands as ONE opaque blit. Owner-draw used to erase the tab
-            // to the background and then draw face + label GDI+ -- two passes
-            // the eye could see apart, so the label blinked on every repaint
-            // (and would have strobed under the fade-in's 16 ms frames).
-            // Nothing exists between the passes anymore.
-            HDC     mdc = CreateCompatibleDC(dc);
-            HBITMAP mbm = CreateCompatibleBitmap(dc, grc.Width, grc.Height);
-            HBITMAP obm = (HBITMAP)SelectObject(mdc, mbm);
-            const RECT mrc = { 0, 0, grc.Width, grc.Height };
-            FillRect(mdc, &mrc, g_brBg);
-            Gdiplus::Graphics gm(mdc);
-            gm.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            gm.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-            Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
-            double   fs = 1.0;
-            COLORREF tc = guic::cDim;
-            if (act) {
-                // v7.0.3: face + accent border + label ease in together.
-                // The cLine border stays beneath the accent overlay so the
-                // tab never loses its outline mid-fade.
-                fs = guiTabFade();
-                if (fs > 0.004) {
-                    Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs)));
-                    gm.FillPath(&fb, p);
-                    Gdiplus::Pen ab(GCol(guic::cAccent, (BYTE)(255 * fs)), 1.0f);
-                    gm.DrawPath(&ab, p);
-                }
-                tc = guiLerpRGB(guic::cDim, guic::cAccent, fs);
-            }
-            Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
-            gm.DrawPath(&pb, p);
-            delete p;
-            guiAAString(gm, mdc, mrc, txt, tc, g_fUIb, 0);
-            BitBlt(dc, 0, 0, grc.Width, grc.Height, mdc, 0, 0, SRCCOPY);
-            SelectObject(mdc, obm);
-            DeleteObject(mbm);
-            DeleteDC(mdc);
-            return TRUE;
-        }
         if (guiIsToggle(id)) {
             // v7.0.0 polish: OFF is a TRANSPARENT face -- border + text over
             // the erased surface. The ON fill stays: it IS the state.
@@ -5974,7 +6043,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0; }
             case IDC_THEME: {                  // v7.0.0: cycle the eight themes
                 applyTheme(g_theme + 1);
-                SetDlgItemTextA(w, IDC_STATUS, kThemes[g_theme].name);
+                // v7.0.4: the theme persists across sessions -- save it (and
+                // everything currently on the controls, exactly like SAVE INI
+                // would) the moment it changes; no restart, no leak.
+                cfgFromControls(w); cfgSanitize();   // same save model as SAVE INI
+                const bool thOk = guiSaveIni();
+                SetDlgItemTextA(w, IDC_STATUS, thOk ?
+                    (std::string("theme saved: ") + kThemes[g_theme].name).c_str()
+                    : kThemes[g_theme].name);
                 return 0; }
             case IDC_APPLY: {
                 const bool wasRunning = g_engState.load() != 0;
@@ -6017,24 +6093,21 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0; }
     case WM_TIMER: {
-        // v7.0.3: timer 2 drives the tab fade-in. Each 16 ms tick repaints
-        // the frame (halo strength = guiTabFade) and the selected tab (face,
-        // border accent and label all read the same clock); when the eased
-        // run completes the timer kills itself and lands one final
-        // full-strength pass so no fractional-alpha frame is ever left on
-        // screen.
+        // v7.0.3: timer 2 drives the tab fade-in. v7.0.4: ONLY the strip
+        // repaints each 16 ms tick (halo, face, border and label all read the
+        // same clock inside its own buffered paint) -- the frame is never
+        // invalidated during the animation. When the eased run completes the
+        // timer kills itself and lands one final full-strength pass so no
+        // fractional-alpha frame is ever left on screen.
         if (wp == 2) {
+            HWND ts = GetDlgItem(w, IDC_TABSTRIP);
             if (g_tabAnimStart &&
                 GetTickCount64() - g_tabAnimStart < (ULONGLONG)KTAB_FADE_MS) {
-                InvalidateRect(w, nullptr, TRUE);
-                if (HWND h = GetDlgItem(w, IDC_TAB0 + g_tab))
-                    InvalidateRect(h, nullptr, TRUE);
+                if (ts) InvalidateRect(ts, nullptr, FALSE);
             } else {
                 KillTimer(w, 2);
                 g_tabAnimStart = 0;
-                InvalidateRect(w, nullptr, TRUE);
-                if (HWND h = GetDlgItem(w, IDC_TAB0 + g_tab))
-                    InvalidateRect(h, nullptr, TRUE);
+                if (ts) InvalidateRect(ts, nullptr, TRUE);
             }
             return 0;
         }
@@ -6751,7 +6824,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.3        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.4        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
