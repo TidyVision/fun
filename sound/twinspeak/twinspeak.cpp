@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,25 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.7  UI RESTRUCTURE, the field's wordlist: FIVE tabs (DEVICES |
+//            TIMING | TRANSPORT | SETTINGS | CENTER EQ) -- OTHER merged
+//            away, its startup pill and its SYNC column (drift trio) now
+//            live on SETTINGS; VOLUME renamed SETTINGS; headers renamed
+//            (DEVICES / GAIN / DEVICE PERIODS (ms) / TIMING); the
+//            backend1/backend2 combos are GONE (both legs are wasapi
+//            exclusive by default; backend1/backend2 = ks in the ini opts
+//            a leg into Kernel Streaming), the transport rows lost their
+//            ks_ prefix (period_frames / periods) and every mention says
+//            "wasapi exclusive"; chimes moved just below chime_gain, the
+//            "CENTER CUES" header is gone, "VOLUME + LEVELS" is now
+//            "CHIME/KEEPALIVE"; keepalive_hz/keepalive_gain are BUILT IN
+//            (1 Hz @ 0.0001, keys and rows retired, old ini values load
+//            clean and are ignored); the keep-alive tone and the chime
+//            are POST-MIX by construction (summed in the out2 output
+//            callbacks, never in the capture stream OBS records); the
+//            taskbar slot is created the instant the panel opens
+//            (ITaskbarList AddTab/ActivateTab on show, DeleteTab on
+//            hide). DSP byte-identical to v7.1.4.
 //    v7.1.6  TRAY-FIRST START: a --tray (startup) launch builds NO control
 //            window at all -- an invisible tray-owner window (same class,
 //            never shown) carries the tray icon and the second-instance
@@ -193,8 +212,9 @@
 //      input_device / output_device1 / output_device2
 //      optional: gain_l, gain_r, gain_lfe, gain_center, volume_follow,
 //                pin_outputs (retired key, ignored), out2_first,
-//                volume_endpoint, keepalive_hz, keepalive_gain,
-//                drift_interval_ms, deep_resync_min
+//                volume_endpoint, drift_interval_ms, deep_resync_min
+//                (v7.1.7: keepalive_hz/keepalive_gain retired -- BUILT IN,
+//                1 Hz @ 0.0001; old keys load clean and are ignored)
 //      Integrated (always on, old keys load clean and are ignored):
 //      capture_exclusive, exclusive, align_modes, clock_sync, drift_guard,
 //      power_guard, yield_default, center_gate, center_upmix_guard, background.
@@ -210,6 +230,7 @@
 #include <windows.h>
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
+#include <objbase.h>        // v7.1.7: CoCreateInstance -- ITaskbarList (the tab slot)
 #include <gdiplus.h>        // v6.6.5: antialiased owner-drawn UI (buttons, text, watermark)
 #include <d2d1_1.h>         // v7.0.6: TRUE GPU strip (D3D11 + DXGI swap chain + D2D 1.1;
                             // v7.0.7: bitblt-model presentation, no flip on child windows)
@@ -322,19 +343,22 @@ static constexpr int      kOutCh2        = 2;      // leg2: stereo center speake
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
 
-// output2 keep-alive tone: 40 Hz at 1% gain (~-40 dBFS, inaudible) summed onto
-// BOTH channels at the DEVICE layer -- every frame, silence or not, underrun or
-// not, phase-continuous. v3 renders it from a precomputed 1200-sample cycle
-// table (48000/40 = exactly one cycle) instead of calling sin() per frame.
+// output2 keep-alive tone: 1 Hz at 0.01% gain (0.0001, ~-80 dBFS, far below
+// hearing) summed onto BOTH channels at the DEVICE layer -- every frame,
+// silence or not, underrun or not, phase-continuous. Rendered from a
+// precomputed 48000-sample cycle table (48000/1 = exactly one cycle) instead
+// of calling sin() per frame. v7.1.7: BUILT IN -- the ini keys and UI rows
+// are gone (the field never needed to move them; 1 Hz wobble holds every
+// amp awake and is inaudible on any driver). POST-MIX by construction: the
+// tone is summed in the leg2 OUTPUT callbacks, after the mix, so it can
+// never enter the capture stream an OBS display-capture records.
 static constexpr double   kTwoPi             = 6.283185307179586;
-static constexpr unsigned kKeepAliveTableMax = 10240;  // holds down to ~4.7 Hz cycles
-// v3.9: the keep-alive tone is ini-tunable (keepalive_hz / keepalive_gain).
-// The S5's amp sleeps on silence; 40 Hz @ 1% may sit BELOW its detect
-// threshold -- if the speaker still powers down, raise keepalive_gain
-// (0.03..0.05 stays inaudible at 40 Hz) or move the frequency.
-static float              g_kaHz   = 40.0f;  // actual tuned values (from ini)
-static float              g_kaGain = 0.01f;
-static unsigned           g_kaLen  = 1200;   // samples per cycle: round(48000 / g_kaHz)
+static constexpr unsigned kKeepAliveTableMax = 48000;  // one 1 Hz cycle @ 48 kHz
+static constexpr float    kKeepAliveHz       = 1.0f;    // v7.1.7: built in
+static constexpr float    kKeepAliveGain     = 0.0001f; // v7.1.7: built in
+static float              g_kaHz   = kKeepAliveHz;
+static float              g_kaGain = kKeepAliveGain;
+static unsigned           g_kaLen  = 48000;   // samples per cycle: round(48000 / g_kaHz)
 static float              g_kaTable[kKeepAliveTableMax];
 static unsigned           g_kaIdx  = 0;      // owned by leg2's device thread only
 
@@ -404,10 +428,8 @@ struct Config {
     bool        pinOutputs     = true;   // v3.8: out1/out2 endpoints pinned 100%/unmuted.
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
-    float       keepaliveHz    = 40.0f;  // v3.9: out2 keep-alive tone (5..2000 Hz)
-    float       keepaliveGain  = 0.001f; // v3.9: out2 keep-alive amplitude (0..0.25).
-                                          // v7.0.0: default 0.001 -- this should keep a
-                                          // bluetooth device awake the whole time
+    // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
+    // kKeepAliveGain, 1 Hz @ 0.0001) -- no struct fields, no ini key, no UI.
     bool        background     = true;   // v6.2: detach the console after a
                                           //       successful start; log to file
                                           // v6.6.8: INTEGRATED -- always on
@@ -2570,7 +2592,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2676,16 +2698,14 @@ static void writeTemplate(const char* path) {
         "; endpoint volumes are pinned 100%% / unmuted while the engine runs.\n"
         "out2_first = on\n"
         "\n"
-        "; KEEP-ALIVE: out2 sums a sine on both channels every frame (silence or\n"
-        "; not) so the center device never sees digital silence. Frequency and\n"
-        "; level are tunable. 40 Hz @ 0.1%% = -60 dBFS, far below hearing --\n"
-        "; this should keep a bluetooth device awake the whole time. If an amp\n"
-        "; (the Xtream S5 included) still powers down while twinspeak runs,\n"
-        "; raise keepalive_gain (0.03..0.05 is still inaudible at 40 Hz) or move\n"
-        "; keepalive_hz. The watchdog reopens out2 automatically whenever it\n"
-        "; comes back.\n"
-        "keepalive_hz = 40\n"
-        "keepalive_gain = 0.001\n"
+        "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI): out2 sums a sine on\n"
+        "; both channels every frame (silence or not) so the center device\n"
+        "; never sees digital silence. 1 Hz @ 0.0001 (-80 dBFS) -- far below\n"
+        "; hearing, and a wobble every amp's sleep timer treats as signal.\n"
+        "; The watchdog reopens out2 automatically whenever it comes back.\n"
+        "; POST-MIX: the tone and the chime are summed in the out2 OUTPUT\n"
+        "; callbacks, after the mix -- they never enter the capture stream an\n"
+        "; OBS capture records.\n"
         "\n"
         "; CHIMES (v6.2): the CenterFold startup signature is back, modernized.\n"
         "; The old jingle was a rising SQUARE fifth (G5 784 Hz -> D6 1174.66 Hz);\n"
@@ -2716,15 +2736,18 @@ static void writeTemplate(const char* path) {
         "; (the log announces both directions -- 'legN YIELD').\n"
         "\n"
         "; WDM-KS OUTPUT BACKEND (v6.3) -- the FlexASIO path, inside twinspeak.\n"
-        "; backend1 / backend2 route each leg through Kernel Streaming instead of\n"
-        "; WASAPI: a direct render pin on the device's wave filter (KsCreatePin),\n"
+        "; v7.1.7: NO UI CONTROL -- both legs run wasapi exclusive unless these\n"
+        "; keys say ks. backend1 / backend2 route each leg through Kernel\n"
+        "; Streaming instead of wasapi exclusive: a direct render pin on the\n"
+        "; device's wave filter (KsCreatePin),\n"
         "; the WaveRT looped buffer as the device's own DMA memory, and the\n"
         "; hardware play-position register mapped read-only -- twinspeak's own\n"
         "; TIME-CRITICAL thread paces the stream against the DAC itself, with no\n"
         "; events, no engine and no scheduler intermediaries in between. The\n"
         "; audio crossing the buffer switch is bit-identical (same rings, same\n"
         "; replay/drop rules, same gates); only the transport changes.\n"
-        ";   backendN = wasapi  the proven v6.2 path (miniaudio, exclusive WaveRT)\n"
+        ";   backendN = wasapi  wasapi exclusive -- the proven path (miniaudio,\n"
+        ";                      exclusive WaveRT event mode) -- the default\n"
         ";   backendN = ks      WDM-KS, lowest latency, 256-sample switches\n"
         "; ks_period_frames = the buffer-switch size in SAMPLES (256 @ 48 kHz =\n"
         "; one bite every 5.33 ms; 96 = one bite every 2 ms -- smaller bites\n"
@@ -2887,8 +2910,8 @@ static void writeTemplate(const char* path) {
         ";   a clone of the program audio. The startup banner prints the route\n"
         ";   map on every launch.\n"
         ";\n"
-        "; NOTE: output2 always sums the keep-alive sine (keepalive_hz @\n"
-        "; keepalive_gain, default 40 Hz @ 0.1%%) onto both channels, every\n"
+        "; NOTE: output2 always sums the keep-alive sine (BUILT IN, v7.1.7:\n"
+        "; 1 Hz @ 0.01%%) onto both channels, every\n"
         "; frame, so the center device NEVER sees digital silence -- and when\n"
         "; the center gates mute a block, the keep-alive is ALL that block\n"
         "; carries. The out2 pump also runs FIRST and at the higher priority\n"
@@ -3013,8 +3036,6 @@ static bool loadIni(const char* path) {
         else if (key == "volume_follow")  g_cfg.volumeFollow = !isOff(val);
         else if (key == "out2_first")     g_cfg.out2First    = !isOff(val);
         else if (key == "volume_endpoint") g_cfg.volumeEndpoint = val;
-        else if (key == "keepalive_hz")   g_cfg.keepaliveHz   = (float)atof(val.c_str());
-        else if (key == "keepalive_gain") g_cfg.keepaliveGain = (float)atof(val.c_str());
         else if (key == "chimes")         g_cfg.chimes        = !isOff(val);   // v6.2
         else if (key == "chime_gain")     g_cfg.chimeGain     = (float)atof(val.c_str()); // v6.2
         else if (key == "backend1")       g_cfg.backend1      = lower(val);    // v6.3
@@ -3456,13 +3477,13 @@ enum {
     IDC_OUT1MS, IDC_OUT2MS, IDC_CAPMS, IDC_RING1, IDC_RING2,
     IDC_DELAY1, IDC_DELAY2, IDC_TGL_OUT2FIRST,   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
     // page: transport
-    IDC_BE1, IDC_BE2, IDC_KSPF, IDC_KSPD,
-    // page: sync & power
-    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (page is OTHER since v6.6.8)
+    IDC_KSPF, IDC_KSPD,         // v7.1.7: IDC_BE1/IDC_BE2 retired -- the backend
+                                // keys live in the ini only (wasapi exclusive | ks)
+    // page: settings (v7.1.7: sync + startup + chime/keepalive, one page)
+    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
-    // page: center & volume
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
-    IDC_KAHZ, IDC_KAGAIN, IDC_CHIMGAIN,
+    IDC_CHIMGAIN,               // v7.1.7: IDC_KAHZ/IDC_KAGAIN retired (keepalive built in)
     // page: center eq
     IDC_TGL_EQ, IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS, IDC_PRE_WARM,
     IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
@@ -3499,7 +3520,7 @@ static COLORREF guiLerpRGB(COLORREF a, COLORREF b, double t) {
 }
 static std::map<int, bool> g_tog;            // toggle button states
 static int       g_eqPreset      = 1;          // active preset index (-1 = custom)
-static std::vector<HWND> g_pageHw[6];          // children per page (show/hide)
+static std::vector<HWND> g_pageHw[5];          // children per page (show/hide)
 static HANDLE    g_engThread     = nullptr;
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
 static std::atomic<int>  g_engRC{0};
@@ -3569,8 +3590,11 @@ static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on de
 // v6.6.1 tray context-menu commands
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
-static const char* kTabNames[6] = {
-    "DEVICES", "TIMING", "TRANSPORT", "OTHER", "VOLUME", "CENTER EQ"
+// v7.1.7: FIVE tabs. OTHER merged away: its startup pill AND its SYNC column
+// (drift corrections) both live on SETTINGS now, next to the chime/keepalive
+// block. DEVICES | TIMING | TRANSPORT | SETTINGS | CENTER EQ.
+static const char* kTabNames[5] = {
+    "DEVICES", "TIMING", "TRANSPORT", "SETTINGS", "CENTER EQ"
 };
 
 // v6.6.4: only a close button -- fixed-size layout, close already hides to the
@@ -4225,8 +4249,6 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "gain_r")            { snprintf(b, 64, "%g", g_cfg.gainR);     return b; }
     else if (key == "gain_lfe")          { snprintf(b, 64, "%g", g_cfg.gainLfe);   return b; }
     else if (key == "gain_center")       { snprintf(b, 64, "%g", g_cfg.gainCenter);return b; }
-    else if (key == "keepalive_hz")      { snprintf(b, 64, "%g", g_cfg.keepaliveHz); return b; }
-    else if (key == "keepalive_gain")    { snprintf(b, 64, "%g", g_cfg.keepaliveGain); return b; }
     else if (key == "chime_gain")        { snprintf(b, 64, "%g", g_cfg.chimeGain); return b; }
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
@@ -4261,7 +4283,7 @@ static const char* kIniKeys[] = {
     "gain_l", "gain_r", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "volume_follow", "volume_endpoint", "out2_first",
-    "keepalive_hz", "keepalive_gain", "chimes", "chime_gain",
+    "chimes", "chime_gain",
     "backend1", "backend2", "ks_period_frames", "ks_periods",
     "drift_correct_ms", "drift_interval_ms",
     "deep_resync_min",
@@ -4357,8 +4379,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
     g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
     // v7.0.0: pinOutputs is integrated -- always on; no control can change it.
-    g_cfg.backend1 = editStr(w, IDC_BE1);  // normalized by cfgSanitize()
-    g_cfg.backend2 = editStr(w, IDC_BE2);
+    // v7.1.7: backend1/backend2 have NO control -- the ini keys stand as loaded.
     g_cfg.ksPeriodFrames = (unsigned)editFloat(w, IDC_KSPF, 256);
     g_cfg.ksPeriods      = (unsigned)editFloat(w, IDC_KSPD, 3);
     // v6.6.8: clockSync / driftGuard / powerGuard / yieldDefault integrated.
@@ -4368,8 +4389,6 @@ static void cfgFromControls(HWND w) {
     // v6.6.8: centerGate / centerUpmixGuard / background integrated.
     g_cfg.volumeFollow    = g_tog[IDC_TGL_VOLFOLLOW];
     g_cfg.chimes          = g_tog[IDC_TGL_CHIMES];
-    g_cfg.keepaliveHz     = editFloat(w, IDC_KAHZ, 40.0f);
-    g_cfg.keepaliveGain   = editFloat(w, IDC_KAGAIN, 0.001f);
     g_cfg.chimeGain       = editFloat(w, IDC_CHIMGAIN, 0.4f);
     g_cfg.centerEq       = g_tog[IDC_TGL_EQ];
     g_cfg.centerEqFreq   = posToFreq(sldGetPos(GetDlgItem(w, IDC_SLD_FREQ)));
@@ -4396,8 +4415,7 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
-    SetDlgItemTextA(w, IDC_BE1, g_cfg.backend1.c_str());
-    SetDlgItemTextA(w, IDC_BE2, g_cfg.backend2.c_str());
+    // v7.1.7: backend1/backend2 have no control -- loaded from the ini only
     snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); SetDlgItemTextA(w, IDC_KSPF, b);
     snprintf(b, 64, "%u", g_cfg.ksPeriods);      SetDlgItemTextA(w, IDC_KSPD, b);
     snprintf(b, 64, "%g", g_cfg.driftCorrectMs);   SetDlgItemTextA(w, IDC_DCORR, b);
@@ -4405,8 +4423,6 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%u", g_cfg.deepResyncMin);    SetDlgItemTextA(w, IDC_DEEPRESYNC, b);
     g_tog[IDC_TGL_VOLFOLLOW]  = g_cfg.volumeFollow;
     g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
-    snprintf(b, 64, "%g", g_cfg.keepaliveHz);    SetDlgItemTextA(w, IDC_KAHZ, b);
-    snprintf(b, 64, "%g", g_cfg.keepaliveGain);  SetDlgItemTextA(w, IDC_KAGAIN, b);
     snprintf(b, 64, "%g", g_cfg.chimeGain);      SetDlgItemTextA(w, IDC_CHIMGAIN, b);
     g_tog[IDC_TGL_EQ] = g_cfg.centerEq;
     sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(g_cfg.centerEqFreq), FALSE);
@@ -4541,9 +4557,9 @@ static void guiStopEngine() {
 
 // ---- page building ----------------------------------------------------------
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
-// v7.0.0: uniform tab width -- the same 798 px strip span the per-name widths
-// owned (6 x 133 px + 5 x 4 px gaps), every tab the same size.
-static const int kTabW[6] = { 133, 133, 133, 133, 133, 133 };
+// v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
+// (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
+static const int kTabW[5] = { 160, 160, 160, 160, 160 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -4555,7 +4571,7 @@ static void comboRow(HWND w, int colX, int y, const char* label, int id,
 static void guiBuildPages(HWND w) {
     // ============ page 0: DEVICES ============
     g_tab = 0;
-    header(w, COLA_X, KHDR_Y, "DEVICE NEEDLES (live list; the edit stays a free-text needle)");
+    header(w, COLA_X, KHDR_Y, "DEVICES");
     comboRow(w, COLA_X, KROW0, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
     comboRow(w, COLA_X, 154, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
     comboRow(w, COLA_X, 188, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
@@ -4566,7 +4582,7 @@ static void guiBuildPages(HWND w) {
          "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
          "leg2 carries ONLY the center channel.\n"
          "volume_endpoint overrides which playback-side slider is the master volume.", 4);
-    header(w, COLB_X, KHDR_Y, "GAINS (on the raw 8ch stream)");
+    header(w, COLB_X, KHDR_Y, "GAIN");
     row(w, COLB_X, KROW0, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
     row(w, COLB_X, 188, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
@@ -4577,13 +4593,13 @@ static void guiBuildPages(HWND w) {
 
     // ============ page 1: TIMING ============
     g_tab = 1;
-    header(w, COLA_X, KHDR_Y, "DEVICE PERIODS (ms) -- keep the legs EQUAL");
+    header(w, COLA_X, KHDR_Y, "DEVICE PERIODS (ms)");
     row(w, COLA_X, KROW0, "out1ms", IDC_OUT1MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out1Ms); return std::string(b); }().c_str());
     row(w, COLA_X, 154, "out2ms", IDC_OUT2MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out2Ms); return std::string(b); }().c_str());
     row(w, COLA_X, 188, "cap_ms (capture burst)", IDC_CAPMS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.capMs); return std::string(b); }().c_str());
     row(w, COLA_X, 222, "ring1_ms", IDC_RING1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring1Ms); return std::string(b); }().c_str());
     row(w, COLA_X, 256, "ring2_ms", IDC_RING2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring2Ms); return std::string(b); }().c_str());
-    header(w, COLB_X, KHDR_Y, "ALIGNMENT (bit-exact ring delay)");
+    header(w, COLB_X, KHDR_Y, "TIMING");
     row(w, COLB_X, KROW0, "delay1_ms", IDC_DELAY1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay1Ms); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 188, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
@@ -4597,57 +4613,49 @@ static void guiBuildPages(HWND w) {
     // ============ page 2: TRANSPORT ============
     g_tab = 2;
     header(w, COLA_X, KHDR_Y, "OUTPUT TRANSPORT PER LEG");
-    comboRow(w, COLA_X, KROW0, "backend1 (leg1)", IDC_BE1, true, g_cfg.backend1.c_str());
-    comboRow(w, COLA_X, 154, "backend2 (leg2)", IDC_BE2, true, g_cfg.backend2.c_str());
-    row(w, COLA_X, 188, "ks_period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
-    row(w, COLA_X, 222, "ks_periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
+    // v7.1.7: the backend combos are GONE -- both legs run wasapi exclusive
+    // by default and KS is opted into with backend1/backend2 = ks in the ini
+    // (the user enforces exclusive anyway; the keys stay for power users).
+    row(w, COLA_X, KROW0, "period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
+    row(w, COLA_X, 154, "periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
     note(w, COLB_X, 96,
-         "wasapi -- the proven path: miniaudio, exclusive WaveRT event mode.\n\n"
+         "wasapi exclusive -- the proven path: miniaudio, exclusive WaveRT\n"
+         "event mode. This is what both legs run unless you say otherwise.\n\n"
          "ks -- the FlexASIO-grade path: a direct kernel-streaming render pin,\n"
          "the WaveRT looped buffer as the device's own DMA memory, paced\n"
          "against the hardware play-position register. Below the Windows\n"
          "engine: no events, no scheduler intermediaries.\n\n"
-         "ks_period_frames = the buffer-switch size in SAMPLES (128 @ 48 kHz\n"
+         "period_frames = the buffer-switch size in SAMPLES (128 @ 48 kHz\n"
          "= one bite every 2.67 ms; 128+ paces steadiest in the field).\n"
-         "ks_periods = the looped buffer around it (3 recommended, 2..8).\n\n"
-         "A driver refusal falls back to WASAPI exclusive automatically and\n"
-         "the log says so. twinspeak --list-ks shows every KS filter.", 13);
+         "periods = the looped buffer around it (3 recommended, 2..8).\n\n"
+         "Route a leg through KS with backend1/backend2 = ks in the ini (no\n"
+         "UI control -- exclusive is enforced here). A driver refusal falls\n"
+         "back to wasapi exclusive automatically and the log says so.", 13);
 
-    // ============ page 3: OTHER ============
+    // ============ page 3: SETTINGS (v7.1.7: SYNC + startup + chime/keepalive) =
     g_tab = 3;
-    header(w, COLA_X, KHDR_Y, "OTHER");
-    tglRow(w, COLA_X, KROW0, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());   // v6.6.6
-    // v6.6.8: clock_sync / drift_guard / power_guard / yield_default pills are
-    // gone -- all four guards are part of the engine now (always on).
-    header(w, COLB_X, KHDR_Y, "SYNC");
-    row(w, COLB_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
-    row(w, COLB_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
-    row(w, COLB_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
-    note(w, COLB_X, 230,
+    header(w, COLA_X, KHDR_Y, "SYNC");
+    row(w, COLA_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
+    row(w, COLA_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
+    row(w, COLA_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
+    note(w, COLA_X, 230,
          "drift_correct_ms: trigger distance from the calibrated baseline.\n"
          "drift_interval_ms: minimum spacing between corrections (2000..60000).\n"
          "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
-
-    // ============ page 4: VOLUME ============
-    g_tab = 4;
-    header(w, COLA_X, KHDR_Y, "CENTER CUES");
-    tglRow(w, COLA_X, KROW0, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
-    // v6.6.8: center_gate / center_upmix_guard / background pills are gone --
-    // all three are part of the engine now (always on).
-    header(w, COLB_X, KHDR_Y, "VOLUME + LEVELS");
+    tglRow(w, COLA_X, 316, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+    header(w, COLB_X, KHDR_Y, "CHIME/KEEPALIVE");
     tglRow(w, COLB_X, KROW0, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
-    row(w, COLB_X, 154, "keepalive_hz", IDC_KAHZ, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveHz); return std::string(b); }().c_str());
-    row(w, COLB_X, 188, "keepalive_gain", IDC_KAGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.keepaliveGain); return std::string(b); }().c_str());
-    row(w, COLB_X, 222, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
-    note(w, COLB_X, 264,
-         "The keep-alive tone keeps the center speaker awake; the 0.001 default\n"
-         "should keep a bluetooth device awake the whole time. If a speaker\n"
-         "still sleeps, raise keepalive_gain to 0.03..0.05 (still inaudible).\n"
-         "In this window the log lives in the pane below -- background mode is\n"
-         "built in now (always on) and only shapes --console runs.", 5);
+    row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
+    note(w, COLB_X, 226,
+         "The keep-alive tone is BUILT IN (1 Hz @ 0.01%): out2 never sees\n"
+         "digital silence, so the center speaker stays awake. POST-MIX: the\n"
+         "tone and the chime are summed in the out2 OUTPUT callbacks, after\n"
+         "the mix -- they never enter the stream an OBS capture records.\n"
+         "The log lives in the pane below; background mode is built in.", 5);
 
-    // ============ page 5: CENTER EQ ============
-    g_tab = 5;
+    // ============ page 4: CENTER EQ ============
+    g_tab = 4;
     tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
     // v7.0.6: CINEMA is retired; the four remaining presets are uniform and
     // span the sliders' 400 px exactly -- 4 x 97 px faces + 3 x 4 px gaps.
@@ -4723,7 +4731,7 @@ static HBITMAP               g_stripBmOld = nullptr;
 static int                   g_stripW = 0, g_stripH = 0;
 static bool                  g_gpuDead = false, g_gpuLogged = false;
 static bool                  g_gpuPainted = false;    // v7.0.7: first-present flag
-static std::wstring          g_tabWide[6];            // v7.0.7: labels widened once
+static std::wstring          g_tabWide[5];            // v7.0.7: labels widened once
 // v7.0.7: the swap chain is the BITBLT model (DXGI_SWAP_EFFECT_DISCARD), not
 // flip: a flip chain on a CHILD window keeps a persistent front buffer at
 // DWM while GDI draws into the same HWND's redirection surface -- the two
@@ -4934,7 +4942,7 @@ static Gdiplus::Bitmap* guiStripLabelLayer(int cw, int ch, double fs, HDC dc) {
     }
     g_lblG->SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     g_lblG->Clear(Gdiplus::Color(0, 0, 0, 0));
-    for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+    for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
         const bool act = (i == g_tab);
         const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
         guiAAString(*g_lblG, dc, trc, kTabNames[i],
@@ -4950,7 +4958,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;                       // the buffer covers every pixel opaquely
     case WM_LBUTTONUP: {
         const int x = (int)(short)LOWORD(lp);
-        for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i)
+        for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i)
             if (x >= fx && x < fx + kTabW[i]) {
                 if (i != g_tab) guiShowPage(GetParent(w), i);
                 return 0;
@@ -4996,7 +5004,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_dctx->DrawRoundedRectangle(rr, g_d2dBr, wd[k]);
                 }
             }
-            for (int i = 0, ix = KSTRIP_PAD; i < 6; ix += kTabW[i] + 4, ++i) {
+            for (int i = 0, ix = KSTRIP_PAD; i < 5; ix += kTabW[i] + 4, ++i) {
                 const bool act = (i == g_tab);
                 // the face rect is the 1 px inset rounded rect (guiRoundPath
                 // convention) -- the centered stroke stays fully inside.
@@ -5045,7 +5053,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             if (!labelsDrawn) {   // layer/upload failed: native text fallback
-                for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+                for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
                     const bool act = (i == g_tab);
                     if (g_tabWide[i].empty()) g_tabWide[i] = guiWide(kTabNames[i]);
                     TSBRCOL(act ? guiLerpRGB(guic::cText, guic::cAccent, fs)
@@ -5099,7 +5107,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g.DrawPath(&gp, bp);
                 delete bp;
             }
-            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+            for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
                 const bool act = (i == g_tab);
                 const Gdiplus::Rect fr2(fx, KSTRIP_FACE_Y, kTabW[i], 23);
                 Gdiplus::GraphicsPath* p = guiRoundPath(fr2, 6);
@@ -5187,7 +5195,7 @@ static void guiShowPage(HWND w, int p) {
     // RedrawWindow then shows the finished page immediately, no fade on the
     // content (the tabs keep theirs -- that is the wanted animation).
     SendMessageA(w, WM_SETREDRAW, FALSE, 0);   // v7.0.6: freeze (no MFC SetRedraw in Win32)
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 5; ++i)
         for (size_t k = 0; k < g_pageHw[i].size(); ++k)
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     SendMessageA(w, WM_SETREDRAW, TRUE, 0);
@@ -5394,6 +5402,49 @@ static bool guiCreateRealWindow() {
     return true;
 }
 
+// ---- v7.1.7: the taskbar slot, managed explicitly ---------------------------
+// The panel is shown with SW_SHOWNA (the v6.6.5 no-activate show), and a
+// no-activate show can leave the taskbar button missing until the shell
+// next re-enumerates tabs or the user clicks the window -- the field wanted
+// the slot the moment the panel opens. ITaskbarList::AddTab creates the
+// button NOW; ActivateTab marks it the active one; DeleteTab removes it
+// when the panel hides back to the tray (the tray icon remains). The
+// vtable is hand-rolled -- no __uuidof, no uuid pragma, every toolchain
+// links identically (the same trick as the D2D IIDs above).
+static const CLSID kTSCLSID_TaskbarList =
+    { 0x56fdf344, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
+static const IID   kTSIID_ITaskbarList =
+    { 0x56fdf342, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
+struct TS_ITaskbarListVtbl {
+    HRESULT (__stdcall *QueryInterface)(void*, const IID&, void**);
+    ULONG   (__stdcall *AddRef)(void*);
+    ULONG   (__stdcall *Release)(void*);
+    HRESULT (__stdcall *HrInit)(void*);
+    HRESULT (__stdcall *AddTab)(void*, HWND);
+    HRESULT (__stdcall *DeleteTab)(void*, HWND);
+    HRESULT (__stdcall *ActivateTab)(void*, HWND);
+    HRESULT (__stdcall *SetActiveAlt)(void*, HWND);
+};
+static void* g_tbList = nullptr;   // ITaskbarList* (lazy, GUI thread only)
+static TS_ITaskbarListVtbl* tbVtbl() {
+    if (g_tbList) return (TS_ITaskbarListVtbl*)*(void**)g_tbList;
+    void* p = nullptr;
+    if (FAILED(CoCreateInstance(kTSCLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+                                kTSIID_ITaskbarList, &p)))
+        return nullptr;            // pre-Win7 or COM trouble: stock behavior
+    g_tbList = p;
+    ((TS_ITaskbarListVtbl*)*(void**)p)->HrInit(p);   // tell the shell we manage tabs
+    return (TS_ITaskbarListVtbl*)*(void**)p;
+}
+static void tbShowTab(HWND w) {   // panel open: the slot exists THIS instant
+    TS_ITaskbarListVtbl* v = tbVtbl();
+    if (v && g_tbList && w) { v->AddTab(g_tbList, w); v->ActivateTab(g_tbList, w); }
+}
+static void tbHideTab(HWND w) {   // panel hidden: the slot goes with it
+    TS_ITaskbarListVtbl* v = tbVtbl();
+    if (v && g_tbList && w) v->DeleteTab(g_tbList, w);
+}
+
 static void guiRestoreWindow() {
     // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
     // tray menu, second instance); every later ask just shows it.
@@ -5401,6 +5452,7 @@ static void guiRestoreWindow() {
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
+    tbShowTab(g_hwnd);    // v7.1.7: the taskbar slot exists THIS instant
 }
 
 // ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
@@ -5444,7 +5496,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.6  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.7  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -5629,7 +5681,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // swallowed IDC_REFRESH and erased it with the wrong surface.
         // v7.0.4: the tab BUTTONs are retired; their ids remain here only as
         // dead-code insurance.
-        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
+        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 4) ||
                               id == IDC_START  || id == IDC_APPLY ||
                               id == IDC_SAVE   || id == IDC_TICK  ||
                               id == IDC_THEME);
@@ -5773,7 +5825,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (id >= IDC_TAB0 && id <= IDC_TAB0 + 5) { guiShowPage(w, id - IDC_TAB0); return 0; }
+        if (id >= IDC_TAB0 && id <= IDC_TAB0 + 4) { guiShowPage(w, id - IDC_TAB0); return 0; }
         switch (id) {
             case IDM_TRAY_OPEN:                 // v6.6.1 tray menu
                 guiRestoreWindow();
@@ -5993,6 +6045,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v6.6.1: closing hides to the tray -- the engine keeps running.
         // Real exit lives in the tray menu (Exit), which stops the engine
         // first. A one-time balloon tells the user where the window went.
+        // v7.1.7: the taskbar slot goes away WITH the panel.
+        tbHideTab(w);
         trayAdd(true);
         ShowWindow(w, SW_HIDE);
         return 0;
@@ -6082,6 +6136,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         g_startTray  = true;
     }
     guiMakeGdi();
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);   // v7.1.7: ITaskbarList
     // v6.6.5: GDI+ session for the antialiased owner-drawn UI + watermark
     {
         Gdiplus::GdiplusStartupInput sin_;
@@ -6146,6 +6201,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // frame, no activate/erase cycle).
         if (!guiCreateRealWindow()) { if (mutex) CloseHandle(mutex); return 1; }
         ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
+        tbShowTab(g_hwnd);               // v7.1.7: the taskbar slot exists THIS instant
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
@@ -6159,7 +6215,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         if (m.message == WM_KEYDOWN && m.wParam == VK_TAB
             && (GetKeyState(VK_CONTROL) & 0x8000)) {
             guiShowPage(g_hwnd, (GetKeyState(VK_SHIFT) & 0x8000)
-                                ? (g_tab + 5) % 6 : (g_tab + 1) % 6);
+                                ? (g_tab + 4) % 5 : (g_tab + 1) % 5);
             continue;
         }
         // v7.1.4 KEYBOARD + TAB: IsDialogMessage drives the whole child tree --
@@ -6286,13 +6342,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_qpcBoot = c;
     }
 
-    // keep-alive cycle table (v3.9: keepalive_hz / keepalive_gain from ini)
-    g_kaHz = g_cfg.keepaliveHz;
-    if (g_kaHz < 5.0f)    g_kaHz = 5.0f;
-    if (g_kaHz > 2000.0f) g_kaHz = 2000.0f;
-    g_kaGain = g_cfg.keepaliveGain;
-    if (g_kaGain < 0.0f)  g_kaGain = 0.0f;
-    if (g_kaGain > 0.25f) g_kaGain = 0.25f;
+    // keep-alive cycle table (v7.1.7: BUILT IN -- 1 Hz @ 0.0001, no ini, no UI)
+    g_kaHz = kKeepAliveHz;
+    g_kaGain = kKeepAliveGain;
     g_kaLen = (unsigned)((double)kSampleRate / (double)g_kaHz + 0.5);
     if (g_kaLen < 8) g_kaLen = 8;
     if (g_kaLen > kKeepAliveTableMax) g_kaLen = kKeepAliveTableMax;
@@ -6760,7 +6812,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.6        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
