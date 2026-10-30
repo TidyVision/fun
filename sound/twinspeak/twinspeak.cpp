@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,18 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.5  field fixes: THE BOOT POP (a duplicate --tray launch signaled
+//            WM_APP+4 and forced the hidden startup window on screen --
+//            --tray duplicates now exit silently, manual ones still come
+//            up); THE ~10 MS START DELAY (the Sleep(30) gap piled
+//            pre-playback backlog on the prefill -- it is trimmed to the
+//            anchor BEFORE the legs start, so the first buffer opens at
+//            target latency, no post-start settle corrections); STATUS +
+//            LOG FLICKER (the status line paints in the frame buffer, the
+//            log EDIT renders through WM_PRINTCLIENT into a buffer and
+//            appends are WM_SETREDRAW-batched); CTRL+TAB / CTRL+SHIFT+TAB
+//            cycle pages; the keyboard map lives tiny in the bottom-left
+//            strip. DSP byte-identical to v7.1.4.
 //    v7.1.4  fixes + keyboard: the GDI+ bar's gray hairline edges are gone
 //            (integer fills + 1px overscan, no shape AA on the bar -- the
 //            AA boundary blend against the stale pixels was the gray);
@@ -2513,7 +2525,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3759,6 +3771,53 @@ static void guiDarkCtl(HWND h) {
     if (f) f(h, L"DarkMode_Explorer", nullptr);
 }
 
+// ---- v7.1.5: the log pane paints through a memory buffer (THE PANE FLICKER)
+// Every log append scrolled the read-only EDIT and its direct WM_PAINT
+// erased-then-drew ON SCREEN -- visible flicker under steady engine logging
+// (the field: "the console text ... still flickers"). The pane is
+// subclassed: WM_ERASEBKGND -> nothing, WM_PAINT renders the control into a
+// memory surface via WM_PRINTCLIENT and lands as ONE opaque blit. The
+// scroll logic, the colors (WM_CTLCOLORSTATIC) and the font stay stock.
+static HDC     g_logDc = nullptr;
+static HBITMAP g_logBm = nullptr, g_logBmOld = nullptr;
+static int     g_logW = 0, g_logH = 0;
+static void guiLogBufRelease() {
+    if (g_logBmOld) { SelectObject(g_logDc, g_logBmOld); g_logBmOld = nullptr; }
+    if (g_logBm)    { DeleteObject(g_logBm);             g_logBm    = nullptr; }
+    if (g_logDc)    { DeleteDC(g_logDc);                 g_logDc    = nullptr; }
+    g_logW = 0; g_logH = 0;
+}
+static bool guiLogBufEnsure(int w, int h) {
+    if (g_logDc && w == g_logW && h == g_logH) return true;
+    guiLogBufRelease();
+    HDC sdc = GetDC(nullptr);
+    g_logDc = CreateCompatibleDC(sdc);
+    g_logBm = CreateCompatibleBitmap(sdc, w, h);
+    ReleaseDC(nullptr, sdc);
+    if (!g_logDc || !g_logBm) { guiLogBufRelease(); return false; }
+    g_logBmOld = (HBITMAP)SelectObject(g_logDc, g_logBm);
+    g_logW = w; g_logH = h;
+    return true;
+}
+static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
+                                   UINT_PTR, DWORD_PTR) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;                       // the blit below is fully opaque
+    case WM_PAINT: {
+        RECT rc; GetClientRect(h, &rc);
+        if (!guiLogBufEnsure(rc.right, rc.bottom)) break;   // no buffer -> stock paint
+        SendMessageA(h, WM_PRINTCLIENT, (WPARAM)g_logDc, PRF_CLIENT | PRF_ERASEBKGND);
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, g_logDc, 0, 0, SRCCOPY);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefSubclassProc(h, m, wp, lp);
+}
+
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4297,6 +4356,9 @@ static void guiAppendLog(const std::string& s) {
         }
     }
     int len = GetWindowTextLengthA(e);
+    // v7.1.5: the append is WM_SETREDRAW-batched -- one repaint per chunk,
+    // then the subclassed pane lands it as a single blit.
+    SendMessageA(e, WM_SETREDRAW, FALSE, 0);
     if (len > 131072) {                               // keep the pane bounded
         SendMessageA(e, EM_SETSEL, 0, len / 2);
         SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)"");
@@ -4305,6 +4367,18 @@ static void guiAppendLog(const std::string& s) {
     SendMessageA(e, EM_SETSEL, len, len);
     SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
     SendMessageA(e, EM_SCROLLCARET, 0, 0);
+    SendMessageA(e, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(e, nullptr, FALSE);
+}
+
+// v7.1.5 FLICKER-FREE STATUS: the engine/health line paints INSIDE the frame
+// buffer (guiPaintFrame) -- the STATIC child is hidden and only STORES the
+// string. Every writer goes through here so the frame's status band is
+// invalidated in the same breath; the next WM_PAINT lands it as one blit.
+static void guiSetStatus(HWND w, const char* s) {
+    SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
+    const RECT sr = { 14, 458, 866, 476 };
+    InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
 static DWORD WINAPI guiEngineThread(LPVOID) {
@@ -4321,7 +4395,7 @@ static void guiStartEngine(HWND w) {
     cfgFromControls(w);
     cfgSanitize();
     if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty() || g_cfg.outputDevice2.empty()) {
-        SetDlgItemTextA(g_hwnd, IDC_STATUS, "set input_device / output_device1 / output_device2 first");
+        guiSetStatus(g_hwnd, "set input_device / output_device1 / output_device2 first");
         return;
     }
     if (!guiSaveIni())
@@ -4961,7 +5035,11 @@ static void guiBuildControls(HWND w) {
     // theme cycler (label = the ACTIVE theme, kThemes[g_theme].name).
     mkBtn(w, IDC_TICK, 448, 414, 150, 36, "120 BPM TICK TEST");
     mkBtn(w, IDC_THEME, 606, 414, 150, 36, kThemes[g_theme].name);
-    HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD | WS_VISIBLE,
+    // v7.1.5 FLICKER-FREE STATUS: the STATIC is HIDDEN -- it only stores the
+    // string; guiPaintFrame draws the line inside the frame buffer (one blit,
+    // no erase-then-draw flicker four times a second). Writers go through
+    // guiSetStatus, which invalidates the status band of the frame.
+    HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
                               14, 458, 852, 16, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
@@ -4971,6 +5049,7 @@ static void guiBuildControls(HWND w) {
         14, 480, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     guiDarkCtl(log);
+    SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
     // six BUTTONs, their regions and the frame-painted halo are all retired.
     guiMakeTabStrip(w);
@@ -5159,9 +5238,22 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.4  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.5  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
+    // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
+    // inside the frame buffer -- the STATIC child (hidden) only stores the
+    // string. One blit, no flicker while the health line updates.
+    char stb[512] = "";
+    if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
+    const RECT stc = { 14, 458, 866, 476 };
+    guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
+    // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
+    // watermark strip (the watermark owns the right half).
+    const RECT kbr = { 14, KLOG_BOTTOM, 520, KCLI_H };
+    guiAAString(g, dc, kbr,
+                "tab = next ctl   ctrl+tab = page   space = on/off   arrows = sliders",
+                guic::cDim, g_fSml, 1);
     guiWatermark(g);
 }
 
@@ -5458,7 +5550,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             guiRepaint(w, id);          // v6.6.1: the pill repaints itself
             if (id == IDC_TGL_STARTUP) {         // v6.6.6: the pill IS the Run key
                 startupSet(g_tog[id]);
-                SetDlgItemTextA(w, IDC_STATUS, g_tog[id]
+                guiSetStatus(w, g_tog[id]
                     ? "startup: twinspeak will run at sign-in (hidden in the tray)"
                     : "startup entry removed");
             }
@@ -5477,7 +5569,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 startupSet(on);
                 g_tog[IDC_TGL_STARTUP] = on;     // v6.6.6: keep the pill in sync
                 guiRepaint(w, IDC_TGL_STARTUP);
-                SetDlgItemTextA(w, IDC_STATUS, on
+                guiSetStatus(w, on
                     ? "startup: twinspeak will run at sign-in (hidden in the tray)"
                     : "startup entry removed");
                 return 0; }
@@ -5491,11 +5583,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             case IDC_SAVE: {
                 cfgFromControls(w); cfgSanitize();
-                SetDlgItemTextA(w, IDC_STATUS, guiSaveIni() ? "ini saved" : "ini save FAILED");
+                guiSetStatus(w, guiSaveIni() ? "ini saved" : "ini save FAILED");
                 return 0; }
             case IDC_TICK: {                   // v7.0.0: the 120 bpm sync tick -- PLAY/STOP toggle
                 if (g_engState.load() == 0) {
-                    SetDlgItemTextA(w, IDC_STATUS, "tick test: start the engine first");
+                    guiSetStatus(w, "tick test: start the engine first");
                     return 0;
                 }
                 if (g_tickOn.load(std::memory_order_acquire)) {
@@ -5504,7 +5596,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_tickSeq0.store(-1, std::memory_order_relaxed);
                     g_tickEndMs.store(0, std::memory_order_relaxed);
                     SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
-                    SetDlgItemTextA(w, IDC_STATUS, "tempo tick: stopped");
+                    guiSetStatus(w, "tempo tick: stopped");
                     return 0;
                 }
                 tickRender();
@@ -5518,7 +5610,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                                   std::memory_order_relaxed);
                 g_tickOn.store(true, std::memory_order_release);
                 SetDlgItemTextA(w, IDC_TICK, "STOP TICK TEST");
-                SetDlgItemTextA(w, IDC_STATUS,
+                guiSetStatus(w,
                     "tempo tick: 120 bpm, 8 beats (4 s) -- raw, all four channels");
                 return 0; }
             case IDC_THEME: {                  // v7.0.0: cycle the eight themes
@@ -5528,7 +5620,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 // would) the moment it changes; no restart, no leak.
                 cfgFromControls(w); cfgSanitize();   // same save model as SAVE INI
                 const bool thOk = guiSaveIni();
-                SetDlgItemTextA(w, IDC_STATUS, thOk ?
+                guiSetStatus(w, thOk ?
                     (std::string("theme saved: ") + kThemes[g_theme].name).c_str()
                     : kThemes[g_theme].name);
                 return 0; }
@@ -5539,11 +5631,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 if (wasRunning) {
                     guiStopEngine();
                     guiStartEngine(w);
-                    SetDlgItemTextA(w, IDC_STATUS,
+                    guiSetStatus(w,
                                     ok ? "saved -- engine restarted"
                                        : "save FAILED -- restarted with the previous ini");
                 } else {
-                    SetDlgItemTextA(w, IDC_STATUS, ok ? "saved -- START to apply" : "ini save FAILED");
+                    guiSetStatus(w, ok ? "saved -- START to apply" : "ini save FAILED");
                 }
                 return 0; }
             case IDC_REFRESH:   guiFillCombos(w);     return 0;
@@ -5600,7 +5692,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g_tickSeq0.store(-1, std::memory_order_relaxed);
                 g_tickEndMs.store(0, std::memory_order_relaxed);
                 SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
-                SetDlgItemTextA(w, IDC_STATUS, "tempo tick: finished");
+                guiSetStatus(w, "tempo tick: finished");
             }
         } else {
             const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
@@ -5633,7 +5725,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         static std::string s_lastStatus;
         if (s != s_lastStatus) {
             s_lastStatus = s;
-            SetDlgItemTextA(w, IDC_STATUS, s.c_str());
+            guiSetStatus(w, s.c_str());
         }
         return 0; }
     case WM_APP + 2:                                   // engine thread ended
@@ -5693,6 +5785,14 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     InitCommonControlsEx(&icc);
     HANDLE mutex = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // v7.1.5 THE BOOT POP: a duplicate --tray launch is the STARTUP path
+        // -- it must never force the window up. The field log: the Run key
+        // starts twinspeak hidden at sign-in, then Windows' startup machinery
+        // re-runs the exe once the taskbar is up; the duplicate landed HERE,
+        // signaled WM_APP+4 and the hidden window popped open. A --tray
+        // duplicate now exits silently; a manual duplicate still says "come
+        // up" below (that behavior is by design for a real user).
+        if (startTray) { CloseHandle(mutex); return 0; }
         // v6.6.1: another CONTROL WINDOW just comes to the front (tray
         // included) instead of a scolding MessageBox. A console-engine run
         // has no window, so it still gets the message below.
@@ -5821,6 +5921,17 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
+        // v7.1.5 CTRL+TAB cycles pages: Ctrl+Tab = next, Ctrl+Shift+Tab =
+        // previous. Handled HERE -- IsDialogMessage hands WM_KEYDOWN to the
+        // focused control, and the loop is the one place that sees the key
+        // no matter which control holds focus. guiShowPage owns the atomic
+        // switch, the fade and the strip repaint.
+        if (m.message == WM_KEYDOWN && m.wParam == VK_TAB
+            && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            guiShowPage(g_hwnd, (GetKeyState(VK_SHIFT) & 0x8000)
+                                ? (g_tab + 5) % 6 : (g_tab + 1) % 6);
+            continue;
+        }
         // v7.1.4 KEYBOARD + TAB: IsDialogMessage drives the whole child tree --
         // Tab / Shift+Tab cycle the tab stops (buttons, pills, edits, combos
         // and now the sliders), Space activates the focused button, and the
@@ -6249,6 +6360,28 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
     Sleep(30);   // let capture + pumps fill both rings with real audio
 
+    // v7.1.5 START AT THE ANCHOR: the Sleep(30) gap + the render devices'
+    // start latency let the capture side pile REAL frames on top of the
+    // prefill -- playback then opened ~10 ms behind and the per-callback
+    // settle trim spent its first corrections shaving that backlog (the
+    // field: "a ~10ms delay every time I start/restart that eventually gets
+    // readjusted"). The excess is trimmed HERE, before either leg starts:
+    // the first buffer opens at the target latency and the settle trim
+    // stays a safety net. Same discardOldest semantics as the per-callback
+    // trim (front-out bit-exact skip; the discarded frames' sequence
+    // numbers are consumed with them).
+    for (int li = 0; li < 2; ++li) {
+        Leg& SL = g_leg[li];
+        if (!g_cfg.clockSync || !SL.out.cap) continue;   // sync off / ring not built
+        const long long level = (long long)SL.out.count();
+        if (level > (long long)SL.targetFrames) {
+            const size_t dropped =
+                SL.out.discardOldest((size_t)(level - (long long)SL.targetFrames));
+            tlog("[twinspeak] leg%d sync     : start trim: dropped %llu fr of pre-playback backlog -- the first buffer opens at the target latency\n",
+                 li + 1, (unsigned long long)dropped);
+        }
+    }
+
     armChime(true);   // v6.2: the first thing the center speaker plays is the signature
 
     ma_result sA = MA_SUCCESS, sB = MA_SUCCESS;
@@ -6325,7 +6458,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.4        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.5        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
