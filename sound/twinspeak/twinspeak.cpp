@@ -26,15 +26,31 @@
 //    v7.1.5  field fixes: THE BOOT POP (a duplicate --tray launch signaled
 //            WM_APP+4 and forced the hidden startup window on screen --
 //            --tray duplicates now exit silently, manual ones still come
-//            up); THE ~10 MS START DELAY (the Sleep(30) gap piled
-//            pre-playback backlog on the prefill -- it is trimmed to the
-//            anchor BEFORE the legs start, so the first buffer opens at
-//            target latency, no post-start settle corrections); STATUS +
-//            LOG FLICKER (the status line paints in the frame buffer, the
-//            log EDIT renders through WM_PRINTCLIENT into a buffer and
-//            appends are WM_SETREDRAW-batched); CTRL+TAB / CTRL+SHIFT+TAB
+//            up); THE START LATENCY, in two halves: (1) the Sleep(30) gap
+//            piled pre-playback backlog on the prefill -- it is trimmed to
+//            the anchor BEFORE the legs start; (2) the two devices begin
+//            EATING their prefills a few ms apart and a start stagger
+//            shifts that leg's whole stream while the ledger reads a FLAT
+//            drift -- the first buffer switch of each leg is QPC-stamped
+//            and the early leg is replay-padded by exactly the gap, so
+//            both streams open on the same instant and the ledger starts
+//            ON the calibrated baseline (no settle correction, no warden
+//            wait); STATUS + LOG FLICKER (the status line paints in the
+//            frame buffer, the log EDIT renders through WM_PRINTCLIENT
+//            into a buffer and appends are WM_SETREDRAW-batched);
+//            THE BOOT POP, round two: Windows' app-restart and Startup-
+//            folder shortcuts replay the exe WITHOUT --tray -- a plain
+//            boot twin either signaled "come up" or won the mutex race
+//            and showed its own window. A shell-age check (the logon
+//            window) now identifies boot twins: they exit silently, a
+//            plain winner inside the logon window runs as the startup
+//            instance, and a --tray twin yields boot ownership (WM_APP+5)
+//            instead of letting the window pop; MOUSE INPUT SPACING (the
+//            UI thread stops queueing behind the engine's helpers at
+//            HIGHEST priority, the watermark measure is cached, and the
+//            status paint pauses mid-drag); CTRL+TAB / CTRL+SHIFT+TAB
 //            cycle pages; the keyboard map lives tiny in the bottom-left
-//            strip. DSP byte-identical to v7.1.4.
+//            strip (+shift = backwards). DSP byte-identical to v7.1.4.
 //    v7.1.4  fixes + keyboard: the GDI+ bar's gray hairline edges are gone
 //            (integer fills + 1px overscan, no shape AA on the bar -- the
 //            AA boundary blend against the stale pixels was the gray);
@@ -702,6 +718,11 @@ struct Leg {
     std::atomic<unsigned long long> wardenDrops{0};  // warden skip events
     std::atomic<unsigned long long> wardenPads{0};   // warden pad events
     std::atomic<double> lagMs{0.0};                  // age of the newest played frame (ms)
+    // v7.1.5 START ALIGN: the QPC microsecond stamp of this leg's FIRST buffer
+    // switch of the run -- the moment THIS device began eating its ring. The
+    // two legs' difference is the real start stagger; the start sequence pads
+    // the early leg by exactly that gap so both streams open together.
+    std::atomic<unsigned long long> firstSwitchUs{0};
     bool                streamSeeded = false;        // pump: out ring's seq space armed
     unsigned long long  lastReopenMs = 0;            // warden pauses 10 s after a reopen
 };
@@ -1100,6 +1121,17 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     if (g_stopSilence.load(std::memory_order_relaxed)) {
         if (frameCount) memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
         return;
+    }
+    // v7.1.5 START ALIGN: stamp the FIRST switch of this run before the pop
+    // counter moves (release store, then the relaxed fetch_add -- the start
+    // sequence polls popped and can rely on seeing the stamp). WASAPI: the
+    // first callback after Start; KS: the pacing thread's first period write,
+    // right after its RUN flip. Either way: when THIS DAC began eating.
+    if (L.popped.load(std::memory_order_relaxed) == 0 && g_qpf > 0.0) {
+        LARGE_INTEGER fsw;
+        QueryPerformanceCounter(&fsw);
+        L.firstSwitchUs.store((unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf),
+                              std::memory_order_release);
     }
     L.popped.fetch_add((unsigned long long)frameCount, std::memory_order_relaxed);    // device clock
 
@@ -3466,7 +3498,45 @@ static ULONG_PTR g_gdipToken = 0;             // v6.6.5: GDI+ session token
 static bool g_trayVisible = false;             // icon currently in the tray
 static bool g_trayHint    = false;             // one-time close balloon shown
 static bool g_startTray   = false;             // --tray: begin hidden in the tray
+static bool g_userShown   = false;             // v7.1.5: the USER opened the window
+                                               // (tray dbl-click / menu / second
+                                               // instance) -- startup shows and the
+                                               // boot yield never set it
 static UINT g_taskbarCreated = 0;              // explorer restart re-adds the icon
+
+// v7.1.5 THE BOOT POP, round two: a plain (no --tray) duplicate. Windows'
+// app-restart machinery and Startup-folder shortcuts replay the exe WITHOUT
+// --tray, so the v7.1.5 "--tray duplicates exit silently" gate misses them:
+// one wins the mutex race and shows its own window, or signals WM_APP+4 and
+// pops the hidden primary. The tell: boot machinery fires right after the
+// shell comes up. This asks the shell (tray window -> explorer process) how
+// long ago IT started: within kBootWindowMs of shell start = the logon
+// window. Not a perfect user/boot oracle, but the tray window itself is the
+// thing "the taskbar completes initialization" waits for, so boot duplicates
+// always land deep inside it.
+static bool withinLogonWindow(unsigned long long msWindow) {
+    HWND sh = FindWindowA("Shell_TrayWnd", nullptr);
+    if (!sh) sh = FindWindowA("Progman", nullptr);
+    if (!sh) return false;                     // shell not up yet: not boot context
+    DWORD pid = 0;
+    GetWindowThreadProcessId(sh, &pid);
+    if (!pid) return false;
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return false;
+    FILETIME ct, ex, kt, ut, now;
+    const BOOL ok = GetProcessTimes(p, &ct, &ex, &kt, &ut);
+    CloseHandle(p);
+    if (!ok) return false;
+    GetSystemTimeAsFileTime(&now);
+    const ULONGLONG shellStart = (ULONGLONG)ct.dwLowDateTime
+                               | ((ULONGLONG)ct.dwHighDateTime << 32);
+    const ULONGLONG nowFt      = (ULONGLONG)now.dwLowDateTime
+                               | ((ULONGLONG)now.dwHighDateTime << 32);
+    if (nowFt <= shellStart) return false;
+    const ULONGLONG shellAgeMs = (nowFt - shellStart) / 10000ULL;   // 100 ns -> ms
+    return shellAgeMs < msWindow;
+}
+static constexpr unsigned long long kBootWindowMs = 120000;   // 2 min after the shell came up
 
 // v6.6.1 forward decls (helpers defined below the page builder)
 static void guiRepaint(HWND w, int id);
@@ -3736,18 +3806,24 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     GetClientRect(g_hwnd, &crc);
     Gdiplus::FontFamily ff(L"Arial");
     Gdiplus::Font f(&ff, 13, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    // v6.6.6: measure with the EXACT format the draw uses. The old code
-    // measured with the DEFAULT format (wrap on, black-box fit) but drew
-    // NoWrap -- on the tight 22px strip the disagreement showed as the
-    // bottom-right text clipped by the client edge.
     Gdiplus::StringFormat sf;
     sf.SetAlignment(Gdiplus::StringAlignmentNear);
     sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
     sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap |
                       Gdiplus::StringFormatFlagsNoFitBlackBox);
-    const Gdiplus::RectF lay(0, 0, (Gdiplus::REAL)crc.right, (Gdiplus::REAL)crc.bottom);
-    Gdiplus::RectF mr(0, 0, 0, 0);
-    g.MeasureString(wt.c_str(), (INT)wt.size(), &f, lay, &sf, &mr);
+    // v7.1.5 THE CACHED MEASURE: MeasureString ran on EVERY frame render --
+    // every hover, every focus ring, every status tick paid a GDI+ layout
+    // pass for text that never changes, and that cost landed between mouse
+    // moves (the field: "mouse inputs too spaced out in time"). The window
+    // is fixed-size; measure ONCE, reuse forever.
+    static Gdiplus::RectF mrCached(0, 0, 0, 0);
+    static bool measured = false;
+    if (!measured) {
+        const Gdiplus::RectF lay(0, 0, (Gdiplus::REAL)crc.right, (Gdiplus::REAL)crc.bottom);
+        g.MeasureString(wt.c_str(), (INT)wt.size(), &f, lay, &sf, &mrCached);
+        measured = true;
+    }
+    const Gdiplus::RectF& mr = mrCached;
     if (mr.Width <= 0) return;
     // centered in the strip below the log pane; right edge 14px off the client edge
     const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - 14) - mr.Width;
@@ -5193,6 +5269,7 @@ static void trayAdd(bool hint) {
     }
 }
 static void guiRestoreWindow() {
+    g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
 }
@@ -5250,14 +5327,22 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    const RECT kbr = { 14, KLOG_BOTTOM, 520, KCLI_H };
+    const RECT kbr = { 14, KLOG_BOTTOM, 552, KCLI_H };
     guiAAString(g, dc, kbr,
-                "tab = next ctl   ctrl+tab = page   space = on/off   arrows = sliders",
+                "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
     guiWatermark(g);
 }
 
 // ---- the window procedure ---------------------------------------------------
+// v7.1.5 MOUSE-INPUT SPACING: while a slider is mid-drag the per-tick status
+// work is skipped -- the health line repaint lands on the NEXT tick instead
+// of interleaving GDI+ frame renders between WM_MOUSEMOVE bursts.
+static bool anySliderDragging() {
+    for (std::map<HWND, Sld>::const_iterator it = g_sld.begin(); it != g_sld.end(); ++it)
+        if (it->second.drag) return true;
+    return false;
+}
 static bool guiIsToggle(int id) {
     switch (id) {
         case IDC_TGL_LFEFOLD:
@@ -5723,7 +5808,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // identical -- 4 idle repaints a second for nothing. Set only on
         // change; the task-manager CPU line stays at the engine's floor.
         static std::string s_lastStatus;
-        if (s != s_lastStatus) {
+        if (s != s_lastStatus && !anySliderDragging()) {   // v7.1.5: no paint storm mid-drag
             s_lastStatus = s;
             guiSetStatus(w, s.c_str());
         }
@@ -5756,8 +5841,28 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0; }
     case WM_APP + 4:                                   // v6.6.1: second instance
+        // v7.1.5 boot-pop guard (belt to the duplicate-side braces): a hidden
+        // startup instance inside the logon window ignores "come up" -- the
+        // sender is boot machinery that slipped past every other gate. A user
+        // double-click outside the logon window (or after ever opening the
+        // window) still comes up, as always.
+        if (g_startTray && !g_userShown && withinLogonWindow(kBootWindowMs))
+            return 0;
         guiRestoreWindow();                            // says "come up"
         return 0;
+    case WM_APP + 5: {                                 // v7.1.5: boot yield
+        // A --tray duplicate lost the mutex race to a PLAIN launch (Windows'
+        // app-restart / a Startup-folder shortcut won the race and showed its
+        // window). The --tray launch is BY DEFINITION the startup path: hand
+        // the plain twin its true role -- go hidden, own the tray icon, run
+        // the startup engine. Never touches a window the user opened.
+        if (!g_userShown) {
+            if (g_cfg.startupEngine && g_engState.load() == 0)
+                guiStartEngine(w);
+            trayAdd(false);
+            ShowWindow(w, SW_HIDE);
+        }
+        return 0; }
     case WM_CLOSE:
         // v6.6.1: closing hides to the tray -- the engine keeps running.
         // Real exit lives in the tray menu (Exit), which stops the engine
@@ -5790,14 +5895,38 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // starts twinspeak hidden at sign-in, then Windows' startup machinery
         // re-runs the exe once the taskbar is up; the duplicate landed HERE,
         // signaled WM_APP+4 and the hidden window popped open. A --tray
-        // duplicate now exits silently; a manual duplicate still says "come
-        // up" below (that behavior is by design for a real user).
-        if (startTray) { CloseHandle(mutex); return 0; }
-        // v6.6.1: another CONTROL WINDOW just comes to the front (tray
-        // included) instead of a scolding MessageBox. A console-engine run
-        // has no window, so it still gets the message below.
+        // duplicate now exits silently -- but if the winner shows a window
+        // nobody asked for (a plain boot twin beat us to the mutex), hand it
+        // the boot yield first: WM_APP+5 hides it, owns the tray icon and
+        // runs the startup engine. Then exit silently.
+        if (startTray) {
+            for (int i = 0; i < 20; ++i) {
+                if (HWND other = FindWindowA("twinspeak.control", nullptr)) {
+                    if (IsWindowVisible(other)) {
+                        DWORD_PTR res = 0;
+                        SendMessageTimeoutA(other, WM_APP + 5, 0, 0,
+                                            SMTO_ABORTIFHUNG, 4000, &res);
+                    }
+                    break;
+                }
+                Sleep(50);
+            }
+            CloseHandle(mutex);
+            return 0;
+        }
+        // v7.1.5 boot pop, round two: a PLAIN duplicate can be boot machinery
+        // too (Windows' app-restart, a Startup-folder shortcut) -- it carries
+        // no --tray, so the gate above misses it. The tell is the SHELL's age:
+        // right after logon, a plain duplicate finding an already-running
+        // HIDDEN instance is not a user asking for the window -- it exits
+        // silently. Outside the logon window (a real user double-click) it
+        // still says "come up", as always.
         for (int i = 0; i < 20; ++i) {
             if (HWND other = FindWindowA("twinspeak.control", nullptr)) {
+                if (withinLogonWindow(kBootWindowMs) && !IsWindowVisible(other)) {
+                    CloseHandle(mutex);
+                    return 0;                       // boot twin: silent exit
+                }
                 DWORD_PTR res = 0;
                 if (SendMessageTimeoutA(other, WM_APP + 4, 0, 0,
                                         SMTO_ABORTIFHUNG, 4000, &res)) {
@@ -5814,6 +5943,17 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         return 1;
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
+    // v7.1.5 boot pop, round two (winner side): a PLAIN launch that beats the
+    // Run-key --tray instance to the mutex shows its window and lets the real
+    // startup twin die silently -- the boot pop, from the other direction.
+    // Inside the logon window, with startup_engine opted in, a plain launch
+    // IS the startup path: run it exactly like --tray (hidden, engine on).
+    if (!startTray && g_cfg.startupEngine && withinLogonWindow(kBootWindowMs)) {
+        tlog("[twinspeak] gui           : plain launch inside the logon window -- running it as the\n");
+        tlog("                            startup instance (hidden in the tray, startup engine)\n");
+        startTray    = true;
+        g_startTray  = true;
+    }
     guiMakeGdi();
     // v6.6.5: GDI+ session for the antialiased owner-drawn UI + watermark
     {
@@ -5898,6 +6038,14 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     RedrawWindow(g_hwnd, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
+    // v7.1.5 THE INPUT PRIORITY: the message-loop thread ran at NORMAL while
+    // the engine's helpers (health loop, volume watcher) and the RT audio
+    // threads share the process -- under load the UI thread got the scraps
+    // and mouse feedback arrived in time-spaced bursts (the field: "mouse
+    // inputs too spaced out in time"). HIGHEST outranks every normal thread
+    // in the process; the audio RT threads still outrank US (MMCSS Pro Audio
+    // sits above priority 15), so the DSP path keeps every cycle it owns.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (g_startTray) {
         // --tray: straight to the tray (the startup path). The balloon shows
         // once so a boot-time launch is not a silent process.
@@ -6288,6 +6436,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.padTotal.store(0, std::memory_order_relaxed);
         L.wardenDrops.store(0, std::memory_order_relaxed);
         L.wardenPads.store(0, std::memory_order_relaxed);
+        L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
         L.lastCorrMs = 0;
     }
 
@@ -6360,16 +6509,17 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
     Sleep(30);   // let capture + pumps fill both rings with real audio
 
-    // v7.1.5 START AT THE ANCHOR: the Sleep(30) gap + the render devices'
-    // start latency let the capture side pile REAL frames on top of the
-    // prefill -- playback then opened ~10 ms behind and the per-callback
-    // settle trim spent its first corrections shaving that backlog (the
-    // field: "a ~10ms delay every time I start/restart that eventually gets
-    // readjusted"). The excess is trimmed HERE, before either leg starts:
-    // the first buffer opens at the target latency and the settle trim
-    // stays a safety net. Same discardOldest semantics as the per-callback
-    // trim (front-out bit-exact skip; the discarded frames' sequence
-    // numbers are consumed with them).
+    // v7.1.5 START AT THE ANCHOR (half ONE of two -- half two, the start
+    // STAGGER align, follows the device starts below): the Sleep(30) gap +
+    // the render devices' start latency let the capture side pile REAL
+    // frames on top of the prefill -- playback then opened ~10 ms behind
+    // and the per-callback settle trim spent its first corrections shaving
+    // that backlog (the field: "a ~10ms delay every time I start/restart
+    // that eventually gets readjusted"). The excess is trimmed HERE, before
+    // either leg starts: the first buffer opens at the target latency and
+    // the settle trim stays a safety net. Same discardOldest semantics as
+    // the per-callback trim (front-out bit-exact skip; the discarded
+    // frames' sequence numbers are consumed with them).
     for (int li = 0; li < 2; ++li) {
         Leg& SL = g_leg[li];
         if (!g_cfg.clockSync || !SL.out.cap) continue;   // sync off / ring not built
@@ -6419,6 +6569,74 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog( "[twinspeak] playback start failed\n");
         return 1;
     }
+
+    // v7.1.5 START AT THE SAME INSTANT (half two of the start-latency fix) --
+    // the start trim above fixed the RING backlog, but the two output devices
+    // also begin EATING their prefills when THEIR start call lands, and the
+    // calls land a few ms apart (ma_device_start vs the KS thread's RUN flip).
+    // A start stagger shifts that leg's WHOLE stream: the early leg stays
+    // early by the gap, the ledger reads a FLAT drift (baseline + gap) from
+    // the first real frame, the 5..9 s baseline calibration absorbs the gap
+    // and the warden never sees it -- the field heard it as "there is still
+    // latency between the legs on every start/apply+restart". So: wait for
+    // both legs' first buffer switch (the moment each DAC began eating --
+    // stamped in bufferSwitchFill), then replay-pad the EARLY leg by exactly
+    // the gap. Both streams then open on the same instant, the ledger starts
+    // ON the calibrated baseline, and no settle correction ever fires. The
+    // pad rides the ring level, so it is clamped under the per-callback trim
+    // line (target + burst + period) -- a larger gap is padded as far as is
+    // safe and the log says so. Everything lands inside the silence prefill
+    // window (guarded), so the filler is literal silence, never a repeat.
+    if (g_cfg.clockSync) {
+        const unsigned long long alignT0 = GetTickCount64();
+        for (;;) {
+            const bool sw0 = g_leg[0].popped.load(std::memory_order_acquire) > 0;
+            const bool sw1 = g_leg[1].popped.load(std::memory_order_acquire) > 0;
+            if (sw0 && sw1) break;
+            if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
+            Sleep(1);
+        }
+        const unsigned long long au0 = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
+        const unsigned long long au1 = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
+        if (!au0 || !au1) {
+            tlog("[twinspeak] start align  : a leg never handed in its first buffer switch --\n"
+                 "                            alignment skipped (the watchdog owns a dead leg)\n");
+        } else {
+            const long long gapUs  = (long long)au0 - (long long)au1;   // > 0: out1 began eating first
+            const long long gapAbs = gapUs < 0 ? -gapUs : gapUs;
+            long long gapFr = (gapAbs * (long long)kSampleRate + 500000) / 1000000;
+            const int  earlyIdx = (gapUs > 0) ? 0 : 1;
+            if (gapFr <= 0) {
+                tlog("[twinspeak] start align  : both legs began eating within one frame -- nothing to align\n");
+            } else {
+                Leg& E = g_leg[earlyIdx];
+                // headroom under the per-callback trim line (target + burst + period):
+                const long long head = (long long)g_capBurstFrames
+                                     + (long long)g_periodFrames[earlyIdx] - 96;
+                bool clipped = gapFr > head;
+                if (clipped) gapFr = head;
+                // the pad must land wholly inside the silence prefill, or the
+                // replay filler would repeat real audio (an audible stutter).
+                if ((long long)E.prefillRemaining < gapFr) {
+                    gapFr = (long long)E.prefillRemaining;
+                    clipped = true;
+                }
+                if (gapFr > 0) {
+                    E.padFrames.fetch_add((size_t)gapFr, std::memory_order_relaxed);
+                    tlog("[twinspeak] start align  : leg%d began eating %lld us before leg%d -- replay-padded\n"
+                         "                            %lld fr (%.2f ms)%s so both legs open their stream on the\n"
+                         "                            same instant; the ledger starts ON the calibrated baseline\n",
+                         earlyIdx + 1, gapAbs, 2 - earlyIdx, gapFr,
+                         (double)gapFr * 1000.0 / (double)kSampleRate,
+                         clipped ? " (clipped to the safe pad)" : "");
+                } else {
+                    tlog("[twinspeak] start align  : stagger %lld us, but no silence prefill left to pad inside --\n"
+                         "                            the early leg already plays; leaving it to the warden\n", gapAbs);
+                }
+            }
+        }
+    }
+
     // v3.8: volume/pin watcher -- 25 ms volume poll, 2 s output pin re-check.
     HANDLE hWatch = (g_cfg.volumeFollow || g_cfg.pinOutputs)
                   ? CreateThread(nullptr, 0, volumeWatchThread, nullptr, 0, nullptr)
