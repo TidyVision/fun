@@ -1,5 +1,18 @@
 // ============================================================================
-//  twinspeak v7.0.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//
+//  v7.0.5 (THE STRIP RENDERS ON THE GPU. The tab strip -- halo, faces,
+//          borders -- now draws through Direct2D: a DC render target backed
+//          by Direct3D (D2D1_RENDER_TARGET_TYPE_DEFAULT, automatic software
+//          fallback if no GPU), bound to a PERSISTENT 32bpp buffer that is
+//          never re-allocated per frame. Labels stay GDI+ glyphs on the
+//          same buffer, one opaque blit presents -- the look is identical,
+//          the cost per 16 ms fade frame drops to geometry + blit. The
+//          GDI+ path survives verbatim as the fallback. THE FADE SMOOTHS
+//          OUT: timeBeginPeriod(1) runs for the lifetime of the animation
+//          so the 16 ms timer lands on real 16 ms instead of the ~15.6 ms
+//          default tick. No engine DSP changed in this version: the audio
+//          path is byte-identical to v7.0.4.)
 //
 //  v7.0.4 (THE STRIP OWNS THE TABS. v7.0.3's frame-painted halo still read
 //          as a detached box and the fade's full-frame repaints strobed
@@ -1199,6 +1212,7 @@
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
 #include <gdiplus.h>        // v6.6.5: antialiased owner-drawn UI (buttons, text, watermark)
+#include <d2d1.h>           // v7.0.5: GPU-rendered tab strip (Direct2D DC render target)
 #include <mmsystem.h>
 #include <cstdio>
 #include <cstring>
@@ -3680,7 +3694,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4608,6 +4622,7 @@ static int       g_tab           = 0;
 // read their strength from guiTabFade() (ease-out cubic). 0 = settled -- every
 // paint then reads full strength, exactly the pre-animation look.
 static ULONGLONG g_tabAnimStart  = 0;
+static bool      g_fadePeriod    = false;   // v7.0.5: timeBeginPeriod(1) refcount-of-one
 static const int KTAB_FADE_MS    = 170;
 static double guiTabFade() {
     if (!g_tabAnimStart) return 1.0;
@@ -5537,6 +5552,93 @@ static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad
 static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
 static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 
+// ---- v7.0.5: Direct2D -- the strip's animation renders on the GPU -----------
+// The halo bands, faces and borders are GPU geometry now: a DC render target
+// (D2D1_RENDER_TARGET_TYPE_DEFAULT = Direct3D-backed, with an automatic
+// software fallback baked in) draws into the strip's PERSISTENT 32bpp buffer
+// via BindDC, the labels stay GDI+ glyphs on that same buffer, and ONE opaque
+// blit presents everything. Nothing here is allocated per frame in steady
+// state -- a 16 ms fade tick is pure geometry + blit. If D2D cannot start
+// (missing d2d1.dll, exotic session) or EndDraw reports a lost device, the
+// proven GDI+ path below runs untouched: same buffer, same pixels, same
+// blit. The factory IID is spelled out literally -- no __uuidof dependency,
+// every toolchain in build.sh links it the same way.
+static ID2D1Factory*        g_d2dFactory = nullptr;  // lazily created, once
+static ID2D1DCRenderTarget* g_d2dRt      = nullptr;  // GPU (or soft) target
+static HDC                  g_stripDc    = nullptr;  // persistent buffer DC
+static HBITMAP              g_stripBm    = nullptr;  // persistent buffer
+static HBITMAP              g_stripBmOld = nullptr;
+static int                  g_stripW = 0, g_stripH = 0;
+static bool                 g_d2dDead = false;       // D2D failed for good
+static const IID kTSIID_ID2D1Factory =
+    { 0x06152247, 0x6f50, 0x465a, { 0x92, 0x45, 0x11, 0x84, 0xfd, 0x3b, 0x84, 0x38 } };
+
+static D2D1_COLOR_F D2Col(COLORREF c, BYTE a) {
+    return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
+                        GetBValue(c) / 255.0f, a / 255.0f);
+}
+
+// the persistent strip buffer: one 32bpp top-down DIB, rebuilt only when the
+// strip's client size actually changes (it is 830x36 for the app's lifetime).
+static bool guiStripBufEnsure(HWND w, int nw, int nh) {
+    if (g_stripDc && nw == g_stripW && nh == g_stripH) return true;
+    if (g_stripBmOld) {
+        SelectObject(g_stripDc, g_stripBmOld);
+        DeleteObject(g_stripBm);
+        g_stripBm = nullptr; g_stripBmOld = nullptr;
+    }
+    if (g_stripDc) { DeleteDC(g_stripDc); g_stripDc = nullptr; }
+    BITMAPV5HEADER bi = {};
+    bi.bV5Size        = sizeof(bi);
+    bi.bV5Width       = nw;
+    bi.bV5Height      = -nh;                 // top-down
+    bi.bV5Planes      = 1;
+    bi.bV5BitCount    = 32;
+    bi.bV5Compression = BI_BITFIELDS;        // BGRA -- premultiplied-friendly
+    bi.bV5RedMask     = 0x00FF0000;
+    bi.bV5GreenMask   = 0x0000FF00;
+    bi.bV5BlueMask    = 0x000000FF;
+    bi.bV5AlphaMask   = 0xFF000000;
+    void* bits = nullptr;
+    HDC wdc = GetDC(w);
+    g_stripBm = CreateDIBSection(wdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(w, wdc);
+    if (!g_stripBm) return false;
+    g_stripDc = CreateCompatibleDC(nullptr);
+    if (!g_stripDc) { DeleteObject(g_stripBm); g_stripBm = nullptr; return false; }
+    g_stripBmOld = (HBITMAP)SelectObject(g_stripDc, g_stripBm);
+    g_stripW = nw; g_stripH = nh;
+    return true;
+}
+
+// the D2D target: factory + DC render target, both lazy and cached. A failure
+// here is permanent (g_d2dDead) -- the GDI+ fallback owns the strip forever.
+static bool guiStripD2dEnsure() {
+    if (g_d2dDead) return false;
+    if (!g_d2dFactory) {
+        D2D1_FACTORY_OPTIONS fo = {};
+        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                     kTSIID_ID2D1Factory, &fo,
+                                     (void**)&g_d2dFactory))) {
+            g_d2dFactory = nullptr;
+            g_d2dDead = true;
+            return false;
+        }
+    }
+    if (!g_d2dRt) {
+        const D2D1_RENDER_TARGET_PROPERTIES p =
+            D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,          // GPU first
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                  D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (FAILED(g_d2dFactory->CreateDCRenderTarget(&p, &g_d2dRt))) {
+            g_d2dRt = nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
 static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND:
@@ -5553,63 +5655,136 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
         RECT rc; GetClientRect(w, &rc);
-        // ONE buffer, ONE blit: bg, halo, faces, borders and labels land as a
-        // single opaque transfer -- no pass can ever be seen apart.
-        HDC     mdc = CreateCompatibleDC(dc);
-        HBITMAP mbm = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HBITMAP obm = (HBITMAP)SelectObject(mdc, mbm);
-        FillRect(mdc, &rc, g_brBg);
-        Gdiplus::Graphics g(mdc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        const int cw = rc.right, ch = rc.bottom;
+        if (cw <= 0 || ch <= 0 || !guiStripBufEnsure(w, cw, ch)) {
+            EndPaint(w, &ps);
+            return 0;
+        }
+        HDC buf = g_stripDc;
         const double fs = guiTabFade();
-        {   // THE HALO: three nested bands burning OUTWARD from the selected
-            // tab's face -- the inner edge starts half a pixel off the border
-            // (it hugs, no dead zone), fading to nothing ~5 px out. Drawn
-            // first; the neighboring faces painted below cover the ~1 px
-            // bleed into their gaps.
+        // v7.0.5 GPU PASS: halo, faces and borders as Direct2D rounded rects
+        // on the persistent buffer. Same geometry, same alphas, same order
+        // as the GDI+ pass below -- the eye sees one image either way.
+        bool gpu = guiStripD2dEnsure();
+        if (gpu) {
+            GdiFlush();
+            gpu = SUCCEEDED(g_d2dRt->BindDC(buf, &rc));
+        }
+        if (gpu) {
+            g_d2dRt->BeginDraw();
+            g_d2dRt->Clear(D2Col(guic::cBg, 255));
+            ID2D1SolidColorBrush* br = nullptr;
+            {   // THE HALO: three nested bands burning OUTWARD from the
+                // selected tab's face (identical to the GDI+ bands).
+                int fxs = KSTRIP_PAD;
+                for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
+                const float fx = (float)fxs, fy = (float)KSTRIP_FACE_Y;
+                const float fw = (float)kTabW[g_tab], fh = 23.0f;
+                const float mid[3] = { 1.35f, 2.90f, 4.40f };  // band centers
+                const float wd [3] = { 1.70f, 1.40f, 1.60f };  // band widths
+                const BYTE  al [3] = { 80, 44, 22 };           // band strengths
+                for (int k = 0; k < 3; ++k) {
+                    const float s = mid[k];
+                    const D2D1_ROUNDED_RECT rr = {
+                        D2D1_RECT_F{ fx - s, fy - s, fx + fw + s, fy + fh + s },
+                        6.0f + s, 6.0f + s };
+                    br = nullptr;
+                    if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                            D2Col(guic::cAccent, (BYTE)(al[k] * fs)), &br)) && br) {
+                        g_d2dRt->DrawRoundedRectangle(rr, br, wd[k]);
+                        br->Release();
+                    }
+                }
+            }
+            for (int i = 0, ix = KSTRIP_PAD; i < 6; ix += kTabW[i] + 4, ++i) {
+                const bool act = (i == g_tab);
+                // the face path is the 1 px inset rounded rect (guiRoundPath
+                // convention) -- the centered stroke stays fully inside.
+                const D2D1_ROUNDED_RECT rr = {
+                    D2D1_RECT_F{ (float)ix + 1.0f, (float)KSTRIP_FACE_Y + 1.0f,
+                                 (float)ix + kTabW[i] - 1.0f,
+                                 (float)KSTRIP_FACE_Y + 22.0f }, 6.0f, 6.0f };
+                br = nullptr;
+                if (act && SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                        D2Col(guic::cPanelHi, (BYTE)(255 * fs)), &br)) && br) {
+                    g_d2dRt->FillRoundedRectangle(rr, br);
+                    br->Release();
+                }
+                br = nullptr;
+                if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                        D2Col(guic::cLine, 255), &br)) && br) {
+                    g_d2dRt->DrawRoundedRectangle(rr, br, 1.0f);
+                    br->Release();
+                }
+                if (act) {
+                    br = nullptr;
+                    if (SUCCEEDED(g_d2dRt->CreateSolidColorBrush(
+                            D2Col(guic::cAccent, (BYTE)(255 * fs)), &br)) && br) {
+                        g_d2dRt->DrawRoundedRectangle(rr, br, 1.0f);
+                        br->Release();
+                    }
+                }
+            }
+            gpu = SUCCEEDED(g_d2dRt->EndDraw(nullptr, nullptr));
+            if (!gpu) {                    // device lost: rebuild on next paint
+                g_d2dRt->Release();
+                g_d2dRt = nullptr;
+            }
+        }
+        if (!gpu) {   // v6.6.5/7.0.4 LEGACY PASS: identical pixels, software
+            FillRect(buf, &rc, g_brBg);
+            Gdiplus::Graphics g(buf);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            const double fs2 = fs;
             int fxs = KSTRIP_PAD;
             for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
             const Gdiplus::RectF fr((Gdiplus::REAL)fxs,
                                     (Gdiplus::REAL)KSTRIP_FACE_Y,
                                     (Gdiplus::REAL)kTabW[g_tab], 23.0f);
-            const float mid[3] = { 1.35f, 2.90f, 4.40f };  // band centers, px off the face
-            const float wd [3] = { 1.70f, 1.40f, 1.60f };  // band widths
-            const BYTE  al [3] = { 80, 44, 22 };           // band strengths
+            const float mid[3] = { 1.35f, 2.90f, 4.40f };
+            const float wd [3] = { 1.70f, 1.40f, 1.60f };
+            const BYTE  al [3] = { 80, 44, 22 };
             for (int k = 0; k < 3; ++k) {
                 const float s = mid[k];
                 const Gdiplus::RectF e(fr.X - s, fr.Y - s,
                                        fr.Width + 2.0f * s, fr.Height + 2.0f * s);
                 Gdiplus::GraphicsPath* bp = guiRoundPathRaw(e, 6.0f + s);
-                Gdiplus::Pen gp(GCol(guic::cAccent, (BYTE)(al[k] * fs)), wd[k]);
+                Gdiplus::Pen gp(GCol(guic::cAccent, (BYTE)(al[k] * fs2)), wd[k]);
                 g.DrawPath(&gp, bp);
                 delete bp;
             }
-        }
-        for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
-            const bool act = (i == g_tab);
-            const Gdiplus::Rect fr(fx, KSTRIP_FACE_Y, kTabW[i], 23);
-            Gdiplus::GraphicsPath* p = guiRoundPath(fr, 6);
-            if (act) {   // face + accent border ease in over the line border
-                Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs)));
-                g.FillPath(&fb, p);
+            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+                const bool act = (i == g_tab);
+                const Gdiplus::Rect fr2(fx, KSTRIP_FACE_Y, kTabW[i], 23);
+                Gdiplus::GraphicsPath* p = guiRoundPath(fr2, 6);
+                if (act) {
+                    Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs2)));
+                    g.FillPath(&fb, p);
+                }
+                Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
+                g.DrawPath(&pb, p);
+                if (act) {
+                    Gdiplus::Pen ab(GCol(guic::cAccent, (BYTE)(255 * fs2)), 1.0f);
+                    g.DrawPath(&ab, p);
+                }
+                delete p;
             }
-            Gdiplus::Pen pb(GCol(guic::cLine), 1.0f);
-            g.DrawPath(&pb, p);
-            if (act) {
-                Gdiplus::Pen ab(GCol(guic::cAccent, (BYTE)(255 * fs)), 1.0f);
-                g.DrawPath(&ab, p);
-            }
-            delete p;
-            const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
-            guiAAString(g, mdc, trc, kTabNames[i],
-                        act ? guiLerpRGB(guic::cDim, guic::cAccent, fs) : guic::cDim,
-                        g_fUIb, 0);
         }
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mdc, 0, 0, SRCCOPY);
-        SelectObject(mdc, obm);
-        DeleteObject(mbm);
-        DeleteDC(mdc);
+        // THE LABELS: GDI+ glyphs on the same buffer for BOTH paths (font,
+        // hinting and color math are byte-identical to v7.0.4).
+        {
+            Gdiplus::Graphics g(buf);
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+                const bool act = (i == g_tab);
+                const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+                guiAAString(g, buf, trc, kTabNames[i],
+                            act ? guiLerpRGB(guic::cDim, guic::cAccent, fs) : guic::cDim,
+                            g_fUIb, 0);
+            }
+        }
+        // ONE buffer, ONE blit -- unchanged since v7.0.4.
+        BitBlt(dc, 0, 0, cw, ch, buf, 0, 0, SRCCOPY);
         EndPaint(w, &ps);
         return 0; }
     }
@@ -5668,6 +5843,11 @@ static void guiShowPage(HWND w, int p) {
     // depends on g_tab (the halo lives in the strip's own buffer), so nothing
     // else on the window can flicker during the animation.
     g_tabAnimStart = GetTickCount64();
+    // v7.0.5: 1 ms system timer resolution for the life of the animation. A
+    // 16 ms WM_TIMER otherwise lands on the ~15.6 ms default tick and the
+    // eased ramp quantizes into visible steps. One begin per animation run,
+    // released exactly once when the timer completes (WM_TIMER id 2).
+    if (!g_fadePeriod) { timeBeginPeriod(1); g_fadePeriod = true; }
     SetTimer(w, 2, 16, nullptr);
     if (HWND ts = GetDlgItem(w, IDC_TABSTRIP)) InvalidateRect(ts, nullptr, TRUE);
 }
@@ -5795,7 +5975,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 0, 420, 32 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.4  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.5  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 8, 866, 30 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -6106,6 +6286,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 if (ts) InvalidateRect(ts, nullptr, FALSE);
             } else {
                 KillTimer(w, 2);
+                if (g_fadePeriod) { timeEndPeriod(1); g_fadePeriod = false; }  // v7.0.5
                 g_tabAnimStart = 0;
                 if (ts) InvalidateRect(ts, nullptr, TRUE);
             }
@@ -6824,7 +7005,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.4        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.5        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
