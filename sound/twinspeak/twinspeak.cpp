@@ -1,1229 +1,129 @@
 // ============================================================================
 //  twinspeak v7.0.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
-//  v7.0.9 (SYNC THEME PAINT + FLUSHED ATOMIC SWITCH + SERIF HEADER. (1) The
-//          tabbar's new theme colors must be on screen the moment the theme
-//          click lands -- three field reports in a row said it landed late,
-//          so applyTheme now finishes with an explicit InvalidateRect +
-//          UpdateWindow on the strip: a synchronous WM_PAINT that runs the
-//          GPU pass and its Present INSIDE the click handler, with the new
-//          colors already copied. No dependency on RDW paint ordering or DWM
-//          catching up. (2) Field directive "make sure every render updates
-//          before the atomic repaint": guiShowPage now opens with
-//          UpdateWindow -- every pending invalidated region paints under the
-//          OLD page before the WM_SETREDRAW freeze, so nothing stale can
-//          land during or after the switch and flicker. (3) The in-window
-//          header "TIDYVISION TWINSPEAK" is Times New Roman bold. The NATIVE
-//          caption's font, though, is drawn by DWM from the system theme and
-//          has no font API -- changing it means replacing the whole
-//          nonclient area with a custom-drawn titlebar. No engine DSP
-//          changed in this version: the audio path is byte-identical to
-//          v7.0.8.)
-//
-//  v7.0.5 (THE STRIP RENDERS ON THE GPU. The tab strip -- halo, faces,
-//          borders -- now draws through Direct2D: a DC render target backed
-//          by Direct3D (D2D1_RENDER_TARGET_TYPE_DEFAULT, automatic software
-//          fallback if no GPU), bound to a PERSISTENT 32bpp buffer that is
-//          never re-allocated per frame. Labels stay GDI+ glyphs on the
-//          same buffer, one opaque blit presents -- the look is identical,
-//          the cost per 16 ms fade frame drops to geometry + blit. The
-//          GDI+ path survives verbatim as the fallback. THE FADE SMOOTHS
-//          OUT: timeBeginPeriod(1) runs for the lifetime of the animation
-//          so the 16 ms timer lands on real 16 ms instead of the ~15.6 ms
-//          default tick. No engine DSP changed in this version: the audio
-//          path is byte-identical to v7.0.4.)
-//
-//  v7.0.4 (THE STRIP OWNS THE TABS. v7.0.3's frame-painted halo still read
-//          as a detached box and the fade's full-frame repaints strobed
-//          everything else. The six tab BUTTONs are retired: ONE custom
-//          control (TidyTabStrip4) owns the whole strip -- the halo is
-//          three nested bands burning outward from the selected face IN the
-//          strip's own double-buffered surface, hugging the border with no
-//          dead zone, unclippable by construction. The fade repaints only
-//          the strip; the frame is never invalidated for a tab change, so
-//          nothing else can flicker. Header/version nudged up 6 px to
-//          clear the strip. THE THEME NOW PERSISTS: the new gui_theme ini
-//          key is loaded at boot and saved automatically on every THEME
-//          press (same save model as SAVE INI).)
-//
-//  v7.0.3 (THE GLOW, PERFECTED. (1) ROUNDED TAB REGIONS: each tab's window
-//          region is now its face shape -- WS_CLIPCHILDREN clips the frame's
-//          halo out of the child's REGION instead of its square rect, so the
-//          glow's rounded shoulders survive every corner; the square clip is
-//          what read as a box around the burn. (2) FADE-IN: selecting a tab
-//          eases the halo + face + border + label in over ~170 ms (a 16 ms
-//          GUI timer drives the frames and lands one final full-strength
-//          pass), instead of snapping on at the next paint. (3) THE LABEL
-//          STOPS FLICKERING: the tab renders into a memory DC and lands as
-//          ONE opaque blit -- the erase pass and the GDI+ pass can no longer
-//          be seen apart.)
-//
-//  v7.0.2 (POLISH, THREE PIECES, ZERO DSP. (1) THE TAB GLOW, OUTWARD ONLY:
-//          the selected tab's halo moved to the FRAME's WM_PAINT -- the
-//          child DC clips at the tab rect, the frame's WS_CLIPCHILDREN DC
-//          clips the other way, so centered strokes on the tab path drawn
-//          by the frame lose exactly their inward half and the outward
-//          half IS the glow, hugging the border from outside. The tab
-//          itself paints just face + border now. (2) THE TICK BUTTON
-//          UNTOGGLES ITSELF: nothing on the engine side cleared g_tickOn
-//          when the 4 s run finished (tickSum just went quiet past beat
-//          8), so the button stayed on STOP TICK TEST until pressed; the
-//          GUI timer now owns the natural end -- flag, anchor, label.
-//          (3) The CENTER + VOLUME tab is renamed VOLUME.)
-//
-//  v7.0.1 (THE LEDGER RESTART FIX: a restart re-arms the whole frame-
-//          interval ledger -- Ring::init zeroes seqTail and the leg's
-//          captured/popped/streamSeeded/counters re-arm at engine start --
-//          so APPLY + RESTART can no longer drag the previous run's ring
-//          fill into the capture-sequence math: the 120 bpm tick's flam
-//          stays exactly where the delay knobs put it, every start. The
-//          selected tab's glow paints fully INSIDE the tab now (the child
-//          DC used to clip the halo's outer half at the rect) and a notch
-//          quieter.)
-//
-//  v7.0.0 (THE ONE-POINT-OH. (1) THE STOP GAP: APPLY + RESTART (and STOP)
-//          silences the legs BEFORE the devices close -- the WASAPI callbacks
-//          emit literal silence from the first shutdown buffer and a KS leg's
-//          WaveRT loop is zeroed while its pin still runs -- so a restart
-//          never spits the last program audio back out. (2) keepalive_gain
-//          defaults to 0.001: this should keep a bluetooth device awake the
-//          whole time. (3) pin_outputs is INTEGRATED -- always on, no ini
-//          key, no pill (old inis load; the line is read and ignored).
-//          (4) Defaults: ring1_ms = ring2_ms = 10, drift_correct_ms = 5.
-//          (5) EIGHT THEMES, LIVE: dark cyan (the classic), dark blue, dark
-//          yellow, dark green, light green, light orange, light gray and
-//          light cyan -- the THEME button on the bottom bar cycles the
-//          palette with one repaint (guic:: colors are runtime data now,
-//          the four GDI brushes are rebuilt per switch). (6) THE 120 BPM
-//          TICK TEST: a button that fires 12 sharp ticks (6 s) across BOTH
-//          legs, sample-aligned in capture-sequence time -- any flam the
-//          ear hears is the legs' real depth difference, the exact
-//          misalignment the drift warden fights. Yes, it's serious.)
-//
-//  v6.6.9 (THREE FINAL TWEAKS, ZERO DSP. (1) INI LEAK PLUGGED: guiSaveIni
-//          skipped splicing any known key whose current value was empty --
-//          clear volume_endpoint in the window, hit APPLY, and the stale
-//          cable name stayed in the file verbatim while an empty duplicate
-//          of the key was appended at the bottom. Every known key line is
-//          spliced now, empty value or not: one key, one line, current.
-//          (2) THE BUTTON TELLS THE TRUTH: during the transient "starting"
-//          engine state the START button read "STARTING..." while its click
-//          already meant stop -- the label is now "STOP".
-//          (3) SILENCE COMPRESSION in the pumps: a block that is bit-zero
-//          (literal +0 samples, scanned word-wise) mixes to a bit-zero
-//          chunk whenever the leg's gains make that provable -- the pump
-//          memsets the chunk and skips the per-frame multiply-add fan-out;
-//          leg2 with the EQ on also resets the biquad state exactly like
-//          mixBlock's all-zero branch. Same bytes out, a fraction of the
-//          work. No engine DSP changed: byte-identical to v6.5.18.)
-//
-//  v6.6.8 (FINAL POLISH: the engine swallows its switches, the sliders go
-//          dark. (1) TEN SWITCHES INTEGRATED: capture_exclusive, exclusive,
-//          align_modes, clock_sync, drift_guard, power_guard, yield_default,
-//          center_gate, center_upmix_guard and background are no longer
-//          settings -- they are the design. Every one is hardcoded ON: the
-//          ini keys are gone from the template and from guiSaveIni (old
-//          inis still load; their lines are read and ignored), the UI pills
-//          are gone, and the fields stay in Config as always-on defaults
-//          the controls can never touch. The page-0 column keeps only
-//          lfe_fold; page 3 (GUARDS -> OTHER) keeps the startup pill and
-//          the SYNC numbers; page 4 keeps chimes. Tabs: SYNC + POWER ->
-//          OTHER; headers: GUARDS -> OTHER, DRIFT WARDEN NUMBERS -> SYNC,
-//          CENTER PRESENCE + CUES -> CENTER CUES.
-//          (2) EQ SLIDERS OWNER-DRAWN: the stock TRACKBAR_CLASSA erased
-//          and repainted through the LIGHT theme parts on every pass --
-//          under DarkMode_Explorer the control still flashed white before
-//          the dark chrome landed. The three EQ sliders are now a tiny
-//          custom control that never erases (WM_ERASEBKGND -> 1) and paints
-//          its groove + thumb GDI+ opaque on g_brPanel; mouse drag reports
-//          through the same WM_HSCROLL the trackbar used, so TBM_GETPOS/
-//          TBM_SETPOS became sldGetPos/sldSetPos and nothing else moved.
-//          No engine DSP changed: byte-identical to v6.5.18.)
-//
-//  v6.6.7 (THE GHOST CORNERS, SECOND ROUND. The screenshot showed every
-//          owner-drawn button with bright gray arcs on its rounded corners
-//          -- the corner path's antialiasing blending against WHITE that
-//          lived underneath it. Three locks, belt + suspenders + a third
-//          belt: (1) WM_CTLCOLORBTN now answers g_brBg -- DefWindowProc's
-//          WHITE-brush answer was feeding every button-side WM_ERASEBKGND
-//          (RDW_ERASE|RDW_ALLCHILDREN, InvalidateRect(..., TRUE));
-//          (2) WM_DRAWITEM erases in plain GDI FillRect -- exact opaque
-//          pixels, no GDI+ alpha in the corners; (3) the rounded path sits
-//          1px inside the item rect, so the centered pen stroke's outer
-//          half is no longer clipped away by the control DC -- borders
-//          render at their full width and the corner AA never straddles
-//          the window edge again. No engine DSP changed: byte-identical
-//          to v6.5.18.)
-//
-//  v6.6.6 (THREE USER-REPORTED FIXES + ONE MISSING BUTTON.
-//          (1) GHOST BORDERED BOX: the log pane carried WS_EX_CLIENTEDGE --
-//          the system's etched 3D border, drawn in the classic LIGHT 3D
-//          colors, which on a near-black UI glows like a ghost of a box.
-//          The edge is gone; the pane's frame is a 1px cLine rectangle the
-//          parent draws itself in WM_PAINT, just outside the child so
-//          WS_CLIPCHILDREN never clips it.
-//          (2) BOTTOM-RIGHT CLIPPING: the watermark was measured with the
-//          DEFAULT StringFormat but drawn NoWrap, and centered in a 22px
-//          strip -- one tight frame from the client edge. The pane gives
-//          4px back (log bottom 598 -> 594), the strip is 26px, and
-//          MeasureString now runs through the exact format the draw uses.
-//          (3) LAUNCH AT WINDOWS STARTUP: the Run-key toggle existed since
-//          v6.6.1 but only in the tray menu. The GUARDS page now carries a
-//          real pill wired to the same HKCU Run key, synced both ways.
-//          No engine DSP changed in this version: the sample path is
-//          byte-identical to v6.5.18.)
-//
-//  v6.6.5 (ANTIALIASED + CONDENSED. (1) GDI+ UI: every owner-drawn visual
-//          (tabs, buttons, toggle pills, START, the header, the watermark)
-//          now renders through GDI+ with SmoothingModeAntiAlias and
-//          TextRenderingHintAntiAliasGridFit -- smooth rounded rects, smooth
-//          glyphs, no jaggies. Links -lgdiplus.
-//          (2) CONDENSED GEOMETRY: client 880x620 (was 1000x750); 34px row
-//          pitch (was 38), slimmer tab strip (26px) and bottom bar (36px),
-//          compacted log pane; every page re-laid.
-//          (3) WHITE-FLASH FIX: the full tree is rendered into the window's
-//          still-hidden redirection surface before ShowWindow (RedrawWindow
-//          RDW_UPDATENOW + SW_SHOWNA) -- the first DWM frame is the finished
-//          dark UI, never one white frame.
-//          (4) WATERMARK v3: GDI+ Arial Bold with a TRUE vertical linear
-//          gradient brush (top orange -> bottom cyan), antialiased -- no more
-//          clip-path / pattern-brush scaffolding.
-//          No engine DSP changed in this version: the sample path is
-//          byte-identical to v6.5.18.)
-//
-//  v6.6.4 (FOUR USER-REPORTED FIXES, two machines agreeing for once:
-//          (1) CONSOLE GHOSTING -- FOR REAL THIS TIME: the log pane is
-//          ES_READONLY, and a read-only edit sends WM_CTLCOLORSTATIC, never
-//          WM_CTLCOLOREDIT. The v6.6.3 OPAQUE fix sat in the wrong message,
-//          so the pane kept TRANSPARENT mode and its scroll blits kept
-//          ghosting on every machine. The pane's colors are now answered in
-//          WM_CTLCOLORSTATIC (OPAQUE + bk color = its brush).
-//          (2) WHITE BORDERS ON THE BUTTONS: with WS_CLIPCHILDREN the parent
-//          never paints under its children, so the square corners of every
-//          owner-drawn rounded button held uninitialized (white) pixels.
-//          WM_DRAWITEM now erases the full item rect with the surface the
-//          button sits on before drawing the rounded face.
-//          (3) WATERMARK v2: Arial (was Segoe UI), VERTICAL gradient -- top
-//          orange to bottom cyan -- and the channel packing fixed (red and
-//          blue were swapped, which is why the orange end rendered yellow).
-//          (4) CLOSE-ONLY TITLE BAR: WS_CAPTION|WS_SYSMENU -- the maximize
-//          and minimize buttons are gone. The layout cannot reflow anyway,
-//          and close already does minimize's job properly (to the tray,
-//          engine up, no taskbar button). No engine DSP changed in this
-//          version: the sample path is byte-identical to v6.5.18.)
-//
-//  v6.6.3 (TIDYVISION BRANDING + SCROLL-GHOST FIX. (1) CONSOLE TEXT PERSISTS
-//          WHILE SCROLLING: the log pane's WM_CTLCOLOREDIT answered with
-//          SetBkMode(TRANSPARENT) -- but a multiline EDIT scrolls by blitting
-//          the existing rows and repainting only the newly exposed line(s),
-//          so the repainted glyphs were drawn OVER the previous frame's
-//          leftovers and old text bled through "persisting" during scroll.
-//          The pane (and every edit + combo list) now answers with OPAQUE
-//          and a bk color matching its background brush: every painted row
-//          erases beneath itself. (2) WATERMARK: "Property of TidyVision -
-//          Copyright 2026-beyond" sits bottom-right, gradient-filled
-//          orange->cyan (glyph clip path + gradient pattern brush, pure
-//          GDI). (3) BRANDING: window title is now "TidyVision TwinSpeak:
-//          Control Panel"; the in-window header, tray tip, balloon title and
-//          the second-instance MessageBox follow. (4) SIZE LOCK: the layout
-//          is hand-placed with no WM_SIZE reflow, so WM_GETMINMAXINFO now
-//          pins the frame to its designed 1000x750 client -- resizing can
-//          no longer break the layout. No engine DSP changed in this
-//          version: the sample path is byte-identical to v6.5.18.)
-//
-//  v6.6.2 (LAYOUT REPAIRS, same two bugs the user saw in v6.6.0/6.6.1:
-//          (1) BUTTONS OVERLAPPING ACROSS TABS: mkBtn() was the only control
-//          factory that never called regPage(), so every owner-drawn toggle
-//          pill and the five EQ preset buttons existed on ALL SIX pages at
-//          once -- page 3/4/5 ON/OFF pills covered the Devices combos and
-//          the FLAT..CINEMA row covered the leg1 row. The pills and presets
-//          now register into the page they are built on (tabs and the
-//          START/APPLY/SAVE bar correctly stay on every page).
-//          (2) LOG PANE TEXT MERGED + OVERLAPPING: tlog lines end in a bare
-//          \n, but a Win32 multiline EDIT honors only \r\n -- a lone LF is
-//          not a break, so the pane merged every line into one paragraph
-//          AND its wrap layout collapsed into overlapping rows. guiAppendLog
-//          now normalizes every break (CR, LF, CRLF -- even a chunk boundary
-//          cut mid-pair) to exactly one CRLF before EM_REPLACESEL.
-//          No engine DSP changed in this version: the sample path is
-//          byte-identical to v6.5.18.)
-//
-//  v6.6.1 (THE WINDOW LIVES IN THE TRAY. Two user-reported fixes:
-//          (1) STALE PAINT: the window only refreshed after a minimize or
-//          resize. Root cause: WS_EX_COMPOSITED plus invalidating only the
-//          FRAME -- owner-drawn child buttons (START, tabs, toggles, EQ
-//          presets) are separate windows that own their own pixels, so a
-//          parent InvalidateRect never reaches them. The frame now carries
-//          WS_CLIPCHILDREN (and loses WS_EX_COMPOSITED), and every visual
-//          state change invalidates the exact child control it changed.
-//          (2) CLOSE = HIDE TO TRAY: the X button no longer quits -- the
-//          window hides and a tray icon appears (first close shows a balloon
-//          hint); the engine keeps running while hidden. The tray icon
-//          restores on double/left-click; right-click opens a menu: Open,
-//          Start/Stop engine, "Run at Windows startup", Exit. The startup
-//          option is the HKCU Run key -- no shell:startup hack -- and it
-//          launches twinspeak with the new --tray flag, which starts the
-//          window straight in the tray. A second copy of twinspeak.exe no
-//          longer scolds with a MessageBox: it activates the running
-//          window instead (tray included). No engine DSP changed in this
-//          version: the sample path is byte-identical to v6.5.18.)
-//
-//  v6.6.0 (THE CONTROL WINDOW. Running twinspeak.exe with no arguments now
-//          opens a black+cyan GUI instead of the console -- every flag mode
-//          (--list/--list-ks/--ini/--foreground/--multi and a bare ini path)
-//          behaves exactly as before. The window holds EVERY ini key, hand-
-//          laid out across six tabs (Devices / Timing / Transport /
-//          Sync+Power / Center+Volume / Center EQ), with the engine itself
-//          running IN-PROCESS: START/STOP on a worker thread (the engine
-//          body is now engineMain(), shared by the console and GUI paths --
-//          one implementation, no drift), a live log pane fed by a tlog
-//          sink, and a status line carrying the engine state + the live
-//          health line. SAVE INI writes the file in place -- every comment
-//          line survives, values are spliced, a .bak is kept. APPLY+RESTART
-//          saves and cycles the engine in one click. Device pickers are
-//          populated by live WASAPI enumeration and stay free-text needles.
-//          The CENTER EQ page carries the built-in presets: FLAT (EQ off,
-//          bit-exact), DIALOGUE (1.8 kHz +4 dB Q0.8), BASS (90 Hz +6 dB
-//          Q0.7), WARMTH (250 Hz +3 dB Q0.9), CINEMA (2 kHz +5 dB Q0.7);
-//          moving a slider by hand marks CUSTOM. Frequency/Q sliders are
-//          log-scaled. No engine DSP changed in this version: the sample
-//          path is byte-identical to v6.5.18.)
-//
-//  v6.5.18 (crackle case CLOSED + one feature. The field culprit was
-//          EQUALIZER APO hooked to the cable's playback endpoint: a system
-//          APO runs inside the Windows audio engine on every shared-mode
-//          stream, so its processing was baked into Line 1 BEFORE twinspeak
-//          captured it. That explains every surviving piece of evidence:
-//          version-independent, restart-persistent, VLC/system-sounds clean
-//          (different endpoints), OBS clean (captures the app pre-engine),
-//          invariant to every period value, and the recording's 18-23.9 kHz
-//          ultrasonic hash with ZERO sample discontinuities -- digital
-//          processing, upstream of a bit-exact path. The engine was
-//          innocent all along. The "Stage:" command in the APO config is
-//          what exposed it: pre-mix (LFX) vs post-mix (GFX) placement.
-//          NEW: CENTER DIALOGUE EQ. The original reason for touching
-//          Equalizer APO was a mid-boost on the center channel for
-//          dialogue. That can NEVER be done with an APO on the leg
-//          devices: the legs are kernel-streaming pins, and KS (like
-//          ASIO and WASAPI-exclusive) bypasses the audio engine -- and
-//          every APO -- entirely. So the boost lives where the center
-//          sample is born: mixBlock's out2 path, an RBJ peaking biquad
-//          (transposed direct form II) on ch3, opt-in via ini:
-//            center_eq       = on|off   (default OFF -- bit-exact preserved)
-//            center_eq_freq  = peak Hz  (default 1800)
-//            center_eq_gain  = peak dB  (default +4.0, clamped +-12)
-//            center_eq_q     = peak Q   (default 0.8, clamped 0.1..10)
-//          A block whose ch3 is digital zero RESETS the filter instead of
-//          feeding it (a biquad fed zeros still rings from its state, and
-//          the center-gate contract says a gated block emits NOTHING).
-//          Keep-alive and chime stay raw (UI cues, not dialogue). With
-//          center_eq = off the out2 path is the same single multiply,
-//          bit for bit as v6.5.17.)
-//
-//  v6.5.17 (field report: crackling in L/R leg1 playback of a miniaudio
-//          app, suspected on the v6.5.14-16 default-device/endpoint-volume
-//          machinery. Two changes, both diagnostic-first:
-//            YIELD MACHINERY DEFAULT-OFF -- yieldDefault now defaults to
-//            false: out of the box this build runs the pre-v6.5.14 behavior
-//            (legs never release, no default-device watching, no session
-//            probing). The ini key yield_default = on opts back in. This
-//            makes the machinery's innocence or guilt directly A/B-testable
-//            with zero config edits.
-//            HIGH PROCESS PRIORITY -- SetPriorityClass(HIGH_PRIORITY_CLASS)
-//            at startup. The realtime threads already run MMCSS "Pro Audio"
-//            + TIME_CRITICAL; the process class is the scheduler's
-//            cross-process weight, and NORMAL class lets foreground app
-//            boost windows delay the engine's helper threads (pump park,
-//            warden, yield watcher) behind arbitrary background work.)
-//
-//  v6.5.16 (field report: switching the default render from a leg device
-//          back to the main speaker (the VAC) "causes some doubling issue
-//          and applications using miniaudio with it can deadlock". Two
-//          causes found, two fixes:
-//            QUIET-REGRAB GUARD -- the app that played to a leg while it
-//            was the Windows default does not re-route the instant the
-//            default moves; its stream stays attached. The v6.5.14 release
-//            path re-grabbed the DAC immediately anyway: twinspeak's render
-//            plus the stale app stream out of the same speaker = the
-//            doubled audio, and the exclusive re-grab mid-re-route is what
-//            wedged miniaudio apps. The release path now probes the leg
-//            endpoint's audio sessions (IAudioSessionManager2) and re-grabs
-//            only when NO foreign session is ACTIVE on it; while busy it
-//            stays yielded (logged, rate-limited 1/5 s) and re-probes each
-//            tick. A failed probe fails OPEN -- pre-v6.5.16 behavior.
-//            CHEAP DEFAULT READ -- v6.5.14 also walked EVERY render endpoint
-//            (ma_context_enumerate_devices) every health tick just to learn
-//            the default's name. That per-second endpoint-store churn is
-//            visible to other processes doing device work. Now it is one
-//            GetDefaultAudioEndpoint + one property read (same eConsole
-//            role miniaudio uses); the full walk is gone.)
-//
-//  v6.5.15 (field report: "when the DAC is yielded, the output devices
-//          aren't supposed to be changed to 100% by the program". The
-//          yield release dropped the DAC but kept the leg's endpoint-
-//          volume pin (IAudioEndpointVolume) alive, and pinCheckTick --
-//          the ~2 s watcher pass that enforces 100%/unmuted on out1/out2
-//          -- had no yield awareness. A leg with a live pin handle (e.g.
-//          after a WASAPI fallback earlier in the session) therefore had
-//          its Windows volume stomped to 100% every 2 s WHILE it sat
-//          released as the system's main device -- exactly the device
-//          whose slider belongs to the user. Two changes:
-//            the YIELD release now drops the endpoint-volume handle with
-//            the DAC (nothing of ours holds -- or touches -- the released
-//            device), and pinCheckTick skips a yielded leg outright.
-//            Re-pinning on yield RELEASE is unchanged: by then the default
-//            has moved away and twinspeak owns the device again.)
-//
-//  v6.5.14 (field directive: "make it so that if the main audio device is
-//          either output_device1 or output_device2 that the DAC shuts off
-//          immediately to let the main device play" + field finding
-//          "setting the buffer size to a reasonable value like 128 minimum
-//          helped a lot". Two changes:
-//            DAC YIELD (yield_default, default ON) -- Windows' default
-//            render endpoint is re-enumerated every health tick; the moment
-//            it is (or becomes) one of the leg devices, THAT leg's DAC is
-//            released the same second: the KS pin closes / the WASAPI device
-//            uninitializes, the pump parks, and nothing of twinspeak's
-//            holds the hardware -- the app playing to the default device
-//            owns it outright. When the default moves elsewhere the leg
-//            reopens through the watchdog path (chime + warden baseline
-//            re-arm included). The watchdog, collapse sentinel, stall
-//            resync, deep resync and warden corrections all skip a yielded
-//            leg -- its stale heartbeat is a deliberate release, not a
-//            fault. Reaction time: one health tick (<= 1 s).
-//            KS BITE FIELD NOTE -- bites under 128 frames now print a
-//            startup note: the lapse guard's lap window shrinks with the
-//            loop, and sub-128 loops (64) buzzed in the field; 128+ is the
-//            steady zone. A note, not a clamp -- the bite stays the user's
-//            call.)
-//
-//  v6.5.13 (field report: "sometimes I eventually get this reverberated
-//          sawing sound that mixes in with the audio" -- the KS looped
-//          WaveRT buffer had an unrecoverable lap-loss mode. The pacing
-//          thread integrates the play register by residue deltas gated at
-//          one full loop (d <= loopBytes always accepts); a deschedule
-//          longer than one lap silently loses k whole laps, the believed
-//          play position falls k loops behind, and the pacing sleeps on a
-//          lead that no longer exists -- the DAC circles the entire loop
-//          re-reading stale audio (the sawing) while heartbeats, und, the
-//          ledger and devbuf all stay clean. v6.5.13 LAPSE GUARD: the
-//          DAC's advance over each poll gap is wall-exact (QPC elapsed x
-//          rate); the residue advance is mod-loop. Any disagreement
-//          beyond tolerance -- or any gap of one lap or more -- re-pins
-//          the write cursor to play+lead and re-primes the lead region
-//          with the last played block (the ASIO replay convention;
-//          silence before the first block): a bit-exact skip of the lost
-//          window, logged as 'KS lapse' and counted in the devbuf line.
-//          A side effect: KS legs now also self-heal cleanly across
-//          system suspend.)
-//
-//  v6.5.12 (field report: "when watching a movie, I noticed that the center
-//          speaker and main speaker eventually start delaying again", with
-//          drift_interval_ms = 2000 in the ini -- BELOW the clamp floor, so
-//          it silently ran at 5000. Two changes:
-//            TIGHTER RESYNC -- the drift_interval_ms clamp floor drops
-//            5000 -> 2000 ms, so the ini's 2000 is now honored. The
-//            warden's ledger is frame arithmetic on the play boundaries,
-//            not the noisy per-second ppm meter, so a 2 s evaluation
-//            spacing costs nothing in accuracy: worst case to the first
-//            re-pin drops from ~15 s (3 streak windows x 5 s) to ~6 s.
-//            DEEP RESYNC (deep_resync_min, default 0 = off) -- the S5's
-//            below-packetizer layer (endpoint FIFO + amp silicon) can
-//            deepen silently over a long session: the drift ledger stays
-//            pinned while the center audibly lags again. No host meter
-//            sees that layer; a scheduled fresh reopen of the center leg
-//            is the one reset that re-primes it. Opt-in for long movie
-//            sessions.)
-//
-//  v6.5.11 (field report: "another synthetic buzz (probably from an
-//          interrupt at 100% cpu) that delays the center speakers ... add
-//          functionality that has it recover from that." -- the buzz is the
-//          known shortfall path: a starved device thread finds the ring
-//          empty and replayFill loops the last fragment (the fragment-loop
-//          buzz). What was MISSING is the AFTERMATH: while the device
-//          thread starves, the pump keeps feeding its ring, so the stalled
-//          leg accumulates stale backlog above its target anchor and its
-//          stream position falls behind the other leg -- the center arrives
-//          late long after the buzz stops. Two-stage recovery, always on:
-//            FAST PATH -- a leg with a shortfall (und) in the last second
-//            AND backlog above its anchor is resynced IMMEDIATELY: the
-//            stale excess is discarded (a bit-exact skip -- the warden's
-//            own operation, but per-leg, on first evidence, no 3 s streak,
-//            no interval wait). The leg resumes at the freshest data the
-//            moment the storm ends.
-//            DEEP PATH -- starvation lasting 3 consecutive seconds reopens
-//            the leg fresh (the watchdog's own mechanism): that also resets
-//            whatever the device-side silicon accumulated during the storm
-//            -- which matters on the S5, whose below-packetizer FIFO "is
-//            running something we have yet to completely uncover".
-//          Gated on the drift baseline being armed (boot/prefill and the
-//          post-reopen transient never fire it) and the power-park state.
-//          The fast path is capped at 100 ms per event; the deep path
-//          respects the 10 s per-leg reopen spacing. Zero sample-path
-//          deltas: the audio crossing the buffer switch is unchanged.)
-//
-//  v6.5.10 (field directive: "have it resync after five seconds to ensure
-//          the best possible stability" -- the whole warden resync chain now
-//          runs on a five-second clock. Correction spacing defaults to
-//          5000 ms -- the default resync clock (the v6.5.12 clamp floor is
-//          2000 ms), so a
-//          ramping drift error can never sit uncorrected longer than the
-//          3 s streak + one 5 s interval. The post-reopen settle gate drops
-//          10 s -> 5 s, so the baseline re-arm completes ~9 s after a
-//          reopen (5 s settle + a 4-sample average) instead of ~14 s, and
-//          boot calibration lands at ~9 s instead of ~15 s. Zero sample-
-//          path deltas; corrections remain bit-exact skips/in-place pads.)
-//
-//  v6.5.9 (field directive: "Read the actual per-leg device buffering at
-//          runtime." -- the align line's est path is arithmetic on CONFIGURED
-//          sizes; this build adds a MEASURED reading off the live devices,
-//          printed every 10 s as the 'devbuf' line next to the health line.
-//          For each leg it reports the frames queued AHEAD of the DAC's play
-//          cursor, from the authoritative source per transport:
-//            WASAPI shared   -> IAudioClient::GetCurrentPadding (the live pad)
-//            WASAPI exclusive -> the whole device buffer (WaveRT exclusive
-//                              drivers misreport padding as 0, and miniaudio
-//                              pops the FULL buffer on each event anyway --
-//                              so the buffer size IS the honest pad);
-//            WDM-KS          -> the pacing thread's own write-minus-play
-//                              lead, read off the DAC position register.
-//          Plus the ring's live depth, so each line is: pad + ring = the
-//          measured waterline per leg, and their difference is the measured
-//          version of the align line's estimate. A DIAGNOSTIC ONLY: nothing
-//          in the sample path, the rings, the rules or the gates changes.
-//          What the line still cannot see: buffering BELOW the USB
-//          packetizer -- the S5's own receiver FIFO / amp silicon (wired
-//          USB does not change this: the FIFO is the S5 firmware's own
-//          choice). If the measured paths read EQUAL while the ear still
-//          hears the center late, that residual is the S5's FIFO, now
-//          proven by elimination instead of estimated.)
-//
-//  v6.5.8 (field report: "the two speakers eventually start delaying each
-//          other sometimes ... I can notice even 10ms on my rhythm game."
-//          TWO warden gaps closed, zero audio-path deltas:
-//    1. STALE BASELINE: the drift baseline was calibrated ONCE (boot,
-//          seconds 8..15) and never revisited -- but a device reopen (S5
-//          sleep/wake, USB re-enumeration, power-guard rebuild) can
-//          legitimately move the path's real latency afterwards. Every
-//          successful reopen now invalidates the baseline; it re-arms
-//          automatically once the path settles (~14 s), with its own log
-//          line. If the drift column is FLAT while the ears still hear
-//          drift after a re-arm, the offset is device silicon (below the
-//          USB packetizer) -- no host trigger exists.
-//    2. CORRECTION SPACING: the 30 s rate limit was hardcoded. New ini
-//          key drift_interval_ms (default 30000 = exact old behavior,
-//          range 5000..60000): lower it (e.g. 10000) so the warden can
-//          chase ramping drift in tighter circles -- the price is each
-//          correction being an audible skip of up to drift_correct_ms.)
-//
-//  v6.5.7 (field report: "it's something that doesn't resemble a chime" --
-//          the interim watchdog_key build is WITHDRAWN to a side archive;
-//          this build ships the audio-thread inspection result instead.
-//          ONE change, zero audio-path deltas: the pump tick drops from
-//          1 ms to 500 us -- the waitable-timer minimum. A periodic timer
-//          cannot go sub-ms (lPeriod is whole milliseconds), so both the
-//          pump threads and the KS pacing thread now run the high-res
-//          timer ONE-SHOT (due time -5000 in 100-ns units, lPeriod = 0),
-//          re-armed at the top of every cycle. Half the tick = half the
-//          refill latency the buffer switch can observe -- the shortfall
-//          path (replayFill looping the last ~4-period fragment, which
-//          synthesizes a buzzy fragment-loop "beep" out of the PROGRAM
-//          audio, not the chime) fires later or never. The KS slack
-//          threshold moves with it: sleep only when >0.5 ms of slack.
-//          Cost: two pumps waking at 2 kHz -- trivial memcpy bursts,
-//          well under the v6.5 optimization pass's pay grade.)
-//
-//  v6.5.5 was the last shipped baseline; see its notes below.
-//  v6.5.4 (field verdict: "Turns out it was from the cpu affinity" -- the
-//          v6.5.3 CPU PLACEMENT shipped, got field-tested, and the pin was
-//          PROVEN to be the glitch source: with every thread on 2 cores, the
-//          KS thread's deadline spin assumes a free neighbor core that no
-//          longer exists, and an MMCSS-boosted audiodg.exe on the same pair
-//          turned scheduling into a fight twinspeak could lose audibly. The
-//          whole placement layer is PULLED: no cpu_affinity, no priority
-//          class, no process-wide mask -- exact v6.5.2 scheduling. Lesson
-//          recorded: a deadline-spin realtime engine wants the scheduler's
-//          full core inventory, not a reserved pair. audiodg.exe placement
-//          remains a Process Lasso concern, outside twinspeak entirely.
-//          Unknown ini keys are silently ignored, so inis that still carry
-//          the v6.5.3 keys keep working untouched.)
-//
-//  v6.5.3 (field directive: "how optimized is this, actually? ... I want to
-//          also ensure it runs on the last two threads of my cpu, same going
-//          with audiodg.exe which I have modified affinity and priority
-//          properties of on process lasso." -- the realtime internals were
-//          already RT-grade (MMCSS 'Pro Audio' + time-critical pumps and
-//          device threads, FTZ/DAZ, high-res waitable timers, lock-free CAS
-//          rings, -O3 -march=x86-64-v3 with FMA fusion disabled); what was
-//          MISSING is CPU PLACEMENT: the scheduler was free to roam all
-//          ~8 threads across all cores, colliding with desktop/DPC churn
-//          and going cache-cold on every migration. Two new ini keys:
-//
-//    cpu_affinity  pin EVERY thread to a fixed CPU set (last:N / "4,5" /
-//                  "4-5" / 0x30 masks), process-wide BEFORE any audio
-//                  thread exists so everything inherits. Paired with a
-//                  Process Lasso rule for audiodg.exe, the whole audio
-//                  chain lives on the same dedicated cores.
-//    priority      raise the PROCESS class (normal/above_normal/high/
-//                  realtime). The audio threads were already time-
-//                  critical; 'high' lifts the rest of the process (health
-//                  loop, watchers, reopen logic) to match. One interaction
-//                  handled: in the HIGH class HIGHEST == TIME_CRITICAL ==
-//                  15, which would erase the out2_first notch -- there the
-//                  mains pump takes ABOVE_NORMAL instead. Defaults: off
-//                  (exact v6.5.2 behavior). Banner reports both.
-//
-//  v6.5.2 (field report: "It eventually starts acting up whenever I let my
-//          computer sleep" + a 4-hour health log from the M720Q. The log
-//          catches the whole failure: the moment the machine degrades into
-//          sleep, the S5's stream stops consuming at the real rate -- first
-//          small excess drops (288/576 fr), then the break: leg2's device
-//          thread kept ticking but consumed at ~42% of the cable's rate
-//          (off +1,345,794 ppm), the out2 ring stuffed to 85 ms, ~572 ms/s
-//          passively evicted, gated drops + warden re-pins fighting a
-//          limit cycle they can never win. The heartbeat watchdog is
-//          STRUCTURALLY BLIND here: the callback thread never went silent,
-//          so nothing reopened the leg. The engine is faultless while
-//          devices behave; nothing in it handled a half-alive device.
-//          The fix -- the POWER GUARD (power_guard = on, default):
-//
-//    1. WM_POWERBROADCAST on a hidden top-level window (a message-only
-//       HWND would never receive broadcasts): PBT_APMSUSPEND parks the
-//       pumps -- no more data into a device the OS is taking away -- and
-//       suppresses the watchdog (no reopen storms mid-suspend). The
-//       resume pair clears the park and the health loop rebuilds the
-//       capture pin + BOTH legs from scratch, replays the chime, and
-//       resets the warden/hint state. A post-sleep stream is never
-//       trusted again.
-//    2. A consumption-collapse sentinel: a healthy 48 kHz link never
-//       leaves +-10% (the same log's worst HEALTHY wobble was +-4000
-//       ppm). Two consecutive 1-s windows beyond that and the leg is
-//       reopened fresh -- this catches the degraded sleep-ENTRY window,
-//       which fires BEFORE the suspend broadcast, plus any driver reset
-//       that leaves a thread ticking at a bogus rate. With both layers,
-//       the worst case across any sleep is one fresh reopen on wake
-//       instead of a permanently glitching path.
-//
-//  v6.5.1 (field report: "I found that my delay between speakers are ~65ms"
-//          -- that number was read off the health line's 'drift' column while
-//          delay1_ms = 60, and it is CORRECT: ~60 ms of it is the user's own
-//          deliberate delay -- the bit-exact alignment that cancels the S5's
-//          silicon lag -- plus the legs' few-ms natural start asymmetry, and
-//          the warden was holding the path exactly there. The column merely
-//          conflates the DELIBERATE alignment with DRIFT. v6.5.1 splits the
-//          two on the health line. A DISPLAY change only: no audio-path,
-//          ledger or rule change of any kind):
-//
-//    5. THE 'err' COLUMN: the health line now ends "| drift %s | err %s".
-//       drift stays the RAW inter-speaker offset (the delay calibration
-//       included) -- the alignment instrument it always was. err is the
-//       distance from the calibrated baseline -- the exact number the
-//       warden's correction rule acts on (|drift - baseline| >=
-//       drift_correct_ms held 3 s). err ~ +0.0 means the path is pinned to
-//       your calibration; err moving and holding is what a real drift event
-//       looks like. Before the baseline exists (first ~15 s) err reads
-//       ----. Documented in the banner, the baseline log line and the ini
-//       template.
-//
-//  v6.5 (field directive: "optimize it max whilst also preserving everything
-//          in the code that's meaningful" -- a PURE optimization pass: every
-//          ini key, every log line, every rule and every sample value stays
-//          bit-identical to v6.4; only the CPU cost of the realtime path
-//          dropped. Proven by a randomized bit-equivalence harness against
-//          the v6.4 code: ring push/pop/discard/silence across 15 ring
-//          geometries, both mixers, both keep-alive paths, at -O0/-O2/-O3
-//          and -O3+x86-64-v3 -- ALL BIT-EXACT):
-//
-//    1. BULK RING COPIES: pushOverwrite/pop copy each run as one (or two,
-//       at the wrap seam) wrap-aware memcpys instead of one memcpy PER
-//       FRAME. The v6.0 "the path is memcpy" promise now holds at the call
-//       level too: a 1 ms capture burst lands in each leg's raw ring as a
-//       single memcpy instead of 48 (96 on the out side). Same data, same
-//       order, same head/tail/seqTail CAS discipline. pushSilence prefills
-//       in cap-sized chunks -- a chunk LARGER than the ring cap would be
-//       clamped by pushOverwrite and silently lose frames (the equivalence
-//       harness caught exactly that before it could ship).
-//
-//    2. BULK MIXER: the per-frame mixFrame() became mixBlock() -- the ini
-//       gains are hoisted into locals, and the leg2 loop still READS ONLY
-//       ch3 (the explicit-mute guarantee stays structural). Per-frame FP
-//       ops are identical (mul, then add -- the build pins
-//       -ffp-contract=off so no mul+add can ever fuse into an FMA and
-//       change a rounding). The v6.4 negative-zero behavior is preserved
-//       literally: the discrete-LFE branch keeps the "+ 0.0f" add because
-//       IEEE says -0 + +0 = +0 (the harness checks that bit).
-//
-//    3. KEEP-ALIVE FAST PATH: sumLeg2Extras sums the tone in wrap-free
-//       RUNS over the cycle table (the wrap check fires once per table
-//       cycle, not per frame) and drops the chime branch from the hot loop
-//       when no chime is armed -- the 99.9% case. The chime-active loop is
-//       unchanged. Same (idx + i) mod len sequence, same clamps.
-//
-//    4. DENORMAL GUARD: every realtime thread (capture, both pumps, both
-//       device callbacks, both KS pacers) now runs with FTZ/DAZ set (SSE
-//       flush-to-zero + denormals-are-zero -- the standard RT-audio
-//       guard). Honest scope: it affects ONLY f32 denormals, i.e. samples
-//       below ~-370 dBFS -- over 100 dB under any DAC's LSB and 330 dB
-//       under the keep-alive's -40 dBFS. What it buys: no denormal
-//       microcode assist (100+ cycles per op) can ever stall the audio
-//       path -- a real dropout class when volume_follow sits near zero
-//       and multiplies quiet content into the denormal range.
-//
-//    5. BUILD: -O3 + LTO + x86-64-v3 (SSE4.2/AVX2; the M720q is Coffee
-//       Lake -- any 2013+ x86-64 CPU runs it) with -ffp-contract=off, so
-//       vectorization accelerates the bulk loops without touching a bit.
-//
-//  v6.4 (field directive: "a timestamp system capturing every frame by its
-//          intervals which are corrected when there's even a 10ms drift
-//          between the two speakers" -- detector only, no live trim input):
-//
-//    DRIFT WARDEN: every capture burst is stamped into a monotonic
-//    frame-interval ledger. Each leg's stream position (the capture
-//    sequence number of its play boundary) is advanced by exactly the
-//    real frames that cross it -- pops, gated drops and warden skips
-//    advance it; replays and deliberate pads do not -- so the difference
-//    of the two legs' positions IS the measured inter-speaker offset in
-//    cable time, printed every second as 'drift' on the health line.
-//    After a ~15 s calibration (the baseline includes the ini delay
-//    offsets), a drift that leaves the baseline by >= drift_correct_ms
-//    (default 10) for 3 consecutive seconds is re-pinned automatically:
-//    the late leg's ring discards its excess (a bit-exact skip -- the
-//    same operation as the v6.0 gated drop) and the early leg is held
-//    (its last buffer replays in place until the depth returns). Both
-//    corrections move the stream position without touching a single
-//    sample's value. What the ledger cannot see: buffering BELOW the USB
-//    packetizer -- the S5's own receiver FIFO. If 'drift' stays flat
-//    while the ear hears drift, the offset is device silicon, no host
-//    trigger exists, and the log itself proves where the offset lives.
-//
-//  v6.3.1 (field directive: "I want to fix the remaining issue which is the
-//          fact that I have actual delay left on the adesso part"):
-//
-//    1. KS-LEG RING FLOOR: on a backend = ks leg the ring floor drops from
-//       (whole device buffer + burst + 4 ms) to (one KS bite + one capture
-//       burst + 1 ms). Justification: a WASAPI-exclusive leg must survive
-//       miniaudio's worst legitimate pull -- the WHOLE buffer popped as two
-//       back-to-back period callbacks -- but a KS leg's pull is twinspeak's
-//       OWN pacing thread: exactly ks_period_frames frames per switch,
-//       never merged, paced against the DAC's position register on an
-//       MMCSS TIME_CRITICAL thread, refilled by a pump that drains every
-//       1 ms. At the field config (ks_period_frames 96, cap_ms 1) that
-//       takes the KS leg from ring 8 ms / est path ~14 ms to ring 5 ms /
-//       est path ~10 ms. Both legs on ks = symmetric minimal paths; the
-//       remaining inter-leg offset is the S5's own USB+amp latency (only
-//       the delay knobs -- and the ear -- can see that part).
-//
-//    2. HONEST CLAMPS: ks_periods below 2 (and ks_period_frames outside
-//       32..4096) were silently clamped; now the log names the clamp and
-//       the reason (a 1-period loop has no write lead -- the DAC would eat
-//       silence the moment the pacer hiccups).
-//
-//    3. THE ALIGN LINE NOW DOES THE ARITHMETIC: it prints both est paths
-//       and their difference with the delay direction spelled out, so the
-//       delay trim starts from a number instead of subtracting two banner
-//       lines by eye.
-//
-//  v6.3 (field directive on the working v6.2 config -- "take stuff from
-//        FlexASIO ... WDM-KS inside twinspeak, lowest latency, 256 samples"):
-//
-//    WDM-KS OUTPUT BACKEND (per leg, ini-selectable). FlexASIO gets its
-//    low-latency path from Windows Kernel Streaming; twinspeak now speaks
-//    the same protocol natively -- a direct KS render pin on the device's
-//    wave filter, BELOW the WASAPI layer and below the Windows audio
-//    engine entirely:
-//
-//      backend1 = wasapi | ks      (leg1, the 5.1 mains)
-//      backend2 = wasapi | ks      (leg2, the center speaker)
-//      ks_period_frames = 256      (the buffer-switch granularity, samples)
-//      ks_periods       = 3        (looped WaveRT buffer, in periods)
-//
-//    Mode "ks" walks the exact chain the low-latency ASIO wrappers use:
-//      1. enumerate KSCATEGORY_RENDER wave filters (SetupAPI), match the
-//         SAME output_deviceN name needles as the WASAPI path;
-//      2. find a render sink pin that accepts 48 kHz (6ch on leg1 /
-//         2ch on leg2) -- KsCreatePin (ksuser.dll, loaded dynamically)
-//         with KSPIN_CONNECT + WAVEFORMATEXTENSIBLE, looped-streaming
-//         interface first;
-//      3. allocate the WaveRT looped buffer (KSPROPERTY_RTAUDIO_BUFFER)
-//         and map the hardware play-position register
-//         (KSPROPERTY_RTAUDIO_POSITIONREGISTER; falls back to polling
-//         KSPROPERTY_AUDIO_POSITION through the same pin);
-//      4. STOP -> ACQUIRE -> PAUSE -> prefill -> RUN, then a TIME-CRITICAL
-//         MMCSS "Pro Audio" thread writes exactly ks_period_frames frames
-//         per bite, pacing itself against the mapped position register
-//         (sleep until far, spin over the last stretch -- no events, no
-//         driver wakeups, no engine).
-//
-//    Everything above the device layer is UNCHANGED and bit-exact: the
-//    same rings, the same v6.0 replay/gated-drop device-master rules, the
-//    same volume follow, the same center gates, keep-alive and chimes.
-//    A KS leg's buffer switch IS playCore() -- the WASAPI path just calls
-//    it from miniaudio's thread, the KS path from its own. If a driver
-//    refuses the KS pin (no WaveRT support, pin busy, format refused)
-//    that leg logs the reason and falls back to the proven v6.2 WASAPI
-//    exclusive path -- never silence, never a half-open device.
-//
-//    KS bypasses the Windows endpoint layer: no endpoint volume (so
-//    pin_outputs is a no-op on a KS leg -- volume_follow still governs
-//    it, applied in the pump exactly as before), and the DAC feeds its
-//    physical jacks directly. twinspeak --list-ks prints every KS render
-//    filter with its pins and formats, for needle picking.
-//
-//  v6.2 (field directives on the working v6.1 config):
-//
-//    1. BACKGROUND = ON: the ini can start twinspeak as a background
-//       process. After a SUCCESSFUL startup the console detaches
-//       (FreeConsole) and every log line -- banner, sync events, health
-//       line -- goes to twinspeak.log next to the ini (health line every
-//       10 s there, so the file stays small). A FAILED start keeps the
-//       console so the reason stays on screen. Stop a background run with:
-//       taskkill /IM twinspeak.exe   (--foreground overrides the ini for
-//       one run; a second instance is refused unless --multi).
-//
-//    2. CHIMES: the CenterFold startup signature is back, modernized --
-//       the old square G5->D6 rising jingle became two short TRIANGLE
-//       blips in the low treble (C7 2093 Hz -> G7 3136 Hz, the same
-//       rising fifth two-plus octaves up, fast decay -- a blip, not a
-//       horn). Summed at the out2 DEVICE layer exactly like the keep-
-//       alive: at engine start and again whenever the watchdog brings
-//       the center leg back. out1 -- the bit-exact mains path -- never
-//       carries them. chimes / chime_gain in the ini.
-//
-//    3. HINT HONESTY: the one-shot "steady clock offset" hint now waits
-//       for a SETTLED path: 10 s minimum, a quiet measurement window (no
-//       corrections/replays inside it), and a same-sign offset beyond
-//       +-5000 ppm held across THREE consecutive windows. The old 1000 ppm
-//       threshold sat below the meter's own noise floor (the ~2 ms device
-//       switch quantizes each 1 s window by +-2000 ppm), and the startup
-//       transient printed a -10000 ppm false alarm seconds after launch.
-//       Both are fixed. The one-time startup excess drop is also tagged
-//       "(startup settle)" in the log, so it reads as what it is: the
-//       strict rule trimming the capture backlog that accumulated while
-//       the devices were still being opened.
-//
-//  v6.1 (field directives on the working v6.0 config -- alignment + center
-//  presence, still bit-exact, still no resampler anywhere):
-//
-//    1. ALIGNMENT DELAY: delay1_ms / delay2_ms push ONE leg's output later
-//       by whole milliseconds. The mechanism is the ASIO-honest one: the
-//       leg's ring target simply grows -- the samples leave it later, bit
-//       for bit; there is no resampler and no pitch path involved. Use the
-//       knob on whichever leg arrives EARLY: if the center speaker's USB
-//       path (amp + DSP) lags the mains, raise delay1_ms so out1 waits for
-//       it; delay2_ms pushes the center leg later instead. The banner
-//       prints each leg's est path so the starting point is the printed
-//       difference; the ear trims the rest.
-//
-//    2. OUT2 IS PROCESSED FIRST ("it needs the most attention"): with
-//       out2_first = on the center leg's pump thread is created first AND
-//       runs at a higher priority than the mains pump (the center leg's
-//       device thread already started first, and the watchdog already
-//       checks it first). out1 is deliberately second in line -- it has
-//       the deeper slack (its raw ring) to absorb the difference.
-//
-//    3. CENTER PRESENCE GATES on out2 -- "if the center channel is absent,
-//       something mixes left and right instead; zero everything except the
-//       keep-alive." Root cause found: that L+R substitute is Windows'
-//       OWN stereo->8ch upmix, applied at the cable's PLAYBACK side before
-//       twinspeak ever captures it -- a stereo app renders to the 8ch Line 1
-//       endpoint and the engine fills FC with a*FL + b*R. It IS ch3 by the
-//       time the capture sees it, so channel muting cannot remove it.
-//       v6.1 adds two gates in the out2 pump, both default ON:
-//         * center_gate         -- a block whose ch3 is digital zero emits
-//           NOTHING but the keep-alive tone (the literal rule).
-//         * center_upmix_guard  -- a least-squares fit per block: if ch3 is
-//           an EXACT linear mix of ch1/ch2 (residual < -30 dB, gains in the
-//           upmix-matrix band, fronts active) the block is classified as
-//           engine upmix and MUTED -- out2 = keep-alive only. Genuine 5.1
-//           dialogue does NOT fit that fingerprint (its center is an
-//           independent track) and always passes. The health line counts
-//           guarded blocks ("cm"); the log announces them with the fitted
-//           gains so the fingerprint is visible.
-//
-//  v6.0 (the three field directives, implemented as structure, not options):
-//
-//    1. "DO NOT USE ANY MORE PITCH SHIFT." The fractional resampler and the
-//       whole v5.0 servo (rho / rhoFll / trim / bias) are DELETED. The audio
-//       path is now literally memcpy: capture -> raw ring -> gain+mute+mix
-//       -> out ring -> device buffer. twinspeak cannot bend pitch because it
-//       never regenerates a sample -- it only MOVES the samples the cable
-//       delivered. (What the ear caught on v5.0 was the trim/lock glide.)
-//
-//    2. "CENTER ONLY ON OUT2 -- MUTE EVERY OTHER CHANNEL, NO CLONE." The
-//       out2 mixer now EXPLICITLY zeroes ch1/ch2/ch4/ch5/ch6/ch7/ch8 in its
-//       private copy of every frame before reading ch3. Out2 structurally
-//       carries ONLY the center channel -- it is not a clone of the program
-//       audio -- and the startup route map states it. Out1 is unchanged:
-//       FL/FR + the LFE fold, FC driven digital silence, so the center
-//       physically cannot enter out1 either.
-//
-//    3. "~50 MS IS TOO MUCH." Buffer geometry tightened: template defaults
-//       move to out1ms = out2ms = 5. Ring target floor is unchanged (the
-//       FULL device buffer + burst + 4 ms -- the device's worst legitimate
-//       bite), but at 5 ms periods that floor is ~19 ms instead of ~29 ms:
-//       est path ~19 + 10 (device) + ~5 (capture burst) = ~34 ms, down from
-//       ~54 ms. The banner prints the real negotiated number; if the ini
-//       still asks for 10 ms periods a hint line offers the 5 ms preset.
-//
-//    CLOCK DISCIPLINE (device-master: what an ASIO driver does at every
-//    buffer switch, expressed in software). The path is bit-exact, so the
-//    two clocks' drift is absorbed by exactly two RULES -- never by rate:
-//      * SHORTFALL -> REPLAY: a buffer switch the ring cannot fill is
-//        padded by REPLAYING the last played buffer (the ASIO underrun
-//        convention) instead of punching a silence hole. Counted "und".
-//      * EXCESS -> GATED DROP: if the cable clock runs faster than the
-//        device and the ring grows past its natural sawtooth by a full
-//        period, the OLDEST excess is discarded -- at most once per 5 s
-//        per leg, each event logged with the measured offset. Counted
-//        "corr" on the health line.
-//    At crystal-level offsets both events are rare enough to be inaudible
-//    (a 10 ms correction every few minutes). If the cable free-runs, the
-//    one-shot hint prints the exact measured ppm to dial into Clock
-//    Correction in the VAC Control Panel -- fixing it at the SOURCE is the
-//    only way to make a bit-exact path silent forever, and the tool now
-//    measures it instead of hiding it behind a resampler.
-//
-//    clock_sync = on/off (new key) turns the discipline off entirely
-//    (off = never replay/drop: shortfall pads silence, excess evicts at
-//    the ring cap -- pure A/B only). auto_resync (v3.7-v5.0) is retired;
-//    an old ini's auto_resync=off still maps to clock_sync=off.
-//
-//  v5.0 (THE ASIO MODEL -- what actually fixes the field crackle):
-//    Field log (v4.0, user config 10/10/5): both leg servos cycled
-//      "EXCESS -- draining buffer (2408 fr held, target 816) -- rho now 1.0500"
-//      "recovered -- clock servo resumed (1680 fr held, target 816) -- rho 1.0000"
-//    several times per SECOND, on BOTH legs. Root cause: v4.0's FLL trusted
-//    band was +-2000 ppm, but a VIRTUAL cable clock is not crystal-locked to
-//    anything -- VAC synthesizes Line 1's clock from system timers, and
-//    without its Clock Correction engaged it free-runs ~0.5-1 % (5000-10000
-//    ppm) away from the real device crystals. The FLL clamped at 0.2 %, the
-//    un-tracked ~0.8 % ballooned the buffer into the EXCESS zone, the zone
-//    slammed rho to 1.05, drained past the exit line, slammed back to 1.0 --
-//    a permanent limit cycle of 5 % pitch steps, several per second. THAT
-//    was the "crackle". (v3.x's shed/dup had the same authority ceiling --
-//    200 frames/s against a 1 % mismatch is ~0.4 % of what was needed --
-//    which is why every geometry from 1 ms to 40 ms crackled.)
-//
-//    v5.0 replaces ALL correction machinery with what ASIO does, expressed
-//    in software (a real ASIO driver gets this from the hardware: one master
-//    clock, callback-driven buffers, and no host-side rate tricks):
-//      * ONE CONTINUOUS clock sync per leg. rho = rhoFll + trim + bias, all
-//        additive, all through a single slew limiter (0.2/s). No modes, no
-//        zones, no steps: the worst possible event is a slow pitch glide.
-//      * rhoFll = the MEASURED cable/device ratio with REAL authority
-//        (+-5 %). Whatever the clocks actually do, the resampler follows.
-//      * trim (<= +-0.3 %, on a 5 s EMA of held level) pins latency to the
-//        ring target continuously -- without touching the instant sawtooth.
-//      * bias (+-3 %) only after a REAL event (time-persisted: stall
-//        cushion gone for 100 ms, flood for 500 ms), glided in and out.
-//      * Ring target floor raised to FULL device buffer + burst + 4 ms
-//        (v4.0 floored at ONE period -- less than the device's own 2-period
-//        buffer, so a single double-size pop could dip the ring below its
-//        own floor every time pop phase and burst phase aligned badly).
-//      * ONE locked ASCII logger: v4.0 wrote servo lines to stderr and the
-//        health line to stdout from six threads -- the garbled console.
-//      * The stale "endpoint mix is 2ch, not 6ch" WARNING is gone: with the
-//        strict split FC/LFE are DRIVEN SILENCE, so a stereo endpoint has
-//        nothing to upmix -- it cannot resurrect a fake center.
-//      * If the measured steady offset exceeds 1000 ppm, one hint line
-//        suggests enabling Clock Correction for the cable in the VAC
-//        Control Panel -- v5.0 tracks any offset; correction shrinks the
-//        steady trim to crystal level.
-//    auto_resync = off still pins rho at exactly 1.0 (bit-exact A/B test).
-//
-//  v4.0 (CLOCK SERVO -- the crackle-proof rewrite):
-//    * The v3.x rate matcher corrected clock drift by DROPPING (shed) or
-//      REPEATING (dup) whole runs of frames. Every such correction is a
-//      hard sample discontinuity -- a click by construction. It also
-//      assumed "a healthy pump never holds more than one capture burst
-//      of pending", which is only true when the device period is close
-//      to the burst. At outXms = 40 (user config) the pump legitimately
-//      parks one FULL PERIOD (1920 fr = 40 ms) of mixed audio in pending
-//      between device drains; the sawtooth (mean ~960 fr) sailed past
-//      the burst-scaled shed gates (720/1680 fr) and the gentle shed
-//      fired at its 200 frames/s pace limit -- one click every 5 ms --
-//      with sporadic bank sheds (up to 20 ms of audio) on top. That is
-//      the "crackles again even with this config" report.
-//    * v4.0 removes shed/dup ENTIRELY. Each leg now runs a fractional
-//      linear-interpolation resampler whose ratio is servoed to the
-//      MEASURED clock ratio cable/device (cumulative capture frames /
-//      cumulative device-popped frames, 1 s windows, slew-limited).
-//      No frame is ever dropped or repeated in steady state, so clicks
-//      are structurally impossible at ANY period/ring/burst geometry.
-//      Steady-state pitch error = the leg's clock offset while trimming
-//      (<= +-0.2 % worst case; real crystal pairs are +-100 ppm =
-//      +-0.01 %) -- far below audibility. Latency stays pinned: the ring
-//      fill converges to target and stays there.
-//    * RECOVERY: after a genuine starvation (capture stall, console
-//      sleep), buffer total below target - 2xperiod switches the leg to
-//      rho = 0.95 (re-deepen at ~2400 fr/s) until the band is regained,
-//      then hands back to the servo. Symmetric excess guard at +5 %.
-//    * auto_resync = off pins rho at exactly 1.0 (bit-exact passthrough,
-//      no correction at all) -- for A/B tests only.
-//    * MMCSS "Pro Audio" is now ALSO registered on miniaudio's own
-//      device threads (capture + both playback callbacks), not just the
-//      pump threads (miniaudio only sets thread priority).
-//    * Health line: stg (staged ms, what pend was) and ppm (live servo
-//      ratio deviation per leg; a sustained +N = that leg's device runs
-//      N/48 ppm SLOW relative to the cable) replace shd/dup.
-//
-//  v3.9 (crash fix + volume autodetect + tunable keep-alive):
-//    * CRASH FIX: the v3.8 health line printf was missing its volStr
-//      argument. Harmless while pending was 0 ("vol (null)"), FATAL the
-//      first second a buffering transient made pending non-zero -- the
-//      %s conversion then consumed raw float bits as a pointer and the
-//      process died instantly (the "closes by itself right after a
-//      glitch sound" report). Every field after vol was shifted by one
-//      as well (the garbage 140732231882871 in ovw was a code pointer).
-//    * VOLUME ENDPOINT AUTODETECT: the cable's playback side is now
-//      matched via volume_endpoint (ini) -> input_device -> "virtual
-//      audio cable"; if all miss, the banner lists EVERY render
-//      endpoint Windows has (name + state) so the right string is
-//      visible and can be pasted into volume_endpoint.
-//    * WATCHDOG/PIN RACE: the 2 s pin checker no longer reads Leg.id
-//      (which the reopen path can rewrite concurrently); the reopen
-//      re-pins the endpoint volume itself, on its own thread.
-//    * TUNABLE KEEP-ALIVE: keepalive_hz / keepalive_gain (ini). The
-//      S5's amp can sleep through 40 Hz @ 1% (-40 dBFS); raise the
-//      gain (0.03..0.05 is still inaudible) if it powers down anyway.
-//
-//  v3.8 (volume follow + output pinning + out2-first + self-healing legs):
-//    * VOLUME FOLLOW (volume_follow = on): the Windows volume of the
-//      cable's PLAYBACK side -- the "Line 1" slider in sndvol / the volume
-//      hotkeys when Line 1 is the default device -- is the single master
-//      knob for BOTH legs. A 25 ms watcher polls the endpoint volume and
-//      mute; every captured frame is scaled BEFORE the per-leg mix, so
-//      out1 and out2 always track it identically and stay level-matched.
-//    * OUTPUT PINNING (pin_outputs = on): the out1/out2 endpoint volumes
-//      are forced to 100% + unmuted at startup and re-checked every 2 s
-//      (drift is logged and re-pinned) -- the Windows output sliders can
-//      no longer double-attenuate; all volume lives on the Line 1 knob.
-//    * OUT2-FIRST (out2_first = on): the center leg is opened and
-//      started BEFORE the mains leg -- its 40 Hz keep-alive is up first.
-//    * WATCHDOG: the 1 s health loop tracks a callback heartbeat per
-//      device thread. A thread silent >5 s (endpoint invalidated, USB
-//      re-enumeration, driver reset -- the "output shut off by itself
-//      while twinspeak still runs" class of failure) is reopened BY
-//      NAME automatically (fresh endpoint id, so a replug re-attaches),
-//      first in its previous share mode then shared, then re-pinned by
-//      the watcher. Retries every second until it succeeds.
-//    * MMCSS: pump threads join the "Pro Audio" MMCSS role at
-//      time-critical priority (10 ms targets are scheduling-sensitive).
-//    * Health line adds "vol NN%" (M = Line 1 muted; --- = follow off).
-//
-//  v3.7 (the "162 ms pending" build -- banks can no longer pin):
-//    User report on v3.6: "162 ms pending and it just crackles at 10 ms
-//    ring1/2_ms. 20 ms works and even period sizes (out1/2ms) at 1 ms
-//    work." Three mechanisms, all fixed:
-//
-//      1. MISSED-BURST POP UNDERRUN (the 10 ms-ring crackle). With the
-//         Line 1 port on WaveCyclic, capture_exclusive falls back to
-//         shared and the engine clamps the 5 ms burst to ~10 ms -- EQUAL
-//         to the 10 ms out period. The pop-vs-burst phase drifts with
-//         the two clocks, so a device pop can land just before its
-//         burst: the ring then holds target - period = 816 - 480 = 336
-//         frames against a 480-frame pop -> a 144-frame silence blip.
-//         ring 20 ms survives because its target (960) is exactly two
-//         periods; 1 ms periods survive because their pops are tiny.
-//         Fix: the ring floor now carries a FULL burst of phase slack
-//         (period + burst + 2 ms -- provably safe at any burst/period
-//         ratio), and the honest latency fix is a smaller burst: the
-//         WaveRT port driver on Line 1 (capture_exclusive then engages,
-//         burst ~5 ms, floor drops to ~17 ms / 12 ms).
-//      2. SHED COULD LOSE THE RACE (the 162 ms "pending"). v3.6 shed at
-//         most 1 frame per 5 passes = 200 frames/s (~4200 ppm); any
-//         stall/burst bank outgrew that and pinned the pending buffer
-//         at its 8192-frame (~170.7 ms) hard cap, evicting the oldest
-//         frames (more crackle) while the pend EMA read ~162 ms.
-//         Fix: BANK SHED -- when the INSTANT pending level passes
-//         shedAbove + 2 bursts, the excess is shed proportionally (up
-//         to two bursts per pass, no EMA lag, no throttle). The bank is
-//         structurally capped near ~35 ms worst case and clears in
-//         milliseconds; the 170 ms pin is impossible by construction.
-//      3. DUP TRICKLE (fast-clock legs). The same 200 frames/s cap on
-//         dup could not track a genuinely fast device clock. Fix: once
-//         the phase-aware confirm window passes, the top-up is
-//         proportional (whole guard-band deficit, capped at burst/4
-//         per pass).
-//    Health line: pend is now the INSTANT level per leg, and the shed/
-//    dup rates are printed -- a sustained shed of ~N frames/s means that
-//    leg's clock is ~N/48 ppm slow. Instant diagnosis.
-//
-//  v3.6 (the 10 ms build -- every drift-guard window now SCALES):
-//    Root causes of the 10 ms crackle + pitch wobble, all three fixed:
-//
-//      1. BURST-PHASE DUP HUNTING -- the dup trigger ("fill below target
-//         minus guard while pending AND raw are empty") is also true for
-//         a few passes inside every capture burst gap even with the
-//         clocks in perfect sync. Whether it fired depended on where the
-//         device pop phase sat relative to the capture bursts, so dup
-//         runs swept in and out audibly (repeated frames = pitch dip /
-//         wobble). v3.6 gates every dup run behind a PHASE-AWARE CONFIRM
-//         WINDOW sized to one capture burst period + 2 ms: a burst-phase
-//         dip always self-corrects at the next burst arrival (refill
-//         reaches target again), genuine fast-clock drift never does.
-//         Phase dips can no longer confirm; real drift confirms within
-//         ~burst + 2 ms. (Replaces v3.5's fixed 12 ms confirm window,
-//         which was itself audible at 10 ms buffers.)
-//      2. FIXED SHED BANK -- surplus was shed only above a FIXED
-//         1024-frame (~21 ms) pending threshold at ANY buffer size, so
-//         the slow-clock leg banked ~21 ms before shedding a single
-//         frame. v3.6 scales the shed threshold to the real capture
-//         burst: burst + max(burst/2, 2 ms), floored at 6 ms total.
-//      3. CAPTURE BURST == OUT PERIOD -- the capture device previously
-//         inherited min(out1ms, out2ms), so shrinking the out legs also
-//         shrank capture bursts and moved every guard target.
-//         v3.6 adds cap_ms (default 5): the capture burst decouples
-//         from the out periods. Small bursts = small dips = tight
-//         windows = stable legs at 10 ms without changing guard
-//         character. All windows key off the REAL negotiated capture
-//         period (printed in the banner), never the request.
-//
-//    * capture_exclusive = on (default): the VAC capture pin is opened
-//      WASAPI-EXCLUSIVE -- on a WaveRT port that is the direct cyclic-
-//      buffer path (~10 ms cable->app). If the pin refuses (another
-//      client, WaveCyclic port, format mismatch) it falls back to
-//      shared automatically and the banner says so.
-//    * Ring target floor now carries half a capture burst of phase
-//      slack: period + max(burst/2, 2 ms) + 2 ms -- the device pop phase
-//      can no longer starve the device at small ring sizes.
-//    * Health line adds the pending EMA per leg ("pend x/y ms") so the
-//      shed bank is visible while tuning.
-//
-//  v3.3 (routing made visible -- NO behavior change vs v3.2):
-//    * The user confirmed the required split AGAIN and demanded zero
-//      duplication. Audit of the v3.2 mixer confirms it already holds:
-//        out1: FL = ch1 + gain_lfe*ch4(LFE), FR = ch2 + gain_lfe*ch4(LFE),
-//              FC + discrete LFE + SL + SR are DRIVEN DIGITAL SILENCE --
-//              center physically cannot appear on out1, and the bass is
-//              folded XOR discrete (never both = never double bass).
-//        out2: L = R = gain_center*ch3 -- leg2's mixer READS ONLY ch3;
-//              ch1/ch2/ch4 are never touched. +40 Hz @ 1% keep-alive.
-//    * v3.3 adds the ROUTE MAP to the startup banner (actual gains from
-//      the ini) so the split is verifiable on every launch instead of
-//      taken on faith.
-//
-//  v3.2 (crackle tuning):
-//    * ring1_ms / ring2_ms: the OUT RING depth is now decoupled from the
-//      device period. outXms still picks the WASAPI period (5 ms); the ring
-//      can sit much deeper (shipped: 40 ms). Scheduler spikes and capture
-//      hiccups up to ring-minus-period are absorbed silently -- same immunity
-//      as a huge device buffer, but it costs only ring depth in latency,
-//      NOT 2x ring in device buffering. Keep ring1_ms == ring2_ms so the
-//      legs stay time-aligned.
-//
-//  v3.1 (routing confirmed by the user):
-//    * lfe_fold now defaults ON -- the cable's LFE is mixed onto FL/FR at
-//      gain_lfe ("LFE is mixed fully into the left and right channels"),
-//      and the DISCRETE 5.1 sub channel is what is now optional (set
-//      lfe_fold = off to drive it). No engine changes vs v3.
-//    * Shipped ini opens exclusive = on (both drivers already accepted it
-//      in v2.1; align_modes still falls back to shared for BOTH together).
-//
-//  What v3 fixes (both bugs reported on v2.1):
-//
-//  1) "Monstrous out1" -- v1/v2 fed the Realtek a STEREO stream on a 5.1
-//     endpoint. miniaudio's rectangular 2->6 channel converter (and, one
-//     layer up, the Windows audio engine for stereo streams on a 6ch mix
-//     format) derives a FAKE center: FC = 0.5*L + 0.5*R. The Realtek's
-//     physical center speaker has been playing a smeared L+R copy all along,
-//     comb-filtering against the Adesso's true center -- and the ini folded
-//     0.4*LFE onto both fronts on top of that. This is the "it pulls L and R
-//     and smears it into the center" complaint, root cause found: the smear
-//     lived on the REALTEK leg, not the Adesso, which is why the 40 Hz
-//     keep-alive never cured it.
-//     v3 opens leg1 as a NATIVE 6ch (5.1) f32 stream:
-//         FL = L + lfe, FR = R + lfe, FC = driven silence, SL/SR = 0
-//         (lfe = gain_lfe * ch4; with lfe_fold = off the fold is skipped and
-//          ch4 goes to the discrete 5.1 sub channel instead).
-//     Every layer sees a full-layout stream: no upmix matrix, no speaker
-//     fill, no fake center, ever.
-//
-//  2) "Delayed out2" + the v2 crackle -- three stacked defects:
-//       a. v2's skip/dup drift guard was bang-bang on the INSTANT ring fill:
-//          capture delivers in 10 ms (480-frame) bursts, so the ring swings
-//          +/- 10 ms inside every period while its MEAN stays put. With
-//          thresholds at target/2 and 2*target, every burst boundary could
-//          cross a threshold and SKIP REAL AUDIO -- that is the crackle, and
-//          it also let each leg's mean float target/2..2*target (up to 7.5 ms
-//          of leg-to-leg skew from drift direction alone).
-//       b. exclusive mode could succeed on one leg and fail on the other;
-//          exclusive halves device buffering (2x5 ms vs 2x10 ms), so legs
-//          ended up with ~10 ms of different fixed device latency.
-//       c. a 5 ms ring simply cannot cover one 10 ms shared-mode device
-//          period: if the pop lands before the next capture burst, the
-//          device underruns. v2's outXms=5 was below the shared floor.
-//     v3 fixes all three with a REFILL-TO-TARGET level controller:
-//       * the pump tops each out ring up to its target on every 1 ms pass
-//         and never pushes past it -- burst-proof by construction, the out
-//         ring can structurally neither overflow nor trigger corrections
-//         from capture bursts (v2's crackle mechanism is gone);
-//       * surplus audio (this leg's device clock slower than the cable)
-//         parks in a small pending buffer and is shed at the drift rate;
-//       * deficit (device clock faster) tops up by duplicating one frame
-//         per pass while the fill sits below target - 1 ms -- self-limiting;
-//       * the ring target is floored at one device period + margin, so a
-//         single pop can never starve the device;
-//     align_modes forces both legs into the SAME share mode (both
-//     exclusive, or both fall back to shared together), so device
-//     buffering is identical and the legs stay time-aligned.
-//     (An out2-late-by-15-20 ms that persists in shared mode usually means
-//     the Adesso's shared mix format is 44.1 kHz and miniaudio inserts a
-//     resampler -- the startup diagnostics now print each leg's negotiated
-//     rate so you see it immediately; fix = set that device's default
-//     format to 24-bit 48000 Hz in Windows sound settings.)
-//
-//  Architecture (v6.0): one 8ch shared capture of the VAC cable, two fully
-//  independent per-leg pipelines on their own threads, all bit-exact:
-//
-//    VAC cable (8ch shared capture)
-//      |  capture callback = dumb fan-out, memcpy only
-//      +--> leg1.raw ring ---> pump 1 (mover) --> leg1.out ring (6ch) --> Realtek
-//      |    mix: FL=L+0.4*LFE, FR=R+0.4*LFE, FC=0 (driven), SL/SR=0
-//      +--> leg2.raw ring ---> pump 2 (mover, FIRST + higher priority) -->
-//           leg2.out ring (2ch) --> Adesso
-//           pump 2 gates: ch3 zero -> nothing; ch3 == a*ch1+b*ch2 (the
-//           Windows stereo-upmix fingerprint) -> muted; then
-//           mix: ch1/ch2/ch4..ch8 EXPLICITLY MUTED, both outs = ch3 only
-//                + 40 Hz @ 1% keep-alive at the device layer
-//      playback callbacks = the ASIO buffer switch: gated excess drop +
-//      last-buffer replay; NO rate state exists anywhere in the program.
-//      delay1_ms/delay2_ms = the leg's ring target grown by whole ms -- the
-//      samples exit later, bit for bit; no pitch path can exist.
-//
-//  v6.6.8: WASAPI exclusive is INTEGRATED -- both legs open exclusive
-//  together (a driver refusal reopens BOTH shared so device buffering stays
-//  identical) and the VAC capture pin is taken exclusive with a logged
-//  shared fallback. Exclusive bypasses the Windows volume slider, which is
-//  why volume_follow + pin_outputs exist. There is no ini key and no UI
-//  pill: the share-mode design is part of the engine. The same is true for
-//  clock_sync, drift_guard, power_guard, yield_default, center_gate,
-//  center_upmix_guard, background -- all always on (v6.6.8).
-//
-//  Config (twinspeak.ini, next to the exe -- or pass a path):
-//      out1ms = 5            ; WASAPI period, leg1 (v6.0 default)
-//      out2ms = 5            ; same for leg2 -- keep EQUAL for alignment
-//      ring1_ms = 10         ; out-ring depth (floored at 2*period+burst+4ms)
-//      ring2_ms = 10         ; keep EQUAL for alignment
-//      delay1_ms = 0         ; v6.1: bit-exact ring delay per leg (the EARLY
-//      delay2_ms = 0         ;        leg takes the delay; see template)
-//      cap_ms = 5            ; capture burst period
-//      ; v6.6.8: exclusive / capture_exclusive / align_modes / clock_sync /
-//      ; drift_guard / power_guard / yield_default / center_gate /
-//      ; center_upmix_guard / background are INTEGRATED (always on) -- old
-//      ; inis that still carry the keys load cleanly, values ignored.
-//      lfe_fold = on         ; LFE folded onto FL/FR at gain_lfe (confirmed)
-//      input_device   = Line 1
-//      output_device1 = Realtek
-//      output_device2 = Xtream
-//      ; optional: gain_l, gain_r, gain_lfe, gain_center
-//      ; v3.8+: volume_follow, pin_outputs, out2_first
-//      ; v3.9+: volume_endpoint, keepalive_hz, keepalive_gain
+//  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
+//  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
+//  leg2 = Adesso Xtream S5 (center-only) -- WASAPI/WDM-KS exclusive, every
+//  sample bit-exact, no resampler or pitch path anywhere. delay1/2_ms are
+//  whole-ms ring targets; drift corrections are frame-level and logged.
+//
+//  ARCHITECTURE (v6.0):
+//    VAC cable (8ch shared capture, exclusive)
+//      +--> leg1.raw ring --> pump 1 --> leg1.out ring (6ch) --> Realtek
+//      |      mix: FL=L+gain_lfe*LFE, FR=R+gain_lfe*LFE, FC=driven, SL/SR=0
+//      +--> leg2.raw ring --> pump 2 (FIRST + higher priority)
+//             gates: ch3 zero -> nothing; ch3 == Windows stereo-upmix
+//             fingerprint -> muted; mix: both outs = ch3 only, rest muted
+//             + 40 Hz @ 1% keep-alive at the device layer
+//    playback callbacks = the ASIO buffer switch: gated excess drop +
+//    last-buffer replay. WASAPI exclusive is INTEGRATED (v6.6.8): both legs
+//    open exclusive together (shared fallback reopens BOTH), capture pin
+//    exclusive with logged fallback. Exclusive bypasses the volume slider --
+//    hence volume_follow + pin_outputs. clock_sync, drift_guard, power_guard,
+//    yield_default, center_gate, center_upmix_guard, background: always on.
+//
+//  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.0.9  custom self-painted titlebar (DWM caption retired: theme colors
+//            land at click time, no caption text), buffered single-blit frame
+//            paint (watermark flicker gone), pending renders flushed before
+//            the atomic page switch, strip recolors inside the theme click.
+//            DSP byte-identical to v7.0.8.
+//    v7.0.8  glow-fade flicker root cause: fade anchor stamped AFTER the
+//            atomic repaint; now stamped before it.
+//    v7.0.7  GPU strip on the BITBLT swap chain (FLIP on a child HWND fought
+//            the GDI surface); cached brush/labels/status text; theme recolor
+//            + strip repaint made synchronous.
+//    v7.0.6  true GPU strip (D3D11 + DXGI + D2D 1.1, GDI+ fallback); atomic
+//            page switch (WM_SETREDRAW freeze + one RDW_UPDATENOW).
+//    v7.0.5  strip renders through Direct2D on a persistent buffer;
+//            timeBeginPeriod(1) for the life of the fade.
+//    v7.0.4  the strip is ONE custom control owning tabs + halo; fade
+//            repaints only the strip; gui_theme persists via ini.
+//    v7.0.3  rounded tab window regions; 170 ms ease-out fade-in; tab face =
+//            one memory-DC blit.
+//    v7.0.2  halo outward-only via the frame clip; tick button untoggles at
+//            natural end; tab renamed VOLUME.
+//    v7.0.1  restart re-arms the frame-interval ledger (no stale ring fill
+//            in the capture-sequence math); glow fully inside the tab.
+//    v7.0.0  stop gap (silence before device close on restart); keepalive
+//            gain 0.001; pin_outputs integrated; ring defaults 10/10/5;
+//            EIGHT live themes; the 120 BPM tick test.
+//    v6.6.9  ini splice leaks plugged (empty values too); START label tells
+//            the truth; silence compression in the pumps.
+//    v6.6.8  ten switches integrated (always on, keys ignored); dark sliders;
+//            audio-object flags.
+//    v6.6.7  ghost corners round 2: buttons erase in plain GDI from the live
+//            surface; owner-draw buffed.
+//    v6.6.6  log pane CLIENTEDGE replaced by a WM_PAINT frame; startup pill;
+//            engine-stopped status; watermark v3.
+//    v6.6.5  GDI+ antialiased UI end to end; condensed 880x620 layout;
+//            watermark linear gradient.
+//    v6.6.4  scroll-ghost fix via WM_CTLCOLORSTATIC; close-only title bar.
+//    v6.6.3  TidyVision branding; OPAQUE background mode for scrolled log
+//            rows.
+//    v6.6.2  layout repairs (button regPage + per-tab visibility).
+//    v6.6.1  tray life (close hides, engine stays up); WS_CLIPCHILDREN
+//            stale-paint fix; TaskbarCreated re-add.
+//    v6.6.0  the control window (no args = GUI); engine in-process on a
+//            worker thread, restart-safe.
+//    v6.5.18 EQUALIZER APO crackle closed (system APO on the shared
+//            endpoint); center dialogue EQ (RBJ peaking biquad on ch3).
+//    v6.5.17 leg1 crackle: diagnostic-first, thread-time instrumentation.
+//    v6.5.16 default-render switch doubling/deadlock fixed; session census.
+//    v6.5.15 DAC yield keeps leg endpoint volumes untouched.
+//    v6.5.14 DAC yields the default device when a leg IS the default.
+//    v6.5.13 KS WaveRT lap-loss mode fixed (lapse guard).
+//    v6.5.12 scheduled deep resync (deep_resync_min) for long watches.
+//    v6.5.11 interrupt-storm buzz recovery (stall resync).
+//    v6.5.10 the whole warden chain on a five-second clock.
+//    v6.5.9  measured per-leg device buffering on the health line (devbuf).
+//    v6.5.8  two warden gaps closed (10 ms rhythm-game skew).
+//    v6.5.7  watchdog_key withdrawn; audio-thread inspection shipped.
+//    v6.5.4  CPU-affinity pin proven to be the glitch source -- withdrawn.
+//    v6.5.3  CPU placement experiment (last-2-core pinning).
+//    v6.5.2  sleep / Modern-Standby power guard.
+//    v6.5.1  "~65 ms delay" was the user's own delay1_ms -- reading, not bug.
+//    v6.5    pure optimization pass: no key/log/rule/sample changes.
+//    v6.4    drift warden: frame-interval ledger + corrections.
+//    v6.3.1  leftover Adesso delay closed.
+//    v6.3    WDM-KS backend inside twinspeak (lowest latency, 256 samples).
+//    v6.2    background start, chimes, more field directives.
+//    v6.1    bit-exact per-leg ring delay (delay1/2_ms) + center gates.
+//    v6.0    no pitch shift: 8ch shared capture + two bit-exact pipelines,
+//            implemented as structure, not options.
+//    v5.0    the ASIO model (buffer-switch semantics) -- the real crackle fix.
+//    v4.0    clock servo rewrite (no drop/dup corrections).
+//    v3.9    health-line crash fix; volume autodetect; tunable keep-alive.
+//    v3.8    volume follow, output pinning, out2-first, self-healing legs.
+//    v3.7    banks can no longer pin (162 ms pending fix).
+//    v3.6    scaled drift-guard windows (10 ms crackle + wobble fixed).
+//    v3.3    routing audit, made visible -- no behavior change.
+//    v3.2    ring depth decoupled from the device period.
+//    v3.1    lfe_fold defaults ON; the discrete 5.1 sub is the option.
+//    v3.0    native 5.1 leg1 (no fake center from upmix) + refill-to-target
+//            level controller (the v2 skip/dup crackle is structurally gone).
+//
+//  Config (twinspeak.ini next to the exe -- or pass a path):
+//      out1ms = 5, out2ms = 5   ; WASAPI periods -- keep EQUAL for alignment
+//      ring1_ms = ring2_ms = 10 ; out-ring depth (floored at 2*period+burst+4ms)
+//      delay1_ms / delay2_ms    ; bit-exact ring delay per leg (the EARLY
+//                               ; leg takes the delay; see the template)
+//      cap_ms = 5               ; capture burst period
+//      lfe_fold = on            ; LFE folded onto FL/FR at gain_lfe
+//      input_device / output_device1 / output_device2
+//      optional: gain_l, gain_r, gain_lfe, gain_center, volume_follow,
+//                pin_outputs (retired key, ignored), out2_first,
+//                volume_endpoint, keepalive_hz, keepalive_gain,
+//                drift_interval_ms, deep_resync_min
+//      Integrated (always on, old keys load clean and are ignored):
+//      capture_exclusive, exclusive, align_modes, clock_sync, drift_guard,
+//      power_guard, yield_default, center_gate, center_upmix_guard, background.
 //
 //  Input channel order is the VAC 8ch standard: 1L 2R 3C 4LFE 5SL 6SR 7RL 8RR.
 //  leg1 output order is Windows 5.1: FL FR FC LFE BL/SL BR/SR (6ch).
-//  Fixed 48 kHz (the cable's rate). Build: bash build.sh  (llvm-mingw, WASAPI).
+//  Fixed 48 kHz (the cable's rate). Build: bash build.sh  (zig c++, WASAPI).
 // ============================================================================
+
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -1260,14 +160,9 @@
 #include <pmmintrin.h>     // v6.5: DAZ (denormals-are-zero)
 
 // --------------------------------------------------- v6.3 WDM-KS includes ---
-// ks.h/ksmedia.h give the kernel-streaming property sets, pin/datarange
-// structs and the KSPROPERTY_CONNECTION/PIN enums. initguid.h FIRST makes
-// DEFINE_GUIDSTRUCT emit the actual GUID definitions in this TU (user-mode
-// KS convention -- no import lib needed for GUIDs). setupapi.h enumerates
-// the KSCATEGORY_RENDER wave filters. The Vista+ WaveRT property values and
-// structures are NOT in every bundled ksmedia.h, so they are defined here
-// under TS_ names with the exact layouts of the WDK ksmedia.h (verified
-// against the reference WDM-KS implementation FlexASIO builds on).
+// initguid first (user-mode GUID defs, no import lib), then the KS property
+// sets + setupapi filter enumeration. Vista+ WaveRT values missing from some
+// ksmedia.h copies are re-defined here under TS_ names, WDK-exact layouts.
 #include <initguid.h>
 #include <ks.h>
 #include <ksmedia.h>
@@ -1363,18 +258,10 @@ static unsigned           g_kaLen  = 1200;   // samples per cycle: round(48000 /
 static float              g_kaTable[kKeepAliveTableMax];
 static unsigned           g_kaIdx  = 0;      // owned by leg2's device thread only
 
-// v6.0 ASIO-STRICT clock discipline -- the audio path is bit-exact memcpy;
-// drift between the cable's virtual clock and each device crystal is absorbed
-// by TWO device-master rules at the buffer switch (never by a rate change):
-//   * SHORTFALL -> REPLAY: a buffer switch the ring cannot fill replays the
-//     last played buffer (ASIO underrun convention), not silence.
-//   * EXCESS -> GATED DROP: ring level above the natural sawtooth top by a
-//     full period discards the oldest excess, at most once per 5 s per leg.
-// The natural sawtooth top is target + burst (one unprocessed capture
-// burst); the drop line adds one more period of margin so pop/burst phase
-// can NEVER false-trigger it. After a drop the level returns to target.
-//   kCorrMinIntervalMs : minimum spacing between drop corrections per leg.
-//   kReplayMaxPeriods  : last-played buffer kept for replay (in periods).
+// v6.0 ASIO-STRICT clock discipline: bit-exact memcpy; clock drift is
+// absorbed at the buffer switch, never by a rate change -- SHORTFALL replays
+// the last buffer (ASIO convention), EXCESS (sawtooth top + margin) drops the
+// oldest excess, at most once per kCorrMinIntervalMs per leg.
 static size_t             g_capBurstFrames    = 240;    // real capture burst
 static size_t             g_periodFrames[2]   = {480, 480}; // real device period per leg
 static constexpr unsigned kCorrMinIntervalMs  = 5000;   // gated drop spacing
@@ -1416,12 +303,9 @@ struct Config {
     float       gainR          = 1.0f;
     float       gainLfe        = 0.4f;
     float       gainCenter     = 1.0f;
-    // v6.5.18 CENTER DIALOGUE EQ: an RBJ peaking biquad on ch3, applied in
-    // the out2 mix path ONLY. Default OFF -- with it off, out2 is the same
-    // single multiply as always (bit-exact). It exists because the legs are
-    // KS/WaveRT pins: kernel streaming bypasses the Windows audio engine and
-    // every APO, so Equalizer APO can never touch what out2 plays. The
-    // dialogue boost must live in the engine itself.
+    // v6.5.18 CENTER DIALOGUE EQ: RBJ peaking biquad on ch3, out2 mix only,
+    // default OFF (off = bit-exact single multiply). KS pins bypass every
+    // APO, so the dialogue boost must live in the engine.
     bool        centerEq       = false;
     float       centerEqFreq   = 1800.0f; // peak frequency (Hz, clamped 20..20000)
     float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
@@ -1449,13 +333,10 @@ struct Config {
                                           // v6.6.8: INTEGRATED -- always on
     bool        chimes         = true;   // v6.2: CenterFold signature, modernized
     float       chimeGain      = 0.4f;   // v6.2: chime blip peak (0..1)
-    // v6.3 WDM-KS output backend, per leg. "wasapi" = the v6.2 path
-    // (miniaudio, exclusive WaveRT event mode). "ks" = a direct kernel-
-    // streaming render pin with a WaveRT looped buffer paced against the
-    // mapped play-position register -- the FlexASIO-grade path, engaged
-    // below the Windows audio engine. ks_period_frames is the buffer-switch
-    // granularity in samples (256 @ 48 kHz = one bite every 5.33 ms);
-    // ks_periods sizes the looped WaveRT buffer around it.
+    // v6.3 per-leg backend: "wasapi" = miniaudio exclusive WaveRT event
+    // mode; "ks" = direct kernel-streaming render pin + looped WaveRT buffer
+    // paced against the mapped play-position register (below the audio
+    // engine, FlexASIO-grade). ks_period_frames = switch granularity.
     std::string backend1       = "wasapi";
     std::string backend2       = "wasapi";
     unsigned    ksPeriodFrames = 256;    // KS buffer-switch size (frames)
@@ -1471,39 +352,29 @@ struct Config {
     // audible skip/stutter of up to drift_correct_ms.
     unsigned    driftIntervalMs = 5000;   // v6.5.10: the five-second resync (was 30000)
     // v6.5.12: scheduled fresh reopen of the CENTER leg (minutes; 0 = off).
-    // The S5's below-packetizer FIFO can deepen silently over a long
-    // session -- the drift ledger stays pinned while the center audibly
-    // lags again. No host meter sees that layer; a scheduled reopen is
-    // the one reset that re-primes it (brief gap, warden re-arms ~9 s).
+    // The S5's below-packetizer FIFO can deepen silently over hours -- no
+    // host meter sees that layer; a scheduled reopen is the one reset that
+    // re-primes it (brief gap, warden re-arms ~9 s).
     unsigned    deepResyncMin   = 0;
-    // v6.5.14 DAC YIELD: when the Windows default render endpoint is one of
-    // the leg devices, that leg's DAC is released immediately (KS pin
-    // closed / WASAPI device freed, pump parked) so the app playing to the
-    // default device owns the hardware; the leg reopens through the
-    // watchdog path when the default moves elsewhere.
-    // v6.5.17: default OFF. v6.6.8: the A/B test is over -- yield_default is
-    // INTEGRATED (always on); the ini key and the UI pill are gone.
+    // v6.5.14 DAC YIELD: if the Windows default render endpoint IS a leg
+    // device, that leg's DAC is released so the default-playing app owns the
+    // hardware; the leg reopens via the watchdog when the default moves.
+    // v6.6.8: INTEGRATED -- always on.
     bool        yieldDefault    = true;   // v6.6.8: INTEGRATED -- always on (v6.5.17 default was off)
-    // v6.5.2 power guard: sleep / Modern-Standby survival. Suspend parks
-    // the pumps; resume rebuilds capture + both legs; a sentinel reopens
-    // any leg consuming beyond +-10% for 2 s (a half-alive post-sleep
-    // stream ticks at a bogus rate with a FRESH heartbeat -- the silence
-    // watchdog cannot see it). v6.6.8: INTEGRATED -- always on.
+    // v6.5.2 power guard: suspend parks the pumps, resume rebuilds capture
+    // + legs; a sentinel reopens any leg consuming beyond +-10% for 2 s (a
+    // half-alive post-sleep stream ticks at a bogus rate with a FRESH
+    // heartbeat the silence watchdog cannot see). v6.6.8: INTEGRATED.
     bool        powerGuard     = true;
 };
 static Config g_cfg;
 
 // --------------------------------------------------- v6.2 chimes -----------
-// The CenterFold startup signature, modernized. CenterFold played a rising
-// SQUARE fifth (G5 784 Hz -> D6 1174.66 Hz, 80+150 ms, amp 0.42); the
-// modernized chime keeps the rising fifth but moves it two-plus octaves up
-// into the LOW TREBLE and renders it as two short TRIANGLE blips with a fast
-// exponential decay (C7 2093 Hz 42 ms -> G7 3136 Hz 72 ms, 20 ms gap) -- a
-// blip, not a horn. The pair is rendered ONCE at startup into a static
-// buffer; leg2's device thread sums it onto BOTH out2 channels exactly like
-// the keep-alive (device layer, deliberately NOT scaled by volume_follow:
-// it is a UI cue, not program audio). out1 never carries it. Re-armed by
-// the watchdog when the center leg comes back (3 s cooldown).
+// The CenterFold signature, modernized: a rising fifth as two short triangle
+// blips with fast decay (C7 42 ms -> G7 72 ms, 20 ms gap) instead of square
+// horns. Rendered ONCE at startup; leg2's device thread sums it onto both
+// out2 channels at the DEVICE layer (not volume-followed: a UI cue, not
+// program audio). out1 never carries it; re-armed on watchdog reopen (3 s).
 static std::vector<float> g_chimeBuf;                 // rendered once, read-only after
 static std::atomic<int>      g_chimeSel{-1};          // -1 idle, 0 = playing
 static std::atomic<unsigned> g_chimeIdx{0};           // leg2's device thread owns it
@@ -1571,24 +442,17 @@ struct Ring {
         buf.assign(c * stride, 0.0f);
         cap = c; mask = c - 1;
         head.store(0); tail.store(0);
-        // v7.0.1 THE LEDGER RESTART FIX: init() runs on every engine start
-        // (a restart included), so the sequence ledger MUST re-arm with the
-        // ring. A stale seqTail made the raw ledger carry the previous
-        // run's leftover -- whatever its ring still held at the STOP -- and
-        // the 120 bpm tick landed at a different capture position on each
-        // leg: the flam moved in completely diverted ways on every
-        // APPLY + RESTART.
+        // v7.0.1: the ledger re-arms with the ring on EVERY engine start -- a
+        // stale seqTail carried the previous run's leftover and moved the 120
+        // bpm tick's flam differently on every APPLY + RESTART.
         seqTail.store(0, std::memory_order_release);
     }
     size_t count() const {
         return (size_t)(head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire));
     }
-    // producer: append n frames; if full, drop the oldest (drop amount
-    // returned). v6.5: the frames are copied as ONE wrap-aware bulk memcpy
-    // (two at the wrap seam) instead of one memcpy per frame -- same data,
-    // same order, same head/tail evolution, a fraction of the call
-    // overhead (bit-exactness proven by the randomized equivalence harness
-    // against the v6.4 per-frame loop, 15 ring geometries).
+    // producer: append n frames; if full, drop the oldest (amount returned).
+    // v6.5: ONE wrap-aware bulk memcpy (two at the seam) instead of per-frame
+    // copies -- same bytes, same head/tail evolution (harness-proven).
     size_t pushOverwrite(const float* src, size_t n) {
         const unsigned long long h = head.load(std::memory_order_relaxed);
         const unsigned long long t = tail.load(std::memory_order_acquire);
@@ -1662,12 +526,10 @@ struct Ring {
         }
         return n;
     }
+    // v6.5: bulk prefill in chunks -- a chunk must NEVER exceed cap:
+    // pushOverwrite clamps n > cap by dropping from src, which would
+    // silently lose the overshoot (the harness caught exactly that).
     void pushSilence(size_t n) {
-        // v6.5: bulk prefill in cap-sized chunks. The chunk must NEVER
-        // exceed cap: pushOverwrite clamps n > cap (dropping from src),
-        // which would silently lose the overshoot -- the v6.4 one-frame-
-        // per-call loop never hit that clamp, and neither may these chunks
-        // (the equivalence harness caught it; see the v6.5 header note).
         static const float z[kInCh * 512] = { 0 };
         const size_t chunkMax = cap < 512 ? cap : 512;
         while (n) {
@@ -1679,11 +541,10 @@ struct Ring {
 };
 
 // ------------------------------------------------- v6.3 WDM-KS output -------
-// Everything one KS output leg owns. KS replaces ONLY the device layer:
-// the pumps, rings, gates and sync rules above are identical for both
-// backends. The WaveRT looped buffer is the driver's own DMA memory mapped
-// into this process; the play position is either a mapped hardware
-// register (zero syscalls per poll) or KSPROPERTY_AUDIO_POSITION.
+// One KS output leg. KS replaces ONLY the device layer -- pumps, rings,
+// gates and sync rules are shared. The WaveRT looped buffer is the driver's
+// DMA memory mapped into this process; play position = mapped HW register
+// (zero syscalls) or KSPROPERTY_AUDIO_POSITION.
 struct KsOut {
     // resolved state (ksOpenLeg / ksCloseLeg, main thread)
     int           active      = 0;      // 1 = this leg runs on KS right now
@@ -1774,13 +635,11 @@ struct Leg {
     // Cleared + reopened through the watchdog path when the default moves.
     std::atomic<bool>   yielded{false};
     // ---- v6.4 DRIFT WARDEN: frame-interval ledger ---------------------------
-    // The OUT ring's seqTail (above) IS this leg's stream position: the
-    // capture sequence number of its play boundary. Pops, gated drops and
-    // warden skips advance it; replays and deliberate pads do not. The
-    // difference of the two legs' positions is the measured inter-speaker
-    // offset (cable time). The pump transfers the raw ring's sequence space
-    // into the out ring; the device thread owns the play boundary; the
-    // health loop owns the warden decisions.
+    // The OUT ring's seqTail IS this leg's stream position (the capture
+    // sequence of its play boundary). Pops/drops/skips advance it; replays
+    // and pads do not. The two legs' difference = the measured inter-speaker
+    // offset. The pump transfers raw-ring sequence space, the device thread
+    // owns the play boundary, the health loop owns the warden decisions.
     size_t              prefillRemaining = 0;        // boot prefill: carries no sequence
     std::atomic<size_t> padFrames{0};                // deliberate replay pad (warden)
     std::atomic<unsigned long long> padTotal{0};     // frames padded (quiet-window check)
@@ -1796,14 +655,12 @@ static std::atomic<bool> g_run{true};
 static std::atomic<bool> g_stopSilence{false};  // v7.0.0: the stop gap emits silence
 
 // ------------------------------------------------------------ v3.8 volume --
-// VOLUME FOLLOW: the Line 1 playback endpoint's Windows volume (the slider
-// in sndvol / the hotkeys when Line 1 is the default device) is the single
-// master knob. A 25 ms watcher polls its IAudioEndpointVolume, the pumps
-// multiply every captured frame by the scalar before mixing, so BOTH legs
-// track it identically and the out1/out2 sliders stay pinned at 100%.
-// The out2 keep-alive is summed at the device layer and is deliberately
-// NOT scaled -- the center device stays awake even at volume 0.
-// GUIDs are spelled out because zig c++ (GNU mode) has no reliable __uuidof.
+// VOLUME FOLLOW: the Line 1 playback endpoint's Windows volume is the single
+// master knob. A 25 ms watcher polls it; the pumps scale every captured
+// frame before mixing, so both legs track identically and the out1/out2
+// sliders stay pinned at 100%. The out2 keep-alive is summed at the device
+// layer and is deliberately NOT scaled. GUIDs spelled out: zig c++ (GNU
+// mode) has no reliable __uuidof.
 static const CLSID kCLSID_MMDeviceEnumerator =
     { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
 static const IID kIID_IMMDeviceEnumerator =
@@ -1833,14 +690,10 @@ static OutPin g_pin[2];                               // out1/out2 pins (watcher
 // v3.8 watchdog heartbeats: each device callback refreshes its timestamp;
 // the health loop reopens any thread that goes silent >5 s.
 static std::atomic<unsigned long long> g_hbCap{0}, g_hbOut0{0}, g_hbOut1{0};
-// v6.5.8: set by every successful device reopen (watchdog leg/capture, the
-// power-guard resume path). The health loop consumes it: the drift warden's
-// baseline is invalidated and re-armed once the path settles, because a
-// reopen can legitimately change the path's host-side latency (an
-// exclusive->shared fallback renegotiates device buffering; a fresh device
-// start refills its silicon FIFO differently). A boot-time-only baseline
-// goes stale against exactly that -- and the warden then "corrects" the
-// path toward a number that no longer describes it.
+// v6.5.8: set by every successful device reopen -- the health loop invalidates
+// and re-arms the warden's baseline, because a reopen can legitimately change
+// host-side latency and a boot-time baseline would then "correct" toward a
+// number that no longer describes the path.
 static std::atomic<bool> g_driftRecalReq{false};
 static unsigned long long g_bootMs = 0;
 // v6.4: QPC anchors the lag display (age of the newest played frame in
@@ -1867,13 +720,10 @@ static float   g_capPeriodMsF = 5.0f;
 // window. "Pro Audio" role + time-critical priority keeps the pumps ahead.
 // avrt.dll is loaded dynamically -- no new import-lib dependency.
 static void boostAudioThread() {
-    // v6.5: FTZ/DAZ on every realtime thread -- the standard RT-audio
-    // denormal guard. Honest scope: affects ONLY f32 denormals, i.e. values
-    // below ~-370 dBFS (100+ dB under any DAC's LSB, 330 dB under the
-    // keep-alive's -40 dBFS). What it buys: a denormal microcode assist
-    // (100+ cycles per operation) can no longer stall the audio path -- a
-    // real dropout class when volume_follow sits near zero and multiplies
-    // quiet content into the denormal range.
+    // v6.5: FTZ/DAZ on every realtime thread -- the standard RT denormal
+    // guard. Only touches f32 values below ~-370 dBFS; what it buys is that
+    // a 100+ cycle denormal microcode assist can never stall the path when
+    // volume_follow multiplies quiet content into the denormal range.
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
     static HMODULE av = LoadLibraryW(L"avrt.dll");
@@ -2061,11 +911,9 @@ static void logRenderEndpoints() {
 // Also re-resolves a pin whose endpoint id changed (watchdog reopen).
 static void pinCheckTick() {
     if (!g_cfg.pinOutputs) return;
-    // v3.9: this runs on the watcher thread. It no longer reads Leg.id and
-    // no longer re-resolves endpoints -- tryRestartLeg (main thread) does
-    // the re-pin after a reopen, so the two threads never touch the same
-    // Leg fields (the old code wcslen'd Leg.id.wasapi while a reopen could
-    // memcpy over it).
+    // v3.9: this runs on the watcher thread and no longer touches Leg fields
+    // -- tryRestartLeg (main thread) re-pins after a reopen, so the two
+    // threads never race on the same Leg state.
     for (int i = 0; i < 2; ++i) {
         // v6.5.15: a yielded leg's device IS the Windows default render
         // endpoint -- its volume slider belongs to the user, not to us.
@@ -2178,24 +1026,15 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     }
 }
 
-// v6.0 playback core -- the ASIO buffer switch, bit-exact:
-//   1) EXCESS -> GATED DROP: if the ring grew a full period past its natural
-//      sawtooth top (target + burst), the cable clock runs faster than this
-//      device: discard the OLDEST excess (level back to target), at most
-//      once per kCorrMinIntervalMs per leg, logged. The pop/burst sawtooth
-//      cannot reach that line, so only real drift ever fires it.
-//   2) the switch itself: pop the ring; a shortfall is padded by REPLAYING
-//      the last played buffer (the ASIO underrun convention) instead of
-//      punching a silence hole. Counted "und". No rate change, no
-//      interpolation -- there is no code path that can bend pitch.
-//   3) remember the buffer just played for (2). Leg2 then sums the
-//      keep-alive tone at the device layer.
-// v6.3: the buffer switch itself, backend-free. WASAPI (miniaudio's device
-// thread) and WDM-KS (twinspeak's own pacing thread) both land HERE, so
-// every guarantee -- gated excess drop, replay-on-shortfall, last-block
-// bookkeeping, the popped counter that feeds the off-meter -- is one code
-// path for both backends. frameCount is the REAL device bite: miniaudio's
-// negotiated period on WASAPI, ks_period_frames on KS.
+// v6.0 playback core -- the ASIO buffer switch, bit-exact, ONE code path for
+// both backends (WASAPI callback and KS pacing thread both land here):
+//   1) EXCESS -> GATED DROP: level a full period past the sawtooth top
+//      (target + burst) means the cable clock is faster -- discard the
+//      OLDEST excess, at most once per kCorrMinIntervalMs, logged.
+//   2) the switch: pop the ring; a shortfall REPLAYS the last buffer (ASIO
+//      convention), never a silence hole, never a rate change.
+//   3) remember the buffer just played; leg2 sums the keep-alive at the
+//      device layer. frameCount = the REAL device bite (period or KS bite).
 static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     Leg& L = g_leg[idx];
     // v7.0.0: the STOP GAP. APPLY + RESTART (and STOP) silences the legs
@@ -2208,11 +1047,9 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     }
     L.popped.fetch_add((unsigned long long)frameCount, std::memory_order_relaxed);    // device clock
 
-    // v6.4: a deliberate warden pad -- the drift warden restoring an EARLY
-    // leg's depth. The last played buffer repeats IN PLACE (the exact ASIO
-    // replay convention), the stream slides padFront frames later, and not
-    // a single ring frame is consumed. Counted separately from real
-    // shortfalls so "und" stays honest.
+    // v6.4: a deliberate warden pad repeats the last played buffer IN PLACE
+    // (the ASIO replay convention) -- the stream slides later, no ring frame
+    // is consumed, and "und" stays honest (counted separately).
     size_t padFront = 0;
     {
         const size_t p = L.padFrames.load(std::memory_order_relaxed);
@@ -2313,16 +1150,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
 // v6.3: leg2's device-layer extras -- keep-alive tone + chime -- as their own
 // function so the KS pump can sum them exactly like playCallback2 does.
 static void sumLeg2Extras(float* out, ma_uint32 frameCount) {
-    // keep-alive tone on top of whatever we just wrote -- silence, replay
-    // padding or real center audio. Phase-continuous via the cycle table.
-    // v6.2: the chime is summed right next to it -- same device-layer rule
-    // (NOT scaled by volume_follow; a UI cue, not program audio).
-    // v6.5: with no chime armed (the 99.9% case) the tone is summed in
-    // wrap-free RUNS over the cycle table -- the wrap check fires once per
-    // table cycle instead of per frame, and the chime branch disappears
-    // from the hot loop entirely. The (idx + i) mod len sample sequence
-    // and every clamp are exactly the general loop's (bit-exact, harness-
-    // proven, including multi-cycle buffers and the chime-exhausted edge).
+    // keep-alive tone (+ armed chime) summed on top of whatever was just
+    // written, phase-continuous via the cycle table, device-layer rule (not
+    // volume-followed). v6.5: with no chime armed the tone is summed in
+    // wrap-free RUNS over the table -- same sample sequence and clamps,
+    // bit-exact (harness-proven).
     int chSel = g_chimeSel.load(std::memory_order_acquire);
     if (chSel < 0) {
         const unsigned len = g_kaLen;
@@ -2386,16 +1218,11 @@ static void playCallback2(ma_device*, void* pOutput, const void*, ma_uint32 fram
 }
 
 // ------------------------------------------- v6.5.18 center dialogue EQ ----
-// An RBJ peaking biquad on the center channel, out2 only. One filter serves
-// both out2 channels: the out2 mixer writes the SAME center value to L and
-// R, so filtering that value once before the fan-out is identical to
-// filtering both channels and cheaper. Coefficients are computed ONCE at
-// startup from kSampleRate (the engine has no resampler: every leg runs at
-// the cable's rate). Transposed direct form II: two state floats, no
-// division in the hot loop, denormal-safe at these gain levels (boost
-// coefficients are O(1), state decays fast). Touched ONLY by the leg2 pump
-// thread -- both pump loops (live + final drain) are in pumpThread, so no
-// locking. Accessed by mixBlock below via g_ceq.on (startup-frozen).
+// RBJ peaking biquad on the center channel, out2 only. One filter serves
+// both out2 channels (the mixer writes the SAME center value to L and R, so
+// filter once before the fan-out). Coefficients computed ONCE at startup;
+// transposed DF2 -- no division in the hot loop. Touched only by the leg2
+// pump thread (both pump loops live in pumpThread, no locking).
 struct CenterEq {
     bool    on     = false;
     float   f0     = 0.0f;   // clamped values, for the banner
@@ -2433,13 +1260,10 @@ static void centerEqInit() {
 }
 
 // ----------------------------------------------------------------- mixer ----
-// v6.5: the mixer is applied to a WHOLE BLOCK with the ini gains hoisted
-// into locals (the config is startup-frozen), replacing the per-frame
-// mixFrame() call. Every per-frame FP operation is unchanged -- multiply,
-// then add, never an FMA (the build pins -ffp-contract=off) -- so the mix
-// is bit-identical to v6.4 (harness-proven, both legs, both lfeFold
-// states, including the IEEE -0 + +0 = +0 negative-zero behavior of the
-// discrete-LFE branch, whose literal "+ 0.0f" is therefore KEPT).
+// v6.5: whole-BLOCK mix with the ini gains hoisted into locals. Every
+// per-frame FP op is unchanged (multiply + add, never FMA -- -ffp-contract
+// off) so the mix is bit-identical to v6.4 (harness-proven, including the
+// IEEE -0 + +0 = +0 behavior of the discrete-LFE branch: the "+ 0.0f" stays).
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // leg1 = NATIVE 5.1 stream. FC is DRIVEN SILENCE: the endpoint sees a
@@ -2472,20 +1296,15 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         }
     } else {
         // v6.0 EXPLICIT CENTER ISOLATION: the out2 copy of the block READS
-        // ONLY ch3 -- every other input channel is muted by never being
-        // touched here, so out2 carries the center channel and NOTHING
-        // else, and can never be a clone of the program audio. (The
-        // guarantee is structural, exactly as in v6.4's mixFrame.)
+        // ONLY ch3 -- every other channel is muted by never being touched,
+        // so out2 can never be a clone of the program audio.
         const float gC = g_cfg.gainCenter;
         if (g_ceq.on) {
             // v6.5.18: peaking EQ on the center sample, BEFORE the gain. A
-            // block whose ch3 is digital zero (a gate hit, or true silence)
-            // RESETS the filter instead of feeding it: a biquad fed zeros
-            // still rings from its state, and the center-gate contract says
-            // a gated block emits NOTHING. A nonzero block runs every sample
-            // through the filter, internal zeros included (that is what a
-            // real filter does -- the ring decays naturally inside speech
-            // gaps shorter than a block).
+            // bit-zero ch3 block RESETS the filter instead of feeding it (a
+            // biquad fed zeros still rings; the gate contract says a gated
+            // block emits NOTHING). Nonzero blocks run every sample through
+            // the filter, internal zeros included.
             bool allZero = true;
             for (size_t i = 0; i < n; ++i)
                 if (sc[i * kInCh + 2] != 0.0f) { allZero = false; break; }
@@ -2522,31 +1341,17 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 }
 
 // ------------------------------------------------- v6.1 center gates -------
-// CENTER PRESENCE on out2. Two gates run in the leg2 pump on every block it
-// is about to mix, both behind ini switches (center_gate /
-// center_upmix_guard), both default ON:
-//
-//   1) center_gate -- the literal rule: if ch3 is digital zero for the whole
-//      block, out2's copy of the block emits NOTHING (the keep-alive tone is
-//      summed later, at the device layer, so the speaker still never sees
-//      digital silence). The mix path already passes zero through as zero --
-//      this gate makes the guarantee explicit and visible (state-change log).
-//
-//   2) center_upmix_guard -- the real-world "center absent but something
-//      plays anyway" case. A stereo app cannot write center to the 8ch
-//      cable: the Windows engine UPmixES it first, FC = a*FL + b*R with
-//      fixed positive gains, at the cable's playback side -- BEFORE the
-//      capture. It is ch3 by the time twinspeak sees it, so no amount of
-//      channel muting can remove it. The fingerprint is exact, though: per
-//      block, least-squares fit ch3 ~ a*ch1 + b*ch2. If the residual is
-//      < -30 dB of ch3's energy with the gains inside the upmix-matrix band
-//      and the fronts actually active, the block is engine upmix, not
-//      center -> muted. Genuine 5.1 dialogue is an INDEPENDENT track and
-//      does not fit (music/FX live in the fronts too); it always passes.
-//      A hit also arms a short hold (50 ms) so the sub-burst-size blocks
-//      between full analysis windows stay muted on a continuous upmix
-//      stream; any block that FAILS the full test disarms it immediately,
-//      so a false hit costs one block, never a scene of dialogue.
+// CENTER PRESENCE on out2 -- two gates in the leg2 pump, both default ON:
+//   1) center_gate: ch3 digital zero for the whole block -> out2's copy
+//      emits NOTHING (the keep-alive is summed later, at the device layer).
+//   2) center_upmix_guard: a stereo app cannot write center to the 8ch
+//      cable -- the Windows engine UPmixES it first, FC = a*FL + b*R. The
+//      fingerprint is exact: per block, least-squares fit ch3 ~ a*ch1 +
+//      b*ch2; residual < -30 dB with the gains inside the upmix band and
+//      the fronts active -> the block is engine upmix, not center -> muted.
+//      Genuine 5.1 dialogue is an INDEPENDENT track and always passes. A
+//      hit arms a 50 ms hold over the sub-analysis blocks; any full-test
+//      failure disarms it immediately (a false hit costs one block).
 static void centerGuard(Leg& L, float* sc, size_t n) {
     // ---- gate 1: ch3 digital zero for the whole block ----------------------
     bool allZero = true;
@@ -2634,12 +1439,9 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
 
 // ---- v6.6.9: silence compression -------------------------------------------
 // TRUE bit-zero test, two frames per word: every sample must be the LITERAL
-// +0.0f bit pattern. (A float == 0.0f compare would also match -0.0f, whose
-// mix output carries the sign -- this scan is stricter, so the fast path's
-// proof holds.) n is frames of kInCh floats = kInCh/2 uint64 words per frame;
-// the pump's scratch always holds whole ring frames, so there is no
-// odd-float tail and the base stays frame-aligned. The memcpy reads compile
-// to plain 8-byte loads; the loop bails at the first nonzero word.
+// +0.0f bit pattern (a == 0.0f compare would also match -0.0f, whose mix
+// output carries the sign). Scratch always holds whole ring frames, so the
+// word count is exact; the loop bails at the first nonzero word.
 static inline bool bitZero8(const float* p, size_t n) {
     unsigned long long w;
     const size_t nw = n * (size_t)(kInCh / 2);
@@ -2651,15 +1453,11 @@ static inline bool bitZero8(const float* p, size_t n) {
 }
 
 // ---- v7.0.0: the 120 BPM tempo tick (the sync test) ------------------------
-// One sharp 7.5 ms burst every 500 ms (120 bpm), 8 beats = 4 s, rendered ONCE
-// into g_tickWave (0.3 amplitude -- the first cut was LOUD). RAW BY DESIGN:
-// the pumps sum the SAME tick samples at the SAME capture-sequence position
-// on BOTH legs -- NO latency compensation of any kind -- onto the tick
-// channels of each leg (leg1: FL/FR/LFE, leg2: the center pair; FC on leg1
-// stays driven silence). Whatever each speaker's path adds is exactly what
-// you hear: the flam IS the measurement. The button is a PLAY/STOP toggle
-// and the test ends itself after 4 s. 1500 Hz, fast decay: sharp enough that
-// a few ms of offset reads as a flam.
+// One sharp 7.5 ms burst every 500 ms, 8 beats = 4 s, rendered ONCE, RAW BY
+// DESIGN: the pumps sum the SAME tick samples at the SAME capture-sequence
+// position on BOTH legs -- no latency compensation -- so whatever each
+// speaker's path adds is exactly what you hear: the flam IS the measurement.
+// PLAY/STOP toggle; ends itself after 4 s. 1500 Hz, fast decay.
 static std::atomic<bool>      g_tickOn{false};
 static std::atomic<long long> g_tickSeq0{-1};      // capture-seq of tick beat zero
 static std::atomic<unsigned long long> g_tickEndMs{0};   // wall time the 4 s run ends
@@ -2714,42 +1512,26 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 }
 
 // ----------------------------------------------------------------- pumps ----
-// v6.0: the pump is a dumb, fast MOVER (ASIO discipline -- the device thread
-// is the master; the producer never corrects anything):
-//     raw ring (8ch) -> master volume -> explicit per-leg muting + mix ->
-//     out ring (push everything).
-// There is NO staging buffer, NO resampler, NO rate state anywhere: what the
-// cable delivered is what the device plays, sample for sample. Excess is
-// handled by the playback callback's gated drop; shortfall by its replay --
-// both at the buffer switch, exactly where an ASIO driver would act.
-// v6.5.7: the pump tick is 500 us -- the waitable-timer minimum. A PERIODIC
-// SetWaitableTimer cannot go below 1 ms (lPeriod is whole milliseconds), so
-// the high-resolution timer runs ONE-SHOT (lPeriod = 0) with a relative due
-// time in 100-ns units and is re-armed at the top of every cycle. The
-// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION flag is what makes 0.5 ms real:
-// without it the OS coalesces the expiry to the scheduler tick. Half the
-// tick = half the refill latency the buffer switch can observe, so the
-// shortfall-replay path (replayFill's fragment loop -- the audible
-// glitch/buzz under load) fires that much later or never.
+// v6.0: the pump is a dumb, fast MOVER (device thread is the master, the
+// producer never corrects anything): raw ring -> master volume -> per-leg
+// mute/mix -> out ring (push all). No staging buffer, no resampler, no rate
+// state anywhere; excess/shortfall are the callback's gated drop / replay.
+// v6.5.7: the pump tick is 500 us -- ONE-SHOT high-resolution timer
+// re-armed per cycle (a PERIODIC timer cannot go below 1 ms).
 static constexpr long long kTick500us = -5000;   // 0.5 ms, negative = relative (100-ns units)
 
 static DWORD WINAPI pumpThread(LPVOID p) {
     const int idx = (int)(INT_PTR)p;
     Leg& L = g_leg[idx];
     boostAudioThread();   // v3.8: MMCSS "Pro Audio" + time-critical priority
-    // v6.1: with out2_first on, the CENTER leg's pump outranks the mains
-    // pump by one priority notch ("out2 is processed first -- it needs the
-    // most attention"). The movers are trivial memcpy work; leg1's deeper
-    // raw ring absorbs any scheduling deference. Device threads stay equal:
-    // both are deadline-bound and must never be ranked against each other.
+    // v6.1: with out2_first on, the CENTER pump outranks the mains pump by
+    // one priority notch. Device threads stay equal: both are deadline-bound.
     if (idx == 0 && g_cfg.out2First)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    // SYNCHRONIZATION timer (no MANUAL_RESET flag!). A manual-reset timer
-    // stays signaled after its first expiry -- WaitForSingleObject does not
-    // reset it -- which silently turns this loop into a 100%-of-a-core busy
-    // spin (v1/v2.0's 30% CPU). A synchronization timer auto-resets each time
-    // a wait is released, so every wait below blocks for exactly one period.
+    // SYNCHRONIZATION timer (no MANUAL_RESET flag!) -- a manual-reset timer
+    // stays signaled and silently turns this loop into a 100%-core spin
+    // (v1/v2.0's 30% CPU). A sync timer auto-resets per released wait.
     HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                         TIMER_ALL_ACCESS);
@@ -2764,17 +1546,11 @@ static DWORD WINAPI pumpThread(LPVOID p) {
     // channel count from idx itself (the config is startup-frozen).
     float*       sc     = L.scratch.data();
     float*       chunk  = L.chunk.data();
-    // v6.6.9 SILENCE COMPRESSION gate, frozen at pump start (the config is
-    // startup-frozen). The fast path replaces mixBlock with a memset ONLY
-    // where the mix of a bit-zero block is PROVABLY a bit-zero chunk:
-    //   leg1: o = gL*f0 (+ gLfe*f3) -- strictly positive gains give +0 out
-    //         for +0 in, in BOTH lfeFold states (a negative gain would emit
-    //         -0, so the fast path refuses it; the full loop stays exact).
-    //   leg2: EQ on -- the all-zero branch already resets the biquad and
-    //         writes literal zeros (the memset reproduces it exactly);
-    //         EQ off -- the chunk is gC*ch3, +0 for any non-negative gC.
-    // centerGuard still runs inside the fast path: its gate state and
-    // logging must see the same blocks it always saw.
+    // v6.6.9 SILENCE COMPRESSION gate, frozen at pump start. The fast path
+    // replaces mixBlock with a memset ONLY where a bit-zero block PROVABLY
+    // mixes to a bit-zero chunk: leg1 needs strictly positive gains (both
+    // lfeFold states); leg2 with EQ on resets the biquad (memset exact), EQ
+    // off needs a non-negative gain. centerGuard still runs inside it.
     L.zeroFast = (idx == 0)
         ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f)
         : (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f);
@@ -2795,11 +1571,9 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         // exactly like the suspend park: nothing feeds a device we released.
         if (L.yielded.load(std::memory_order_relaxed)) continue;
 
-        // drain raw -> master volume -> mute/mix -> out ring (push all).
-        // The ring headroom absorbs the normal pop/burst sawtooth; real
-        // excess is dropped by the callback's gated rule, so this push can
-        // only passively evict under a pathological flood (clock_sync off
-        // with a fast cable) -- counted in outDrop.
+        // drain raw -> master volume -> mute/mix -> out ring (push all); the
+        // ring headroom absorbs the pop/burst sawtooth, so this push can only
+        // passively evict under a pathological flood (counted in outDrop).
         for (;;) {
             const size_t avail = L.raw.count();
             if (avail == 0) break;
@@ -2885,32 +1659,18 @@ static DWORD WINAPI pumpThread(LPVOID p) {
 }
 
 // ============================================================ v6.3 WDM-KS ===
-// A direct kernel-streaming output path -- the protocol FlexASIO speaks
-// through its WDM-KS backend, embedded in twinspeak and paced harder:
-//
-//   filter  : a KSCATEGORY_RENDER wave filter opened as a file
-//             (\\?\hdaudio#... or the USB Audio device object)
-//   pin     : a render sink pin instantiated with KsCreatePin
-//             (ksuser.dll) under KSPIN_CONNECT + WAVEFORMATEXTENSIBLE
-//   buffer  : the WaveRT looped buffer -- the driver's own DMA memory,
-//             mapped into this process (KSPROPERTY_RTAUDIO_BUFFER)
-//   clock   : the hardware play-position register mapped read-only
-//             (KSPROPERTY_RTAUDIO_POSITIONREGISTER), or KSPROPERTY_AUDIO_
-//             POSITION polled through the pin when no register exists
-//   pacing  : our own TIME-CRITICAL MMCSS thread -- write exactly
-//             ks_period_frames frames when the write cursor threatens to
-//             slip below the lead; sleep while far, spin over the last
-//             millisecond. No events, no engine, no scheduler intermediaries.
-//
-// The audio that crosses bufferSwitchFill() is bit-identical to the WASAPI
-// path; only who paces the DMA changes. Position semantics follow the
-// WaveRT specification and the reference WDM-KS backends: the register /
-// PlayOffset is a BYTE offset inside the looped buffer.
-//
-// NOTE on pin instances: a KS pin is a direct line to the DAC. Windows
-// endpoint volume, endpoint muting and the engine's own mixing do not
-// apply while twinspeak holds it; volume_follow still governs the leg
-// (applied in the pump, exactly as for WASAPI legs).
+// A direct kernel-streaming output path -- the FlexASIO protocol, embedded
+// and paced harder: filter = KSCATEGORY_RENDER wave filter opened as a file;
+// pin = KsCreatePin render sink (KSPIN_CONNECT + WAVEFORMATEXTENSIBLE);
+// buffer = the WaveRT looped buffer (driver DMA memory, mapped here); clock
+// = the mapped HW play-position register or KSPROPERTY_AUDIO_POSITION;
+// pacing = our own TIME-CRITICAL MMCSS thread writing exactly
+// ks_period_frames when the write cursor nears the lead. No events, no
+// engine, no scheduler. The audio crossing bufferSwitchFill() is
+// bit-identical to WASAPI; only who paces the DMA changes. NOTE: a KS pin
+// is a direct line to the DAC -- Windows endpoint volume/muting do not
+// apply while held; volume_follow still governs the leg (applied in the
+// pump, exactly as for WASAPI legs).
 
 // (declared later, ini section -- used here for name matching)
 static bool containsCI(const std::string& hay, const std::string& needle);
@@ -3443,10 +2203,9 @@ static void ksCloseLeg(int idx) {
     }
     if (K.pin) {
         // v7.0.0: the shutdown silence, KS edition -- the looped WaveRT buffer
-        // IS the DMA's memory; until the pin stops it keeps looping whatever
-        // was written last. Zero it while the pin still runs (a PAUSE would
-        // freeze the cursor on the old content), let the DMA read one silent
-        // sweep, then stop. A restart never replays the last program audio.
+        // keeps looping whatever was written last until the pin stops, so
+        // zero it WHILE the pin still runs (a PAUSE would freeze the cursor
+        // on the old content), let the DMA read one silent sweep, then stop.
         if (K.loopBuf && K.loopBytes) {
             memset(K.loopBuf, 0, K.loopBytes);
             Sleep(40);
@@ -3568,20 +2327,13 @@ static DWORD WINAPI ksThread(LPVOID p) {
         else          { ok = ksReadPosIoctl(K.pin, &raw); }
         if (ok) {
             // ---- v6.5.13 LAPSE GUARD ------------------------------------
-            // The residue integration below can only see advances MOD the
-            // loop: a poll gap of one lap or more (a deschedule under an
-            // interrupt storm, system suspend) silently loses k whole laps,
-            // the believed play position falls k loops behind, and the
-            // pacing sleeps on a lead that no longer exists -- the DAC
-            // circles the loop re-reading stale audio (the reverberated
-            // sawing) with heartbeats, und, the ledger and devbuf all
-            // clean. Detection: the DAC's true advance over the gap is
-            // wall-exact (elapsed x rate); the residue advance is mod-loop.
-            // Any lap-sized gap, or any residue advance disagreeing with
-            // the wall expectation beyond a tolerance, means laps were
-            // lost: re-pin the write cursor to play+lead and re-prime the
-            // lead region (replay convention) -- a bit-exact skip of the
-            // lost window.
+            // The residue integration only sees advances MOD the loop: a poll
+            // gap of one lap or more (deschedule, suspend) silently loses k
+            // laps and the DAC circles re-reading stale audio (the sawing)
+            // with every other meter clean. Detection: the DAC's true advance
+            // over the gap is wall-exact; residue advance is mod-loop. A
+            // lap-sized gap or disagreement beyond tolerance -> re-pin the
+            // write cursor to play+lead and re-prime (a bit-exact skip).
             LARGE_INTEGER qn;
             QueryPerformanceCounter(&qn);
             double elapsed = 0.0;
@@ -4228,14 +2980,10 @@ static bool pickDevice(ma_context* ctx, ma_device_type type, const std::string& 
     return true;
 }
 
-// v6.5.16: the friendly name of the CURRENT default render endpoint, read
-// directly (GetDefaultAudioEndpoint = one endpoint, one property read, the
-// same eConsole role miniaudio itself uses). v6.5.14 walked EVERY render
-// endpoint through ma_context_enumerate_devices on every health tick -- a
-// full endpoint-store sweep per second just to learn one name, and that
-// churn is visible to every other process doing device work (miniaudio
-// apps enumerating/initing at the same moment contended with us). One
-// name, one read; the per-tick walk is gone.
+// v6.5.16: the CURRENT default render endpoint's friendly name, read
+// directly (one endpoint, one property read, eConsole role). v6.5.14 walked
+// EVERY render endpoint per health tick -- churn every enumerating process
+// contended with. One name, one read.
 static bool defaultRenderName(std::string* outName) {
     IMMDeviceEnumerator* en = nullptr;
     if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
@@ -4262,16 +3010,13 @@ static bool defaultRenderName(std::string* outName) {
 }
 
 // v6.5.16: how many FOREIGN audio sessions are ACTIVE on the render endpoint
-// whose friendly name contains the needle (first name match -- the same
-// rule that opens the leg)? Consumed by the yield-release path: the app
-// that played to this device while it WAS the Windows default does not
-// re-route the instant the default moves -- its stream stays attached.
-// Re-grabbing the DAC under a live stream produced the field-reported
-// doubled audio (twinspeak's render plus the stale app stream out of the
-// same speaker) and wedged miniaudio apps mid-re-route. The release path
-// therefore re-grabs only a QUIET device.
-// Returns: >= 0 foreign active sessions; -1 the probe itself failed
-// (caller fails OPEN -- pre-v6.5.16 behavior, logged).
+// matching the needle? Consumed by the yield-release path: an app that
+// played to this device while it WAS the default does not re-route the
+// instant the default moves -- re-grabbing the DAC under a live stream
+// produced the field-reported doubled audio and wedged miniaudio apps.
+// The release path re-grabs only a QUIET device.
+// Returns >= 0 foreign active sessions; -1 the probe failed (caller fails
+// OPEN -- pre-v6.5.16 behavior, logged).
 static int foreignActiveSessions(const std::string& nameNeedle) {
     const std::wstring wNeedle = narrowToWide(nameNeedle);
     IMMDeviceEnumerator* en = nullptr;
@@ -4357,12 +3102,10 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 }
 
 // ------------------------------------------------- v3.8 watchdog restarts --
-// The "output shut off by itself while twinspeak still runs" class of
-// failure: a device thread silently stops (endpoint invalidated, USB
-// re-enumeration, driver reset). The health loop reopens the leg BY NAME
-// (fresh endpoint id -- a replug re-attaches), first in its previous share
-// mode, then shared. Called once per second while the heartbeat is stale;
-// retries are silent until the state changes or the reopen succeeds.
+// The "output shut off by itself" class: a device thread silently stops
+// (endpoint invalidated, USB replug, driver reset). The health loop reopens
+// the leg BY NAME (fresh endpoint id), previous share mode first, then
+// shared; silent retries until the state changes or it succeeds.
 static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
                           const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
@@ -4531,37 +3274,22 @@ static void printLegDevice(int idx) {
 }
 
 // ============================================================ v6.6.0 GUI ====
-// THE CONTROL WINDOW. Launched by running twinspeak.exe with NO arguments
-// (console modes unchanged behind their flags). Black + cyan, hand-drawn:
-//
-//   * SIX TABS -- Devices / Timing / Transport / Sync+Power / Center+Vol /
-//     Center EQ -- covering EVERY ini key (nothing lives only in the file).
-//   * START / STOP runs the engine IN-PROCESS on a worker thread; the pane
-//     below is the live log (the same tlog stream the console shows), the
-//     status line carries the engine state + the live health line.
-//   * APPLY+RESTART saves the ini and cycles the engine in one click;
-//     SAVE writes twinspeak.ini in place, preserving every comment line
-//     (values are spliced into the existing lines; new keys are appended).
-//   * CENTER EQ presets: FLAT / DIALOGUE / BASS / WARMTH -- one
-//     click sets the peaking filter (and FLAT turns the EQ off). Moving a
-//     slider by hand marks the section CUSTOM.
-//   * Device pickers are populated by live WASAPI enumeration (the same
-//     names --list prints); the edit part stays a free-text needle.
-//
-// Controls are stock Win32 (edits/combos dark via the DarkMode_Explorer
-// theme when available, else WM_CTLCOLOR*), and every button/toggle/tab is
-// owner-drawn so the whole window stays in the black+cyan language. The
-// engine thread is the SAME engineMain the console path runs -- no second
-// implementation to drift out of sync.
+// THE CONTROL WINDOW (no args; console modes unchanged behind flags).
+// Hand-drawn black+cyan Win32 UI: SIX TABS covering every ini key; START/STOP
+// runs the SAME engineMain in-process (the pane below is the live log);
+// APPLY+RESTART saves + cycles in one click; SAVE splices values into the
+// existing ini lines, preserving comments; CENTER EQ presets FLAT/DIALOGUE/
+// BASS/WARMTH; device pickers from live enumeration (edit stays free-text).
+// Edits/combos dark via DarkMode_Explorer, else WM_CTLCOLOR*; every
+// button/toggle/tab is owner-drawn.
 // ----------------------------------------------------------------------------
 static int engineMain(const std::string& iniPath, bool fgForce,
                       bool allowMulti, bool guiMode);
 
-// ---- v7.0.0 THEMES: the palette is runtime data. Eight themes -- four dark,
-// four light -- switched live from the THEME button on the bottom bar. The
-// guic:: colors below are ASSIGNABLE now: applyTheme() copies the active
-// record in and recreates the four GDI brushes; every painter reads the
-// globals fresh on each frame, so a switch is one repaint, no restart.
+// ---- v7.0.0 THEMES: the palette is RUNTIME data -- eight themes (four
+// dark, four light), live-switched from the THEME button. applyTheme()
+// copies the active record in + recreates the four brushes; painters read
+// the globals fresh each frame, so a switch is one repaint, no restart.
 struct GuiTheme {
     const char* name;
     COLORREF bg, panel, panel2, panelHi, line, text, dim;
@@ -4634,8 +3362,8 @@ enum {
 
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
-static HFONT     g_fHead = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr;
+static HFONT     g_fCapX = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
+                 g_fSml = nullptr, g_fMono = nullptr;   // g_fCapX: Marlett close glyph (v7.0.9)
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -4688,21 +3416,56 @@ static const char* kTabNames[6] = {
     "DEVICES", "TIMING", "TRANSPORT", "OTHER", "VOLUME", "CENTER EQ"
 };
 
-// v6.6.4: the title bar carries ONLY the close button. No maximize (the
-// layout is hand-placed at a fixed size and cannot reflow) and no minimize
-// (closing already hides the window -- to the tray, engine stays up -- while
-// minimize just parks it on the taskbar; close does the same job properly).
+// v6.6.4: only a close button -- fixed-size layout, close already hides to the
+// tray. v7.0.9: the caption itself is custom (see kCapH below); WS_CAPTION
+// stays so the bar still answers HTCAPTION drag + the WS_SYSMENU right-click.
 static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
+
+// v7.0.9 THE CUSTOM TITLEBAR: the DWM caption is gone entirely (its text, its
+// close button, and the dark->light recolor that never took until a DWM
+// round-trip). The top 31 px strip of the window is our own bar: theme colors
+// painted directly, so a theme click recolors it the same instant as the
+// client. WM_NCCALCSIZE insets the client top by kCapH -- every child
+// coordinate keeps its old meaning. DWM's own frame drawing is switched off
+// (DWMNCRP_DISABLED, set in guiMain) so nothing fights the bar.
+static const int  kCapH = 31;
+static bool       g_capHot = false;   // mouse over the close glyph
+static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
+    RECT wr; GetWindowRect(w, &wr);
+    const RECT r = { (wr.right - wr.left) - 46, 0, wr.right - wr.left, kCapH };
+    return r;
+}
+// Paints the bar straight to the screen with GetWindowDC -- usable from any
+// context (theme click, WM_NCPAINT, hover), never needs an invalidate.
+static void guiPaintBar(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    HDC dc = GetWindowDC(w);
+    RECT wr; GetWindowRect(w, &wr);
+    const int ww = wr.right - wr.left;
+    const RECT bar = { 0, 0, ww, kCapH };
+    FillRect(dc, &bar, g_brBg);
+    const RECT ln = { 0, kCapH - 1, ww, kCapH };          // 1px bottom edge: chrome, not dead space
+    FillRect(dc, &ln, g_brPanel2);
+    const RECT cl = guiCapCloseRect(w);
+    if (g_capHot) { RECT hf = cl; FillRect(dc, &hf, g_brPanel2); }
+    if (g_fCapX) {
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, guic::cText);
+        SelectObject(dc, g_fCapX);
+        DrawTextA(dc, "r", 1, (RECT*)&cl, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    ReleaseDC(w, dc);
+}
 
 // ---- fonts / brushes -------------------------------------------------------
 static void applyTheme(int i);   // v7.0.0: forward decl (defined right below guiMakeGdi)
 static void guiMakeGdi() {
-    // v7.0.9: the in-window header ("TIDYVISION TWINSPEAK") is Times New
-    // Roman bold now -- the user asked for a serif title. FW_BOLD, not
-    // FW_SEMIBOLD: Times has no semibold weight and GDI would guess.
-    g_fHead = CreateFontA(-21, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+    // v7.0.9: g_fCapX is Marlett 'r' -- the exact Windows close glyph -- for
+    // the custom titlebar's X. (The Times New Roman header font is retired
+    // with the in-window header text it served.)
+    g_fCapX = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, "Times New Roman");
+                          DEFAULT_PITCH | FF_DONTCARE, "Marlett");
     g_fUI   = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
@@ -4718,32 +3481,11 @@ static void guiMakeGdi() {
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
 }
 
-// v7.0.6: the title bar follows the theme -- dark themes keep the dark
-// caption (DWMWA_USE_IMMERSIVE_DARK_MODE, 1903 spelling 20 / 1809 spelling
-// 19, best effort), light themes get the light one. The split is the theme
-// background's luminance: <50% = dark. The strip itself already paints from
-// the live theme colors, so bar + caption now move together.
-typedef HRESULT (WINAPI *TS_DWMSET)(HWND, DWORD, LPCVOID, DWORD);
-static void guiCaptionTheme(COLORREF bg) {
-    static TS_DWMSET fn = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        HMODULE dwm = LoadLibraryA("dwmapi.dll");
-        if (dwm) fn = (TS_DWMSET)GetProcAddress(dwm, "DwmSetWindowAttribute");
-    }
-    if (!fn || !g_hwnd) return;
-    const int lum = 30 * GetRValue(bg) + 59 * GetGValue(bg) + 11 * GetBValue(bg);
-    const BOOL v = (lum < 12800) ? TRUE : FALSE;
-    fn(g_hwnd, 20, &v, sizeof(v));
-    fn(g_hwnd, 19, &v, sizeof(v));
-    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
-}
+// (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
+// itself -- v7.0.9 paints the bar from the live guic:: colors instead.)
 
-// v7.0.0: live theme switch -- copy the record into the guic:: globals, rebuild
-// the four GDI brushes, repaint the whole frame (children included, erase +
-// paint in one pass -- the v6.6.5 white-frame technique). No restart, no leak:
-// the old brush objects are deleted before the new ones are created.
+// v7.0.0: live theme switch -- commit colors + brushes, then ONE synchronous
+// repaint of the whole tree, bar included, so nothing can show old colors.
 static void applyTheme(int i) {
     g_theme = i % 8;
     const GuiTheme& t = kThemes[g_theme];
@@ -4760,6 +3502,9 @@ static void applyTheme(int i) {
     #undef TSREBR
     if (g_hwnd) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
+        // v7.0.9: the titlebar is ours and painted straight from these colors
+        // -- it recolors HERE, synchronously, before the atomic repaint.
+        guiPaintBar(g_hwnd);
         RedrawWindow(g_hwnd, nullptr, nullptr,
                      RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
         // v7.0.9: the tabbar's new colors must be ON SCREEN before the click
@@ -4774,7 +3519,6 @@ static void applyTheme(int i) {
             InvalidateRect(ts, nullptr, FALSE);
             UpdateWindow(ts);
         }
-        guiCaptionTheme(t.bg);      // v7.0.6: the caption follows the theme
     }
 }
 
@@ -4793,11 +3537,9 @@ static Gdiplus::Color GCol(COLORREF c, BYTE a = 255) {
 
 // rounded-rect path out of four arcs -- the AA replacement for guiRoundRect
 static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& rin, int rad) {
-    // v6.6.7: the path is inset 1px inside the item rect. The pen stroke is
-    // centered on the path -- at the rect boundary its outer half was
-    // clipped away by the control DC, thinning every border and letting the
-    // corner AA straddle the window edge. Inset, the full 1px stroke is
-    // visible and its AA always blends against our own dark erase.
+    // v6.6.7: the path is inset 1px inside the item rect -- a stroke ON the
+    // boundary loses its outer half to the control DC clip; inset, the full
+    // stroke shows and its AA blends against our own dark erase.
     const Gdiplus::Rect r(rin.X + 1, rin.Y + 1, rin.Width - 2, rin.Height - 2);
     Gdiplus::GraphicsPath* p = new Gdiplus::GraphicsPath();
     const int d = rad * 2;
@@ -4928,13 +3670,10 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
 }
 
 // ---- v6.6.8: the EQ sliders are owner-drawn ---------------------------------
-// Stock TRACKBAR_CLASSA erased and repainted through the LIGHT theme parts on
-// every pass -- even under DarkMode_Explorer the control flashed white before
-// the dark chrome landed (the parent's RDW_ERASE passes made it visible).
-// Ours never erases (WM_ERASEBKGND -> 1) and paints groove + thumb GDI+
-// opaque on the panel brush: a white frame cannot exist. The mouse drag
-// reports through the SAME WM_HSCROLL the trackbar used, so the parent's
-// handling did not change at all.
+// Stock TRACKBAR_CLASSA flashed white before the dark chrome landed even
+// under DarkMode_Explorer. Ours never erases (WM_ERASEBKGND -> 1) and paints
+// groove + thumb GDI+ opaque: no white frame can exist. Drag reports through
+// the SAME WM_HSCROLL, so parent handling did not change.
 struct Sld { int lo, hi, pos; bool drag; };
 static std::map<HWND, Sld> g_sld;
 
@@ -5238,11 +3977,9 @@ static bool guiSaveIni() {
                 if (key == kIniKeys[k]) { isKey = true; keyIdx = k; break; }
         }
         if (isKey) {
-            // v6.6.9: splice EVERY known key line, empty value or not. The old
-            // "skip empty" rule left a cleared volume_endpoint (or device
-            // name) verbatim in the file -- the stale endpoint name leaked
-            // into every later save -- and then appended a second, empty copy
-            // of the same key at the bottom. One key, one line, current.
+            // v6.6.9: splice EVERY known key line, empty value or not -- the
+            // old "skip empty" rule leaked the stale value verbatim and
+            // appended an empty duplicate. One key, one line, current.
             seen[keyIdx] = true;
             out += head.substr(0, eq + 1) + " " + cfgValueText(key) + "\r\n";
             continue;
@@ -5381,11 +4118,9 @@ static void guiLogSink(const char* s) {
 static void guiAppendLog(const std::string& s) {
     HWND e = GetDlgItem(g_hwnd, IDC_LOG);
     if (!e) return;
-    // v6.6.2: the multiline EDIT honors only \r\n. A bare \n is not a break:
-    // lines merge into one paragraph and the wrap layout collapses into
-    // OVERLAPPING rows (the "console text overlaps" bug). Normalize every
-    // break -- CR, LF, CRLF, even a ring-trim cut mid-pair -- to exactly
-    // one CRLF before it touches the control.
+    // v6.6.2: the multiline EDIT honors only \r\n; a bare \n makes rows
+    // merge and the wrap layout COLLAPSE into overlapping lines. Normalize
+    // every break (CR / LF / CRLF / a ring-trim cut mid-pair) to one CRLF.
     std::string norm;
     norm.reserve(s.size() + 16);
     for (size_t i = 0; i < s.size(); ++i) {
@@ -5581,17 +4316,12 @@ static void guiBuildPages(HWND w) {
 }
 
 // ---- v7.0.4: the tab strip is ONE custom control ----------------------------
-// Six owner-drawn BUTTONs fought the system's clipping for three versions
-// (v7.0.0 burned the glow inward, v7.0.1 inset it, v7.0.2 moved it to the
-// frame, v7.0.3 rounded the child regions) and the glow always lost: a child
-// DC clips at the tab rect, the frame's WS_CLIPCHILDREN DC clips the other
-// way, and whatever survived read as a detached box around the tab. One
-// control now owns the whole strip: the halo is drawn around the selected
-// tab's face IN the strip's own double-buffered surface, so nothing can clip
-// it -- it hugs the border and burns outward on all four sides. The fade
-// repaints exactly this one small control (one erase, one buffer, one blit);
-// the frame is never invalidated for a tab change, so nothing else on the
-// window can flicker. That regression is structurally impossible now.
+// Six owner-drawn BUTTONs lost the glow to system clipping for three versions
+// (child DC clips at the tab rect, frame's WS_CLIPCHILDREN clips the other
+// way). One control owns the whole strip: the halo is drawn around the
+// selected face IN the strip's own double-buffered surface -- unclippable by
+// construction, hugging the border, burning outward. The fade repaints only
+// this one small control; the frame is never invalidated for a tab change.
 static void guiShowPage(HWND w, int p);     // fwd: defined below
 
 // rounded-rect path with NO 1 px inset (guiRoundPath is the face variant);
@@ -5615,19 +4345,13 @@ static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
 static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 
 // ---- v7.0.7: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
-// v7.0.5's DC render target still copied through GDI at EndDraw and could
-// silently land on WARP -- "nothing goes to the GPU". The strip still renders
-// for real: a D3D11 device (hardware first, WARP fallback for RDP/VM), a
-// D2D 1.1 device context drawing the halo/faces/borders as GPU geometry,
-// labels as DirectWrite glyphs ON the GPU -- but v7.0.7 PRESENTS through a
-// bitblt-model swap chain, because v7.0.6's flip model on a CHILD window
-// fought GDI for the same HWND's pixels: the tab buttons flickered, theme
-// repaints lost to the stale flip front buffer and the CPU burned on the
-// churn. Bitblt model: defined GDI interop, GPU-rasterized frame, one GPU
-// blit at Present. The whole GPU stack unavailable -> the v7.0.4 GDI+ pass
-// verbatim. The chosen path is logged once. The interface IIDs are spelled
-// out literally -- no __uuidof dependency, every toolchain in build.sh links
-// identically.
+// The strip renders for real: D3D11 device (hardware first, WARP for RDP/VM),
+// D2D 1.1 device context for halo/faces/borders, DirectWrite glyphs ON the
+// GPU, presented through a BITBLT-model swap chain -- v7.0.6's flip model on
+// a CHILD window fought GDI for the same HWND's pixels (flicker, stale theme
+// colors, CPU burn). Bitblt = defined GDI interop, one GPU blit at Present.
+// The whole stack unavailable -> the v7.0.4 GDI+ pass verbatim. IIDs spelled
+// out literally -- no __uuidof, every toolchain links identically.
 static ID2D1Factory1*        g_d2dFactory = nullptr;  // lazily created, once
 static ID3D11Device*         g_d3d11      = nullptr;
 static IDXGISwapChain1*      g_swap       = nullptr;
@@ -5645,16 +4369,11 @@ static bool                  g_gpuDead = false, g_gpuLogged = false;
 static bool                  g_gpuPainted = false;    // v7.0.7: first-present flag
 static std::wstring          g_tabWide[6];            // v7.0.7: labels widened once
 // v7.0.7: the swap chain is the BITBLT model (DXGI_SWAP_EFFECT_DISCARD), not
-// flip. v7.0.6 proved why on real hardware: a flip-model chain on a CHILD
-// window keeps its front buffer alive at DWM while GDI keeps drawing into the
-// same HWND's redirection surface -- and GDI + flip presentation on one HWND
-// do not mix. Every theme click repainted the strip with GDI-legal frames
-// that the stale flip frame simply outvoted ("tabbar doesn't update its
-// color"), and the two surfaces alternated on screen ("tab buttons
-// flicker") while device-churn + vsync-blocked Presents burned CPU. Bitblt
-// model has DEFINED GDI interop, no persistent front buffer, and still
-// rasterizes 100% on the GPU -- D3D11 geometry + DirectWrite glyphs in VRAM,
-// Present = one GPU blit into DWM's surface.
+// flip: a flip chain on a CHILD window keeps a persistent front buffer at
+// DWM while GDI draws into the same HWND's redirection surface -- the two
+// outvote each other (stale colors + flicker) and Presents block on vsync.
+// Bitblt has DEFINED GDI interop, no persistent front buffer, and still
+// rasterizes 100% on the GPU.
 static const IID kTSIID_ID2D1Factory1 =
     { 0xbb12d362, 0xdaee, 0x4b9a, { 0xaa, 0x1d, 0x14, 0xba, 0x40, 0x1c, 0xfa, 0x1f } };
 static const IID kTSIID_IDXGIDevice =
@@ -5705,10 +4424,9 @@ static bool guiStripBufEnsure(HWND w, int nw, int nh) {
 }
 
 // the GPU stack, built once: D3D11 -> DXGI device/adapter/factory -> D2D 1.1
-// device context -> swap chain (bitblt model, see the g_tabWide block) ->
-// backbuffer target -> cached brush -> DirectWrite tab format. Any failure
-// tears the stack down, marks g_gpuDead and hands the strip to the GDI+
-// pass for good.
+// device context -> bitblt swap chain -> backbuffer target -> cached brush
+// -> DirectWrite tab format. Any failure tears it down, marks g_gpuDead and
+// hands the strip to the GDI+ pass for good.
 static void guiStripGpuRelease() {
     if (g_target) { g_target->Release(); g_target = nullptr; }
     if (g_dctx)   { g_dctx->Release();   g_dctx   = nullptr; }
@@ -5761,11 +4479,8 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
         g_dctx->SetDpi(96.0f, 96.0f);    // DIPs == pixels: the geometry is authored in px
         g_dctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);  // v7.0.7: explicit AA
         g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-        // v7.0.7: bitblt model, ONE buffer, Present(0,0). See the block
-        // comment at g_tabWide: flip on a child window fought GDI for the
-        // HWND's pixels (flicker, stale theme colors, CPU churn). Bitblt is
-        // the model every child-window D3D surface uses -- deterministic,
-        // GDI-legal, and the rendering itself stays on the GPU.
+        // v7.0.7: bitblt model, ONE buffer, Present(0,0) -- see the g_tabWide
+        // block: flip on a child window fought GDI for the HWND's pixels.
         DXGI_SWAP_CHAIN_DESC1 sd = {};
         sd.Width      = (UINT)cw;
         sd.Height     = (UINT)ch;
@@ -5850,13 +4565,11 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int cw = rc.right, ch = rc.bottom;
         if (cw <= 0 || ch <= 0) { EndPaint(w, &ps); return 0; }
         const double fs = guiTabFade();
-        // v7.0.7 GPU PASS: halo, faces and borders as Direct2D 1.1 geometry
-        // and the labels as DirectWrite glyphs, all on the swap chain's
-        // backbuffer -- presented by Present(), never copied by GDI. The
-        // per-paint GDI FillRect of v7.0.6 is GONE: once the GPU stack owns
-        // the window, nothing but the swap chain ever draws to it (the
-        // flip-era GDI mixing was the flicker). One one-time fill covers the
-        // pre-first-present frame only.
+        // v7.0.7 GPU PASS: everything on the swap chain's backbuffer --
+        // geometry + DirectWrite glyphs, presented by Present(), never copied
+        // by GDI. Once the GPU stack owns the window, nothing else draws to
+        // it (the flip-era GDI mixing was the flicker); one one-time fill
+        // covers the pre-first-present frame only.
         bool gpu = guiStripGpuEnsure(w, cw, ch);
         if (gpu && !g_gpuPainted) {
             FillRect(dc, &rc, g_brBg);   // exactly once: cover the pre-present frame
@@ -5922,11 +4635,9 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             #undef TSBRCOL
             const HRESULT ehr = g_dctx->EndDraw(nullptr, nullptr);
             if (SUCCEEDED(ehr)) {
-                // v7.0.7: Present(0, 0) -- no vsync wait. A UI repaint must
-                // never block: Present(1,0) stalled every synchronous
-                // RedrawWindow (theme click, tab click) for up to a frame
-                // inside the message handler. The DWM composes at its own
-                // rate regardless; the blit is one 830x36 GPU copy.
+                // v7.0.7: Present(0, 0) -- no vsync wait; Present(1,0) stalled
+                // every synchronous RedrawWindow for up to a frame inside the
+                // message handler. DWM composes at its own rate regardless.
                 g_swap->Present(0, 0);
             } else {
                 // device lost: tear the stack down; this frame falls through
@@ -6033,52 +4744,41 @@ static void guiBuildControls(HWND w) {
 static void guiShowPage(HWND w, int p) {
     // v7.0.9: FLUSH EVERY PENDING RENDER FIRST (field directive: "make sure
     // every render updates before the atomic repaint"). Any window still
-    // holding an invalidated region -- a half-finished owner-draw button,
-    // a queued log/status paint -- paints NOW, before the freeze, under the
-    // old page. Nothing stale can land during or after the switch and
-    // flicker; the atomic repaint below then starts from a clean slate.
+    // holding an invalidated region paints NOW, under the OLD page -- nothing
+    // stale can land during or after the switch.
     UpdateWindow(w);
-    // v7.0.6: the page switch is ATOMIC. The old hide-then-show let the
-    // exposed parent rects hit the screen between the two ShowWindow passes
-    // -- one frame of blank background before the new page's children
-    // painted ("flashes blank until the next frame"). WM_SETREDRAW freezes the
-    // frame through both passes, and ONE synchronous RedrawWindow walks
-    // parent + children afterwards -- the screen only ever shows the
-    // finished page, immediately, with NO fade on the content (the tab
-    // buttons keep theirs; that is the animation the user wants).
+    // v7.0.6: the page switch is ATOMIC. The old hide-then-show let exposed
+    // parent rects hit the screen between the two passes -- one blank frame.
+    // WM_SETREDRAW freezes the frame through both; ONE synchronous
+    // RedrawWindow then shows the finished page immediately, no fade on the
+    // content (the tabs keep theirs -- that is the wanted animation).
     SendMessageA(w, WM_SETREDRAW, FALSE, 0);   // v7.0.6: freeze (no MFC SetRedraw in Win32)
     for (int i = 0; i < 6; ++i)
         for (size_t k = 0; k < g_pageHw[i].size(); ++k)
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     SendMessageA(w, WM_SETREDRAW, TRUE, 0);
     g_tab = p;
-    // v7.0.8: the fade anchor MUST be stamped BEFORE the atomic repaint.
-    // v7.0.6's rewrite painted the strip first and anchored second -- the
-    // synchronous pass read the STALE anchor (fs = 1.0 full glow), the next
-    // 16 ms tick read fs = 0 (glow gone), then the ramp climbed back: full
-    // -> off -> fade-in on every tab click. That flash is the "glow fading
-    // flicker". v7.0.4's ordering (anchor, then one strip invalidate) never
-    // had it because there was no full-frame repaint in between; the atomic
-    // switch re-introduced one. Anchor first = the atomic paint is already
-    // fs ~ 0 and the glow climbs monotonically.
+    // v7.0.8: the fade anchor is stamped BEFORE the atomic repaint. The
+    // reverse order made the synchronous pass read a STALE anchor (full
+    // glow), the next tick fs ~ 0, then the ramp back: full -> off -> fade-in
+    // on every click. Anchor first = the paint is already fs ~ 0 and the
+    // glow climbs monotonically.
     g_tabAnimStart = GetTickCount64();
     RedrawWindow(w, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-    // v7.0.4/v7.0.5: the selected tab FADES IN, and ONLY the strip animates.
-    // v7.0.5: 1 ms system timer resolution for the life of the animation. A
-    // 16 ms WM_TIMER otherwise lands on the ~15.6 ms default tick and the
-    // eased ramp quantizes into visible steps. One begin per animation run,
-    // released exactly once when the timer completes (WM_TIMER id 2).
+    // v7.0.4/v7.0.5: only the strip animates. timeBeginPeriod(1) for the
+    // life of the animation -- a bare 16 ms WM_TIMER lands on the ~15.6 ms
+    // tick and the eased ramp quantizes into visible steps. One begin per
+    // run, released exactly once (WM_TIMER id 2).
     if (!g_fadePeriod) { timeBeginPeriod(1); g_fadePeriod = true; }
     SetTimer(w, 2, 16, nullptr);
     if (HWND ts = GetDlgItem(w, IDC_TABSTRIP)) InvalidateRect(ts, nullptr, TRUE);
 }
 
 // ---- v6.6.1: repaint helpers -----------------------------------------------
-// Owner-drawn children own their pixels: invalidating the frame never repaints
-// them (that was the "it only updates when I minimize" bug -- a minimize or
-// resize invalidates the whole tree, which is why THAT fixed it). Every visual
-// state change below now invalidates the exact child control it changed.
+// Owner-drawn children own their pixels: invalidating the frame never
+// repaints them (the "only updates when I minimize" bug). Every visual state
+// change invalidates the exact child it changed.
 static void guiRepaint(HWND w, int id) {
     if (HWND h = GetDlgItem(w, id)) InvalidateRect(h, nullptr, TRUE);
 }
@@ -6089,12 +4789,10 @@ static void guiRepaintPresets(HWND w) {
 }
 
 // ---- v7.0.6: the button render buffer (THE 1PX CLIP FIX) --------------------
-// One shared memory surface, grown to the largest button seen. Every owner-
-// drawn button paints into it with one spare pixel column on the right and
-// one spare row at the bottom -- the gutter absorbs the border stroke's
-// outer antialiasing half that a DC-sized surface clipped away (the "clipped
-// by exactly 1 px on the bottom right" report) -- and the finished face
-// lands on the screen as ONE opaque blit cropped to the item rect.
+// One shared memory surface, grown to the largest button seen, with one
+// spare column/row -- the gutter absorbs the border stroke's outer AA half a
+// DC-sized surface clipped away -- and the finished face lands as ONE opaque
+// blit cropped to the item rect.
 static HDC     g_btnDc    = nullptr;
 static HBITMAP g_btnBm    = nullptr, g_btnBmOld = nullptr;
 static int     g_btnW = 0, g_btnH = 0;
@@ -6184,6 +4882,53 @@ static void guiRestoreWindow() {
     SetForegroundWindow(g_hwnd);
 }
 
+// ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
+// The frame face is rendered into this memory surface and lands on the screen
+// as ONE blit -- no erase pass, no partial updates, nothing for DWM to sample
+// mid-build. (Same technique as the button buffer below.)
+static HDC     g_frmDc = nullptr;
+static HBITMAP g_frmBm = nullptr, g_frmBmOld = nullptr;
+static int     g_frmW = 0, g_frmH = 0;
+static void guiFrameBufRelease() {
+    if (g_frmBmOld) { SelectObject(g_frmDc, g_frmBmOld); g_frmBmOld = nullptr; }
+    if (g_frmBm)    { DeleteObject(g_frmBm);             g_frmBm    = nullptr; }
+    if (g_frmDc)    { DeleteDC(g_frmDc);                 g_frmDc    = nullptr; }
+    g_frmW = 0; g_frmH = 0;
+}
+static bool guiFrameBufEnsure(int w, int h) {
+    if (g_frmDc && w == g_frmW && h == g_frmH) return true;
+    guiFrameBufRelease();
+    HDC sdc = GetDC(nullptr);
+    g_frmDc = CreateCompatibleDC(sdc);
+    g_frmBm = CreateCompatibleBitmap(sdc, w, h);
+    ReleaseDC(nullptr, sdc);
+    if (!g_frmDc || !g_frmBm) { guiFrameBufRelease(); return false; }
+    g_frmBmOld = (HBITMAP)SelectObject(g_frmDc, g_frmBm);
+    g_frmW = w; g_frmH = h;
+    return true;
+}
+// The complete frame face -- background, page panel, log frame, version line,
+// watermark -- into ANY dc (the memory buffer normally, the screen directly
+// as the no-buffer fallback). Header text is gone in v7.0.9: the custom
+// titlebar replaced it.
+static void guiPaintFrame(HDC dc, int cw, int ch) {
+    const RECT full = { 0, 0, cw, ch };
+    FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
+    const RECT panel = { 12, KPANEL_T, 866, KPANEL_B };
+    FillRect(dc, &panel, g_brPanel);
+    FrameRect(dc, &panel, g_brPanel2);
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
+    g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
+    char vbuf[640];
+    snprintf(vbuf, sizeof(vbuf), "v7.0.9  |  %s", g_guiIniPath.c_str());
+    const RECT ver = { 300, 8, 866, 30 };
+    guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
+    guiWatermark(g);
+}
+
 // ---- the window procedure ---------------------------------------------------
 static bool guiIsToggle(int id) {
     switch (id) {
@@ -6205,64 +4950,71 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
+    case WM_NCCALCSIZE:
+        // v7.0.9: shrink the client top by kCapH -- that strip becomes the
+        // custom titlebar; every child coordinate keeps its old meaning.
+        if (wp) { ((RECT*)lp)->top += kCapH; return 0; }
+        break;
+    case WM_NCPAINT:
+        guiPaintBar(w);                 // the bar is ours; never the classic frame
+        return 0;
+    case WM_NCACTIVATE:
+        // lParam -1: DefWindowProc must not repaint the (retired) classic
+        // frame on activation changes; the bar itself is activation-blind.
+        guiPaintBar(w);
+        return DefWindowProcA(w, msg, wp, -1);
+    case WM_NCHITTEST: {
+        // The bar's drag area answers HTCAPTION through DefWindowProc
+        // (WS_CAPTION does the work). The close glyph is answered HTCLIENT
+        // so its clicks land as WM_LBUTTONDOWN and we own the hover state.
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT wr; GetWindowRect(w, &wr);
+        if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH &&
+            pt.x - wr.left >= (wr.right - wr.left) - 46)
+            return HTCLIENT;
+        break; }
+    case WM_NCMOUSEMOVE:
+        if (g_capHot) { g_capHot = false; guiPaintBar(w); }   // left the X onto the drag area
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
-        const RECT panel = { 12, KPANEL_T, 866, KPANEL_B };
-        FillRect(dc, &panel, g_brPanel);
-        FrameRect(dc, &panel, g_brPanel2);
-        // v6.6.5: header + version + watermark are GDI+ -- antialiased glyphs
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        {   // v6.6.6: the pane's own frame -- a 1px cLine rectangle just
-            // outside the child. The old WS_EX_CLIENTEDGE etched edge was
-            // drawn in the classic LIGHT 3D system colors: on the dark UI
-            // it read as a ghost bordered box around the log.
-            Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);
-            g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
+        // v7.0.9 THE WATERMARK-FLICKER FIX: the frame painted straight to the
+        // screen behind an erase pass -- RDW_ERASE wiped the client blank
+        // (watermark gone), GDI+ rebuilt it, and DWM sampled the blank strip
+        // on every tab click / theme press. The full face is rendered into
+        // the buffer and lands as ONE blit; no intermediate state exists.
+        RECT crc; GetClientRect(w, &crc);
+        const int cw = crc.right, ch = crc.bottom;
+        if (guiFrameBufEnsure(cw, ch)) {
+            guiPaintFrame(g_frmDc, cw, ch);
+            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                   ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+                   g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        } else {
+            guiPaintFrame(dc, cw, ch);   // no buffer: draw straight (old path)
         }
-        // v7.0.4: the tab halo moved INTO the strip control (tabStripProc) --
-        // the frame no longer paints it, and a tab change no longer repaints
-        // the frame at all. The header/version sit a few px higher to clear
-        // the strip's top edge (the strip owns y 28..64).
-        const RECT hdr = { 18, 0, 420, 32 };
-        guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
-        char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.9  |  %s", g_guiIniPath.c_str());
-        const RECT ver = { 300, 8, 866, 30 };
-        guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
-        guiWatermark(g);
         EndPaint(w, &ps);
         return 0; }
-    case WM_ERASEBKGND: {
-        // v7.0.0 THE THEME-ERASE FIX: the class brush was g_brBg at
-        // registration -- but applyTheme() DELETES g_brBg and creates a new
-        // one, so after the first theme switch the class held a dead handle
-        // and DefWindowProc's erase washed the whole frame white on every
-        // theme press. The class brush is nullptr now; the frame's erase is
-        // answered HERE, from the LIVE g_brBg -- always the active theme.
-        RECT rc;
-        GetClientRect(w, &rc);
-        FillRect((HDC)wp, &rc, g_brBg);
-        return 1; }
+    case WM_ERASEBKGND:
+        // The class brush went stale after the first applyTheme (deleted +
+        // recreated) -- that is why erase is answered here, not by the class.
+        // v7.0.9: it now does NOTHING: the buffered WM_PAINT covers every
+        // pixel, and a fill here would only hand DWM a blank intermediate
+        // frame (the watermark flicker).
+        return 1;
     case WM_CTLCOLORBTN:
-        // v6.6.7: RDW_ERASE|RDW_ALLCHILDREN (the white-flash fix) and every
-        // InvalidateRect(..., TRUE) send the owner-drawn buttons a
-        // WM_ERASEBKGND, and DefWindowProc answers WM_CTLCOLORBTN with the
-        // classic WHITE brush. Whatever WM_DRAWITEM paints afterwards, that
-        // white pass is what the corner antialiasing blended against -- the
-        // bright ghost arcs on every rounded corner. Answer DARK so no
-        // pass can ever put white under the AA again.
+        // v6.6.7: DefWindowProc answers WM_CTLCOLORBTN with WHITE, and the
+        // white pass under the corner AA was the ghost arcs. Answer DARK so
+        // no pass can ever put white under the AA.
         return (LRESULT)g_brBg;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         const int id = GetDlgCtrlID((HWND)lp);
-        // v6.6.4 THE REAL SCROLL-GHOST FIX: the log pane is ES_READONLY, and a
-        // read-only edit sends WM_CTLCOLORSTATIC -- never WM_CTLCOLOREDIT. The
-        // v6.6.3 OPAQUE fix sat in the message the pane does not send, so the
-        // pane kept TRANSPARENT mode and its scroll blits kept ghosting on
-        // every machine. Its colors are answered HERE instead.
+        // v6.6.4 THE REAL SCROLL-GHOST FIX: the log pane is ES_READONLY -- it
+        // sends WM_CTLCOLORSTATIC, never WM_CTLCOLOREDIT, so the v6.6.3 fix
+        // sat in a message the pane does not send. Its colors are answered
+        // HERE instead.
         SetBkMode(dc, OPAQUE);
         if (id == IDC_LOG) {
             SetBkColor(dc, guic::cLogBg);
@@ -6282,13 +5034,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, guic::cDim);
         return (LRESULT)g_brPanel; }
     case WM_CTLCOLOREDIT: {
-        // v6.6.3 SCROLL-GHOST FIX: a multiline EDIT scrolls by blitting the
-        // existing rows and repainting only the newly exposed line(s). With
-        // SetBkMode(TRANSPARENT) the repainted glyphs are drawn OVER whatever
-        // pixels the blit left behind -- old text bleeds through and "persists"
-        // while scrolling. OPAQUE + a bk color matching the background brush
-        // makes every painted row erase beneath itself. Statics keep
-        // TRANSPARENT (they never scroll and must blend with the panel).
+        // v6.6.3 SCROLL-GHOST FIX: a multiline EDIT scrolls by blitting old
+        // rows and repainting only the exposed line(s); with TRANSPARENT the
+        // new glyphs draw over the blit's leftovers and old text bleeds
+        // through. OPAQUE + a matching bk color erases beneath every row.
         HDC dc = (HDC)wp;
         SetBkMode(dc, OPAQUE);
         if (GetDlgCtrlID((HWND)lp) == IDC_LOG) {   // the pane: soft cyan on near-black
@@ -6307,42 +5056,32 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, guic::cText);
         return (LRESULT)g_brPanel2; }
     case WM_DRAWITEM: {
-        // v6.6.5: the whole button face is GDI+ -- antialiased rounded rects
-        // and antialiased glyphs. The full item rect is still erased with the
-        // surface color first (the v6.6.4 white-corner fix). v7.0.0 polish:
-        // resting faces are TRANSPARENT -- the surface shows through, only
-        // border + text paint; fills remain for pressed feedback and state.
+        // v6.6.5: the whole button face is GDI+ AA; the item rect is erased
+        // with the surface color first (the white-corner fix). v7.0.0:
+        // resting faces are TRANSPARENT -- border + text only; fills remain
+        // for pressed feedback and state.
         const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
         const RECT rc = d->rcItem;
         const int id = (int)d->CtlID;
         // v7.0.6 THE 1PX CLIP FIX: the button paints into the shared buffer
-        // (one spare column/row on the right/bottom -- see guiBtnBufEnsure)
-        // and lands as ONE blit cropped to the item rect. Borders are full
-        // on all four sides again; if the buffer cannot be had, dc falls
-        // back to the item DC and paints the old (clipped) way.
+        // (spare column/row, see guiBtnBufEnsure) and lands as ONE blit; no
+        // buffer -> the item DC and the old clipped look.
         const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
         HDC dc = guiBtnBufEnsure(bw, bh);
         if (!dc) dc = d->hDC;
         char txt[128];
         GetWindowTextA(d->hwndItem, txt, sizeof(txt));
         const bool pressed = (d->itemState & ODS_SELECTED) != 0;
-        // v7.0.0: the bottom-bar set is EXPLICIT -- the old [IDC_START..
-        // IDC_TICK] range test swallowed IDC_REFRESH (205), so the page-bound
-        // REFRESH DEVICES button erased with the window background while
-        // sitting ON the panel: a rectangle of the wrong color, and its
-        // transparent face showed the wrong surface through.
-        // v7.0.4: the six tab BUTTONs are retired -- the strip control owns
-        // the tabs now (tabStripProc). WM_DRAWITEM only ever sees the
-        // remaining owner-drawn buttons; the retired IDC_TAB0..5 ids are
-        // kept in the onPage test below only as dead-code insurance.
+        // v7.0.0: the bottom-bar set is EXPLICIT -- a range test once
+        // swallowed IDC_REFRESH and erased it with the wrong surface.
+        // v7.0.4: the tab BUTTONs are retired; their ids remain here only as
+        // dead-code insurance.
         const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 5) ||
                               id == IDC_START  || id == IDC_APPLY ||
                               id == IDC_SAVE   || id == IDC_TICK  ||
                               id == IDC_THEME);
-        // v6.6.7: erase FIRST and in PLAIN GDI -- exact opaque pixels, no
-        // GDI+ alpha. The old GDI+ fill let the square corners blend
-        // against whatever the button's own WM_ERASEBKGND had put there
-        // (DefWindowProc answers WM_CTLCOLORBTN with the WHITE brush),
+        // v6.6.7: erase FIRST in PLAIN GDI -- a GDI+ fill let the square
+        // corners blend against the white WM_CTLCOLORBTN pass underneath,
         // leaving bright ghost arcs on every rounded corner.
         FillRect(dc, &rc, onPage ? g_brPanel : g_brBg);
         Gdiplus::Graphics g(dc);
@@ -6417,6 +5156,34 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
+    case WM_LBUTTONDOWN: {
+        // v7.0.9: clicks in the bar arrive with NEGATIVE-y client coords
+        // (the strip lies above the client origin). Inside the close slot
+        // they close -- which hides to the tray, engine stays up.
+        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
+        if (cy < 0) {
+            RECT cl = guiCapCloseRect(w);
+            if (cx >= cl.left && cx < cl.right) PostMessageA(w, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break; }
+    case WM_MOUSEMOVE: {
+        // hover feedback for the bar's X; TrackMouseEvent arms the leave
+        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
+        bool hot = false;
+        if (cy < 0) {
+            RECT cl = guiCapCloseRect(w);
+            hot = (cx >= cl.left && cx < cl.right);
+        }
+        if (hot != g_capHot) {
+            g_capHot = hot;
+            if (hot) { TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, w, 0 }; TrackMouseEvent(&t); }
+            guiPaintBar(w);
+        }
+        break; }
+    case WM_MOUSELEAVE:
+        if (g_capHot) { g_capHot = false; guiPaintBar(w); }
+        break;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
         if (code != BN_CLICKED) break;
@@ -6539,12 +5306,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0; }
     case WM_TIMER: {
-        // v7.0.3: timer 2 drives the tab fade-in. v7.0.4: ONLY the strip
-        // repaints each 16 ms tick (halo, face, border and label all read the
-        // same clock inside its own buffered paint) -- the frame is never
-        // invalidated during the animation. When the eased run completes the
-        // timer kills itself and lands one final full-strength pass so no
-        // fractional-alpha frame is ever left on screen.
+        // v7.0.3: timer 2 drives the tab fade-in; ONLY the strip repaints
+        // each tick. When the run completes the timer kills itself and lands
+        // one final full-strength pass -- no fractional-alpha frame remains.
         if (wp == 2) {
             HWND ts = GetDlgItem(w, IDC_TABSTRIP);
             if (g_tabAnimStart &&
@@ -6558,15 +5322,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        // v7.0.2: the tick test ends itself -- and now the BUTTON untoggles
-        // with it. Nothing on the engine side clears g_tickOn at the end of
-        // the 4 s run (tickSum just goes quiet past beat 8), so the GUI
-        // timer owns the natural end: flag, anchor, label, all reset here.
-        // The v7.0.0 branch only ran when g_tickOn was ALREADY false, so a
-        // self-finished run left the button reading STOP TICK TEST forever.
-        // The else side keeps the old job: an engine restart voids the run
-        // (g_tickOn cleared on the engine thread, endMs left set) and the
-        // stale endMs restores the label.
+        // v7.0.2: the tick test ends itself AND the button untoggles with it
+        // -- nothing on the engine side cleared g_tickOn at the natural end,
+        // so the GUI timer owns it: flag, anchor, label. The else side keeps
+        // the old job: an engine restart voids the run and the stale endMs
+        // restores the label.
         if (g_tickOn.load(std::memory_order_relaxed)) {
             const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
             if (end != 0 && GetTickCount64() > end) {
@@ -6709,27 +5469,47 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     RegisterClassA(&wc);
     RECT r = { 0, 0, KCLI_W, KCLI_H };
     AdjustWindowRect(&r, kGuiFrame, FALSE);
-    // v6.6.1 STALE-PAINT FIX: WS_EX_COMPOSITED was deferring child repaints
-    // (the "only updates after a minimize" bug) and the frame invalidated
-    // only itself, never the owner-drawn children. The frame now carries
-    // WS_CLIPCHILDREN -- the parent never paints over its children and every
-    // visual state change invalidates the exact child (see guiRepaint). The
-    // window starts HIDDEN; --tray leaves it in the tray, otherwise it shows.
+    // v6.6.1 STALE-PAINT FIX: WS_EX_COMPOSITED deferred child repaints and
+    // the frame invalidated only itself. WS_CLIPCHILDREN instead: the parent
+    // never paints over its children; every state change invalidates the
+    // exact child (see guiRepaint). Starts HIDDEN (tray launch).
     g_hwnd = CreateWindowExA(0, "twinspeak.control", "TidyVision TwinSpeak: Control Panel",
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) { if (mutex) CloseHandle(mutex); return 1; }
-    guiCaptionTheme(kThemes[g_theme].bg);   // v7.0.6: the caption follows the ini's theme
+    // v7.0.9 THE CUSTOM TITLEBAR, part 2: DWM's own caption drawing is
+    // switched off (DWMWA_NCRENDERING_POLICY -> DWMNCRP_DISABLED) so its
+    // text/buttons/dark-light recolor can never fight the bar we paint.
+    // Cost: no DWM shadow/border -- a flat themed rectangle, consistent
+    // with the flat UI.
+    {
+        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+        const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+            LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+        if (dwmSet) {
+            const int off = 1;   // DWMNCRP_DISABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof(off));
+        }
+    }
+    // v7.0.9: the NCCALCSIZE top inset (kCapH) replaced the system caption;
+    // its height differs from kCapH by a couple px per OS, so re-measure the
+    // client and resize once -- the design client is EXACTLY 880x620 again.
+    {
+        RECT rc; GetClientRect(g_hwnd, &rc);
+        if (rc.right != KCLI_W || rc.bottom != KCLI_H)
+            SetWindowPos(g_hwnd, nullptr, 0, 0,
+                         (r.right - r.left) + (KCLI_W - rc.right),
+                         (r.bottom - r.top) + (KCLI_H - rc.bottom),
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
     guiFillCombos(g_hwnd);
-    // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the window's (still
-    // hidden) redirection surface now -- parent erase + paint, every child
-    // paint, every owner-draw -- so the first frame DWM ever composites is
-    // the finished dark UI. Showing with SW_SHOWNA then costs no extra
-    // activate/erase cycle: one white frame becomes zero white frames.
+    // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
+    // redirection surface now, so the first frame DWM composites is the
+    // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
     RedrawWindow(g_hwnd, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
@@ -6759,12 +5539,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
 // ---------------------------------------------------------------- main ------
 static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
 
-// v6.6.0: the engine body, split out of main() so the GUI can run it on a
-// worker thread and restart it in-process. The caller owns the single-
-// instance mutex (console main or the GUI holds it for the process lifetime).
-// guiMode: the background/FreeConsole detach is suppressed (the log pane is
-// the destination; g_logSink is already armed) and the run must be restart-
-// safe (g_run is re-armed here; every engine global is (re)initialized below).
+// v6.6.0: the engine body, split out of main() so the GUI runs it on a
+// worker thread and can restart it in-process. The caller owns the single-
+// instance mutex. guiMode: no background/FreeConsole detach (the log pane is
+// the destination) and restart-safe (g_run re-armed, all engine globals
+// re-initialized below).
 static int engineMain(const std::string& iniPath, bool fgForce,
                       bool allowMulti, bool guiMode);
 
@@ -6845,13 +5624,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v6.5.17: HIGH process priority class. The RT threads already carry
-    // MMCSS "Pro Audio" + THREAD_PRIORITY_TIME_CRITICAL -- that orders them
-    // WITHIN the process. The process class is the scheduler's cross-process
-    // weight: at NORMAL, a foreground app's priority-boost window can push
-    // the engine's helper threads (pump park, warden, health loop, yield
-    // watcher) behind seconds of background work. HIGH is the weight a DAW
-    // host takes by default; it does not starve other processes' streams.
+    // v6.5.17: HIGH process priority class. MMCSS orders the RT threads
+    // WITHIN the process; the class is the scheduler's cross-process weight
+    // (at NORMAL a foreground boost can bury the helper threads). HIGH is
+    // the weight a DAW host takes; it does not starve other streams.
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
     timeBeginPeriod(1);
@@ -6882,12 +5658,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v6.5.18: center dialogue EQ coefficients (ini: center_eq*)
     centerEqInit();
 
-    // v6.2 chimes: render the modernized CenterFold signature ONCE -- two
-    // short triangle blips in the low treble, the old rising fifth (G5->D6
-    // square) two-plus octaves up: C7 2093 Hz (42 ms) -> G7 3136 Hz (72 ms),
-    // 20 ms gap, exponential decay. Peak = chime_gain clamped to 0..1. It
-    // plays when the engine goes live (armed right before the legs start)
-    // and again whenever the watchdog reopens the center leg.
+    // v6.2 chimes: render the modernized signature ONCE -- C7 42 ms -> G7
+    // 72 ms triangle blips, 20 ms gap, exp decay, peak = chime_gain. Plays
+    // on engine start and on every watchdog reopen of the center leg.
     {
         float cg = g_cfg.chimeGain;
         if (cg < 0.0f) cg = 0.0f;
@@ -6961,6 +5734,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     g_leg[1].backend = (ok2 && wantKS2) ? 1 : 0;
     g_leg[0].backend = (ok1 && wantKS1) ? 1 : 0;
     if (!ok2) ok2 = initLegDevice(1, &ctx, &id2, periodMs2, g_cfg.exclusive);
+    // v3: legs go exclusive TOGETHER or shared TOGETHER (v2 let one leg win
+    // and the buffering mismatch skewed them ~10 ms). A driver refusal on
+    // either WASAPI leg reopens BOTH shared so device buffering stays
+    // identical; KS legs are committed to their pin and stay as-is.
     if (!ok1) ok1 = initLegDevice(0, &ctx, &id1, periodMs1, g_cfg.exclusive);
     if ((!ok1 || !ok2) && g_cfg.exclusive) {
         if (g_cfg.alignModes) {
@@ -6992,12 +5769,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v3.6: the CAPTURE side gets its own period and its own share mode,
-    // opened BEFORE the rings (the ring floor needs the REAL negotiated
-    // capture burst). Exclusive on the VAC pin = the direct WaveRT
-    // cyclic-buffer read on a WaveRT port (~10 ms cable->app); on a
-    // WaveCyclic port or when the pin is busy it usually refuses, and we
-    // fall back to shared automatically (banner reports which one won).
+    // v3.6: the CAPTURE side gets its own period + share mode, opened BEFORE
+    // the rings (the ring floor needs the REAL negotiated burst). Exclusive
+    // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
+    // WaveCyclic/busy and falls back to shared (banner reports the winner).
     ma_device_config cc = ma_device_config_init(ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = capPeriodMs;
@@ -7026,11 +5801,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v4.0: the REAL negotiated device period per leg (the shared engine
-    // clamps; exclusive honors small values) feeds the ring floor and the
-    // v6.0 gated-drop line. The real capture burst feeds the ring floor.
-    // v6.3: a KS leg's device bite is exactly ks_period_frames (our own
-    // pacing thread never asks for more), so that IS its device period.
+    // v4.0: the REAL negotiated device period per leg feeds the ring floor
+    // and the gated-drop line. v6.3: a KS leg's bite is exactly
+    // ks_period_frames (our pacing thread never asks for more).
     for (int i = 0; i < 2; ++i) {
         if (g_leg[i].backend == 1) {
             g_periodFrames[i] = (size_t)g_cfg.ksPeriodFrames;
@@ -7045,13 +5818,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                      : (size_t)(capPeriodMs * (kSampleRate / 1000));
     if (g_capBurstFrames == 0) g_capBurstFrames = 240;
 
-    // rings, now that each leg's real device period AND the real capture
-    // burst are known. Target floor: the FULL device buffer + a full burst
-    // + 4 ms (the ring must cover the device's worst legitimate bite -- in
-    // miniaudio's exclusive event mode the pop is the WHOLE device buffer,
-    // pulled as two back-to-back period callbacks); capacity = target +
-    // spare so the normal pop/burst sawtooth never reaches the overwrite
-    // line. This target is the LATENCY ANCHOR of the bit-exact path.
+    // rings, now that each leg's real device period AND burst are known.
+    // Target floor = FULL device buffer + burst + margin (in miniaudio's
+    // exclusive event mode the pop is the WHOLE buffer as two back-to-back
+    // callbacks); capacity = target + spare so the pop/burst sawtooth never
+    // reaches the overwrite line. This target is the LATENCY ANCHOR.
     for (int i = 0; i < 2; ++i) {
         Leg& L = g_leg[i];
         const float ms = (i == 0) ? g_cfg.out1Ms : g_cfg.out2Ms;
@@ -7059,27 +5830,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const float delayMs = (i == 0) ? g_cfg.delay1Ms : g_cfg.delay2Ms;
         if (ringMs < 0.0f) ringMs = ms;   // v3.2: ring1_ms/ring2_ms default to outXms
         const size_t cfgFrames    = (size_t)((double)kSampleRate * ringMs / 1000.0);
-        // v6.3: a KS leg's device bite is one period exactly (our pacing
-        // thread writes period frames and never merges); the floor is thus
-        // ONE device period + burst + margin.
-        // v6.3.1: the margin is PER-TRANSPORT. A KS leg's pull is twinspeak's
-        // own pacing thread -- exactly one bite, paced against the DAC's
-        // position register, refilled by a pump that drains every 1 ms --
-        // so the floor needs only 1 ms of jitter on top of (bite + burst).
-        // A WASAPI leg keeps the full 4 ms margin: miniaudio's exclusive
-        // event mode pops the WHOLE buffer as two back-to-back callbacks,
-        // and the floor must survive that bite.
+        // v6.3/v6.3.1: a KS leg's bite is one period exactly, and its pull is
+        // our own paced thread -- so its margin is 1 ms over (bite + burst);
+        // a WASAPI leg keeps the 4 ms (exclusive event mode pops the whole
+        // buffer as two back-to-back callbacks).
         const size_t devPeriodFr  = (L.backend == 1)
                                   ? (size_t)g_cfg.ksPeriodFrames
                                   : (L.dev.playback.internalPeriodSizeInFrames
                                      ? L.dev.playback.internalPeriodSizeInFrames : 480);
         const size_t marginFr     = (L.backend == 1) ? kKsMarginFrames
                                                      : kPeriodMarginFrames;
-        // v6.1: the alignment delay IS extra ring depth -- the ring target
-        // grows by delay_ms and the samples leave it that much later, bit
-        // for bit. The gated-drop line (target + burst + period) rides on
-        // the SAME target, so the delay cannot cause false excess drops;
-        // the prefill covers the delay, so playback starts pre-delayed.
+        // v6.1: the alignment delay IS extra ring depth -- the samples leave
+        // the ring later, bit for bit; the gated-drop line rides the SAME
+        // target so the delay cannot cause false drops; prefill covers it.
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
         L.targetFrames = std::max<size_t>(cfgFrames,
@@ -7095,17 +5858,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.lastBlock.assign(L.lastCap * (size_t)L.outCh, 0.0f);
         L.lastN = 0;
         L.haveLast = false;
-        // v7.0.1 THE LEDGER RESTART FIX (leg side): every clock the ledger
-        // reads is PER RUN. A restart used to inherit the previous run's
-        // captured/popped/streamSeeded, so the pumps' seqBefore and the tick
-        // press's beat-zero anchor (captured + 1 s) lived in mismatched
-        // capture-sequence spaces -- the stale part was whatever the old
-        // run's rings held at the STOP, and it differed per leg. The drift
-        // warden read the same stale out-ledger and corrected against it.
-        // Zero the whole per-run state HERE, before any device or pump
-        // thread exists (no concurrency at this point): raw seqTail, out
-        // seqTail, captured and the tick anchor now start the same run
-        // together, on both legs, every start.
+        // v7.0.1: every clock the ledger reads is PER RUN. A restart used to
+        // inherit captured/popped/streamSeeded, putting seqBefore and the
+        // tick anchor in mismatched capture-sequence spaces (per leg!), and
+        // the warden corrected against a stale out-ledger. Zeroed HERE, on
+        // the main thread, before any device/pump thread exists.
         L.captured.store(0, std::memory_order_relaxed);
         L.popped.store(0, std::memory_order_relaxed);
         L.streamSeeded = false;
@@ -7122,10 +5879,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
 
     // ---------------- v3.8 COM volume layer (setup on the main thread) -----
-    // Before any device starts: resolve the cable's PLAYBACK-side endpoint
-    // (name match against input_device), seed the volume atomics, resolve
-    // the out1/out2 endpoint pins and force 100%/unmuted. The watcher
-    // thread takes over both jobs once the devices are running.
+    // Before any device starts: resolve the cable's playback endpoint, seed
+    // the volume atomics, resolve + force 100%/unmuted the out pins. The
+    // watcher takes over both jobs once the devices run.
     const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     if (g_cfg.volumeFollow) {
         // v3.9: needle cascade -- volume_endpoint (ini override) first, then
@@ -7242,14 +5998,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     (void)hPower;
 
     // v6.2 BACKGROUND: detach BEFORE the banner -- a failure above already
-    // returned with the console intact and the reason on screen; from here
-    // on the run is good, so the banner, sync lines and health line all go
-    // into twinspeak.log next to the ini (the console note is the last
-    // thing the window ever shows). Everything twinspeak logs funnels
-    // through stdout (tlog), so one freopen is the whole mechanism.
-    // FreeConsole closes a console the process owns; a console shared with
-    // the shell the user ran us from simply stays theirs. Stop a background
-    // run: taskkill /IM twinspeak.exe
+    // returned with the console intact; from here the run is good and the
+    // banner/logs go to twinspeak.log next to the ini (everything funnels
+    // through stdout/tlog, so one freopen is the whole mechanism).
+    // Stop a background run: taskkill /IM twinspeak.exe
     if (!guiMode && g_cfg.background && !fgForce) {   // v6.6.0: never detach under the GUI
         size_t ds = iniPath.find_last_of("\\/");
         std::string logPath = (ds == std::string::npos)
@@ -7456,15 +6208,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     bool   driftRecal = false;                           // v6.5.8: this calibration is a re-arm
     int    wardenStreak = 0;
     unsigned long long wardenLastMs = 0;
-    // v6.2: the clock hint fires only on a SETTLED path -- at least 10 s
-    // up, a quiet measurement window (no corrections, no replays inside
-    // it), and the same-sign exceedance held across THREE consecutive
-    // windows at more than kHintPpm. Two reasons: the meter itself is
-    // quantized by the ~2 ms device switch (one period = 2000 ppm of
-    // per-window jitter, +-4000 under load), so 1000 ppm -- the v6.0/v6.1
-    // threshold -- sat BELOW the noise floor; and the startup transient
-    // (initial replays reading as -10000..-13944 ppm for a second or two)
-    // printed a false "steady clock offset" alarm seconds after launch.
+    // v6.2: the clock hint fires only on a SETTLED path -- >=10 s up, a
+    // quiet window (no corrections/replays), same-sign exceedance held
+    // across THREE windows at more than kHintPpm. The meter is quantized by
+    // the ~2 ms device switch (1000 ppm sat below the noise floor) and the
+    // startup transient used to print a false alarm.
     static constexpr long kHintPpm = 5000;   // above the one-period meter quantum
     unsigned sec = 0;
     int hintStreak = 0;
@@ -7489,12 +6237,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 off1 = (long)(((double)(A1 - a10) / (double)(C1 - p10) - 1.0) * 1000000.0);
             a10 = A1; p10 = C1;
         }
-        // v6.0 fields: held = ring + raw backlog per leg (the latency anchor
-        // is the ring target printed in the banner); off = measured clock
-        // offset ppm; und = buffer switches padded by the replay rule;
-        // drop = frames discarded by passive overwrite (raw + ring cap);
-        // corr = gated excess-drop events. v6.2: computed BEFORE the hint
-        // so the hint can require a quiet window.
+        // v6.0 fields: held = ring + raw backlog (the latency anchor is the
+        // ring target); off = measured clock offset ppm; und = replay-padded
+        // switches; drop = passive overwrite; corr = gated drops. v6.2:
+        // computed BEFORE the hint so it can require a quiet window.
         unsigned long long d0 = g_leg[0].rawDrop.load() + g_leg[0].outDrop.load(),
                            d1 = g_leg[1].rawDrop.load() + g_leg[1].outDrop.load(),
                            u0 = g_leg[0].und.load(),        u1 = g_leg[1].und.load(),
@@ -7502,9 +6248,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                            m1 = g_leg[1].cmUpmix.load(),    // v6.1 upmix-guarded blocks
                            q0 = g_leg[0].padTotal.load(),   q1 = g_leg[1].padTotal.load(); // v6.4
         // v6.4 DRIFT LEDGER: the two legs' play boundaries in capture-sequence
-        // space. Their difference IS the inter-speaker offset in cable time
-        // (1 ms = 48 frames) -- replays/pads correctly do NOT advance it,
-        // pops/drops/skips correctly DO.
+        // space; their difference IS the inter-speaker offset (1 ms = 48 fr).
+        // Replays/pads correctly do NOT advance it; pops/drops/skips DO.
         const long long st0 = (long long)g_leg[0].out.seqTail.load(std::memory_order_relaxed);
         const long long st1 = (long long)g_leg[1].out.seqTail.load(std::memory_order_relaxed);
         const bool driftOK = (st0 > 0 && st1 > 0);
@@ -7512,11 +6257,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         char driftStr[16];
         if (driftOK) snprintf(driftStr, sizeof(driftStr), "%+5.1f", driftMs);
         else         snprintf(driftStr, sizeof(driftStr), "%6s", "----");
-        // v6.0 one-shot field hint, v6.2 SETTLED-PATH GATING: a steady
-        // offset far beyond crystal level means the cable's virtual clock
-        // is free-running (VAC Clock Correction off). v6.0 is bit-exact --
-        // it never hides the offset behind a resampler; it measures it and
-        // hands you the number -- but only after the path has settled.
+        // v6.0 one-shot field hint, v6.2 SETTLED-PATH GATING: a steady offset
+        // far beyond crystal level means the cable's virtual clock is
+        // free-running (VAC Clock Correction off). v6.0 measures and reports
+        // it -- never hides it behind a resampler -- but only once settled.
         if (!ccHintDone && sec >= 10) {
             const long a0 = off0 < 0 ? -off0 : off0;
             const long a1 = off1 < 0 ? -off1 : off1;
@@ -7559,18 +6303,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
         // Field directive: "if the main audio device is either output_device1
         // or output_device2 that the DAC shuts off immediately to let the
-        // main device play." The default render endpoint is re-enumerated
-        // every tick; a needle match releases THAT leg's DAC the same
-        // second (KS: pin closed + pacer stopped; WASAPI: device freed) --
-        // nothing of ours holds the hardware, so the app playing to the
-        // default device owns it outright. When the default moves elsewhere
-        // the leg reopens through the watchdog path (chime + baseline
-        // re-arm included). While yielded: the pump parks (the raw ring
-        // overflows harmlessly, exactly like the suspend park), the
-        // watchdog skips the leg (the stale heartbeat is a deliberate
-        // release, not a fault), the collapse sentinel / stall resync /
-        // deep resync / warden corrections all hold off, and the devbuf
-        // line prints '----'. Reaction time: one health tick (<= 1 s).
+        // main device play." The default endpoint is re-checked every tick;
+        // a needle match releases THAT leg's DAC the same second (KS: pin
+        // closed + pacer stopped; WASAPI: device freed) so the default-
+        // playing app owns the hardware. When the default moves away the leg
+        // reopens via the watchdog path. While yielded: pump parked (raw ring
+        // overflows harmlessly, like the suspend park), watchdog/sentinel/
+        // resyncs/warden all hold off, devbuf prints '----'. Reaction: one
+        // health tick (<= 1 s).
         if (g_cfg.yieldDefault && !g_powerPark.load(std::memory_order_relaxed)) {
             std::string defName;
             if (defaultRenderName(&defName)) {
@@ -7594,25 +6334,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                             ma_device_uninit(&Y.dev);
                             memset(&Y.dev, 0, sizeof(Y.dev));
                         }
-                        // v6.5.15: drop the endpoint-volume pin WITH the DAC.
-                        // While this device is the system's main output its
-                        // volume is the user's; pinCheckTick must have nothing
-                        // to stomp 100%/unmuted onto. The normal reopen path
-                        // re-pins on yield release, when we own it again.
+                        // v6.5.15: drop the endpoint-volume pin WITH the DAC --
+                        // while this device is the system's main output its
+                        // volume belongs to the user; the reopen re-pins.
                         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
                         g_pin[i].id.clear();
                         Y.lastReopenMs = nowMs;   // warden settle gates stay coherent
                     } else if (!mine && Y.yielded.load(std::memory_order_relaxed)) {
                         // v6.5.16: the default moved away -- but the app that
-                        // played to this device while it WAS the default does
-                        // not re-route the instant Windows moves it; its
-                        // stream stays attached. Re-grabbing the DAC under a
-                        // live stream doubled the audio (our render plus the
-                        // stale app stream out of the same speaker) and
-                        // wedged miniaudio apps mid-re-route (field: "some
-                        // doubling issue and applications using miniaudio
-                        // ... can deadlock"). So the re-grab waits for a
-                        // QUIET device; a failed probe fails OPEN (logged).
+                        // played here while it WAS the default does not
+                        // re-route instantly; its stream stays attached.
+                        // Re-grabbing under a live stream doubled the audio
+                        // and wedged miniaudio apps. Wait for a QUIET device;
+                        // a failed probe fails OPEN (logged).
                         const int busy = foreignActiveSessions(yneedle);
                         if (busy > 0) {
                             static unsigned long long lastBusyLog[2] = { 0, 0 };
@@ -7663,11 +6397,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             colStreak0 = 0; colStreak1 = 0;
         }
         // CONSUMPTION-COLLAPSE SENTINEL: |off| beyond +-10% for 2 consecutive
-        // 1-s windows is physically impossible for a healthy 48 kHz link. A
-        // half-alive post-sleep stream ticks at a fraction of the real rate
-        // with a FRESH heartbeat -- only this meter can see it. Also catches
-        // the degraded sleep-ENTRY window (it fires before the broadcast)
-        // and any driver reset that leaves a bogus-rate thread running.
+        // seconds is impossible for a healthy 48 kHz link. A half-alive
+        // post-sleep stream ticks at a bogus rate with a FRESH heartbeat --
+        // only this meter sees it (also catches degraded sleep ENTRY and
+        // any driver reset leaving a bogus-rate thread running).
         if (g_cfg.powerGuard && !g_powerPark.load(std::memory_order_relaxed)
             && nowMs - g_bootMs > 30000) {
             // v6.5.14: a yielded leg's off meter reads garbage by design
@@ -7703,20 +6436,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             }
         }
         // ---------------- v6.5.11 STALL RESYNC ----------------
-        // A starved device thread (interrupt storm, a 100% CPU hog) trips
-        // the shortfall path -- replayFill loops the last fragment (the
-        // synthetic buzz) -- and the leg ends up BEHIND: while it starved,
-        // the pump kept feeding its ring, so stale backlog piled up above
-        // the target anchor and the stream position slipped. Recovery:
+        // A starved device thread (interrupt storm, CPU hog) trips the
+        // shortfall replay (the synthetic buzz) and slips BEHIND while the
+        // pump kept feeding its ring. Recovery:
         //   FAST: und this second + backlog above the anchor -> discard the
-        //     excess NOW (bit-exact skip; the warden's own operation, but
-        //     per-leg, on first evidence, no streak/interval wait).
-        //   DEEP: starvation 3 seconds running -> reopen the leg fresh
-        //     (resets the device-side FIFO state the storm disturbed --
-        //     exactly the S5's below-packetizer mystery layer).
-        // Gated on the drift baseline being armed (no boot/prefill or
-        // post-reopen transients) and the suspend park. Capped at 100 ms
-        // per discard; the reopen path respects the 10 s per-leg spacing.
+        //     excess NOW (bit-exact skip, no streak wait).
+        //   DEEP: 3 s of starvation -> reopen the leg fresh (resets the
+        //     device-side FIFO state the storm disturbed).
+        // Gated on the baseline being armed + the suspend park; capped at
+        // 100 ms per discard; reopen respects the 10 s per-leg spacing.
         if (driftBaseOK && !g_powerPark.load(std::memory_order_relaxed)) {
             for (int i = 0; i < 2; ++i) {
                 Leg& SLeg = g_leg[i];
@@ -7754,16 +6482,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             }
         }
         // ---------------- v6.5.12 DEEP RESYNC (optional, deep_resync_min) --
-        // The S5's below-packetizer layer (endpoint FIFO + amp DSP silicon)
-        // can deepen silently over a long session: the drift ledger stays
-        // pinned (host paths stay equal) while the center audibly lags
-        // again. No host meter sees that layer -- the devbuf line reads the
-        // HOST side of the packetizer -- so the only reset that re-primes
-        // it is a fresh reopen of the leg (the stall resync's deep path,
-        // but on a schedule instead of on starvation evidence). Gated on
-        // the baseline being armed and the suspend park; the reopen sets
-        // the usual baseline-invalidation, so the warden re-arms ~9 s
-        // later and the delay calibration carries across untouched.
+        // The S5's below-packetizer layer (endpoint FIFO + amp DSP) can
+        // deepen silently over hours: the ledger stays pinned while the
+        // center audibly lags again -- no host meter sees that layer. The
+        // only reset that re-primes it is a scheduled fresh reopen (the
+        // stall resync's deep path, on a schedule instead of evidence).
+        // Gated on the baseline + suspend park; the reopen invalidates the
+        // baseline, so the warden re-arms ~9 s later, delay intact.
         if (g_cfg.deepResyncMin && driftBaseOK
             && !g_powerPark.load(std::memory_order_relaxed)
             && !g_leg[1].yielded.load(std::memory_order_relaxed)) {
@@ -7782,23 +6507,20 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             }
         }
         // ---------------- v6.4 DRIFT WARDEN ----------------
-        // Baseline: the settled path's average drift (seconds 5..9, both
-        // heartbeats fresh, no reopen inside 5 s -- the baseline includes
-        // the ini delay offsets, i.e. the user's own delay1_ms calibration).
-        // Correction: |drift - baseline| >= drift_correct_ms held for 3
-        // consecutive windows, at most once per drift_interval_ms (the
-        // v6.5.10 five-second resync default): the late leg's ring
-        // discards its excess (bit-exact skip), the early leg is held (its
-        // last buffer replays in place). Never fires on a dead/reopening leg.
+        // Baseline: the settled path's average drift (seconds 5..9, heartbeats
+        // fresh, no reopen within 5 s -- includes the user's own delay
+        // calibration). Correction: |drift - baseline| >= drift_correct_ms
+        // held 3 windows, at most once per drift_interval_ms: the late leg's
+        // ring discards its excess (bit-exact skip), the early leg replays
+        // in place. Never fires on a dead/reopening leg.
         if (driftOK) {
             const bool settled = (nowMs - g_leg[0].lastReopenMs > 5000)
                               && (nowMs - g_leg[1].lastReopenMs > 5000)
                               && (nowMs - hbOutGet(0) < 5000)
                               && (nowMs - hbOutGet(1) < 5000);
-            // v6.5.8: a reopen (watchdog leg/capture, power-guard resume) can
-            // legitimately move the path's real latency afterwards -- the boot
-            // baseline goes stale, so it is invalidated and re-armed once the
-            // path settles again (~9 s: 5 s settle + a 4-sample average).
+            // v6.5.8: a reopen can legitimately move the path's real latency
+            // -- the baseline is invalidated and re-armed once settled again
+            // (~9 s: 5 s settle + a 4-sample average).
             if (g_driftRecalReq.exchange(false) && driftBaseOK) {
                 driftBaseOK = false;
                 driftSum = 0.0;  driftN = 0;
@@ -7908,11 +6630,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 wardenStreak = 0;
             }
         }
-        // v6.5.1: err -- the warden's own number, the live distance from the
-        // calibrated baseline. drift is the RAW inter-speaker offset (the
-        // delay calibration included); err is what the correction rule acts
-        // on. Computed here, AFTER the warden step, so the calibration lands
-        // in the same second it happens.
+        // v6.5.1: err -- the warden's own number: the live distance from the
+        // calibrated baseline (drift is the RAW offset, the delay included;
+        // err is what the correction rule acts on). Computed AFTER the
+        // warden step so the calibration lands in the same second.
         char errStr[16];
         if (driftOK && driftBaseOK)
             snprintf(errStr, sizeof(errStr), "%+5.1f", driftMs - driftBase);
@@ -7926,16 +6647,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         else
             snprintf(volStr, sizeof(volStr), "%6s", "---");
         // ---- v6.5.9 MEASURED device buffering per leg (the 'devbuf' line) ----
-        // The align line's est path is arithmetic on CONFIGURED sizes. This
-        // is the live reading, from the authoritative source per transport:
-        //   WASAPI shared    -> IAudioClient::GetCurrentPadding (the live pad)
-        //   WASAPI exclusive -> the whole device buffer (WaveRT exclusive
-        //                       drivers misreport padding as 0, and miniaudio
-        //                       pops the FULL buffer per event, so the buffer
-        //                       size IS the honest pad);
-        //   WDM-KS           -> the pacing thread's write-minus-play lead off
-        //                       the DAC position register (the live sawtooth).
-        // Telemetry only, best-effort: a failed call just prints ----.
+        // The live reading, from the authoritative source per transport:
+        // WASAPI shared = GetCurrentPadding; exclusive = the whole device
+        // buffer (WaveRT drivers misreport padding as 0 and miniaudio pops
+        // the FULL buffer per event); WDM-KS = the pacer's write-minus-play
+        // lead off the DAC position register. Telemetry only: a failed call
+        // prints ----.
         double      padMs[2]  = { 0.0, 0.0 };
         const char* padHow[2] = { "----", "----" };
         for (int i = 0; i < 2; ++i) {
