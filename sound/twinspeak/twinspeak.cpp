@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.17 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.18 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,20 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.18 THE UNFOCUS FRAME, RETIRED: field report -- losing focus still
+//            grew a full Luna caption (blue gradient, icon + title, glossy
+//            red X) over the bar, persistent. The themed frame painter runs
+//            on deactivation even with no NC area and WM_NCACTIVATE's -1,
+//            so the caption that existed to be painted is removed at the
+//            source: WS_CAPTION is gone from the style (WS_SYSMENU |
+//            WS_THICKFRAME now) -- no caption, nothing any theme can draw.
+//            The DWM drop shadow survives on WS_THICKFRAME (the canonical
+//            borderless recipe); WM_NCHITTEST answers flat HTCLIENT below
+//            the bar (THICKFRAME would otherwise offer resize edges to a
+//            fixed-size window); WM_NCACTIVATE re-blits the bar AFTER
+//            DefWindowProc as self-heal insurance. Drag stays HTCAPTION,
+//            Alt+Space and the caption right-click stay WS_SYSMENU. DSP
+//            byte-identical to v7.1.4.
 //    v7.1.17 THE FRAME THAT CANNOT FLASH: the XP-caption artifact is
 //            structural, so the fix is structural -- WM_NCCALCSIZE now
 //            returns the whole window as client (the v7.0.9 top-inset kept
@@ -2657,7 +2671,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3715,22 +3729,27 @@ static const char* kTabNames[5] = {
 };
 
 // v6.6.4: only a close button -- fixed-size layout, close already hides to the
-// tray. v7.0.9: the caption itself is custom; WS_CAPTION stays so the DWM
-// keeps treating this as a framed window (taskbar, Alt+Space, the sysmenu).
-// v7.1.17 THE FRAME THAT CANNOT FLASH: every artifact since v7.0.9 (the
-// first-drag XP bar, the activate-time recolor, v7.1.16's classic caption on
-// drag) came through ONE door -- the window had a REAL non-client area (the
-// v7.0.9 top inset kept a genuine NC strip), and whenever GDI decided to
-// classic-paint that strip (drag start, activation, NC recalcs), the XP-era
-// caption won the race no matter how many messages we swallowed. The strip
-// no longer exists: WM_NCCALCSIZE returns the WHOLE window as client, so
-// there is no NC pixel anywhere for any frame painter to draw into. The bar
-// is the client's top 31 px -- ours forever, structurally. The DWM owns the
-// frame chrome again: it composites its own Win10 drop shadow around the
-// window rect (a region-shaped window cannot carry it -- v7.1.0's rounding
-// region is gone), and the corners are pinned SQUARE (DWMWCP_DONOTROUND;
-// pre-Win11 ignores the call and is square anyway).
-static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
+// tray. v7.0.9: the caption itself is custom. v7.1.17 THE FRAME THAT CANNOT
+// FLASH: WM_NCCALCSIZE returns the WHOLE window as client -- no NC pixel
+// anywhere for any frame painter to draw into; the bar is the client's top
+// 31 px, ours forever, structurally.
+// v7.1.18 THE UNFOCUS FRAME, RETIRED AT THE SOURCE: field report -- on
+// losing focus the window still grew a full Luna caption (blue gradient,
+// icon + title text, glossy red close button) over the bar, PERSISTENT.
+// The window had no NC area, WM_NCACTIVATE answered DefWindowProc with
+// lParam -1, WM_NCPAINT/0x00AE/0x00AF were all swallowed -- and the themed
+// frame painter still ran on deactivation (machines with customized visual
+// styles take that path regardless of the -1 convention). The caption
+// existed to be painted because the window still carried WS_CAPTION: any
+// themed frame engine may paint it whenever it likes. So the style goes:
+// no WS_CAPTION, no caption FOR ANYONE to draw -- the artifact becomes
+// structurally impossible, same argument as v7.1.17's NC removal. The DWM
+// shadow survives on WS_THICKFRAME (the canonical borderless recipe:
+// WS_POPUP/WS_SYSMENU + WS_THICKFRAME + WM_NCCALCSIZE 0 = the standard
+// Win10 drop shadow). WS_SYSMENU stays for Alt+Space and the HTCAPTION
+// right-click sysmenu; the window is fixed-size, so resize edges are
+// meaningless -- WM_NCHITTEST answers HTCLIENT below the bar.
+static const DWORD kGuiFrame = WS_SYSMENU | WS_THICKFRAME;
 
 // v7.0.9 THE CUSTOM TITLEBAR (v7.1.17: now a client strip): the top 31 px of
 // the CLIENT is our own bar -- theme colors painted directly, so a theme
@@ -5605,8 +5624,9 @@ static bool guiCreateRealWindow() {
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
     {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
-        // The window keeps WS_CAPTION and carries NO region, so the DWM
-        // composites its standard Win10 drop shadow around the window rect
+        // The window carries NO region (v7.1.18: and no WS_CAPTION -- the
+        // shadow lives on WS_THICKFRAME), so the DWM composites its standard
+        // Win10 drop shadow around the window rect
         // -- the same shadow every default white/black titlebar window
         // gets. Corners are pinned SQUARE (Win11 rounds by default; the
         // call fails harmlessly pre-Win11, which is square anyway). No
@@ -5735,7 +5755,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f + kCapH, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.17  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.18  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8 + kCapH, 866, 30 + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -5809,17 +5829,28 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         guiPaintBar(w);                 // the bar is ours; never the classic frame
         return 0;
     case WM_NCACTIVATE:
-        // lParam -1: DefWindowProc must not repaint the (retired) classic
-        // frame on activation changes; the bar itself is activation-blind.
-        guiPaintBar(w);
-        return DefWindowProcA(w, msg, wp, -1);
+        // lParam -1: DefWindowProc must not repaint the (retired) frame on
+        // activation changes. v7.1.18 ORDER FIX: the bar used to be blitted
+        // BEFORE DefWindowProc -- on themed machines the deactivation path
+        // could still land a Luna caption over it, and the stale frame
+        // survived (nothing repainted after). Now DefWindowProc runs first
+        // and the bar is re-blitted AFTER it -- whatever the system drew in
+        // the message gets overwritten by our one blit. (With WS_CAPTION
+        // gone there is no caption at all; this is pure self-heal insurance.)
+        {
+            const LRESULT r = DefWindowProcA(w, msg, wp, -1);
+            guiPaintBar(w);
+            return r;
+        }
     case WM_NCHITTEST: {
         // v7.1.17: the bar is CLIENT pixels now, so the drag answer is
         // EXPLICIT (DefWindowProc's frame logic no longer owns any strip).
         // Top 31 px: the close slot stays HTCLIENT (clicks + hover stay
         // ours), everything else is HTCAPTION -- drag, snap, Alt+Space and
-        // the WS_SYSMENU right-click all work through it. Below the bar:
-        // DefWindowProc (HTCLIENT everywhere, the window is fixed-size).
+        // the WS_SYSMENU right-click all work through it. v7.1.18: below
+        // the bar the answer is a flat HTCLIENT -- the style now carries
+        // WS_THICKFRAME, and DefWindowProc would answer resize hittests at
+        // the edges (HTBOTTOMRIGHT & co.) for a window that cannot resize.
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT wr; GetWindowRect(w, &wr);
         if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH) {
@@ -5827,7 +5858,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 return HTCLIENT;
             return HTCAPTION;
         }
-        break; }
+        return HTCLIENT; }
     case WM_NCMOUSEMOVE:
         if (g_capHot) { g_capHot = false; guiPaintBar(w); }   // left the X onto the drag area
         break;
@@ -7151,7 +7182,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.17       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.18       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
