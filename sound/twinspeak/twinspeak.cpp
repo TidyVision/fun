@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.0.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,22 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.1  tab labels are the BUTTONS' pixels: GDI+ single-bit grid-fit
+//            (the exact WM_DRAWITEM renderer) into a transparent ARGB layer
+//            uploaded as a D2D bitmap over the GPU geometry -- DirectWrite
+//            has no grid-fit aliasing and never matched. Inactive labels
+//            read cText (the resting button color) -- cDim washed out on
+//            the dark themes; active ramps cText -> cAccent. DSP
+//            byte-identical to v7.1.0.
+//    v7.1.0  window chrome polish: the XP-era caption flash on the first
+//            drag is suppressed (undocumented WM_NCUAHDRAWCAPTION/FRAME),
+//            the window corners are rounded (DWM round preference -- true
+//            antialiased; GDI region fallback on Win10), the tab labels
+//            render aliased/crisp on both the GPU and GDI+ passes, the
+//            active EQ preset's 2 px accent ring draws on an inset-2 path
+//            (its outer half no longer shaves on the item edge), and the
+//            custom bar carries "TwinSpeak" in a dark-blue -> teal
+//            vertical gradient. DSP byte-identical to v7.0.9.
 //    v7.0.9  custom self-painted titlebar (DWM caption retired: theme colors
 //            land at click time, no caption text), buffered single-blit frame
 //            paint (watermark flicker gone), pending renders flushed before
@@ -2469,7 +2485,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3363,7 +3379,8 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fCapX = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr;   // g_fCapX: Marlett close glyph (v7.0.9)
+                 g_fSml = nullptr, g_fMono = nullptr,
+                 g_fTitle = nullptr;   // v7.1.0: the bar's "TwinSpeak" title
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -3430,6 +3447,8 @@ static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
 // (DWMNCRP_DISABLED, set in guiMain) so nothing fights the bar.
 static const int  kCapH = 31;
 static bool       g_capHot = false;   // mouse over the close glyph
+static bool       g_winRegionFallback = false;   // v7.1.0: no DWM rounding -> GDI region
+static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
 static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
     RECT wr; GetWindowRect(w, &wr);
     const RECT r = { (wr.right - wr.left) - 46, 0, wr.right - wr.left, kCapH };
@@ -3448,6 +3467,27 @@ static void guiPaintBar(HWND w) {
     FillRect(dc, &ln, g_brPanel2);
     const RECT cl = guiCapCloseRect(w);
     if (g_capHot) { RECT hf = cl; FillRect(dc, &hf, g_brPanel2); }
+    // v7.1.0 THE BAR'S TITLE: "TwinSpeak" on the left, filled with a TRUE
+    // vertical linear gradient -- very dark blue (top) -> teal (bottom) --
+    // same LinearGradientBrush technique as the watermark. GDI+ on the
+    // window DC; antialias grid-fit keeps the glyphs clean at 14 px.
+    if (g_fTitle) {
+        Gdiplus::Graphics g(dc);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        Gdiplus::Font tf(dc, g_fTitle);
+        const Gdiplus::RectF tr(12.0f, 3.0f, 220.0f, (Gdiplus::REAL)(kCapH - 7));
+        // the gradient spans the text line itself: very dark blue top,
+        // teal bottom. Left-aligned, vertically centered in the bar.
+        Gdiplus::LinearGradientBrush gb(
+            tr, Gdiplus::Color(255, 8, 16, 54),    // very dark blue, top
+                Gdiplus::Color(255, 0, 130, 130),  // teal, bottom
+            Gdiplus::LinearGradientModeVertical);
+        Gdiplus::StringFormat sf;
+        sf.SetAlignment(Gdiplus::StringAlignmentNear);
+        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        g.DrawString(kCapTitle, -1, &tf, tr, &sf, &gb);
+    }
     if (g_fCapX) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, guic::cText);
@@ -3478,6 +3518,11 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+    // v7.1.0: the titlebar's product name -- Segoe UI Semibold 14 px, drawn
+    // in the dark-blue -> teal vertical gradient (see guiPaintBar).
+    g_fTitle = CreateFontA(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
 }
 
@@ -3536,11 +3581,12 @@ static Gdiplus::Color GCol(COLORREF c, BYTE a = 255) {
 }
 
 // rounded-rect path out of four arcs -- the AA replacement for guiRoundRect
-static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& rin, int rad) {
+static Gdiplus::GraphicsPath* guiRoundPathInset(const Gdiplus::Rect& rin, int rad, int inset) {
     // v6.6.7: the path is inset 1px inside the item rect -- a stroke ON the
     // boundary loses its outer half to the control DC clip; inset, the full
     // stroke shows and its AA blends against our own dark erase.
-    const Gdiplus::Rect r(rin.X + 1, rin.Y + 1, rin.Width - 2, rin.Height - 2);
+    const Gdiplus::Rect r(rin.X + inset, rin.Y + inset,
+                          rin.Width - 2 * inset, rin.Height - 2 * inset);
     Gdiplus::GraphicsPath* p = new Gdiplus::GraphicsPath();
     const int d = rad * 2;
     p->AddArc(r.X, r.Y, d, d, 180, 90);
@@ -3549,6 +3595,9 @@ static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& rin, int rad) {
     p->AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
     p->CloseFigure();
     return p;
+}
+static Gdiplus::GraphicsPath* guiRoundPath(const Gdiplus::Rect& rin, int rad) {
+    return guiRoundPathInset(rin, rad, 1);
 }
 
 static std::wstring guiWide(const char* s) {
@@ -4478,7 +4527,10 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
     if (ok) {   // v7.0.7: the flip variable is gone -- bitblt model only
         g_dctx->SetDpi(96.0f, 96.0f);    // DIPs == pixels: the geometry is authored in px
         g_dctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);  // v7.0.7: explicit AA
-        g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        // v7.1.0: the tab labels render ALIASED (field request -- crisp
+        // pixel glyphs; ClearType's subpixel softness is retired here).
+        // The GDI+ fallback pass matches (SingleBitPerPixelGridFit).
+        g_dctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_ALIASED);
         // v7.0.7: bitblt model, ONE buffer, Present(0,0) -- see the g_tabWide
         // block: flip on a child window fought GDI for the HWND's pixels.
         DXGI_SWAP_CHAIN_DESC1 sd = {};
@@ -4544,6 +4596,43 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
              warp ? ", WARP adapter" : "");
     }
     return true;
+}
+
+// ---- v7.1.1: the strip's LABEL LAYER -- the buttons' exact renderer ---------
+// The six labels are rasterized by the same code path as WM_DRAWITEM's
+// buttons (guiAAString on GDI+, single-bit grid-fit -- hard, hinted, aliased
+// pixels) into a transparent ARGB layer. The GPU pass uploads that layer as
+// a premultiplied D2D bitmap (no GDI touches the swap-chain HWND); the GDI+
+// legacy pass draws the same strings with the same hint directly. Both paths
+// now show the buttons' text look, byte for byte. Colors: inactive = cText
+// (the resting button color -- cDim washed out on the dark themes), active
+// ramps cText -> cAccent with the fade.
+static Gdiplus::Bitmap*   g_lblBmp = nullptr;
+static Gdiplus::Graphics* g_lblG   = nullptr;
+static int                g_lblW = 0, g_lblH = 0;
+static void guiStripLabelsRelease() {
+    delete g_lblG;  g_lblG  = nullptr;
+    delete g_lblBmp; g_lblBmp = nullptr;
+    g_lblW = 0; g_lblH = 0;
+}
+static Gdiplus::Bitmap* guiStripLabelLayer(int cw, int ch, double fs, HDC dc) {
+    if (!g_lblBmp || g_lblW != cw || g_lblH != ch) {
+        guiStripLabelsRelease();
+        g_lblBmp = new Gdiplus::Bitmap(cw, ch, PixelFormat32bppARGB);
+        if (g_lblBmp) g_lblG = new Gdiplus::Graphics(g_lblBmp);
+        if (!g_lblBmp || !g_lblG) { guiStripLabelsRelease(); return nullptr; }
+        g_lblW = cw; g_lblH = ch;
+    }
+    g_lblG->SetTextRenderingHint(Gdiplus::TextRenderingHintSingleBitPerPixelGridFit);
+    g_lblG->Clear(Gdiplus::Color(0, 0, 0, 0));
+    for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+        const bool act = (i == g_tab);
+        const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+        guiAAString(*g_lblG, dc, trc, kTabNames[i],
+                    act ? guiLerpRGB(guic::cText, guic::cAccent, fs) : guic::cText,
+                    g_fUIb, 0);
+    }
+    return g_lblBmp;
 }
 
 static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4617,20 +4706,48 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_dctx->DrawRoundedRectangle(rr, g_d2dBr, 1.0f);
                 }
             }
-            for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
-                // THE LABELS: DirectWrite glyphs on the GPU. ClearType, same
-                // center/center layout and same color math as the GDI+ pass.
-                // v7.0.7: the wide strings are built once, the brush is the
-                // shared cached one -- zero per-frame allocations.
-                const bool act = (i == g_tab);
-                if (g_tabWide[i].empty()) g_tabWide[i] = guiWide(kTabNames[i]);
-                TSBRCOL(act ? guiLerpRGB(guic::cDim, guic::cAccent, fs)
-                            : guic::cDim, 255);
-                const D2D1_RECT_F tr = {
-                    (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
-                    (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
-                g_dctx->DrawText(g_tabWide[i].c_str(),
-                                 (UINT32)g_tabWide[i].size(), g_dwfTab, tr, g_d2dBr);
+            // v7.1.1 THE LABELS ARE THE BUTTONS' PIXELS: the labels are
+            // rasterized by the exact WM_DRAWITEM renderer (GDI+ single-bit
+            // grid-fit) into a transparent ARGB layer, uploaded as a
+            // premultiplied D2D bitmap and blended over the GPU geometry.
+            // D2D/DirectWrite has no grid-fit aliasing, so native text could
+            // never match the buttons -- borrowing their rasterizer does.
+            // Colors: inactive labels read cText now (the resting button
+            // color) -- cDim washed out on the dark themes; the active label
+            // ramps cText -> cAccent with the fade.
+            bool labelsDrawn = false;
+            if (Gdiplus::Bitmap* lb = guiStripLabelLayer(cw, ch, fs, dc)) {
+                Gdiplus::BitmapData bd;
+                const Gdiplus::Rect lr(0, 0, cw, ch);
+                if (lb->LockBits(&lr, Gdiplus::ImageLockModeRead,
+                                 PixelFormat32bppPARGB, &bd) == Gdiplus::Ok) {
+                    const D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          D2D1_ALPHA_MODE_PREMULTIPLIED));
+                    ID2D1Bitmap* bm = nullptr;
+                    if (SUCCEEDED(g_dctx->CreateBitmap(
+                            D2D1::SizeU((UINT32)cw, (UINT32)ch),
+                            bd.Scan0, (UINT32)bd.Stride, &bp, &bm)) && bm) {
+                        g_dctx->DrawBitmap(bm,
+                            D2D1::RectF(0.0f, 0.0f, (float)cw, (float)ch));
+                        bm->Release();
+                        labelsDrawn = true;
+                    }
+                    lb->UnlockBits(&bd);
+                }
+            }
+            if (!labelsDrawn) {   // layer/upload failed: native text fallback
+                for (int i = 0, fx = KSTRIP_PAD; i < 6; fx += kTabW[i] + 4, ++i) {
+                    const bool act = (i == g_tab);
+                    if (g_tabWide[i].empty()) g_tabWide[i] = guiWide(kTabNames[i]);
+                    TSBRCOL(act ? guiLerpRGB(guic::cText, guic::cAccent, fs)
+                                : guic::cText, 255);
+                    const D2D1_RECT_F tr = {
+                        (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
+                        (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
+                    g_dctx->DrawText(g_tabWide[i].c_str(),
+                                     (UINT32)g_tabWide[i].size(), g_dwfTab, tr, g_d2dBr);
+                }
             }
             #undef TSBRCOL
             const HRESULT ehr = g_dctx->EndDraw(nullptr, nullptr);
@@ -4653,6 +4770,9 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             FillRect(buf, &rc, g_brBg);
             Gdiplus::Graphics g(buf);
             g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            // v7.1.0: tab labels aliased here too -- the GPU pass's ALIASED
+            // mode and this hint render the same crisp glyphs.
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintSingleBitPerPixelGridFit);
             const double fs2 = fs;
             int fxs = KSTRIP_PAD;
             for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
@@ -4687,8 +4807,9 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 delete p;
                 const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+                // v7.1.1: cText base -- same color math as the label layer
                 guiAAString(g, buf, trc, kTabNames[i],
-                            act ? guiLerpRGB(guic::cDim, guic::cAccent, fs) : guic::cDim,
+                            act ? guiLerpRGB(guic::cText, guic::cAccent, fs) : guic::cText,
                             g_fUIb, 0);
             }
             BitBlt(dc, 0, 0, cw, ch, buf, 0, 0, SRCCOPY);
@@ -4923,7 +5044,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.0.9  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.1  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     guiWatermark(g);
@@ -4955,6 +5076,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // custom titlebar; every child coordinate keeps its old meaning.
         if (wp) { ((RECT*)lp)->top += kCapH; return 0; }
         break;
+    case 0x00AE:   // WM_NCUAHDRAWCAPTION (undocumented)
+    case 0x00AF: { // WM_NCUAHDRAWFRAME   (undocumented)
+        // v7.1.0 THE FIRST-DRAG XP BAR: on the first drag (and some
+        // activations) Windows paints its XP-era themed caption through
+        // these two messages -- NOT through WM_NCPAINT -- so the retired
+        // caption flashed back over our bar exactly once per session.
+        // Both are answered with 0: the bar is ours, nobody else draws it.
+        return 0; }
     case WM_NCPAINT:
         guiPaintBar(w);                 // the bar is ours; never the classic frame
         return 0;
@@ -5142,7 +5271,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // the erased surface. Fills survive only where they mean something:
         // the pressed feedback (cPanelHi) and the active EQ preset (cPanel2
         // under the 2 px accent ring).
-        Gdiplus::GraphicsPath* p = guiRoundPath(grc, accentBtn ? 11 : 6);
+        // v7.1.0 THE RING SHAVE: the active preset's 2 px ring rode the
+        // inset-1 path, so its outer half ran past the item edge and the
+        // control clipped it -- a flat shaved spot on all four edges (the
+        // "selectors still clip" report; v7.0.6's fix covered 1 px strokes
+        // only). The ring now draws on its own inset-2 path: the stroke
+        // spans 1..3 px inside the face, its AA tail fully owned.
+        Gdiplus::GraphicsPath* p = guiRoundPathInset(grc, accentBtn ? 11 : 6,
+                                                     accentBtn ? 2 : 1);
         if (pressed || accentBtn) {
             Gdiplus::SolidBrush fb(GCol(pressed ? guic::cPanelHi : guic::cPanel2));
             g.FillPath(&fb, p);
@@ -5481,15 +5617,27 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // v7.0.9 THE CUSTOM TITLEBAR, part 2: DWM's own caption drawing is
     // switched off (DWMWA_NCRENDERING_POLICY -> DWMNCRP_DISABLED) so its
     // text/buttons/dark-light recolor can never fight the bar we paint.
-    // Cost: no DWM shadow/border -- a flat themed rectangle, consistent
-    // with the flat UI.
+    // v7.1.0 ROUNDED WINDOW: DWMWA_WINDOW_CORNER_PREFERENCE -> DWMWCP_ROUND
+    // (Win11) -- DWM clips the window to a rounded rect with ANTIALIASED
+    // corners, the only true-AA rounding a plain HWND can get. On Win10 the
+    // attribute is unknown and the call fails -> a GDI round-rect region as
+    // the flat-edged fallback (same shape, aliased -- regions cannot AA).
     {
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+        bool rounded = false;
         if (dwmSet) {
             const int off = 1;   // DWMNCRP_DISABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof(off));
+            const int round = 2; // DWMWCP_ROUND
+            rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                                       &round, sizeof(round)));
+        }
+        if (!rounded) {
+            // applied after the re-measure below (the region wants the final
+            // window size); flagged here so the fallback runs exactly once.
+            g_winRegionFallback = true;
         }
     }
     // v7.0.9: the NCCALCSIZE top inset (kCapH) replaced the system caption;
@@ -5502,6 +5650,13 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                          (r.right - r.left) + (KCLI_W - rc.right),
                          (r.bottom - r.top) + (KCLI_H - rc.bottom),
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    // v7.1.0: the Win10 region fallback -- the window is final-sized now, so
+    // the round-rect region matches it exactly. SetWindowRgn owns the HRGN.
+    if (g_winRegionFallback) {
+        RECT wr; GetWindowRect(g_hwnd, &wr);
+        HRGN rg = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1, 16, 16);
+        if (rg) SetWindowRgn(g_hwnd, rg, FALSE);
     }
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
@@ -6023,7 +6178,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.9        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.1        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
