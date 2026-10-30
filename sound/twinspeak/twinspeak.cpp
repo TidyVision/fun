@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.13 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -21,23 +21,42 @@
 //    exclusive with logged fallback. Exclusive bypasses the volume slider --
 //    hence volume_follow + pin_outputs. clock_sync, drift_guard, power_guard,
 //    yield_default, center_gate, center_upmix_guard, background: always on.
+//    Drift corrections: the warden (baseline at seconds 5..9, >=
+//    drift_correct_ms held 3 s, drift_interval_ms spacing) plus a
+//    FIRST-SECOND fast tier at 10x that cadence (v7.1.14).
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.1.13 SNAP -- THE 100 MS ARRIVAL LOCK: the tick kept showing the
-//            leg1/leg2 flam because two machines never saw it. The coarse
-//            start align pads from a STAMP MODEL; whatever residual it
-//            leaves is a constant offset the seq ledger reads as FLAT, the
-//            baseline calibration (seconds 5..9) ABSORBS it, and the warden
-//            (>= 5 ms, 3 s streak, 5 s spacing) never touches sub-5 ms slow
-//            drift. Now a frame-exact snapCorrect() runs in two tiers: the
-//            START snap samples the ledger against the ini's own delay
-//            model for 100 ms right after prefill drains and pins it before
-//            the baseline can bake a residual in (and logs the slow-drift
-//            slope as evidence), and the health loop's FINE tier snaps any
-//            |err| in [0.5 ms, drift_correct_ms) once per 2 s cooldown,
-//            verified across its own 100 ms window. Above the warden's
-//            threshold the warden stays the owner -- no double-fire.
-//            Transport-level only; DSP byte-identical to v7.1.4.
+//    v7.1.15 GUI POLISH, THE FIELD'S FOUR: the center-EQ note carried
+//            17 text rows in a 13-row box -- the STATIC clipped its
+//            own tail; re-wrapped short, full height, nothing cuts
+//            off. SAVE TO SLOT moved from column B to right below
+//            the sliders with its own line ("makes sure this slot's
+//            current modifications persist across sessions"). The
+//            ON/OFF pills re-inked: ON = full accent face + the
+//            dark on-accent ink (the old bright-on-accentDk label
+//            measured ~3.3:1), OFF border steps cLine -> cDim so the
+//            pill reads on every theme. The window shadow is
+//            EXPLICIT: DwmExtendFrameIntoClientArea 1 px +
+//            NCRENDERING_POLICY = ON -- the documented triggers a
+//            corner preference alone does not guarantee. Plus the
+//            settings page's keep-alive note says 40 Hz @ 0.1% now
+//            (stale since v7.1.12). GUI-only; DSP byte-identical
+//            to v7.1.4.
+//    v7.1.14 THE FIRST SECOND AT 10X: v7.1.13's snap is REVERTED -- the
+//            field still measured the start offset with it in. Instead,
+//            the drift CORRECTION itself runs ten times faster for the
+//            first 1000 ms of a run, then returns to its normal speed.
+//            The warden's steady-state gates (baseline armed at seconds
+//            5..9, |err| >= drift_correct_ms held 3 s, corrections 5 s
+//            apart) are all wide open exactly when the tick test looks,
+//            so the fast tier samples the ledger every 100 ms against
+//            the ini's own delay model, decides in 3 fast windows
+//            (300 ms instead of 3 s), and re-fires every 500 ms (instead
+//            of 5 s) with the warden's own bit-exact skip/replay-pad
+//            table -- the startup residual is re-pinned before the
+//            baseline can absorb it. Same trigger distance as the
+//            warden; hardcoded (no ini key, no UI). Transport-level
+//            only; DSP byte-identical to v7.1.4.
 //    v7.1.12 KEEP-ALIVE RETUNE: the out2 keep-alive tone is back at 40 Hz
 //            and up to 0.001 (-60 dBFS) -- the field's call: 1 Hz @ 0.0001
 //            (-80 dBFS) was too little for some amps' sleep timers. Still
@@ -452,19 +471,16 @@ static constexpr size_t   kKsMarginFrames     = 48;     // 1 ms above (bite + bu
 static constexpr unsigned kWardenStreakNeeded  = 3;
 static constexpr size_t   kWardenMaxPadFrames  = 4800;   // 100 ms @ 48 kHz
 
-// v7.1.13 SNAP: the fine-grained arrival lock. The warden owns the COARSE
-// band (|err| >= drift_correct_ms, held 3 s, spaced drift_interval_ms); the
-// snap owns everything FINER: any measurable arrival skew >= kSnapErrMs is
-// corrected frame-exact and then VERIFIED inside a kSnapWindowMs window.
-// Two tiers fire it: the START snap (the first 100 ms of a run, against the
-// ini's own delay model, so the baseline calibration cannot absorb a startup
-// residual) and the health loop's runtime snap (the slow drift the warden's
-// coarse gate never sees). Hardcoded: the field asked for it built in.
-static constexpr float    kSnapErrMs       = 0.5f;   // fine-tier trigger distance
-static constexpr unsigned kSnapCooldownMs  = 2000;   // min spacing between snaps
-static constexpr unsigned kSnapWindowMs    = 100;    // the snap's measure/verify window
-static constexpr unsigned kSnapPollMs      = 5;      // ledger sample cadence inside it
-static constexpr int      kSnapMaxAttempts = 3;      // corrections per snap event
+// v7.1.14 FIRST-SECOND FAST TIER: the drift corrector at 10x the warden's
+// cadence, for the first 1000 ms of a run only. Same trigger distance the
+// warden uses (drift_correct_ms), same bit-exact skip/replay-pad table --
+// ten times the speed: 100 ms ledger samples (the health tick is 1000 ms),
+// a 3-window decision (300 ms instead of 3 s), 500 ms spacing (instead of
+// drift_interval_ms). Hardcoded: no ini key, no UI.
+static constexpr unsigned kFastTierMs        = 1000;  // the fast lane's whole life
+static constexpr unsigned kFastTierPollMs    = 100;   // ledger sample cadence (10x the tick)
+static constexpr unsigned kFastTierStreak    = 3;     // fast windows before a fire
+static constexpr unsigned kFastTierSpacingMs = 500;   // drift_interval_ms / 10
 
 struct Config {
     float       out1Ms         = 5.0f;
@@ -1739,74 +1755,6 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
     if (stamped) g_tickWrites[idx].fetch_add(1, std::memory_order_relaxed);
 }
 
-// v7.1.13 SNAP: one frame-exact arrival correction, shared by the start snap
-// and the health loop's fine tier. errMs is the seq-ledger distance from the
-// target (warden sign convention: > 0 = leg1 early / leg2 late, drift above
-// target). Mechanically the warden's own direction table -- skip the late
-// leg's REAL excess, or in-place replay-pad the early leg -- but at FRAME
-// precision instead of the warden's ms-scale chunk, and pads are clamped to
-// the same per-callback trim headroom the start aligner uses (target + burst
-// + period is the drop line; a pad under burst + period - 96 can never trip
-// it). Returns the frames actually applied (0 = nothing safe to correct).
-static long long snapCorrect(double errMs, const char* tag) {
-    long long errFr = (long long)(errMs * 48.0 + (errMs >= 0.0 ? 0.5 : -0.5));
-    if (!errFr) return 0;
-    const long long dpt0 = (long long)g_leg[0].out.count() - (long long)g_leg[0].targetFrames;
-    const long long dpt1 = (long long)g_leg[1].out.count() - (long long)g_leg[1].targetFrames;
-    if (errFr > 0 && dpt1 > 0) {          // leg2 late: give the real excess back
-        Leg& W = g_leg[1];
-        long long x = errFr < dpt1 ? errFr : dpt1;
-        const long long lvl = (long long)W.out.count();
-        if (x > lvl) x = lvl;
-        if (x > 0) {
-            W.out.discardOldest((size_t)x);   // seqTail advances: a true skip
-            W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-            tlog("[twinspeak] %-11s: leg2 skipped %lld fr (%.2f ms) of excess -- arrival re-pinned\n",
-                 tag, x, (double)x * 1000.0 / (double)kSampleRate);
-            return x;
-        }
-    } else if (errFr > 0 && dpt0 < 0) {   // leg1 early: hold it (in-place replay)
-        Leg& W = g_leg[0];
-        long long x = (-errFr < -dpt0) ? -errFr : -dpt0;
-        const long long head = (long long)g_capBurstFrames + (long long)g_periodFrames[0] - 96;
-        if (x > head) x = head;
-        if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
-        if (x > 0) {
-            W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
-            W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-            tlog("[twinspeak] %-11s: leg1 replay-padded %lld fr (%.2f ms) -- arrival re-pinned\n",
-                 tag, x, (double)x * 1000.0 / (double)kSampleRate);
-            return x;
-        }
-    } else if (errFr < 0 && dpt0 > 0) {   // leg1 late: give the real excess back
-        Leg& W = g_leg[0];
-        long long x = -errFr < dpt0 ? -errFr : dpt0;
-        const long long lvl = (long long)W.out.count();
-        if (x > lvl) x = lvl;
-        if (x > 0) {
-            W.out.discardOldest((size_t)x);
-            W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
-            tlog("[twinspeak] %-11s: leg1 skipped %lld fr (%.2f ms) of excess -- arrival re-pinned\n",
-                 tag, x, (double)x * 1000.0 / (double)kSampleRate);
-            return x;
-        }
-    } else if (errFr < 0 && dpt1 < 0) {   // leg2 early: hold it (in-place replay)
-        Leg& W = g_leg[1];
-        long long x = (-errFr < -dpt1) ? -errFr : -dpt1;
-        const long long head = (long long)g_capBurstFrames + (long long)g_periodFrames[1] - 96;
-        if (x > head) x = head;
-        if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
-        if (x > 0) {
-            W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
-            W.wardenPads.fetch_add(1, std::memory_order_relaxed);
-            tlog("[twinspeak] %-11s: leg2 replay-padded %lld fr (%.2f ms) -- arrival re-pinned\n",
-                 tag, x, (double)x * 1000.0 / (double)kSampleRate);
-            return x;
-        }
-    }
-    return 0;
-}
-
 // ----------------------------------------------------------------- pumps ----
 // v6.0: the pump is a dumb, fast MOVER (device thread is the master, the
 // producer never corrects anything): raw ring -> master volume -> per-leg
@@ -2765,7 +2713,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.13 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3041,6 +2989,11 @@ static void writeTemplate(const char* path) {
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
         "drift_interval_ms = 5000\n"
+        "\n"
+        "; v7.1.14: the FIRST SECOND of every run corrects at 10x this\n"
+        "; cadence -- 100 ms ledger samples, a 300 ms decision, 500 ms\n"
+        "; spacing, hardcoded -- against the ini's own delay model, so a\n"
+        "; startup residual is re-pinned before the baseline can absorb it.\n"
         "\n"
         "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
         "; thread starves (an interrupt storm, a 100%% CPU hog), the shortfall\n"
@@ -4974,7 +4927,7 @@ static void guiBuildPages(HWND w) {
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
     note(w, COLB_X, 226,
-         "The keep-alive tone is BUILT IN (1 Hz @ 0.01%): out2 never sees\n"
+         "The keep-alive tone is BUILT IN (40 Hz @ 0.1%): out2 never sees\n"
          "digital silence, so the center speaker stays awake. POST-MIX: the\n"
          "tone and the chime are summed in the out2 OUTPUT callbacks, after\n"
          "the mix -- they never enter the stream an OBS capture records.\n"
@@ -4992,29 +4945,48 @@ static void guiBuildPages(HWND w) {
         snprintf(nm, sizeof(nm), "SLOT %d", i + 1);
         regPage(mkBtn(w, IDC_SLOT1 + i, COLA_X + i * 81, 148, 76, 26, nm));
     }
-    HWND sv = mkBtn(w, IDC_EQSAVE, COLB_X, 66, 150, 26, "SAVE TO SLOT");
+    // v7.1.15: SAVE TO SLOT lives under the sliders now (was column B,
+    // detached from what it saves) -- the button sits directly beneath
+    // the curve it writes, with its own one-line description.
+    HWND sv = mkBtn(w, IDC_EQSAVE, COLA_X, 366, 400, 26, "SAVE TO SLOT");
     regPage(sv);                       // v7.1.9: page 4 only
+    note(w, COLA_X, 396,
+         "makes sure this slot's current modifications persist across sessions.", 2);
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
     mkSlider(w, IDC_SLD_GAIN, COLA_X, 276, 400, -24, 24);
     mkLabel(w, IDC_LBL_Q, COLA_X, 312, 400, "SHARPNESS (Q)", g_fUIb, 16);
     mkSlider(w, IDC_SLD_Q, COLA_X, 330, 400, 0, 1000);
-    note(w, COLB_X, 96,
-         "One peaking band on ch3, applied inside the engine's out2 mix path --\n"
-         "out2 ONLY. The mains (out1) are never touched.\n\n"
-         "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
-         "EQs (Equalizer APO and friends) can never see this stream. The\n"
-         "boost lives here instead.\n\n"
-         "SLOTS: left-click applies a slot and ARMS it -- the face stays\n"
-         "accented while you tweak. Adjust the sliders, press SAVE TO SLOT\n"
-         "and the curve + the EQ pill land in the armed slot (ini updated\n"
-         "at once). Right-click a slot saves straight into it. Slot 1\n"
-         "ships with 387 Hz / +3.5 dB / Q 0.30. The pill above is the off\n"
-         "switch -- EQ off = the bit-exact path.\n\n"
-         "The boost stacks with gain_center; the mix clamps at full scale,\n"
-         "so loud center peaks may clip first -- lower gain_center if they\n"
-         "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 13);
+    // v7.1.15 THE NOTE THAT ATE ITS OWN TAIL: the old note carried 17
+    // text rows inside a 13-row box -- a STATIC renders every line it
+    // is handed and simply stops at the control's bottom edge, so the
+    // final paragraphs were cut off. The text is re-wrapped to lines a
+    // 406 px column can never wrap (all <= 57 chars) and the control is
+    // sized for the TRUE row count. Nothing clips.
+    note(w, COLB_X, 66,
+         "One peaking band on ch3, applied inside the engine's\n"
+         "out2 mix path -- out2 ONLY. The mains (out1) are never\n"
+         "touched.\n"
+         "\n"
+         "A KS/WaveRT leg bypasses the Windows audio engine, so\n"
+         "system-wide EQs (Equalizer APO and friends) can never\n"
+         "see this stream. The boost lives here instead.\n"
+         "\n"
+         "SLOTS: left-click applies a slot and ARMS it -- the\n"
+         "face stays accented while you tweak. Adjust the\n"
+         "sliders, press SAVE TO SLOT and the curve + the EQ pill\n"
+         "land in the armed slot (ini updated at once). SAVE TO\n"
+         "SLOT makes sure this slot's current modifications\n"
+         "persist across sessions. Right-click a slot saves\n"
+         "straight into it. Slot 1 ships with 387 Hz / +3.5 dB /\n"
+         "Q 0.30. The pill above is the off switch -- EQ off =\n"
+         "the bit-exact path.\n"
+         "\n"
+         "The boost stacks with gain_center; the mix clamps at\n"
+         "full scale, so loud center peaks may clip first --\n"
+         "lower gain_center if they do. Keep-alive and chime are\n"
+         "NOT equalized (UI cues, not dialogue).", 22);
 }
 
 // ---- v7.0.4: the tab strip is ONE custom control ----------------------------
@@ -5705,8 +5677,29 @@ static bool guiCreateRealWindow() {
             const int round = 2; // DWMWCP_ROUND
             rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
                                        &round, sizeof(round)));
+            // v7.1.15 THE SHADOW, EXPLICIT: the field lost the drop shadow
+            // again -- corner preference + USEWINDOWSTYLE alone do not
+            // guarantee it once WM_NCCALCSIZE eats the side frames. The two
+            // documented shadow triggers are SET here instead of hoped
+            // for: DWMWA_NCRENDERING_POLICY = ENABLED, and the frame
+            // extended into the client by 1 px -- invisible on a fully
+            // custom-painted client, but it makes DWM commit to the full
+            // window shadow on Win10 and Win11 alike.
+            const int ncrOn = 2;   // DWMNCRP_ENABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrOn, sizeof(ncrOn));
+            typedef HRESULT (WINAPI *TS_DWMEA)(HWND, LPCVOID);
+            const TS_DWMEA dwmExt = (TS_DWMEA)GetProcAddress(
+                LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+            if (dwmExt) {
+                struct TSMargins { int cxLeft, cxRight, cyTop, cyBottom; } m = { 1, 1, 1, 1 };
+                dwmExt(g_hwnd, &m);
+            }
         }
         if (!rounded) g_winRegionFallback = true;
+        tlog("[twinspeak] gui           : window shadow -- extend-frame 1 px + NCRENDERING ON%s\n",
+             g_winRegionFallback
+                 ? " (region fallback: a shaped window cannot carry the DWM shadow)"
+                 : " + corner preference ROUND");
     }
     // v7.0.9: re-measure the NCCALCSIZE-inset client and resize once -- the
     // design client is EXACTLY 880x620 again.
@@ -5835,7 +5828,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.13  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.15  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -6035,16 +6028,24 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (guiIsToggle(id)) {
             // v7.0.0 polish: OFF is a TRANSPARENT face -- border + text over
             // the erased surface. The ON fill stays: it IS the state.
+            // v7.1.15 CONTRAST: the field could not read the states --
+            // ON's bright accent text on the accentDk face measures
+            // ~3.3:1 (DARK CYAN), the muddiest label on the page. ON is
+            // now a FULL accent face with the theme's dark on-accent ink
+            // (cOnText): ~11:1, and a filled pill reads as a switch, not
+            // a label. OFF keeps its transparent face but the border
+            // steps up from cLine (near-invisible on the dark themes) to
+            // cDim so the pill itself is visible in every theme.
             const bool on = g_tog[id];
             Gdiplus::GraphicsPath* p = guiRoundPath(grc, 10);
-            Gdiplus::SolidBrush fb(GCol(guic::cAccentDk));
-            Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cLine), 1.0f);
+            Gdiplus::SolidBrush fb(GCol(guic::cAccent));
+            Gdiplus::Pen        pb(GCol(on ? guic::cAccent : guic::cDim), 1.0f);
             if (on) g.FillPath(&fb, p);
             g.DrawPath(&pb, p);
             delete p;
             // v7.0.0: OFF reads in full text color -- cDim washed out on
-            // every theme; ON keeps the accent.
-            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cAccent : guic::cText,
+            // every theme; v7.1.15: ON reads in cOnText on the accent face.
+            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cOnText : guic::cText,
                         g_fUIb, 0);
             if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
                 Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
@@ -7144,86 +7145,138 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
     }
 
-    // v7.1.13 START SNAP -- the 100 ms arrival lock. The coarse align above
-    // pads from FIRST-SWITCH STAMPS, which is a MODEL (stamp minus one
-    // period). If the model is off -- a driver that primes its WaveRT buffer
-    // differently, a pad clipped to the safe headroom, a burst the trim line
-    // ate -- the residual is a CONSTANT stream offset the seq ledger reads
-    // as FLAT, the baseline calibration (seconds 5..9) then ABSORBS it, and
-    // the warden never corrects it: the tick shows the flam forever. So:
-    // once both legs' play boundary carries real sequence (prefill drained),
-    // sample the ledger against the ini's OWN delay model for 100 ms and
-    // snap it frame-exact. The baseline then calibrates ON the corrected
-    // path instead of baking the residual in -- and the log names both the
-    // measured offset and the slow drift (the slope) the field suspects.
-    if (g_cfg.clockSync) {
-        // wait until both boundaries carry real sequence (bounded: a starved
+    // v7.1.14 FIRST-SECOND FAST TIER -- the drift correction at 10x speed,
+    // for exactly one second, then back to normal. The warden is the only
+    // steady-state drift corrector and every one of its gates is wide open
+    // when the tick test looks: the baseline arms at seconds 5..9, the
+    // trigger is |err| >= drift_correct_ms held 3 s, corrections space 5 s
+    // apart. A start residual that survives the start align (the stamp
+    // model's error: a driver priming its WaveRT buffer differently, a pad
+    // clipped to the safe headroom, a burst the trim line ate) sits in
+    // that unguarded window, the baseline then ABSORBS it, and the flam
+    // is on the tick forever. So: for the first 1000 ms of a run
+    // (hardcoded -- no ini key, no UI) the corrector runs the warden's own
+    // bit-exact table at ten times the cadence -- sample every 100 ms
+    // (the health tick is 1000 ms), decide in 3 fast windows (300 ms
+    // instead of 3 s), re-fire every 500 ms (drift_interval_ms / 10
+    // instead of 5 s) -- against the ini's own delay model,
+    // -(delay1 - delay2) ms: the reading a truly synced pair settles at,
+    // since a deeper ring holds its play boundary back. Trigger distance
+    // is unchanged: the same |err| >= drift_correct_ms the warden uses --
+    // same threshold, ten times the speed. After 1000 ms this loop exits,
+    // the engine returns to the normal 1 s health tick, and the warden
+    // calibrates its baseline at seconds 5..9 ON the corrected path.
+    // Transport-level only: ring skips and in-place replay pads, never a
+    // resampled sample.
+    if (g_cfg.clockSync && g_cfg.driftGuard) {
+        // both ledgers must carry real sequence first (bounded: a starved
         // leg is watchdog territory)
-        const unsigned long long snapT0 = GetTickCount64();
+        const unsigned long long ftWait0 = GetTickCount64();
         for (;;) {
             if (g_leg[0].out.seqTail.load(std::memory_order_acquire) > 0
              && g_leg[1].out.seqTail.load(std::memory_order_acquire) > 0) break;
             if (!g_run.load(std::memory_order_relaxed)) break;
-            if (GetTickCount64() - snapT0 > 500) break;
+            if (GetTickCount64() - ftWait0 > 500) break;
             Sleep(2);
         }
-        // the delay model: a deeper ring holds the stream BACK, so the leg
-        // with the extra delay_ms reads a boundary that many frames BEHIND
-        // the other -- drift settles at -(delay1 - delay2) ms when arrivals
-        // are truly synced (the path constants live in the user's tuning).
         const double modelMs = -(double)(g_cfg.delay1Ms - g_cfg.delay2Ms);
-        auto readLedger = [&]() -> double {
+        const unsigned long long ft0 = GetTickCount64();
+        int streak = 0, fires = 0;
+        unsigned long long lastFireMs = 0;
+        while (g_run.load(std::memory_order_relaxed)
+               && GetTickCount64() - ft0 < kFastTierMs) {
             const long long s0 = (long long)g_leg[0].out.seqTail.load(std::memory_order_acquire);
             const long long s1 = (long long)g_leg[1].out.seqTail.load(std::memory_order_acquire);
-            return (s0 > 0 && s1 > 0) ? (double)(s0 - s1) / 48.0 : 999.0;   // 999 = starved leg
-        };
-        // the census window: 100 ms of ledger samples, 5 ms apart
-        double firstMs = 999.0, lastMs = 999.0;
-        int samples = 0;
-        const unsigned long long w0 = GetTickCount64();
-        while (GetTickCount64() - w0 <= kSnapWindowMs && g_run.load(std::memory_order_relaxed)) {
-            const double d = readLedger();
-            if (d != 999.0) {
-                if (!samples) firstMs = d;
-                lastMs = d;
-                ++samples;
-            }
-            Sleep(kSnapPollMs);
-        }
-        if (samples >= 4) {
-            const double slopeUsS = samples > 1
-                                  ? (lastMs - firstMs) * 1000.0
-                                    / ((double)samples * kSnapPollMs / 1000.0)
-                                  : 0.0;
-            tlog("[twinspeak] start snap  : ledger %+.2f ms vs delay model %+.2f ms over %d samples in %u ms"
-                 " (slow drift %+.0f us/s)\n",
-                 lastMs, modelMs, samples, kSnapWindowMs, slopeUsS);
-            // correction attempts inside the same 100 ms budget: measure,
-            // snap frame-exact, re-measure -- at most kSnapMaxAttempts
-            int corrected = 0;
-            for (int attempt = 1; attempt <= kSnapMaxAttempts; ++attempt) {
-                if (!g_run.load(std::memory_order_relaxed)) break;
-                if (GetTickCount64() - w0 > kSnapWindowMs + 50) break;   // budget spent
-                const double dNow = readLedger();
-                if (dNow == 999.0) break;
-                const double err = dNow - modelMs;
-                if (err < 1.0 / 48.0 && err > -1.0 / 48.0) {
-                    tlog("[twinspeak] start snap  : arrival ON the model (err %+.3f ms) -- nothing to snap\n", err);
-                    break;
+            double err = 0.0;
+            if (s0 > 0 && s1 > 0) {
+                err = (double)(s0 - s1) / 48.0 - modelMs;
+                if (err >= g_cfg.driftCorrectMs || err <= -g_cfg.driftCorrectMs) ++streak;
+                else streak = 0;
+            } else streak = 0;
+            const unsigned long long nowMs = GetTickCount64();
+            if (streak >= (int)kFastTierStreak && nowMs - lastFireMs >= kFastTierSpacingMs) {
+                const long long errFr = (long long)(err * 48.0);
+                const long long dpt0 = (long long)g_leg[0].out.count() - (long long)g_leg[0].targetFrames;
+                const long long dpt1 = (long long)g_leg[1].out.count() - (long long)g_leg[1].targetFrames;
+                bool did = false;
+                if (err > 0 && dpt1 > 0) {          // leg2 late: give the real excess back
+                    Leg& W = g_leg[1];
+                    long long x = errFr < dpt1 ? errFr : dpt1;
+                    const long long lvl = (long long)W.out.count();
+                    if (x > lvl) x = lvl;
+                    if (x > 0) {
+                        W.out.discardOldest((size_t)x);   // seqTail advances: a true skip
+                        W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
+                        tlog("[twinspeak] fast tier    : leg2 re-pinned -- skipped %lld fr (%.1f ms) of the\n"
+                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
+                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
+                        did = true;
+                    }
+                } else if (err > 0 && dpt0 < 0) {   // leg1 early: hold it (in-place replay)
+                    Leg& W = g_leg[0];
+                    long long x = -errFr < -dpt0 ? -errFr : -dpt0;
+                    const long long head = (long long)g_capBurstFrames
+                                         + (long long)g_periodFrames[0] - 96;
+                    if (x > head) x = head;
+                    if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
+                    if (x > 0) {
+                        W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
+                        W.wardenPads.fetch_add(1, std::memory_order_relaxed);
+                        tlog("[twinspeak] fast tier    : leg1 re-pinned -- replay-padded %lld fr (%.1f ms) of the\n"
+                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
+                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
+                        did = true;
+                    }
+                } else if (err < 0 && dpt0 > 0) {   // leg1 late: give the real excess back
+                    Leg& W = g_leg[0];
+                    long long x = -errFr < dpt0 ? -errFr : dpt0;
+                    const long long lvl = (long long)W.out.count();
+                    if (x > lvl) x = lvl;
+                    if (x > 0) {
+                        W.out.discardOldest((size_t)x);
+                        W.wardenDrops.fetch_add(1, std::memory_order_relaxed);
+                        tlog("[twinspeak] fast tier    : leg1 re-pinned -- skipped %lld fr (%.1f ms) of the\n"
+                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
+                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
+                        did = true;
+                    }
+                } else if (err < 0 && dpt1 < 0) {   // leg2 early: hold it
+                    Leg& W = g_leg[1];
+                    long long x = -errFr < -dpt1 ? -errFr : -dpt1;
+                    const long long head = (long long)g_capBurstFrames
+                                         + (long long)g_periodFrames[1] - 96;
+                    if (x > head) x = head;
+                    if (x > (long long)kWardenMaxPadFrames) x = (long long)kWardenMaxPadFrames;
+                    if (x > 0) {
+                        W.padFrames.fetch_add((size_t)x, std::memory_order_relaxed);
+                        W.wardenPads.fetch_add(1, std::memory_order_relaxed);
+                        tlog("[twinspeak] fast tier    : leg2 re-pinned -- replay-padded %lld fr (%.1f ms) of the\n"
+                             "                            startup residual; drift %+.1f ms -> toward the delay model %+.1f ms\n",
+                             x, (double)x * 1000.0 / (double)kSampleRate, err + modelMs, modelMs);
+                        did = true;
+                    }
                 }
-                if (!snapCorrect(err, "start snap")) {
-                    tlog("[twinspeak] start snap  : err %+.2f ms but no ring holds it safely -- left to the warden\n", err);
-                    break;
+                if (did) {
+                    ++fires;
+                    lastFireMs = nowMs;
+                    tlog("[twinspeak] fast tier    : fired at %llu ms -- 10x cadence (%u ms samples, %u ms\n"
+                         "                            spacing); the warden takes over at the normal speed now\n",
+                         nowMs - ft0, kFastTierPollMs, kFastTierSpacingMs);
+                } else {
+                    lastFireMs = nowMs;   // nothing safe to correct: back off one spacing
                 }
-                ++corrected;
-                Sleep(10);   // let one callback carry the correction before re-measuring
+                streak = 0;
             }
-            if (corrected)
-                tlog("[twinspeak] start snap  : locked in %d correction(s); the baseline will calibrate on THIS path\n",
-                     corrected);
-        } else {
-            tlog("[twinspeak] start snap  : a leg never carried real sequence within the window -- skipped\n");
+            Sleep(kFastTierPollMs);
         }
+        if (fires)
+            tlog("[twinspeak] fast tier    : first second done -- %d correction(s); returning to the\n"
+                 "                            normal cadence (the baseline arms at seconds 5..9 ON this\n"
+                 "                            corrected path)\n", fires);
+        else
+            tlog("[twinspeak] fast tier    : first second clean -- drift held within %.0f ms of the\n"
+                 "                            delay model; nothing to correct, the normal warden cadence\n"
+                 "                            resumes\n", g_cfg.driftCorrectMs);
     }
 
     // v3.8: volume/pin watcher -- 25 ms volume poll, 2 s output pin re-check.
@@ -7265,7 +7318,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.13       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.15       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -7450,7 +7503,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     bool   driftRecal = false;                           // v6.5.8: this calibration is a re-arm
     int    wardenStreak = 0;
     unsigned long long wardenLastMs = 0;
-    unsigned long long snapLastMs = 0;                   // v7.1.13 fine-tier snap clock
     // v6.2: the clock hint fires only on a SETTLED path -- >=10 s up, a
     // quiet window (no corrections/replays), same-sign exceedance held
     // across THREE windows at more than kHintPpm. The meter is quantized by
@@ -7875,58 +7927,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 }
             } else if (!settled) {
                 wardenStreak = 0;
-            }
-        }
-        // ---------------- v7.1.13 SNAP (the fine tier) ----------------
-        // The warden above only fires at |err| >= drift_correct_ms (5 ms
-        // default) after a 3 s streak, spaced 5 s -- a SLOW drift that grows
-        // through the sub-5 ms band never reaches it, and the field hears it
-        // on the tick as a flam that crawls. So: whenever the baseline is
-        // armed and the path is settled, any |err| in [0.5 ms, drift_correct_ms)
-        // gets snapped frame-exact (the warden's own direction table, at
-        // frame precision), at most once per kSnapCooldownMs, and each snap
-        // is VERIFIED across a kSnapWindowMs window -- if the first
-        // correction did not take, up to kSnapMaxAttempts in total. Above
-        // the warden's threshold the warden owns the error, so the two
-        // machines can never fight over one drift.
-        if (driftOK && driftBaseOK && g_cfg.driftGuard
-            && !g_powerPark.load(std::memory_order_relaxed)
-            && (nowMs - g_leg[0].lastReopenMs > 5000)
-            && (nowMs - g_leg[1].lastReopenMs > 5000)
-            && (nowMs - hbOutGet(0) < 5000)
-            && (nowMs - hbOutGet(1) < 5000)
-            && (nowMs - snapLastMs >= kSnapCooldownMs)
-            && (nowMs - wardenLastMs >= kSnapCooldownMs)) {
-            double err = driftMs - driftBase;
-            if (err < g_cfg.driftCorrectMs && err > -g_cfg.driftCorrectMs
-                && (err >= kSnapErrMs || err <= -kSnapErrMs)) {
-                snapLastMs = nowMs;
-                wardenLastMs = nowMs;   // one shared recency clock: no double-fire
-                tlog("[twinspeak] snap        : arrival off the baseline by %+.2f ms -- snapping (window %u ms)\n",
-                     err, kSnapWindowMs);
-                int corrected = 0;
-                const unsigned long long v0 = GetTickCount64();
-                for (int attempt = 1; attempt <= kSnapMaxAttempts; ++attempt) {
-                    if (!g_run.load(std::memory_order_relaxed)) break;
-                    if (!snapCorrect(err, "snap")) break;
-                    ++corrected;
-                    // verify across the window: fresh ledger samples, 5 ms apart
-                    double sum = 0.0;  int n = 0;
-                    while (GetTickCount64() - v0 <= kSnapWindowMs
-                           && n < (int)(kSnapWindowMs / kSnapPollMs)
-                           && g_run.load(std::memory_order_relaxed)) {
-                        const long long s0 = (long long)g_leg[0].out.seqTail.load(std::memory_order_acquire);
-                        const long long s1 = (long long)g_leg[1].out.seqTail.load(std::memory_order_acquire);
-                        if (s0 > 0 && s1 > 0) { sum += (double)(s0 - s1) / 48.0; ++n; }
-                        Sleep(kSnapPollMs);
-                    }
-                    if (!n) break;
-                    err = sum / (double)n - driftBase;
-                    if (err < kSnapErrMs && err > -kSnapErrMs) break;
-                }
-                tlog("[twinspeak] snap        : %d correction(s) -- arrival now %+.2f ms from baseline%s\n",
-                     corrected, err,
-                     (err < kSnapErrMs && err > -kSnapErrMs) ? " (locked)" : " (still outside -- will retry after the cooldown)");
             }
         }
         // v6.5.1: err -- the warden's own number: the live distance from the
