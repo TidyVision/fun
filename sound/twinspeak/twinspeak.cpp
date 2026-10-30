@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.19 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.21 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,59 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.21 THE MANIFEST KILLED THE EXE: v7.1.20's manifest carried "--"
+//            inside two XML comments ("comctl32 v6 -- the activation
+//            context", "real pixels -- no more bitmap stretch"). "--" is
+//            illegal inside XML comments, Windows' SxS loader parses the
+//            embedded manifest STRICTLY, refused to build the activation
+//            context, and the exe died at startup ("side-by-side
+//            configuration is incorrect") before WinMain ever ran. Both
+//            comments reworded; build.sh strict-parses the manifest before
+//            compiling resources so this class of failure cannot ship
+//            again. No code change; DSP byte-identical to v7.1.4.
+//    v7.1.20 THE WINDOW ITSELF: a full pass over the top-level window
+//            (the interior was already polished). ROUNDING FIXED FOR
+//            REAL: CS_DROPSHADOW is retired -- the legacy shadow is drawn
+//            from the SQUARE window rect along the bottom edge, and its
+//            silhouette filled the DWM-rounded bottom-corner notches,
+//            which is exactly why the window read as rounded only on the
+//            top half; with the class style gone the DWMWCP_ROUND clip
+//            shows on all four corners and DWM's own (shape-following)
+//            shadow remains. MANIFEST: the exe embeds one now (RT_MANIFEST)
+//            -- System-DPI awareness (the >100%-scaling blur is gone;
+//            layout constants, fonts and the strip scale once in
+//            guiInitDpi()), comctl32 v6 (guiDarkCtl's DarkMode_Explorer
+//            finally binds; v5 classes ignored it), asInvoker,
+//            longPathAware. SUBSYSTEM: GUI, not console -- no more black
+//            console flash on every double-click / sign-in launch; console
+//            modes re-attach to the parent console themselves and a
+//            WinMain shim forwards to main(). FOCUS: the first launch
+//            activates the window (SW_SHOWNA kept, SetForegroundWindow
+//            added). NO FREEZE: STOP/APPLY no longer block the UI thread
+//            up to 10 s -- the stop is async (WM_APP+2 reaps the thread
+//            and chains the APPLY+RESTART); the blocking join exists only
+//            on the shutdown path. SIZE LOCK: WM_WINDOWPOSCHANGING pins
+//            the window to the designed size (Aero snap / Win+arrow can
+//            no longer stretch the fixed layout) and SC_MAXIMIZE/SC_SIZE
+//            are refused. TRAY: failed NIM_ADD retries on a 2 s timer,
+//            no more HICON leak (LR_SHARED), the balloon says CLICK (a
+//            single left-click opens -- as it always has), the tip
+//            reflects the engine state, and the close explainer re-arms
+//            for the first three closes per session. EXIT IS FINDABLE:
+//            the system menu (Alt+Space / caption right-click) carries
+//            "Exit twinspeak"; Esc hides like the X; Enter activates the
+//            focused button. POSITION: the window remembers where it was
+//            (gui_window_x/y in the ini, spliced by the normal save),
+//            every open is clamped into the nearest monitor's work area,
+//            and WM_DISPLAYCHANGE re-clamps. PLUS: TaskbarCreated and the
+//            second-instance messages are opened through UIPI
+//            (ChangeWindowMessageFilterEx), the small icon is a true 16px
+//            (WNDCLASSEXW + hIconSm), the bar dims when the window is
+//            inactive, the stale X hover is cleared on hide, the 250 ms
+//            timer sleeps while hidden, WM_ENDSESSION stops the engine
+//            cleanly, the version line ellipsizes long ini paths, and the
+//            ITaskbarList is Released at exit. DSP byte-identical to
+//            v7.1.4.
 //    v7.1.19 ROUND AGAIN, ALL FOUR: the corner preference flips back from
 //            DWMWCP_DONOTROUND to DWMWCP_ROUND -- the user asked for the
 //            window rounded top AND bottom. With the v7.1.17/18 frame
@@ -3042,7 +3095,15 @@ static void writeTemplate(const char* path) {
         "; you click the tray icon), the engine starts BY ITSELF -- no\n"
         "; START press needed. off = the old behavior (the engine waits\n"
         "; for START).\n"
-        "startup_engine = on\n");
+        "startup_engine = on\n"
+        "\n"
+        "; v7.1.20: gui_window_x / gui_window_y = where the control panel\n"
+        "; last sat, rewritten automatically each time it hides (the values\n"
+        "; below land in the file on the next save). -99999 = let Windows\n"
+        "; place it; the position is always clamped back into a live\n"
+        "; monitor's work area on open.\n"
+        "gui_window_x = -99999\n"
+        "gui_window_y = -99999\n");
     fclose(f);
 }
 
@@ -3105,6 +3166,12 @@ static void cfgSanitize() {
 // v7.0.4: the GUI theme persists across sessions -- loadIni (which runs long
 // before the GUI exists) parks the parsed gui_theme here; guiMakeGdi applies it.
 static int g_themeSaved = 0;
+
+// v7.1.20: window-position persistence (gui_window_x / gui_window_y in the
+// ini). Captured on every hide and at shutdown; spliced back by the normal
+// ini save. -99999 = "let Windows place it" (virtual-screen coords can be
+// negative, so the sentinel must be far outside that range).
+static int g_guiWinX = -99999, g_guiWinY = -99999;
 
 static bool loadIni(const char* path) {
     FILE* f = fopen(path, "r");
@@ -3174,6 +3241,8 @@ static bool loadIni(const char* path) {
             if (g_themeSaved < 0 || g_themeSaved > 10) g_themeSaved = 0;   // v7.1.8: 11 themes
         }
         else if (key == "startup_engine") g_cfg.startupEngine = !isOff(val);   // v7.1.2
+        else if (key == "gui_window_x") g_guiWinX = atoi(val.c_str());   // v7.1.20
+        else if (key == "gui_window_y") g_guiWinY = atoi(val.c_str());   // v7.1.20
     }
     fclose(f);
     cfgSanitize();
@@ -3661,6 +3730,7 @@ static int       g_eqSel         = -1;         // v7.1.10: THE selected slot -- 
                                                // TWO faces at once; one var, one accent)
 static std::vector<HWND> g_pageHw[5];          // children per page (show/hide)
 static HANDLE    g_engThread     = nullptr;
+static bool      g_applyRestart  = false;   // v7.1.20: APPLY+RESTART chains off WM_APP+2
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
 static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
@@ -3670,7 +3740,7 @@ static std::atomic<bool> g_logDirty{false};
 static NOTIFYICONDATAA g_nid = {};
 static ULONG_PTR g_gdipToken = 0;             // v6.6.5: GDI+ session token
 static bool g_trayVisible = false;             // icon currently in the tray
-static bool g_trayHint    = false;             // one-time close balloon shown
+static int g_closeHints  = 0;             // v7.1.20: close balloons for the first 3 closes
 static bool g_startTray   = false;             // --tray: begin hidden in the tray
 static bool g_userShown   = false;             // v7.1.5: the USER opened the window
                                                // (tray dbl-click / menu / second
@@ -3725,6 +3795,7 @@ static void guiRepaint(HWND w, int id);
 static void guiRepaintSlots(HWND w);
 static void trayAdd(bool hint);
 static void trayRemove();
+static void trayUpdateTip(bool running);   // v7.1.20: the tip tracks the engine
 static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on demand
 // v6.6.1 tray context-menu commands
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
@@ -3757,6 +3828,46 @@ static const char* kTabNames[5] = {
 // Win10 drop shadow). WS_SYSMENU stays for Alt+Space and the HTCAPTION
 // right-click sysmenu; the window is fixed-size, so resize edges are
 // meaningless -- WM_NCHITTEST answers HTCLIENT below the bar.
+// ---- v7.1.20 DPI SCALE ------------------------------------------------------
+// The manifest makes the process System-DPI-aware; these translate the
+// 96-dpi design pixels into real pixels exactly once per launch. Every
+// window-geometry constant goes through S() (integers) / Sf() (floats);
+// the named constants below are mutable and re-derived in guiInitDpi()
+// -- call sites keep their literal, design-space meaning.
+static UINT g_dpi96 = 96;
+static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
+static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
+// v7.1.20: the scaled geometry lives HERE (single definitions -- the old
+// const definitions farther down the file are gone).
+static int kCapH      = 31;                            // the caption bar
+static int KCLI_W     = 880, KCLI_H      = 620;        // designed client size
+static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
+static int KLOG_BOTTOM= 594;                            // log pane bottom
+static int kTabW[5]   = { 166, 166, 166, 166, 166 };   // tab face widths
+static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
+// guiInitDpi runs FIRST in guiMain -- before guiMakeGdi (fonts) and before
+// any window exists. System-aware means the DPI is fixed for the process
+// lifetime; no WM_DPICHANGED re-layout is needed (the manifest keeps the
+// door open for PerMonitorV2 if the panel ever goes resizable).
+static void guiInitDpi() {
+    HDC sdc = GetDC(nullptr);
+    if (sdc) {
+        const int d = GetDeviceCaps(sdc, LOGPIXELSX);
+        if (d > 0) g_dpi96 = (UINT)d;
+        ReleaseDC(nullptr, sdc);
+    }
+    kCapH      = S(31);
+    KCLI_W     = S(880);
+    KCLI_H     = S(620);
+    KPANEL_T   = S(66);
+    KPANEL_B   = S(402);
+    KLOG_BOTTOM= S(594);
+    kTabW[0] = kTabW[1] = kTabW[2] = kTabW[3] = kTabW[4] = S(166);
+    kTabGap     = S(4);
+    KSTRIP_PAD  = S(5);
+    KSTRIP_FACE_Y = S(6);
+}
+
 static const DWORD kGuiFrame = WS_SYSMENU | WS_THICKFRAME;
 
 // v7.0.9 THE CUSTOM TITLEBAR (v7.1.17: now a client strip): the top 31 px of
@@ -3766,12 +3877,12 @@ static const DWORD kGuiFrame = WS_SYSMENU | WS_THICKFRAME;
 // its clicks, hover and leave tracking stay ours. Child coordinates keep
 // their old content-space meaning: the creation helpers add kCapH and the
 // frame paint shifts by kCapH -- no layout literal moved.
-static const int  kCapH = 31;
 static bool       g_capHot = false;   // mouse over the close glyph
+// (kCapH is defined -- and scaled -- in the v7.1.20 DPI block above.)
 static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
 static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
     RECT wr; GetWindowRect(w, &wr);
-    const RECT r = { (wr.right - wr.left) - 46, 0, wr.right - wr.left, kCapH };
+    const RECT r = { (wr.right - wr.left) - S(46), 0, wr.right - wr.left, kCapH };
     return r;
 }
 // Paints the bar from a persistent memory buffer -- usable from any context
@@ -3830,14 +3941,19 @@ static bool guiBarBufEnsure(int ww, int hh) {
     return true;
 }
 // renders the whole bar into dc (memory buffer or screen -- identical code)
+// v7.1.20: all geometry goes through the DPI scale; the bar also dims when
+// the window is INACTIVE (GetActiveWindow) -- flat bg, dim title -- so the
+// chrome reads active vs. inactive like every native caption does.
+static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
 static void guiRenderBar(HDC dc, int ww) {
+    const bool active = (GetActiveWindow() != nullptr);   // GUI thread only
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // the face: the theme bg with a light touch at the top -- depth without
     // inventing a color the theme does not own (guiLerpRGB toward white).
     // Integer fill + overscan: every bar pixel is covered exactly once, no
     // boundary blend, no gray hairline.
-    const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), 0.07);
+    const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), active ? 0.07 : 0.03);
     Gdiplus::LinearGradientBrush face(
         Gdiplus::Rect(0, 0, ww + 1, kCapH + 1),
         Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
@@ -3851,29 +3967,35 @@ static void guiRenderBar(HDC dc, int ww) {
     // the close slot: hover face + the thin system-style X. Shape smoothing
     // turns ON for the X's diagonals ONLY -- the two strokes need AA; the
     // fills above stay integer-exact.
-    const int cx = ww - 23, cy = kCapH / 2;   // slot center (46 x kCapH slot)
-    if (g_capHot) {
+    const int slotW = S(46);
+    const int cx = ww - S(23), cy = kCapH / 2;   // slot center (46 x kCapH slot)
+    if (g_capHot && active) {
         Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                               GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-        g.FillRectangle(&hf, ww - 46, 0, 46, kCapH);
+        g.FillRectangle(&hf, ww - slotW, 0, slotW, kCapH);
     }
-    const COLORREF xcol = g_capHot ? guic::cAccent : guic::cText;
-    Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)), 1.25f);
+    const COLORREF xcol = (g_capHot && active) ? guic::cAccent : guic::cText;
+    Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)),
+                    Sf(1.25f) < 1.0f ? 1.0f : Sf(1.25f));
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.DrawLine(&xp, cx - 5, cy - 5, cx + 5, cy + 5);   // the modern thin X --
-    g.DrawLine(&xp, cx + 5, cy - 5, cx - 5, cy + 5);   // the DWM close glyph's
+    g.DrawLine(&xp, cx - S(5), cy - S(5), cx + S(5), cy + S(5));   // the modern thin X --
+    g.DrawLine(&xp, cx + S(5), cy - S(5), cx - S(5), cy + S(5));   // the DWM close glyph's
     g.SetSmoothingMode(Gdiplus::SmoothingModeNone);    // own shape, drawn ours
     // the product name, theme-aware (see the v7.1.4 note above).
     if (g_fTitle) {
         const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
                             GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma
         Gdiplus::Font tf(dc, g_fTitle);
-        const Gdiplus::RectF tr(12.0f, 3.0f, 220.0f, (Gdiplus::REAL)(kCapH - 7));
+        const Gdiplus::RectF tr(Sf(12), Sf(3), Sf(220), (Gdiplus::REAL)(kCapH - S(7)));
         Gdiplus::StringFormat sf;
         sf.SetAlignment(Gdiplus::StringAlignmentNear);
         sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        if (dark) {
+        if (!active) {
+            // v7.1.20: inactive -- the title steps down to the dim color
+            Gdiplus::SolidBrush nb(GCol(guic::cDim));
+            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &nb);
+        } else if (dark) {
             Gdiplus::LinearGradientBrush gb(
                 tr, Gdiplus::Color(255, 160, 200, 205),   // cyan gray, light -- top
                     Gdiplus::Color(255, 108, 134, 140),   // slate cyan gray -- bottom
@@ -3907,21 +4029,22 @@ static void guiMakeGdi() {
     // modern thin caption shape, two antialiased GDI+ pen strokes (see
     // guiRenderBar). (The Times New Roman header font is retired with the
     // in-window header text it served.)
-    g_fUI   = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    // v7.1.20: the pixel heights scale with the DPI (S of the design px).
+    g_fUI   = CreateFontA(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_fUIb  = CreateFontA(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+    g_fUIb  = CreateFontA(-S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_fSml  = CreateFontA(-11, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    g_fSml  = CreateFontA(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    g_fMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    g_fMono = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
     // v7.1.0: the titlebar's product name -- Segoe UI Semibold 14 px, drawn
     // in the dark-blue -> teal vertical gradient (see guiPaintBar).
-    g_fTitle = CreateFontA(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+    g_fTitle = CreateFontA(-S(14), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                            DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
@@ -3971,13 +4094,12 @@ static void applyTheme(int i) {
 // ---- v6.6.5 CONDENSED GEOMETRY: the whole frame is tighter -- client 880x620
 // (was 1000x750), 34px row pitch (was 38), slimmer bars everywhere.
 static const int COLA_X = 24, COLB_X = 460, LBL_W = 160, CTL_W = 200;
-static const int KCLI_W = 880, KCLI_H = 620;   // designed client size
-static const int KLOG_BOTTOM = 594;            // v6.6.6: log ends here; 26px watermark strip below
-static const int KPANEL_T = 66, KPANEL_B = 402; // page panel band
+// (KCLI_W/KCLI_H/KLOG_BOTTOM/KPANEL_T/KPANEL_B are defined -- and scaled --
+// in the v7.1.20 DPI block above.)
 static const int KHDR_Y = 94, KROW0 = 120;   // page header / first row / pitch
 
 // ---- small drawing helpers (v6.6.5: GDI+ -- everything the eye sees is AA) --
-static Gdiplus::Color GCol(COLORREF c, BYTE a = 255) {
+static Gdiplus::Color GCol(COLORREF c, BYTE a) {
     return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
 }
 
@@ -4042,7 +4164,7 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     RECT crc = { 0, 0, 880, 620 };
     GetClientRect(g_hwnd, &crc);
     Gdiplus::FontFamily ff(L"Arial");
-    Gdiplus::Font f(&ff, 13, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    Gdiplus::Font f(&ff, (Gdiplus::REAL)S(13), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::StringFormat sf;
     sf.SetAlignment(Gdiplus::StringAlignmentNear);
     sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -4064,7 +4186,7 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     if (mr.Width <= 0) return;
     // centered in the strip below the log pane; right edge 14px off the client edge
     // v7.1.17: content space sits kCapH lower inside the client.
-    const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - 14) - mr.Width;
+    const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - S(14)) - mr.Width;
     const Gdiplus::REAL y = (Gdiplus::REAL)(KLOG_BOTTOM + kCapH)
                           + ((Gdiplus::REAL)(crc.bottom - (KLOG_BOTTOM + kCapH)) - mr.Height) / 2.0f;
     const Gdiplus::RectF tr(x, y, mr.Width, mr.Height);
@@ -4134,7 +4256,8 @@ static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
 }
 
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
-    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
+    // v7.1.20: design px in, real px out (DPI scale; kCapH is already real).
+    x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
@@ -4143,7 +4266,7 @@ static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT
 }
 
 static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
-    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
+    x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "EDIT", val,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4157,7 +4280,7 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
     // NOTE: deliberately NOT regPage()d here -- the tab strip and the
     // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
     // presets, REFRESH) are registered by their builders (v6.6.2).
-    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
+    x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
@@ -4166,13 +4289,13 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
 }
 
 static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
-    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
+    x = S(x); y = S(y) + kCapH;   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
         (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
-        x, y, CTL_W, 220, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+        x, y, S(CTL_W), S(220), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
-    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, 16);
+    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, S(16));
     guiDarkCtl(h);
     regPage(h);
     return h;
@@ -4313,7 +4436,7 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
-    y += kCapH;   // v7.1.17: children live in content space -- the bar tops the client
+    x = S(x); y = S(y) + kCapH; cw = S(cw);   // v7.1.20: DPI scale
     static bool sldClass = false;      // registered once
     if (!sldClass) {
         WNDCLASSA wc = {};
@@ -4324,7 +4447,7 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
         sldClass = true;
     }
     HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP,   // v7.1.4: a tab stop
-                             x, y, cw, 28, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+                             x, y, cw, S(28), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     g_sld[h] = { lo, hi, lo, false };
     InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
     regPage(h);
@@ -4351,7 +4474,7 @@ static void header(HWND w, int colX, int y, const char* txt) {
 }
 
 static void note(HWND w, int colX, int y, const char* txt, int lines) {
-    mkLabel(w, 0, colX, y, 406, txt, g_fSml, lines * 15 + 4);
+    mkLabel(w, 0, colX, y, 406, txt, g_fSml, lines * 15 + 4);   // the helper scales
 }
 
 // ---- EQ slider mapping (freq and Q on log scales, gain linear) ------------
@@ -4519,6 +4642,8 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "backend2")          return g_cfg.backend2;
     else if (key == "gui_theme")        { snprintf(b, 64, "%u", (unsigned)g_theme); return b; }
     else if (key == "startup_engine")   return boolText(g_cfg.startupEngine);   // v7.1.2
+    else if (key == "gui_window_x")     { snprintf(b, 64, "%d", g_guiWinX); return b; }   // v7.1.20
+    else if (key == "gui_window_y")     { snprintf(b, 64, "%d", g_guiWinY); return b; }   // v7.1.20
     return "";
 }
 
@@ -4541,6 +4666,8 @@ static const char* kIniKeys[] = {
     "deep_resync_min",
     "gui_theme",                // v7.0.4: the GUI theme persists
     "startup_engine",           // v7.1.2: the startup launch auto-starts the engine
+    "gui_window_x",             // v7.1.20: the panel's last position (-99999 = default)
+    "gui_window_y",             // v7.1.20: captured on hide/shutdown, spliced on save
 };
 
 // v6.6.0: write twinspeak.ini WITHOUT destroying it. Every line that is not a
@@ -4751,7 +4878,8 @@ static void guiAppendLog(const std::string& s) {
 // invalidated in the same breath; the next WM_PAINT lands it as one blit.
 static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
-    const RECT sr = { 14, 458 + kCapH, 866, 476 + kCapH };   // v7.1.17: +kCapH
+    // v7.1.20: MUST mirror guiPaintFrame's scaled status band exactly.
+    const RECT sr = { S(14), S(458) + kCapH, S(866), S(476) + kCapH };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -4790,15 +4918,30 @@ static void guiStartEngine(HWND w) {
         tlog("[twinspeak] gui           : could not write the ini -- running with the in-window values\n");
     g_engState.store(1);
     guiRepaint(g_hwnd, IDC_START);   // v6.6.1: the button owns its own pixels
+    trayUpdateTip(true);             // v7.1.20: the tray tip tracks the engine
     g_engThread = CreateThread(nullptr, 0, guiEngineThread, nullptr, 0, nullptr);
 }
 
+// v7.1.20 THE FREEZE FIX: guiStopEngine used to sit in WaitForSingleObject
+// (10 s timeout) ON THE UI THREAD -- the window went dead for the whole
+// stop (no repaint, no move, ghost "not responding", and a duplicate's
+// SendMessageTimeout aborted against the frozen queue). The stop is now
+// ASYNCHRONOUS: flag + repaint here; the engine thread lands WM_APP+2 when
+// it finishes, which reaps the handle and runs a chained APPLY+RESTART.
+// The 250 ms timer reaps as a backup. Only the shutdown path joins
+// synchronously (guiStopEngineJoin).
 static void guiStopEngine() {
     const int st = g_engState.load();
     if (st == 0 || st == 3) return;
     g_engState.store(3);
     if (g_hwnd) guiRepaint(g_hwnd, IDC_START);
     g_run.store(false);
+    trayUpdateTip(false);
+}
+// shutdown-only (message loop already exited / process going away): a block
+// here costs nothing the user can see.
+static void guiStopEngineJoin() {
+    if (g_engState.load() != 0) { g_engState.store(3); g_run.store(false); }
     if (g_engThread) {
         WaitForSingleObject(g_engThread, 10000);
         CloseHandle(g_engThread);
@@ -4815,7 +4958,7 @@ static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads
 // v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 lands
 // on the field's sweet spot: +6 px (166). 5 x 166 + 4 x 4 gaps + 5 px
 // left pad ends at 851 inside the 866 px strip -- halo fits, no overflow.
-static const int kTabW[5] = { 166, 166, 166, 166, 166 };
+// (kTabW / kTabGap are defined -- and scaled -- in the v7.1.20 DPI block.)
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -4982,8 +5125,8 @@ static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad
 // left edge of its slot and 6 px down -- so a 5 px halo fits inside the
 // control on every side. Faces keep the exact positions (and the 23 px height
 // with its 3 px bottom notch) the old buttons had.
-static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 866, KSTRIP_H = 36;
-static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
+static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 866, KSTRIP_H = 36;   // design px -- S() at the creation site
+// (KSTRIP_PAD / KSTRIP_FACE_Y are defined -- and scaled -- in the DPI block.)
 
 // ---- v7.0.7: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
 // The strip renders for real: D3D11 device (hardware first, WARP for RDP/VM),
@@ -5157,7 +5300,12 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
             HDC sdc = GetDC(nullptr);
             const int dpi = GetDeviceCaps(sdc, LOGPIXELSY);
             ReleaseDC(nullptr, sdc);
-            const float px = 13.0f * 96.0f / (float)(dpi > 0 ? dpi : 96);
+            // v7.1.20: the render target draws DIPs == pixels (SetDpi 96
+            // above), so the 13 design px must arrive as PHYSICAL px:
+            // 13 * dpi/96. (The old 96/dpi form was a no-op under the
+            // DPI-unaware build -- dpi was always 96 -- and would have
+            // SHRUNK the labels under the manifest's awareness.)
+            const float px = 13.0f * (float)(dpi > 0 ? dpi : 96) / 96.0f;
             ok = SUCCEEDED(g_dwf->CreateTextFormat(
                     L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
@@ -5219,9 +5367,9 @@ static Gdiplus::Bitmap* guiStripLabelLayer(int cw, int ch, double fs, HDC dc) {
     }
     g_lblG->SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     g_lblG->Clear(Gdiplus::Color(0, 0, 0, 0));
-    for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
+    for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + kTabGap, ++i) {
         const bool act = (i == g_tab);
-        const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+        const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + S(25) };
         guiAAString(*g_lblG, dc, trc, kTabNames[i],
                     act ? guiLerpRGB(guic::cText, guic::cAccent, fs) : guic::cText,
                     g_fUIb, 0);
@@ -5235,7 +5383,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;                       // the buffer covers every pixel opaquely
     case WM_LBUTTONUP: {
         const int x = (int)(short)LOWORD(lp);
-        for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i)
+        for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + kTabGap, ++i)
             if (x >= fx && x < fx + kTabW[i]) {
                 if (i != g_tab) guiShowPage(GetParent(w), i);
                 return 0;
@@ -5266,29 +5414,29 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             {   // THE HALO: three nested bands burning OUTWARD from the
                 // selected tab's face (identical geometry to the GDI+ pass).
                 int fxs = KSTRIP_PAD;
-                for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
+                for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + kTabGap;
                 const float fx = (float)fxs, fy = (float)KSTRIP_FACE_Y;
-                const float fw = (float)kTabW[g_tab], fh = 23.0f;
+                const float fw = (float)kTabW[g_tab], fh = Sf(23.0f);
                 const float mid[3] = { 1.35f, 2.90f, 4.40f };  // band centers
                 const float wd [3] = { 1.70f, 1.40f, 1.60f };  // band widths
                 const BYTE  al [3] = { 80, 44, 22 };           // band strengths
                 for (int k = 0; k < 3; ++k) {
-                    const float s = mid[k];
+                    const float s = Sf(mid[k]);
                     const D2D1_ROUNDED_RECT rr = {
                         D2D1_RECT_F{ fx - s, fy - s, fx + fw + s, fy + fh + s },
-                        6.0f + s, 6.0f + s };
+                        Sf(6.0f) + s, Sf(6.0f) + s };
                     TSBRCOL(guic::cAccent, al[k] * fs);
-                    g_dctx->DrawRoundedRectangle(rr, g_d2dBr, wd[k]);
+                    g_dctx->DrawRoundedRectangle(rr, g_d2dBr, Sf(wd[k]));
                 }
             }
-            for (int i = 0, ix = KSTRIP_PAD; i < 5; ix += kTabW[i] + 4, ++i) {
+            for (int i = 0, ix = KSTRIP_PAD; i < 5; ix += kTabW[i] + kTabGap, ++i) {
                 const bool act = (i == g_tab);
                 // the face rect is the 1 px inset rounded rect (guiRoundPath
                 // convention) -- the centered stroke stays fully inside.
                 const D2D1_ROUNDED_RECT rr = {
                     D2D1_RECT_F{ (float)ix + 1.0f, (float)KSTRIP_FACE_Y + 1.0f,
                                  (float)ix + kTabW[i] - 1.0f,
-                                 (float)KSTRIP_FACE_Y + 22.0f }, 6.0f, 6.0f };
+                                 (float)KSTRIP_FACE_Y + Sf(22.0f) }, Sf(6.0f), Sf(6.0f) };
                 if (act) {
                     TSBRCOL(guic::cPanelHi, 255 * fs);
                     g_dctx->FillRoundedRectangle(rr, g_d2dBr);
@@ -5330,14 +5478,14 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             if (!labelsDrawn) {   // layer/upload failed: native text fallback
-                for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
+                for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + kTabGap, ++i) {
                     const bool act = (i == g_tab);
                     if (g_tabWide[i].empty()) g_tabWide[i] = guiWide(kTabNames[i]);
                     TSBRCOL(act ? guiLerpRGB(guic::cText, guic::cAccent, fs)
                                 : guic::cText, 255);
                     const D2D1_RECT_F tr = {
                         (float)fx, (float)KSTRIP_FACE_Y - 1.0f,
-                        (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + 25.0f };
+                        (float)(fx + kTabW[i]), (float)KSTRIP_FACE_Y + Sf(25.0f) };
                     g_dctx->DrawText(g_tabWide[i].c_str(),
                                      (UINT32)g_tabWide[i].size(), g_dwfTab, tr, g_d2dBr);
                 }
@@ -5368,26 +5516,26 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
             const double fs2 = fs;
             int fxs = KSTRIP_PAD;
-            for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + 4;
+            for (int i = 0; i < g_tab; ++i) fxs += kTabW[i] + kTabGap;
             const Gdiplus::RectF fr((Gdiplus::REAL)fxs,
                                     (Gdiplus::REAL)KSTRIP_FACE_Y,
-                                    (Gdiplus::REAL)kTabW[g_tab], 23.0f);
+                                    (Gdiplus::REAL)kTabW[g_tab], Sf(23.0f));
             const float mid[3] = { 1.35f, 2.90f, 4.40f };
             const float wd [3] = { 1.70f, 1.40f, 1.60f };
             const BYTE  al [3] = { 80, 44, 22 };
             for (int k = 0; k < 3; ++k) {
-                const float s = mid[k];
+                const float s = Sf(mid[k]);
                 const Gdiplus::RectF e(fr.X - s, fr.Y - s,
                                        fr.Width + 2.0f * s, fr.Height + 2.0f * s);
-                Gdiplus::GraphicsPath* bp = guiRoundPathRaw(e, 6.0f + s);
-                Gdiplus::Pen gp(GCol(guic::cAccent, (BYTE)(al[k] * fs2)), wd[k]);
+                Gdiplus::GraphicsPath* bp = guiRoundPathRaw(e, Sf(6.0f) + s);
+                Gdiplus::Pen gp(GCol(guic::cAccent, (BYTE)(al[k] * fs2)), Sf(wd[k]));
                 g.DrawPath(&gp, bp);
                 delete bp;
             }
-            for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + 4, ++i) {
+            for (int i = 0, fx = KSTRIP_PAD; i < 5; fx += kTabW[i] + kTabGap, ++i) {
                 const bool act = (i == g_tab);
-                const Gdiplus::Rect fr2(fx, KSTRIP_FACE_Y, kTabW[i], 23);
-                Gdiplus::GraphicsPath* p = guiRoundPath(fr2, 6);
+                const Gdiplus::Rect fr2(fx, KSTRIP_FACE_Y, kTabW[i], S(23));
+                Gdiplus::GraphicsPath* p = guiRoundPath(fr2, S(6));
                 if (act) {
                     Gdiplus::SolidBrush fb(GCol(guic::cPanelHi, (BYTE)(255 * fs2)));
                     g.FillPath(&fb, p);
@@ -5399,7 +5547,7 @@ static LRESULT CALLBACK tabStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g.DrawPath(&ab, p);
                 }
                 delete p;
-                const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + 25 };
+                const RECT trc = { fx, KSTRIP_FACE_Y - 1, fx + kTabW[i], KSTRIP_FACE_Y + S(25) };
                 // v7.1.2: cText base -- same color math as the label layer
                 guiAAString(g, buf, trc, kTabNames[i],
                             act ? guiLerpRGB(guic::cText, guic::cAccent, fs) : guic::cText,
@@ -5425,8 +5573,9 @@ static void guiMakeTabStrip(HWND w) {
         RegisterClassA(&wc);
         reg = true;
     }
+    // v7.1.20: the design-px strip constants scale at the creation site.
     CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
-                    KSTRIP_X, KSTRIP_Y + kCapH, KSTRIP_W, KSTRIP_H, w,
+                    S(KSTRIP_X), S(KSTRIP_Y) + kCapH, S(KSTRIP_W), S(KSTRIP_H), w,
                     (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
 }
 
@@ -5443,14 +5592,17 @@ static void guiBuildControls(HWND w) {
     // string; guiPaintFrame draws the line inside the frame buffer (one blit,
     // no erase-then-draw flicker four times a second). Writers go through
     // guiSetStatus, which invalidates the status band of the frame.
+    // v7.1.20: the direct creations scale too (the factories do it for the
+    // rest).
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              14, 458 + kCapH, 852, 16, w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
+                              S(14), S(458) + kCapH, S(852), S(16),
+                              w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        14, 480 + kCapH, 852, 114, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), S(480) + kCapH, S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
@@ -5563,6 +5715,19 @@ static void startupSet(bool on) {
 }
 
 // ---- v6.6.1: the tray icon --------------------------------------------------
+// v7.1.20: the tip reflects the engine state (updated on start/stop only --
+// no polling), a failed NIM_ADD retries every 2 s on timer id 3 (the
+// tray-only sign-in launch can beat the shell and must recover), and the
+// icon handle is LR_SHARED so re-adds after an explorer restart leak
+// nothing.
+static void trayUpdateTip(bool running) {
+    if (!g_trayVisible) return;
+    g_nid.uFlags = NIF_TIP;
+    lstrcpynA(g_nid.szTip, running ? "TidyVision TwinSpeak -- engine running"
+                                   : "TidyVision TwinSpeak -- engine stopped",
+              (int)sizeof(g_nid.szTip));
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
 static void trayRemove() {
     if (!g_trayVisible) return;
     Shell_NotifyIconA(NIM_DELETE, &g_nid);
@@ -5577,17 +5742,25 @@ static void trayAdd(bool hint) {
     g_nid.uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP + 3;
     g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
-                                    IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+                                    IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     lstrcpynA(g_nid.szTip, "TidyVision TwinSpeak", (int)sizeof(g_nid.szTip));
     g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
-    if (g_trayVisible && hint && !g_trayHint) {
-        g_trayHint = true;
+    if (!g_trayVisible) {
+        // v7.1.20: the shell was not ready (a sign-in launch can beat the
+        // taskbar). Retry on the owner window until it lands; TaskbarCreated
+        // covers the explorer-restart case on top.
+        SetTimer(g_hwnd, 3, 2000, nullptr);
+        return;
+    }
+    KillTimer(g_hwnd, 3);
+    if (hint && g_closeHints < 3) {   // v7.1.20: explain the first 3 closes, not once ever
+        ++g_closeHints;
         g_nid.uFlags       = NIF_INFO;
         lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
         lstrcpynA(g_nid.szInfo,
                   "Still running -- the engine stays up.\n"
-                  "Double-click this icon to reopen the window; "
+                  "Click this icon to reopen the window; "
                   "right-click for Start/Stop and Exit.",
                   (int)sizeof(g_nid.szInfo));
         g_nid.dwInfoFlags = NIIF_INFO;
@@ -5604,6 +5777,65 @@ static void trayBalloon(const char* text) {
     lstrcpynA(g_nid.szInfo, text, (int)sizeof(g_nid.szInfo));
     g_nid.dwInfoFlags = NIIF_INFO;
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
+
+// ---- v7.1.20: window-level helpers ------------------------------------------
+// UIPI: an elevated twinspeak must still receive explorer's TaskbarCreated
+// broadcast and the second-instance messages, or the tray icon is lost on
+// an explorer restart and duplicate launches fall to the MessageBox.
+static void tsAllowUiMessages(HWND w) {
+    if (!w) return;
+    // local types: header-independent (old/mingw SDKs may not declare them)
+    typedef struct TS_CFS { DWORD cbSize; DWORD ExtStatus; } TS_CFS;
+    typedef BOOL (WINAPI *TS_CWMFE)(HWND, UINT, DWORD, TS_CFS*);
+    #ifndef MSGFLT_ALLOW
+    #define MSGFLT_ALLOW 1
+    #endif
+    const TS_CWMFE f = (TS_CWMFE)(void*)GetProcAddress(
+        GetModuleHandleA("user32.dll"), "ChangeWindowMessageFilterEx");
+    if (!f) return;                       // pre-Win7: no UIPI, nothing to do
+    f(w, g_taskbarCreated, MSGFLT_ALLOW, (TS_CFS*)nullptr);
+    f(w, WM_APP + 4,       MSGFLT_ALLOW, (TS_CFS*)nullptr);
+    f(w, WM_APP + 5,       MSGFLT_ALLOW, (TS_CFS*)nullptr);
+}
+// A real, keyboard-reachable quit: "Exit twinspeak" joins the system menu
+// (Alt+Space, or right-click the bar) next to Close -- the only quit was
+// buried in the tray menu.
+static void tsAddSysExit(HWND w) {
+    HMENU sm = GetSystemMenu(w, FALSE);
+    if (!sm) return;
+    AppendMenuA(sm, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(sm, MF_STRING, IDM_TRAY_EXIT, "Exit twinspeak (stops the engine)");
+}
+// Clamp an open window back into the nearest monitor's work area -- the bar
+// stays reachable after a monitor unplug, a resolution drop, or a restored
+// position from a since-disconnected display.
+static void guiClampToWorkArea(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    RECT wr; if (!GetWindowRect(w, &wr)) return;
+    HMONITOR mon = MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(mon, &mi)) return;
+    int x = wr.left, y = wr.top;
+    const int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    if (y + wh > mi.rcWork.bottom) y = mi.rcWork.bottom - wh;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;      // taller than the work area: pin the bar
+    if (x + ww > mi.rcWork.right) x = mi.rcWork.right - ww;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (x != wr.left || y != wr.top)
+        SetWindowPos(w, nullptr, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+// Window-position persistence: captured on every hide / shutdown, spliced
+// into the ini by the normal save (gui_window_x / gui_window_y).
+// (g_guiWinX / g_guiWinY are defined above loadIni -- v7.1.20.)
+static void guiCaptureWindowPos(HWND w) {
+    // v7.1.20: only the real panel -- never the hidden tray surrogate (a
+    // taskkill WM_CLOSE broadcast would otherwise capture its dummy rect).
+    if (!w || !IsWindow(w) || w == g_trayWnd || w != g_hwnd) return;
+    RECT wr; if (!GetWindowRect(w, &wr)) return;
+    g_guiWinX = wr.left;    // full int: virtual-screen coords can be negative
+    g_guiWinY = wr.top;
 }
 // ---- v7.1.6 TRAY-FIRST: the deferred control window -------------------------
 // A --tray (startup) launch builds NOTHING but the invisible tray owner; the
@@ -5653,6 +5885,15 @@ static bool guiCreateRealWindow() {
                    &round, sizeof(round));
         }
     }
+    // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
+    tsAddSysExit(g_hwnd);
+    tsAllowUiMessages(g_hwnd);
+    // v7.1.20: restore the last captured position (spliced into the ini by
+    // the normal save); guiClampToWorkArea at show time catches monitors
+    // that have gone away since.
+    if (g_guiWinX != -99999 && g_guiWinY != -99999)
+        SetWindowPos(g_hwnd, nullptr, g_guiWinX, g_guiWinY, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
@@ -5721,6 +5962,8 @@ static void guiRestoreWindow() {
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
     tbShowTab(g_hwnd);    // v7.1.7: the taskbar slot exists THIS instant
+    guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
+    SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
 
 // ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
@@ -5748,6 +5991,14 @@ static bool guiFrameBufEnsure(int w, int h) {
     g_frmW = w; g_frmH = h;
     return true;
 }
+// v7.1.20: long ini paths used to run off the version line and clip mid-glyph.
+// Middle-truncate so BOTH ends stay visible (the drive and the file name).
+static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
+    if (s.size() <= maxChars) return s;
+    const size_t keep = maxChars > 3 ? (maxChars - 3) / 2 : 1;
+    return s.substr(0, keep) + "..." + s.substr(s.size() - keep, keep);
+}
+
 // The complete frame face -- background, page panel, log frame, version line,
 // watermark -- into ANY dc (the memory buffer normally, the screen directly
 // as the no-buffer fallback). Header text is gone in v7.0.9: the custom
@@ -5755,31 +6006,35 @@ static bool guiFrameBufEnsure(int w, int h) {
 static void guiPaintFrame(HDC dc, int cw, int ch) {
     // v7.1.17: the client's top kCapH rows are the bar (painted separately);
     // every frame-paint coordinate below shifts by kCapH -- the layout
-    // literals keep their content-space meaning.
+    // literals keep their content-space meaning. v7.1.20: the literals go
+    // through the DPI scale; kCapH / KPANEL_* / KLOG_BOTTOM are already real.
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
-    const RECT panel = { 12, KPANEL_T + kCapH, 866, KPANEL_B + kCapH };
+    const RECT panel = { S(12), KPANEL_T + kCapH, S(866), KPANEL_B + kCapH };
     FillRect(dc, &panel, g_brPanel);
     FrameRect(dc, &panel, g_brPanel2);
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
-    g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f + kCapH, 853.0f, 115.0f));
+    g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(13) + 0.5f,
+                                        (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
+                                        (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.19  |  %s", g_guiIniPath.c_str());
-    const RECT ver = { 300, 8 + kCapH, 866, 30 + kCapH };
+    snprintf(vbuf, sizeof(vbuf), "v7.1.21  |  %s",
+             tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
+    const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
     // inside the frame buffer -- the STATIC child (hidden) only stores the
     // string. One blit, no flicker while the health line updates.
     char stb[512] = "";
     if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
-    const RECT stc = { 14, 458 + kCapH, 866, 476 + kCapH };
+    const RECT stc = { S(14), S(458) + kCapH, S(866), S(476) + kCapH };
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    const RECT kbr = { 14, KLOG_BOTTOM + kCapH, 552, KCLI_H + kCapH };
+    const RECT kbr = { S(14), KLOG_BOTTOM + kCapH, S(552), KCLI_H + kCapH };
     guiAAString(g, dc, kbr,
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
@@ -5866,7 +6121,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT wr; GetWindowRect(w, &wr);
         if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH) {
-            if (pt.x - wr.left >= (wr.right - wr.left) - 46)
+            if (pt.x - wr.left >= (wr.right - wr.left) - S(46))
                 return HTCLIENT;
             return HTCAPTION;
         }
@@ -5874,6 +6129,55 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCMOUSEMOVE:
         if (g_capHot) { g_capHot = false; guiPaintBar(w); }   // left the X onto the drag area
         break;
+    case WM_ACTIVATE:
+        // v7.1.20: the bar dims when the window loses activation -- re-blit
+        // it on every activation change (DefWindowProc still runs).
+        guiPaintBar(w);
+        break;
+    case WM_WINDOWPOSCHANGING: {
+        // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
+        // (Win+arrow, drag-to-edge) and any SetWindowPos resize; those paths
+        // are not bound by WM_GETMINMAXINFO's min==max. Pin the window to
+        // the designed size in every sizing pass so the fixed layout cannot
+        // be stretched by the shell. (WM_SYSCOMMAND refuses SC_SIZE and
+        // SC_MAXIMIZE on top; WM_GETMINMAXINFO stays as the third belt.)
+        WINDOWPOS* p = (WINDOWPOS*)lp;
+        if (p && !(p->flags & SWP_NOSIZE)) {
+            p->cx = KCLI_W;
+            p->cy = KCLI_H + kCapH;
+        }
+        break; }
+    case WM_SYSCOMMAND: {
+        // v7.1.20: the fixed layout cannot survive a resize or a maximize,
+        // so refuse those commands outright (keyboard Win+arrows included);
+        // IDM_TRAY_EXIT from the appended system-menu item is the real quit.
+        // NOTE: the 0xFFF0 mask is only for the built-in SC_* values -- the
+        // custom menu id must compare against the full wParam.
+        const int sc = (int)(wp & 0xFFF0);
+        if (sc == SC_MAXIMIZE || sc == SC_SIZE || sc == SC_RESTORE) return 0;
+        if ((int)wp == IDM_TRAY_EXIT) {
+            trayRemove();
+            if (g_engState.load() != 0) guiStopEngine();
+            guiCaptureWindowPos(w);
+            DestroyWindow(w);
+            return 0;
+        }
+        break; }
+    case WM_DISPLAYCHANGE:
+        // v7.1.20: a monitor went away / the resolution dropped -- pull the
+        // window back into a work area so the bar stays reachable.
+        guiClampToWorkArea(w);
+        break;
+    case WM_ENDSESSION:
+        // v7.1.20: logoff/shutdown -- remember where the window was and give
+        // the engine a chance to release its devices cleanly (the threads
+        // watch g_run at every buffer switch; no blocking here, Windows
+        // allows only seconds).
+        if (wp) {
+            guiCaptureWindowPos(w);
+            if (g_engState.load() != 0) { g_engState.store(3); g_run.store(false); }
+        }
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
@@ -6144,6 +6448,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             case IDM_TRAY_EXIT:
                 trayRemove();
                 if (g_engState.load() != 0) guiStopEngine();
+                guiCaptureWindowPos(w);          // v7.1.20: remember the last spot
                 DestroyWindow(w);
                 return 0;
             case IDC_START:
@@ -6197,11 +6502,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 cfgFromControls(w); cfgSanitize();
                 const bool ok = guiSaveIni();
                 if (wasRunning) {
+                    // v7.1.20: the restart CHAINS off WM_APP+2 (the engine
+                    // thread's farewell) -- no frozen window between the two
+                    // halves, and the new engine only starts on the old one's
+                    // corpse.
+                    g_applyRestart = true;
                     guiStopEngine();
-                    guiStartEngine(w);
-                    guiSetStatus(w,
-                                    ok ? "saved -- engine restarted"
-                                       : "save FAILED -- restarted with the previous ini");
+                    guiSetStatus(w, ok
+                        ? "saved -- restarting the engine..."
+                        : "save FAILED -- restarting with the previous ini");
                 } else {
                     guiSetStatus(w, ok ? "saved -- START to apply" : "ini save FAILED");
                 }
@@ -6243,6 +6552,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH;
         return 0; }
     case WM_TIMER: {
+        // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
+        // re-tries every 2 s until the shell accepts it).
+        if (wp == 3) {
+            if (!g_trayVisible) trayAdd(false);
+            if (g_trayVisible) KillTimer(w, 3);
+            return 0;
+        }
         // v7.0.3: timer 2 drives the tab fade-in; ONLY the strip repaints
         // each tick. When the run completes the timer kills itself and lands
         // one final full-strength pass -- no fractional-alpha frame remains.
@@ -6280,6 +6596,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
             }
         }
+        // v7.1.20: the async stop's backup reap -- if WM_APP+2's bounded wait
+        // expired (hidden window, timer asleep), the next tick closes the
+        // handle. The thread itself already set state 0.
+        if (g_engThread && WaitForSingleObject(g_engThread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_engThread);
+            g_engThread = nullptr;
+            guiRepaint(w, IDC_START);
+        }
         guiFlushLogRing();                               // v7.1.6: one shared drain
         static const char* stName[4] = { "engine stopped", "engine started",
                                          "engine RUNNING", "engine stopping..." };
@@ -6301,13 +6625,32 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             guiSetStatus(w, s.c_str());
         }
         return 0; }
-    case WM_APP + 2:                                   // engine thread ended
+    case WM_APP + 2: {                                 // engine thread ended
+        // v7.1.20: reap the thread NOW -- the poster is microseconds from
+        // exiting, so the bounded wait almost never actually waits (and a
+        // leftover handle is closed by the timer's reap instead).
+        if (g_engThread) {
+            if (WaitForSingleObject(g_engThread, 250) == WAIT_OBJECT_0) {
+                CloseHandle(g_engThread);
+                g_engThread = nullptr;
+            }
+        }
         guiRepaint(w, IDC_START);                      // v6.6.1
-        return 0;
+        // v7.1.20: the chained APPLY+RESTART -- the restart fires only after
+        // the old engine is truly gone, with no UI-thread freeze anywhere.
+        if (g_applyRestart) {
+            g_applyRestart = false;
+            if (g_hwnd && IsWindow(g_hwnd)) guiStartEngine(g_hwnd);
+        }
+        return 0; }
     case WM_APP + 3: {                                 // v6.6.1: tray icon events
+        // v7.1.20: version-0 notifications deliver WM_RBUTTONUP (never
+        // WM_CONTEXTMENU -- that lParam only exists with
+        // NOTIFYICON_VERSION_4), so the dead check is gone. A single
+        // left-click opens (as the balloon now says).
         if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
             guiRestoreWindow();
-        } else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+        } else if (lp == WM_RBUTTONUP) {
             // SetForegroundWindow before TrackPopupMenu + the WM_NULL after:
             // without them the menu refuses to dismiss when the user clicks
             // elsewhere.
@@ -6353,9 +6696,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0; }
     case WM_CLOSE:
         // v6.6.1: closing hides to the tray -- the engine keeps running.
-        // Real exit lives in the tray menu (Exit), which stops the engine
-        // first. A one-time balloon tells the user where the window went.
-        // v7.1.7: the taskbar slot goes away WITH the panel.
+        // Real exit lives in the tray menu (Exit) and the system menu's
+        // "Exit twinspeak" (v7.1.20). A balloon tells the user where the
+        // window went (the first three closes per session).
+        // v7.1.20: capture the position for the ini, clear the stale X hover,
+        // and let the 250 ms tick sleep while hidden (it returns in
+        // guiRestoreWindow). The hidden tray surrogate ignores WM_CLOSE
+        // entirely (taskkill broadcasts reach it too).
+        if (w == g_trayWnd) return 0;
+        guiCaptureWindowPos(w);
+        g_capHot = false;
+        KillTimer(w, 1);
         tbHideTab(w);
         trayAdd(true);
         ShowWindow(w, SW_HIDE);
@@ -6375,7 +6726,10 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     g_guiIniPath = iniPath;
     g_startTray  = startTray;
     g_logSink = guiLogSink;                            // everything logs to the pane now
-    FreeConsole();                                     // the window replaces the console
+    // v7.1.20: the exe is GUI-subsystem now (no loader console flash) -- if
+    // we were started from a terminal, detach politely; there is nothing to
+    // free otherwise.
+    FreeConsole();
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
     HANDLE mutex = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
@@ -6433,6 +6787,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         return 1;
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
+    guiInitDpi();   // v7.1.20: FIRST geometry act -- scale every constant + font
     // v7.1.5 boot pop, round two (winner side): a PLAIN launch that beats the
     // Run-key --tray instance to the mutex shows its window and lets the real
     // startup twin die silently -- the boot pop, from the other direction.
@@ -6446,25 +6801,41 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         g_startTray  = true;
     }
     guiMakeGdi();
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);   // v7.1.7: ITaskbarList
+    // v7.1.7: ITaskbarList (the result only matters if COM changed modes under
+    // us -- the taskbar slot then just falls back to shell timing).
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
+        tlog("[twinspeak] gui           : COM init failed -- the taskbar slot falls back to shell timing\n");
     // v6.6.5: GDI+ session for the antialiased owner-drawn UI + watermark
     {
         Gdiplus::GdiplusStartupInput sin_;
         Gdiplus::GdiplusStartup(&g_gdipToken, &sin_, nullptr);
     }
     g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
-    WNDCLASSA wc = {};
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;   // v7.1.4: the window gets its drop shadow back
+    // v7.1.20: WNDCLASSEXW (a true small icon -- hIconSm -- for the taskbar /
+    // Alt-Tab instead of a scaled 32 px) and CS_DROPSHADOW is GONE: the legacy
+    // shadow draws from the SQUARE window rect along the bottom edge and its
+    // silhouette filled the DWM-rounded bottom-corner notches -- the reason
+    // the window read as rounded on the top half only. The DWM shadow from
+    // WS_THICKFRAME follows the rounded shape and is the only shadow now.
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = guiWndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
-    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
+    wc.hIcon = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                 GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                                 LR_DEFAULTSIZE);
     if (!wc.hIcon) wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                   LR_DEFAULTSIZE | LR_SHARED);
+    if (!wc.hIconSm) wc.hIconSm = wc.hIcon;
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;   // v7.0.0: the erase is ours (WM_ERASEBKGND above);
                                   // a class-held brush would go stale the first time
                                   // applyTheme() deletes + recreates g_brBg
-    wc.lpszClassName = "twinspeak.control";
-    RegisterClassA(&wc);
+    wc.lpszClassName = L"twinspeak.control";
+    if (!RegisterClassExW(&wc)) return 1;   // v7.1.20: checked (was ignored)
     // v7.1.5 THE INPUT PRIORITY: the message-loop thread ran at NORMAL while
     // the engine's helpers (health loop, volume watcher) and the RT audio
     // threads share the process -- under load the UI thread got the scraps
@@ -6487,10 +6858,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                                     WS_OVERLAPPED, 0, 0, 0, 0,
                                     nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
+        tsAllowUiMessages(g_trayWnd);   // v7.1.20: the surrogate must hear explorer + twins
         g_hwnd = g_trayWnd;
         trayAdd(false);
         trayBalloon("Running in the tray -- the engine is starting.\n"
-                    "Double-click the icon to open the control panel; "
+                    "Click the icon to open the control panel; "
                     "right-click for Start/Stop and Exit.");
         tlog("[twinspeak] gui           : tray-only start -- no window exists; double-click the tray icon\n");
         tlog("                            to build and open the control panel (no taskbar button).\n");
@@ -6511,7 +6883,15 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // frame, no activate/erase cycle).
         if (!guiCreateRealWindow()) { if (mutex) CloseHandle(mutex); return 1; }
         ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
+        // v7.1.20 THE FOCUS FIX: SW_SHOWNA alone left the first-open window
+        // UNFOCUSED -- keyboard dead until the first click (the tray path
+        // always foregrounded; the double-click path never did). The v6.6.5
+        // pre-render already made activation safe.
+        SetForegroundWindow(g_hwnd);
+        SetActiveWindow(g_hwnd);
         tbShowTab(g_hwnd);               // v7.1.7: the taskbar slot exists THIS instant
+        guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
+        g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
@@ -6528,6 +6908,34 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                                 ? (g_tab + 4) % 5 : (g_tab + 1) % 5);
             continue;
         }
+        // v7.1.20 KEYBOARD: Enter activates the focused button (IsDialogMessage
+        // only drives Space -- there is no default-ID plumbing here); Esc hides
+        // like the X. Esc yields to an open combo dropdown first (the list owns
+        // the key while it is dropped).
+        if (m.message == WM_KEYDOWN && (m.wParam == VK_RETURN || m.wParam == VK_ESCAPE)
+            && g_hwnd && IsWindow(g_hwnd)) {
+            HWND f = GetFocus();
+            if (f) {
+                char cn[16]; GetClassNameA(f, cn, sizeof(cn));
+                if (m.wParam == VK_RETURN && !strcmp(cn, "Button")) {
+                    SendMessageA(f, BM_CLICK, 0, 0);
+                    continue;
+                }
+                if (m.wParam == VK_ESCAPE && strcmp(cn, "ComboBox") != 0) {
+                    bool comboOpen = false;
+                    for (HWND t = f; t && t != g_hwnd; t = GetParent(t)) {
+                        char cn2[16]; GetClassNameA(t, cn2, sizeof(cn2));
+                        if (!strcmp(cn2, "ComboLBox") ||
+                            (!strcmp(cn2, "ComboBox") &&
+                             SendMessageA(t, CB_GETDROPPEDSTATE, 0, 0))) {
+                            comboOpen = true;
+                            break;
+                        }
+                    }
+                    if (!comboOpen) { PostMessageA(g_hwnd, WM_CLOSE, 0, 0); continue; }
+                }
+            }
+        }
         // v7.1.4 KEYBOARD + TAB: IsDialogMessage drives the whole child tree --
         // Tab / Shift+Tab cycle the tab stops (buttons, pills, edits, combos
         // and now the sliders), Space activates the focused button, and the
@@ -6539,7 +6947,13 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         DispatchMessageA(&m);
     }
     KillTimer(g_hwnd, 1);
-    if (g_engState.load() != 0) guiStopEngine();
+    // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
+    // UI is gone anyway), then release the taskbar-list COM object.
+    guiStopEngineJoin();
+    if (g_tbList) {
+        ((TS_ITaskbarListVtbl*)*(void**)g_tbList)->Release(g_tbList);
+        g_tbList = nullptr;
+    }
     if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }   // v6.6.5
     if (mutex) CloseHandle(mutex);
     return 0;
@@ -6547,6 +6961,27 @@ static int guiMain(const std::string& iniPath, bool startTray) {
 
 // ---------------------------------------------------------------- main ------
 static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
+
+// v7.1.20 CONSOLE, GUI-SUBSYSTEM EDITION: the exe no longer allocates a
+// console at load (that was the black window flashing on every double-click
+// and at every sign-in -- the loader created it, then guiMain's FreeConsole
+// destroyed it half a second later). Console modes re-attach themselves:
+// attach to the parent terminal when one exists (no window is created for
+// that), and -- only for the console modes, only if there is no parent --
+// allocate one so double-clicked `--list` output is still visible.
+static void tsEnsureConsole(bool allowAlloc) {
+    const HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (so && so != INVALID_HANDLE_VALUE) return;   // piped / redirected / already attached
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        return;
+    }
+    if (allowAlloc && AllocConsole()) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
+}
 
 // v6.6.0: the engine body, split out of main() so the GUI runs it on a
 // worker thread and can restart it in-process. The caller owns the single-
@@ -6558,6 +6993,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
 int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
+    tsEnsureConsole(false);                // v7.1.20: ride the parent terminal, if any
     std::string iniPath;
     bool doList = false, doListKS = false, fgForce = false, allowMulti = false;
     bool wantGui = false, startTray = false;   // v6.6.1: --gui / --tray
@@ -6599,6 +7035,11 @@ int main(int argc, char** argv) {
     // their exact behavior behind explicit flags. v6.6.1: --gui is the same
     // default made explicit; --tray starts hidden in the tray.
     if (argc <= 1 || wantGui) return guiMain(iniPath, startTray);
+
+    // v7.1.20: a real console mode -- make sure the output has somewhere to
+    // go even with no parent terminal (AllocConsole only here; the GUI path
+    // never allocates).
+    tsEnsureConsole(true);
 
     // v6.2 single-instance lock (console runs; the GUI holds its own).
     HANDLE hInstance = nullptr;
@@ -7895,4 +8336,40 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     timeEndPeriod(1);
     tlog("[twinspeak] stopped.\n");
     return 0;
+}
+
+// v7.1.20: the GUI-subsystem entry. The linker picks WinMainCRTStartup under
+// --subsystem,windows; this shim forwards to main() with parsed args so the
+// console modes keep their exact argv behavior. (Under a console-subsystem
+// build the entry is mainCRTStartup and this shim simply never runs.)
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    int n = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &n);
+    char** argv = nullptr;
+    if (wargv && n > 0) {
+        argv = (char**)HeapAlloc(GetProcessHeap(), 0, sizeof(char*) * (size_t)n);
+        if (argv) {
+            for (int i = 0; i < n; ++i) {
+                const int need = WideCharToMultiByte(CP_ACP, 0, wargv[i], -1,
+                                                     nullptr, 0, nullptr, nullptr);
+                argv[i] = (char*)HeapAlloc(GetProcessHeap(), 0,
+                                           (SIZE_T)(need > 0 ? need : 1));
+                if (argv[i]) {
+                    if (need > 0)
+                        WideCharToMultiByte(CP_ACP, 0, wargv[i], -1, argv[i], need,
+                                            nullptr, nullptr);
+                    else
+                        argv[i][0] = '\0';
+                }
+            }
+        }
+        LocalFree(wargv);
+    }
+    const int rc = main(n, argv);
+    if (argv) {
+        for (int i = 0; i < n; ++i)
+            if (argv[i]) HeapFree(GetProcessHeap(), 0, argv[i]);
+        HeapFree(GetProcessHeap(), 0, argv);
+    }
+    return rc;
 }
