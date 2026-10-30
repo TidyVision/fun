@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.21 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.22 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,20 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.22 THE LAST EDGE PAINTER: the field still saw a Windows-2000-
+//            style hard ring on the window edges. With no NC area, no
+//            caption and no region, one persistent painter remained: the
+//            DWM's own 1px window border (DWMWA_BORDER_COLOR) -- on a
+//            machine with a customized visual style it renders in the
+//            theme's hard classic gray. DWMWA_COLOR_NONE retires it (the
+//            shadow and the rounded shape are separate attributes and
+//            survive; pre-Win11 the call fails harmlessly) and
+//            DWMWA_NCRENDERING_POLICY=DWMNCRP_ENABLED pins NC rendering
+//            to the DWM for good. The v7.1.18 self-heal also widens:
+//            WM_NCACTIVATE/WM_NCPAINT re-blit the WHOLE buffered face
+//            (then the bar), so a themed strike into any client edge is
+//            overwritten before the message returns. DSP byte-identical
+//            to v7.1.4.
 //    v7.1.21 THE MANIFEST KILLED THE EXE: v7.1.20's manifest carried "--"
 //            inside two XML comments ("comctl32 v6 -- the activation
 //            context", "real pixels -- no more bitmap stretch"). "--" is
@@ -5873,9 +5887,15 @@ static bool guiCreateRealWindow() {
         // for exactly that) -- with no region and no caption the rounding
         // is pure DWM geometry now, it clips the window alpha shape and
         // costs nothing. The call fails harmlessly pre-Win11, which is
-        // square anyway. No NCRENDERING override, no extend-frame: the
-        // frame painter has no NC area to paint, and the shadow does not
-        // need either.
+        // square anyway.
+        // v7.1.22 THE LAST EDGE PAINTER: the shadow came with the DWM's
+        // own 1px border line drawn just inside the window rect -- on a
+        // machine with a customized visual style that line renders in the
+        // theme's hard classic gray and reads Windows-2000. DWMWA_COLOR
+        // _NONE retires the line (shadow + rounded shape are separate
+        // attributes and both survive); DWMNCRP_ENABLED pins nonclient
+        // rendering to the DWM so no theme/classic engine can claim the
+        // edge again.
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
@@ -5883,6 +5903,12 @@ static bool guiCreateRealWindow() {
             const int round = 2;   // DWMWCP_ROUND -- all four corners
             dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
                    &round, sizeof(round));
+            const DWORD noBorder = 0xFFFFFFFEu;   // DWMWA_COLOR_NONE
+            dwmSet(g_hwnd, 34 /* DWMWA_BORDER_COLOR */,
+                   &noBorder, sizeof(noBorder));
+            const int ncrp = 2;                   // DWMNCRP_ENABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
+                   &ncrp, sizeof(ncrp));
         }
     }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
@@ -5991,6 +6017,24 @@ static bool guiFrameBufEnsure(int w, int h) {
     g_frmW = w; g_frmH = h;
     return true;
 }
+// v7.1.22 THE FULL-FRAME SELF-HEAL: WM_NCACTIVATE/WM_NCPAINT re-blit the
+// whole buffered face -- not just the bar -- so a themed engine that strikes
+// into any client edge (the machine that grew a Luna caption out of nowhere
+// proved they strike into CLIENT pixels) has its vandalism overwritten
+// before the message returns. One BitBlt; the buffer holds exactly what the
+// last WM_PAINT put on screen, so the blit is a no-op except where someone
+// drew over us. Gated on g_frmFaceReady: until the first WM_PAINT has
+// rendered the face there is nothing to heal with.
+static bool g_frmFaceReady = false;
+static void guiBlitFullFace(HWND w) {
+    if (!g_frmFaceReady || !g_frmDc) return;
+    RECT crc; GetClientRect(w, &crc);
+    HDC dc = GetDC(w);
+    if (dc) {
+        BitBlt(dc, 0, 0, crc.right, crc.bottom, g_frmDc, 0, 0, SRCCOPY);
+        ReleaseDC(w, dc);
+    }
+}
 // v7.1.20: long ini paths used to run off the version line and clip mid-glyph.
 // Middle-truncate so BOTH ends stay visible (the drive and the file name).
 static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
@@ -6021,7 +6065,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.21  |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.1.22  |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6093,6 +6137,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // Both are answered with 0: the bar is ours, nobody else draws it.
         return 0; }
     case WM_NCPAINT:
+        // v7.1.22: an NC recalc is exactly when a themed engine strikes --
+        // heal the whole face first, then re-land the bar.
+        guiBlitFullFace(w);
         guiPaintBar(w);                 // the bar is ours; never the classic frame
         return 0;
     case WM_NCACTIVATE:
@@ -6103,9 +6150,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // survived (nothing repainted after). Now DefWindowProc runs first
         // and the bar is re-blitted AFTER it -- whatever the system drew in
         // the message gets overwritten by our one blit. (With WS_CAPTION
-        // gone there is no caption at all; this is pure self-heal insurance.)
+        // gone there is no caption at all.) v7.1.22: the heal widens from
+        // the top bar to the WHOLE face -- the same machines strike into
+        // the client edges too, and the left/right/bottom rows had nobody
+        // to overwrite them.
         {
             const LRESULT r = DefWindowProcA(w, msg, wp, -1);
+            guiBlitFullFace(w);   // v7.1.22: heal ALL edges, not just the top
             guiPaintBar(w);
             return r;
         }
@@ -6190,6 +6241,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int cw = crc.right, ch = crc.bottom;
         if (guiFrameBufEnsure(cw, ch)) {
             guiPaintFrame(g_frmDc, cw, ch);
+            g_frmFaceReady = true;   // v7.1.22: the heal source exists
             BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                    g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
