@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.10 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,20 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.11 THE RESTART IS CLEAN AND THE LEGS OPEN TOGETHER: guiStopEngine
+//            raises the stop gap ITSELF (the engine's health loop slept a
+//            full second before noticing -- APPLY+RESTART played program
+//            audio through the stop, the silent gap never arrived; the
+//            loop now polls g_run every 50 ms); the start-align's first-
+//            switch stamps are PERIOD-CORRECTED (the first callback fires
+//            one device period after the DAC began eating, and the two
+//            legs' periods differ -- the raw gap carried a P1-P2 bias and
+//            leg1 landed late until the warden reeled it in); the DWM's
+//            all-directions window shadow is back (NCRENDERING_POLICY =
+//            DISABLED was killing it, leaving the thin bottom-right
+//            CS_DROPSHADOW); the tick test logs a per-leg census at the
+//            natural end (the center-missing witness); tabs land on +7 px
+//            (167). DSP byte-identical to v7.1.4.
 //    v7.1.10 ONE ACCENT, +6 px TABS: the slot selection collapses to ONE
 //            variable -- v7.1.9's armed target and exact-match highlight
 //            were separate and could light TWO slot faces at once; now a
@@ -1625,6 +1639,19 @@ static std::atomic<unsigned long long> g_tickEndMs{0};   // wall time the 4 s ru
 static std::vector<float>     g_tickWave;          // ONE pre-rendered tick (48 kHz mono)
 static constexpr size_t kTickPeriod = 24000;       // 500 ms @ 48 kHz = 120 bpm
 static constexpr size_t kTickCount  = 8;           // 8 beats = 4 s, then it stops
+// v7.1.11 TICK CENSUS: chunks each leg's pump actually stamped with tick
+// samples. The center-missing field report needs a witness: if leg2's
+// count is 0 the dispatch never reached its pump (seq window); if it is
+// ~8+ the samples left the pump and the loss is device-side.
+static std::atomic<unsigned long long> g_tickWrites[2] = {};   // pump-thread only
+static void tickCensusLog() {
+    tlog("[twinspeak] tick test     : census -- leg1 stamped %llu chunks, leg2 %llu\n"
+         "                            (8 beats in 500 us pump cycles -> a healthy leg reads\n"
+         "                            dozens; a leg at 0 never saw the window, a leg with\n"
+         "                            counts but no sound loses it past the pump)\n",
+         (unsigned long long)g_tickWrites[0].load(std::memory_order_relaxed),
+         (unsigned long long)g_tickWrites[1].load(std::memory_order_relaxed));
+}
 
 static void tickRender() {
     if (!g_tickWave.empty()) return;
@@ -1648,11 +1675,13 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
     if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
     const size_t wn = g_tickWave.size();
     const int    ch = (idx == 0) ? kOutCh1 : 2;
+    bool stamped = false;   // v7.1.11 census: did THIS chunk carry samples?
     for (size_t i = 0; i < n; ++i) {
         const long long t = pos + (long long)i;
         if (t >= (long long)(kTickCount * kTickPeriod)) break;
         const size_t ph = (size_t)t % kTickPeriod;
         if (ph >= wn) continue;
+        stamped = true;
         const float s = g_tickWave[ph];
         float* o = chunk + i * (size_t)ch;
         // v7.0.0: the tick channels -- leg1: FL, FR, LFE (FC is DRIVEN
@@ -1668,6 +1697,7 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
             o[c] = v;
         }
     }
+    if (stamped) g_tickWrites[idx].fetch_add(1, std::memory_order_relaxed);
 }
 
 // ----------------------------------------------------------------- pumps ----
@@ -2628,7 +2658,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.10 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4723,6 +4753,13 @@ static void guiStopEngine() {
     if (st == 0 || st == 3) return;
     g_engState.store(3);
     if (g_hwnd) guiRepaint(g_hwnd, IDC_START);
+    // v7.1.11 THE STOP GAP STARTS HERE: the callbacks used to keep playing
+    // the program until the ENGINE thread noticed g_run (its health loop
+    // sleeps a full second) -- an APPLY+RESTART kept the audio running for
+    // up to a second and the designed silent gap never arrived. Setting
+    // the flag HERE silences the legs the instant the GUI decides to stop;
+    // engineMain's own store still re-arms the gap for a console CTRL+C.
+    g_stopSilence.store(true, std::memory_order_relaxed);
     g_run.store(false);
     if (g_engThread) {
         WaitForSingleObject(g_engThread, 10000);
@@ -4737,10 +4774,10 @@ static void guiStopEngine() {
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
 // v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
 // (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
-// v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 lands
-// on the field's sweet spot: +6 px (166). 5 x 166 + 4 x 4 gaps + 5 px
-// left pad ends at 851 inside the 866 px strip -- halo fits, no overflow.
-static const int kTabW[5] = { 166, 166, 166, 166, 166 };
+// v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 went to
+// 166; v7.1.11 lands on the field's final call: +7 px (167). 5 x 167 +
+// 4 x 4 gaps + 5 px left pad ends at 856 inside the 866 px strip.
+static const int kTabW[5] = { 167, 167, 167, 167, 167 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -5552,8 +5589,11 @@ static bool guiCreateRealWindow() {
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
         bool rounded = false;
         if (dwmSet) {
-            const int off = 1;   // DWMNCRP_DISABLED
-            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof(off));
+            // v7.1.11: the NCRENDERING_POLICY = DISABLED call is GONE -- it
+            // killed the DWM's own window shadow (the all-four-directions
+            // one a captioned window gets on Win10), leaving only the thin
+            // menu-style CS_DROPSHADOW on the bottom-right. The policy now
+            // stays USEWINDOWSTYLE so DWM draws the full shadow again.
             const int round = 2; // DWMWCP_ROUND
             rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
                                        &round, sizeof(round)));
@@ -5687,7 +5727,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.10  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.11  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -6068,6 +6108,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                                  + (long long)kSampleRate, std::memory_order_release);
                 g_tickEndMs.store(GetTickCount64() + 1000ULL + 4000ULL,
                                   std::memory_order_relaxed);
+                g_tickWrites[0].store(0); g_tickWrites[1].store(0);   // v7.1.11 census
                 g_tickOn.store(true, std::memory_order_release);
                 SetDlgItemTextA(w, IDC_TICK, "STOP TICK TEST");
                 guiSetStatus(w,
@@ -6166,6 +6207,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g_tickEndMs.store(0, std::memory_order_relaxed);
                 SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
                 guiSetStatus(w, "tempo tick: finished");
+                tickCensusLog();                     // v7.1.11: the witness line
             }
         } else {
             const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
@@ -6936,9 +6978,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
             Sleep(1);
         }
-        const unsigned long long au0 = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
-        const unsigned long long au1 = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
-        if (!au0 || !au1) {
+        const unsigned long long au0raw = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
+        const unsigned long long au1raw = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
+        // v7.1.11 PERIOD BIAS: the first callback fires one device period
+        // AFTER the DAC truly began eating -- miniaudio primes the device
+        // buffer, the driver consumes that prime, THEN the first event
+        // lands. The two legs' negotiated periods differ, so the raw gap
+        // carries a (P1 - P2) bias: the aligner padded the wrong amount
+        // (or the wrong leg) and the field heard leg1 arrive late on every
+        // start/apply+restart until the warden reeled it in. Compare the
+        // TRUE eat-starts: stamp minus this leg's own period. KS legs are
+        // left alone -- their pacing thread writes the first period itself,
+        // there is no prime for the DAC to eat first.
+        long long au0 = (long long)au0raw, au1 = (long long)au1raw;
+        if (g_leg[0].backend != 1 && g_periodFrames[0])
+            au0 -= (long long)((double)g_periodFrames[0] * 1e6 / (double)kSampleRate);
+        if (g_leg[1].backend != 1 && g_periodFrames[1])
+            au1 -= (long long)((double)g_periodFrames[1] * 1e6 / (double)kSampleRate);
+        if (!au0raw || !au1raw) {
             tlog("[twinspeak] start align  : a leg never handed in its first buffer switch --\n"
                  "                            alignment skipped (the watchdog owns a dead leg)\n");
         } else {
@@ -6965,10 +7022,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     E.padFrames.fetch_add((size_t)gapFr, std::memory_order_relaxed);
                     tlog("[twinspeak] start align  : leg%d began eating %lld us before leg%d -- replay-padded\n"
                          "                            %lld fr (%.2f ms)%s so both legs open their stream on the\n"
-                         "                            same instant; the ledger starts ON the calibrated baseline\n",
+                         "                            same instant; the ledger starts ON the calibrated baseline\n"
+                         "                            (v7.1.11: stamps are period-corrected -- %zu / %zu fr)\n",
                          earlyIdx + 1, gapAbs, 2 - earlyIdx, gapFr,
                          (double)gapFr * 1000.0 / (double)kSampleRate,
-                         clipped ? " (clipped to the safe pad)" : "");
+                         clipped ? " (clipped to the safe pad)" : "",
+                         g_periodFrames[0], g_periodFrames[1]);
                 } else {
                     tlog("[twinspeak] start align  : stagger %lld us, but no silence prefill left to pad inside --\n"
                          "                            the early leg already plays; leaving it to the warden\n", gapAbs);
@@ -7016,7 +7075,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.10       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.11       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
@@ -7213,7 +7272,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     unsigned stallSec[2] = { 0, 0 };   // v6.5.11: consecutive starved seconds per leg
     unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
     while (g_run.load()) {
-        Sleep(1000);
+        // v7.1.11: poll g_run every 50 ms inside the 1 s health tick -- the
+        // old bare Sleep(1000) delayed the whole shutdown sequence by up to
+        // a second (the silence the field never heard on APPLY+RESTART).
+        for (int w = 0; w < 20 && g_run.load(); ++w) Sleep(50);
+        if (!g_run.load()) break;
         ++sec;
         // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 over the
         // last second (both counters integrate the real clocks; bursts and
