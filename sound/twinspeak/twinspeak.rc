@@ -1,13 +1,16 @@
-// twinspeak.rc -- v6.6.4: app icon + version info.
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.1.20: the manifest.
 // Task Manager (and Explorer > Properties > Details) read FileDescription
-// below: "TwinSpeak". No windows.h include needed -- the VERSIONINFO forms
-// used here are RC syntax, not C macros, so both windres and zig rc accept
-// this file as-is.
+// below: "TwinSpeak". No windows.h include needed -- the VERSIONINFO and
+// RT_MANIFEST forms used here are RC syntax, not C macros, so both windres
+// and zig rc accept this file as-is.
+// v7.1.20: `1 24` embeds twinspeak.manifest (RT_MANIFEST = 24, id 1) --
+// DPI awareness (the blur fix), comctl32 v6 (DarkMode_Explorer), asInvoker.
 1 ICON "twinspeak.ico"
+1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,1,19,0
-PRODUCTVERSION  7,1,19,0
+FILEVERSION     7,1,20,0
+PRODUCTVERSION  7,1,20,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -18,12 +21,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TidyVision TwinSpeak"
-            VALUE "FileVersion",      "7.1.19.0"
+            VALUE "FileVersion",      "7.1.20.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.1.19.0"
+            VALUE "ProductVersion",   "7.1.20.0"
         END
     END
     BLOCK "VarFileInfo"
