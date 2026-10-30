@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.16 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.17 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -26,6 +26,28 @@
 //    FIRST-SECOND fast tier at 10x that cadence (v7.1.14).
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.17 THE ACTIVATION GHOST, EXORCISED + SQUARE, PINNED: the field
+//            clicked out and back and met the CLASSIC frame -- the real
+//            window title, the icon, the caption buttons, the blue
+//            active-window accent border -- painted over our bar. Why:
+//            v7.1.16 removed the region (the shadow killer), but a region
+//            was ALSO suppressing ALL DWM non-client rendering; unshaped,
+//            the WS_CAPTION window's real 31 px NC strip gets DWM's
+//            STANDARD caption composed into it on every activation
+//            change. The cure is the borderless recipe: WM_NCCALCSIZE
+//            now eats the WHOLE frame -- the client IS the window
+//            (KCLI_W x (KCLI_H + kCapH)), the bar is the client's top
+//            31 px, and DWM's frame renderer has NO non-client area to
+//            paint into. Caption + thickframe styles stay (with the
+//            extend-frame 1 px pin) so the all-directions DWM shadow
+//            still triggers. Children ride kCapH down once at build; the
+//            frame pass shifts kCapH; the bar band is copied into the
+//            frame buffer so the one-blit paint covers everything; the
+//            drag area answers HTCAPTION explicitly; the X's guards move
+//            from negative-y to the strip band; SC_SIZE is refused. The
+//            corner preference is DWMWCP_DONOTROUND -- square on Win10
+//            AND Win11, per the field's ask. GUI-only; DSP
+//            byte-identical to v7.1.4.
 //    v7.1.16 THE REGION THAT ATE THE SHADOW + THE STACK THAT FITS: the
 //            field's "I still don't see a drop shadow" was our own log
 //            line talking -- "a shaped window cannot carry the DWM
@@ -2730,7 +2752,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3794,19 +3816,25 @@ static const char* kTabNames[5] = {
 };
 
 // v6.6.4: only a close button -- fixed-size layout, close already hides to the
-// tray. v7.0.9: the caption itself is custom (see kCapH below); WS_CAPTION
-// stays so the bar still answers HTCAPTION drag + the WS_SYSMENU right-click.
-static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
+// tray. v7.0.9: the caption itself is custom (see kCapH below). v7.1.17: the
+// window is the borderless-with-shadow recipe -- caption + thickframe styles
+// stay so DWM keeps drawing the all-directions shadow, but WM_NCCALCSIZE
+// eats the whole frame, so there is no NC area and no standard caption;
+// the bar answers its own HTCAPTION drag (WM_NCHITTEST).
+static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME;
 
 // v7.0.9 THE CUSTOM TITLEBAR: the DWM caption is gone entirely (its text, its
 // close button, and the dark->light recolor that never took until a DWM
 // round-trip). The top 31 px strip of the window is our own bar: theme colors
 // painted directly, so a theme click recolors it the same instant as the
-// client. WM_NCCALCSIZE insets the client top by kCapH -- every child
-// coordinate keeps its old meaning. DWM's own frame drawing is left at the
-// window-style default (v7.1.11: an explicit NCRENDERING DISABLED here killed
-// the window shadow) -- the bar defends itself message-by-message instead
-// (WM_NCPAINT, NCACTIVATE lParam -1, the 0x00AE/0x00AF swallow).
+// client. v7.1.17: WM_NCCALCSIZE eats the ENTIRE frame -- the client IS the
+// window rect, the bar is the client's top kCapH strip, and DWM's frame
+// renderer has no non-client area to paint its standard caption into (the
+// activation ghost). Children ride kCapH down once at build (see
+// guiCreateRealWindow); the frame pass paints kCapH lower (see guiPaintFrame).
+// DWM's own frame drawing is left ENABLED (v7.1.11: DISABLED killed the
+// window shadow; the shadow is the point) -- there is simply no NC area
+// left for it to draw a caption into.
 static const int  kCapH = 31;
 static bool       g_capHot = false;   // mouse over the close glyph
 static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
@@ -4013,8 +4041,8 @@ static void applyTheme(int i) {
 // (was 1000x750), 34px row pitch (was 38), slimmer bars everywhere.
 static const int COLA_X = 24, COLB_X = 460, LBL_W = 160, CTL_W = 200;
 static const int KCLI_W = 880, KCLI_H = 620;   // designed client size
-static const int KLOG_BOTTOM = 594;            // v6.6.6: log ends here; 26px watermark strip below
-static const int KPANEL_T = 66, KPANEL_B = 402; // page panel band
+static const int KLOG_BOTTOM = 594 + 31;       // v7.1.17: client == window now; the log pane's bottom edge (was client 594)
+static const int KPANEL_T = 66 + 31, KPANEL_B = 402 + 31; // v7.1.17: page panel band (was client 66..402)
 static const int KHDR_Y = 94, KROW0 = 120;   // page header / first row / pitch
 
 // ---- small drawing helpers (v6.6.5: GDI+ -- everything the eye sees is AA) --
@@ -4785,7 +4813,7 @@ static void guiAppendLog(const std::string& s) {
 // invalidated in the same breath; the next WM_PAINT lands it as one blit.
 static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
-    const RECT sr = { 14, 458, 866, 476 };
+    const RECT sr = { 14, 458 + kCapH, 866, 476 + kCapH };   // v7.1.17: the band rides kCapH with the frame pass
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -4968,7 +4996,7 @@ static void guiBuildPages(HWND w) {
     // detached from what it saves) -- the button sits directly beneath
     // the curve it writes, with its own one-line description.
     // v7.1.16 THE OVERLAP: that note shipped as a 2-row box carrying ONE
-    // line -- 396..430 on a page panel that ends at KPANEL_B = 402 -- so
+    // line -- 396..430 on a page panel that then ended at 402 -- so
     // it hung 28 px past the panel and lay across the STOP / APPLY +
     // RESTART / SAVE INI row at 414 (the STATIC is built after the bottom
     // bar, so it painted OVER the buttons' tops). And the arithmetic was
@@ -5680,10 +5708,27 @@ static void trayBalloon(const char* text) {
 // so nothing takes a taskbar slot; the moment the panel opens it gets its
 // taskbar button (and Alt-Tab entry) so it can be seen and reached like any
 // window; closing hides it and the button goes away -- the tray icon remains.
+// v7.1.17: one child, one ride down. The client ate the frame (WM_NCCALCSIZE),
+// so the design children -- laid out for a client that started kCapH below the
+// window top -- shift once, right after the build, and land where they always
+// were on screen.
+static BOOL CALLBACK tsShiftChild(HWND c, LPARAM lp) {
+    HWND p = GetParent(c);
+    RECT r; GetWindowRect(c, &r);
+    POINT pt = { r.left, r.top };
+    ScreenToClient(p, &pt);
+    SetWindowPos(c, nullptr, pt.x, pt.y + (int)lp, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return TRUE;
+}
+
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
-    RECT r = { 0, 0, KCLI_W, KCLI_H };
+    // v7.1.17: the client IS the window (WM_NCCALCSIZE eats the frame) --
+    // the design client is KCLI_W x (KCLI_H + kCapH): the old 620-tall
+    // client rides kCapH down inside it, the bar is its top 31 px band.
+    RECT r = { 0, 0, KCLI_W, KCLI_H + kCapH };
     AdjustWindowRect(&r, kGuiFrame, FALSE);
     g_hwnd = CreateWindowExA(0, "twinspeak.control",
                              "TidyVision TwinSpeak: Control Panel",
@@ -5704,7 +5749,11 @@ static bool guiCreateRealWindow() {
             // one a captioned window gets on Win10), leaving only the thin
             // menu-style CS_DROPSHADOW on the bottom-right. The policy now
             // stays ENABLED so DWM draws the full shadow again.
-            const int round = 2; // DWMWCP_ROUND
+            // v7.1.17 SQUARE, PINNED: the field wants a square window.
+            // DWMWCP_DONOTROUND on Win11 (Win10 fails the attribute
+            // harmlessly and is square already); the shadow does not care
+            // either way -- it rides on the frame styles + extend-frame.
+            const int round = 1; // DWMWCP_DONOTROUND
             rounded = SUCCEEDED(dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
                                        &round, sizeof(round)));
             // v7.1.15/16 THE SHADOW PINS: DWMWA_NCRENDERING_POLICY = ENABLED
@@ -5734,25 +5783,31 @@ static bool guiCreateRealWindow() {
         // and the region revoked it lines later, every version since
         // v7.1.0. The fallback is GONE: the window is NEVER shaped again.
         // Win10 keeps square corners and gets the full all-directions DWM
-        // shadow back; Win11 still rounds, via the corner preference.
+        // shadow back; Win11 gets the same square corners via DONOTROUND.
         tlog("[twinspeak] gui           : window shadow -- extend-frame 1 px + NCRENDERING ON%s\n",
-             rounded ? " + corner preference ROUND"
+             rounded ? " + corner preference DONOTROUND (square)"
                      : " (square corners: pre-Win11, window UNSHAPED so DWM keeps the shadow)");
     }
-    // v7.0.9: re-measure the NCCALCSIZE-inset client and resize once -- the
-    // design client is EXACTLY 880x620 again.
+    // v7.0.9: re-measure the NCCALCSIZE client and resize once -- v7.1.17:
+    // the client IS the window and the design is EXACTLY KCLI_W x
+    // (KCLI_H + kCapH) again.
     {
         RECT rc; GetClientRect(g_hwnd, &rc);
-        if (rc.right != KCLI_W || rc.bottom != KCLI_H)
+        if (rc.right != KCLI_W || rc.bottom != KCLI_H + kCapH)
             SetWindowPos(g_hwnd, nullptr, 0, 0,
                          (r.right - r.left) + (KCLI_W - rc.right),
-                         (r.bottom - r.top) + (KCLI_H - rc.bottom),
+                         (r.bottom - r.top) + ((KCLI_H + kCapH) - rc.bottom),
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     guiBuildControls(g_hwnd);
     controlsFromCfg(g_hwnd);
     guiShowPage(g_hwnd, 0);
     guiFillCombos(g_hwnd);
+    // v7.1.17: the client is the WHOLE window now -- the old client origin
+    // sat kCapH down it, so every child rides kCapH down ONCE, right here,
+    // and keeps its exact on-window position. Done before the first render
+    // so the v6.6.5 white-flash pass paints the finished layout.
+    EnumChildWindows(g_hwnd, tsShiftChild, kCapH);
     // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
     // redirection surface now, so the first frame DWM composites is the
     // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
@@ -5854,25 +5909,28 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     const RECT panel = { 12, KPANEL_T, 866, KPANEL_B };
     FillRect(dc, &panel, g_brPanel);
     FrameRect(dc, &panel, g_brPanel2);
+    // v7.1.17: every literal below is the OLD client coordinate + kCapH --
+    // the client is the whole window now and the frame pass paints kCapH
+    // lower so nothing moves on screen.
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
-    g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
+    g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f + kCapH, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.16  |  %s", g_guiIniPath.c_str());
-    const RECT ver = { 300, 8, 866, 30 };
+    snprintf(vbuf, sizeof(vbuf), "v7.1.17  |  %s", g_guiIniPath.c_str());
+    const RECT ver = { 300, 8 + kCapH, 866, 30 + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
     // inside the frame buffer -- the STATIC child (hidden) only stores the
     // string. One blit, no flicker while the health line updates.
     char stb[512] = "";
     if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
-    const RECT stc = { 14, 458, 866, 476 };
+    const RECT stc = { 14, 458 + kCapH, 866, 476 + kCapH };
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    const RECT kbr = { 14, KLOG_BOTTOM, 552, KCLI_H };
+    const RECT kbr = { 14, KLOG_BOTTOM, 552, KCLI_H + kCapH };
     guiAAString(g, dc, kbr,
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
@@ -5912,9 +5970,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_NCCALCSIZE:
-        // v7.0.9: shrink the client top by kCapH -- that strip becomes the
-        // custom titlebar; every child coordinate keeps its old meaning.
-        if (wp) { ((RECT*)lp)->top += kCapH; return 0; }
+        // v7.1.17 THE CLIENT EATS THE FRAME: return 0 with the rect
+        // untouched -- the client IS the window rect. The old top += kCapH
+        // strip was the window's ONLY non-client area, and on every
+        // activation change DWM composed its STANDARD caption into it (the
+        // real title, the icon, the caption buttons, the blue accent
+        // border) straight over our bar -- the ghost the field saw on
+        // click-out/click-back once v7.1.16 removed the region (a region
+        // suppresses ALL DWM NC rendering; an unshaped window does not).
+        // With no NC area at all there is nothing for DWM's frame renderer
+        // to paint into. The caption + thickframe styles stay (with the
+        // extend-frame 1 px pin) so the all-directions DWM shadow still
+        // triggers -- the documented borderless-with-shadow recipe.
+        if (wp) return 0;
         break;
     case 0x00AE:   // WM_NCUAHDRAWCAPTION (undocumented)
     case 0x00AF: { // WM_NCUAHDRAWFRAME   (undocumented)
@@ -5933,14 +6001,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         guiPaintBar(w);
         return DefWindowProcA(w, msg, wp, -1);
     case WM_NCHITTEST: {
-        // The bar's drag area answers HTCAPTION through DefWindowProc
-        // (WS_CAPTION does the work). The close glyph is answered HTCLIENT
-        // so its clicks land as WM_LBUTTONDOWN and we own the hover state.
+        // v7.1.17: the strip is CLIENT area now -- DefWindowProc would
+        // answer HTCLIENT for every point in the window, so the bar owns
+        // its NC answers HERE: the drag area is HTCAPTION (drag + the
+        // WS_SYSMENU right-click menu, exactly what the caption style gave
+        // the old NC strip), and the close slot stays HTCLIENT so its
+        // clicks land as WM_LBUTTONDOWN and we own the hover state.
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT wr; GetWindowRect(w, &wr);
-        if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH &&
-            pt.x - wr.left >= (wr.right - wr.left) - 46)
-            return HTCLIENT;
+        const int wx = pt.x - wr.left, wy = pt.y - wr.top;
+        if (wy >= 0 && wy < kCapH) {
+            if (wx >= (wr.right - wr.left) - 46) return HTCLIENT;
+            return HTCAPTION;
+        }
         break; }
     case WM_NCMOUSEMOVE:
         if (g_capHot) { g_capHot = false; guiPaintBar(w); }   // left the X onto the drag area
@@ -5953,15 +6026,23 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // (watermark gone), GDI+ rebuilt it, and DWM sampled the blank strip
         // on every tab click / theme press. The full face is rendered into
         // the buffer and lands as ONE blit; no intermediate state exists.
+        // v7.1.17: the client is the WHOLE window now, so the buffer must
+        // also cover the bar's band: guiPaintBar renders + blits the bar
+        // (window coords, unchanged), the frame pass paints kCapH lower,
+        // and the bar's fresh buffer is copied over the top band before the
+        // ONE blit -- every pixel of the window covered, no garbage band.
+        guiPaintBar(w);
         RECT crc; GetClientRect(w, &crc);
         const int cw = crc.right, ch = crc.bottom;
         if (guiFrameBufEnsure(cw, ch)) {
             guiPaintFrame(g_frmDc, cw, ch);
+            BitBlt(g_frmDc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);
             BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                    g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
         } else {
             guiPaintFrame(dc, cw, ch);   // no buffer: draw straight (old path)
+            guiPaintBar(w);              // re-claim the bar band the fill crossed
         }
         EndPaint(w, &ps);
         return 0; }
@@ -6155,22 +6236,33 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
+    case WM_SYSCOMMAND:
+        // v7.1.17: WS_THICKFRAME (the shadow recipe's frame style) makes
+        // the system menu offer Size -- and the layout is hand-placed at
+        // fixed coordinates. Size/Maximize are answered with nothing;
+        // Move, Close and everything else behave as before.
+        switch (wp & 0xFFF0) {
+        case SC_SIZE: case SC_MAXIMIZE: return 0; }
+        break;
     case WM_LBUTTONDOWN: {
-        // v7.0.9: clicks in the bar arrive with NEGATIVE-y client coords
-        // (the strip lies above the client origin). Inside the close slot
-        // they close -- which hides to the tray, engine stays up.
+        // v7.1.17: the bar is CLIENT area now, so strip clicks arrive with
+        // y in [0, kCapH) (they used to be negative -- the strip lay above
+        // the old client origin). The close slot is the only HTCLIENT
+        // ground in the strip (WM_NCHITTEST); clicks inside it close --
+        // which hides to the tray, engine stays up.
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        if (cy < 0) {
+        if (cy < kCapH) {
             RECT cl = guiCapCloseRect(w);
             if (cx >= cl.left && cx < cl.right) PostMessageA(w, WM_CLOSE, 0, 0);
             return 0;
         }
         break; }
     case WM_MOUSEMOVE: {
-        // hover feedback for the bar's X; TrackMouseEvent arms the leave
+        // hover feedback for the bar's X (client ground since v7.1.17 --
+        // y in [0, kCapH)); TrackMouseEvent arms the leave
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
         bool hot = false;
-        if (cy < 0) {
+        if (cy >= 0 && cy < kCapH) {
             RECT cl = guiCapCloseRect(w);
             hot = (cx >= cl.left && cx < cl.right);
         }
@@ -6310,9 +6402,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         break; }
     case WM_GETMINMAXINFO: {
         // v6.6.3 polish, v6.6.5 size: the layout is hand-placed at fixed
-        // coordinates and there is no WM_SIZE reflow -- lock the frame to the
-        // designed 880x620 client; min == max == no resizing at all.
-        RECT r = { 0, 0, KCLI_W, KCLI_H };
+        // coordinates and there is no WM_SIZE reflow -- lock the frame to
+        // the designed window. v7.1.17: the client IS the window, and the
+        // design client is KCLI_W x (KCLI_H + kCapH) -- the old 620-tall
+        // client rides kCapH down inside it. min == max == no resizing.
+        RECT r = { 0, 0, KCLI_W, KCLI_H + kCapH };
         AdjustWindowRect(&r, kGuiFrame, FALSE);
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
@@ -7350,7 +7444,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.16       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.17       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
