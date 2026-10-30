@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.18 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.19 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,14 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.19 ROUND AGAIN, ALL FOUR: the corner preference flips back from
+//            DWMWCP_DONOTROUND to DWMWCP_ROUND -- the user asked for the
+//            window rounded top AND bottom. With the v7.1.17/18 frame
+//            architecture (no region, no WS_CAPTION, client == window) the
+//            rounding is pure DWM geometry: it clips the composited alpha
+//            shape on Win11 and the DWM shadow wraps the rounded outline;
+//            pre-Win11 ignores the call and stays square. Nothing else
+//            moves. DSP byte-identical to v7.1.4.
 //    v7.1.18 THE UNFOCUS FRAME, RETIRED: field report -- losing focus still
 //            grew a full Luna caption (blue gradient, icon + title, glossy
 //            red X) over the bar, persistent. The themed frame painter runs
@@ -2671,7 +2679,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.19 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -5628,17 +5636,21 @@ static bool guiCreateRealWindow() {
         // shadow lives on WS_THICKFRAME), so the DWM composites its standard
         // Win10 drop shadow around the window rect
         // -- the same shadow every default white/black titlebar window
-        // gets. Corners are pinned SQUARE (Win11 rounds by default; the
-        // call fails harmlessly pre-Win11, which is square anyway). No
-        // NCRENDERING override, no extend-frame: the frame painter has no
-        // NC area to paint, and the shadow does not need either.
+        // gets. v7.1.19: the corners go back to DWM-ROUNDED, all four of
+        // them (DWMWCP_ROUND rounds top AND bottom edges -- the user asked
+        // for exactly that) -- with no region and no caption the rounding
+        // is pure DWM geometry now, it clips the window alpha shape and
+        // costs nothing. The call fails harmlessly pre-Win11, which is
+        // square anyway. No NCRENDERING override, no extend-frame: the
+        // frame painter has no NC area to paint, and the shadow does not
+        // need either.
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
         if (dwmSet) {
-            const int square = 1;   // DWMWCP_DONOTROUND
+            const int round = 2;   // DWMWCP_ROUND -- all four corners
             dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                   &square, sizeof(square));
+                   &round, sizeof(round));
         }
     }
     guiBuildControls(g_hwnd);
@@ -5755,7 +5767,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f + kCapH, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.18  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.19  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8 + kCapH, 866, 30 + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -7182,7 +7194,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.18       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.19       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
