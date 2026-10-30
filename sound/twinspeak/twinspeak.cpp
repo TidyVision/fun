@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,19 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.8  TITLEBAR FLICKER GONE + THE X IS BACK + MORE THEMES + EQ SLOTS:
+//            the bar renders into a memory buffer and lands as ONE blit --
+//            no intermediate state for DWM to sample, so the title text and
+//            the close X stop flickering on hover/activate/theme clicks;
+//            the Marlett 'r' glyph is retired for the modern thin caption X
+//            (two AA strokes, the DWM close shape); DARK RED, DARK ORANGE
+//            and LIGHT RED join the theme cycler (eleven total, appended so
+//            saved gui_theme indices survive); the four built-in EQ presets
+//            become FIVE USER SAVE SLOTS -- left-click applies, right-click
+//            saves the sliders + pill into the slot and splices the ini
+//            (eq_slotN_on/freq/gain/q), slot 1 ships reserved with 387 Hz /
+//            +3.5 dB / Q 0.30; the tab faces widen +8 px (160 -> 168) to
+//            fill more of the strip. DSP byte-identical to v7.1.4.
 //    v7.1.7  UI RESTRUCTURE, the field's wordlist: FIVE tabs (DEVICES |
 //            TIMING | TRANSPORT | SETTINGS | CENTER EQ) -- OTHER merged
 //            away, its startup pill and its SYNC column (drift trio) now
@@ -94,7 +107,7 @@
 //            to v7.1.3.
 //    v7.1.3  the titlebar is GDI+: ONE Gdiplus::Graphics paints the whole
 //            bar -- the face is a subtle top-lit vertical gradient of the
-//            theme bg, the bottom edge + close hover face + Marlett X are
+//            theme bg, the bottom edge + close hover face + close X are
 //            GDI+ fills with grayscale AA, the glyph brightens to the
 //            accent on hover, and "TwinSpeak" keeps its blue->teal
 //            gradient but LIFTED (the very-dark-blue top stop vanished
@@ -414,6 +427,13 @@ struct Config {
     float       centerEqFreq   = 1800.0f; // peak frequency (Hz, clamped 20..20000)
     float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
     float       centerEqQ      = 0.8f;    // peak Q (clamped 0.1..10)
+    // v7.1.8 CENTER EQ SAVE SLOTS: the four built-in presets are retired --
+    // five user slots persist in the ini (eq_slotN_on/freq/gain/q). Slot 1
+    // ships reserved with the field's dialogue curve; freq <= 0 = empty slot.
+    bool        eqSlotOn[5]    = { true, false, false, false, false };
+    float       eqSlotF[5]     = { 387.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float       eqSlotG[5]     = { 3.5f,   0.0f, 0.0f, 0.0f, 0.0f };
+    float       eqSlotQ[5]     = { 0.30f,  0.0f, 0.0f, 0.0f, 0.0f };
     bool        clockSync      = true;    // v6.0 device-master replay/drop discipline
                                           // (replaces v5.0's auto_resync / resampler)
                                           // v6.6.8: INTEGRATED -- always on
@@ -2592,7 +2612,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -2682,6 +2702,31 @@ static void writeTemplate(const char* path) {
         "center_eq_freq = 1800\n"
         "center_eq_gain = 4.0\n"
         "center_eq_q = 0.8\n"
+        "; v7.1.8 EQ SAVE SLOTS: five user slots replace the old built-in\n"
+        "; presets. Left-click a slot applies it; right-click saves the\n"
+        "; current sliders + the EQ pill into it (and splices this file).\n"
+        "; Slot 1 ships reserved with the dialogue curve below; a freq of 0\n"
+        "; marks an empty slot.\n"
+        "eq_slot1_on = on\n"
+        "eq_slot1_freq = 387\n"
+        "eq_slot1_gain = 3.5\n"
+        "eq_slot1_q = 0.30\n"
+        "eq_slot2_on = off\n"
+        "eq_slot2_freq = 0\n"
+        "eq_slot2_gain = 0\n"
+        "eq_slot2_q = 0\n"
+        "eq_slot3_on = off\n"
+        "eq_slot3_freq = 0\n"
+        "eq_slot3_gain = 0\n"
+        "eq_slot3_q = 0\n"
+        "eq_slot4_on = off\n"
+        "eq_slot4_freq = 0\n"
+        "eq_slot4_gain = 0\n"
+        "eq_slot4_q = 0\n"
+        "eq_slot5_on = off\n"
+        "eq_slot5_freq = 0\n"
+        "eq_slot5_gain = 0\n"
+        "eq_slot5_q = 0\n"
         "\n"
         "; VOLUME: volume_follow = the Windows volume of the cable's PLAYBACK\n"
         "; side (the Line 1 slider in sndvol, or the volume hotkeys when Line 1\n"
@@ -3031,6 +3076,16 @@ static bool loadIni(const char* path) {
         else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
         else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
         else if (key == "center_eq_q")    g_cfg.centerEqQ    = (float)atof(val.c_str());
+        // v7.1.8: the five EQ save slots (eq_slotN_on / _freq / _gain / _q)
+        else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
+                 key[7] >= '1' && key[7] <= '5') {
+            const int n = key[7] - '1';
+            const std::string t = key.substr(8);
+            if      (t == "_on")   g_cfg.eqSlotOn[n] = !isOff(val);
+            else if (t == "_freq") g_cfg.eqSlotF[n]  = (float)atof(val.c_str());
+            else if (t == "_gain") g_cfg.eqSlotG[n]  = (float)atof(val.c_str());
+            else if (t == "_q")    g_cfg.eqSlotQ[n]  = (float)atof(val.c_str());
+        }
         else if (key == "delay1_ms")      g_cfg.delay1Ms = (float)atof(val.c_str());
         else if (key == "delay2_ms")      g_cfg.delay2Ms = (float)atof(val.c_str());
         else if (key == "volume_follow")  g_cfg.volumeFollow = !isOff(val);
@@ -3047,7 +3102,7 @@ static bool loadIni(const char* path) {
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
         else if (key == "gui_theme") {
             g_themeSaved = atoi(val.c_str());      // v7.0.4: theme persistence
-            if (g_themeSaved < 0 || g_themeSaved > 7) g_themeSaved = 0;
+            if (g_themeSaved < 0 || g_themeSaved > 10) g_themeSaved = 0;   // v7.1.8: 11 themes
         }
         else if (key == "startup_engine") g_cfg.startupEngine = !isOff(val);   // v7.1.2
     }
@@ -3416,8 +3471,9 @@ static void printLegDevice(int idx) {
 static int engineMain(const std::string& iniPath, bool fgForce,
                       bool allowMulti, bool guiMode);
 
-// ---- v7.0.0 THEMES: the palette is RUNTIME data -- eight themes (four
-// dark, four light), live-switched from the THEME button. applyTheme()
+// ---- v7.0.0 THEMES: the palette is RUNTIME data -- eleven themes (v7.1.8
+// adds DARK RED, DARK ORANGE, LIGHT RED), live-switched from the THEME
+// button. applyTheme()
 // copies the active record in + recreates the four brushes; painters read
 // the globals fresh each frame, so a switch is one repaint, no restart.
 struct GuiTheme {
@@ -3425,7 +3481,7 @@ struct GuiTheme {
     COLORREF bg, panel, panel2, panelHi, line, text, dim;
     COLORREF accent, accentDk, onText, stop, log, logBg;
 };
-static const GuiTheme kThemes[8] = {
+static const GuiTheme kThemes[11] = {
     //               bg                panel             panel2            panelHi           line              text              dim
     { "DARK CYAN",    RGB(  9, 10, 12), RGB( 16, 18, 21), RGB( 24, 27, 31), RGB( 31, 35, 40), RGB( 44, 49, 55), RGB(226,232,234), RGB(126,136,142),
       RGB(  0,229,238), RGB(  0,121,128), RGB(  4, 24, 26), RGB(255,105,115), RGB(150,222,214), RGB(  6,  7,  8) },
@@ -3443,6 +3499,14 @@ static const GuiTheme kThemes[8] = {
       RGB( 66,104,158), RGB( 48, 78,120), RGB(249,250,251), RGB(195, 44, 55), RGB( 40, 68,105), RGB(238,240,242) },
     { "LIGHT CYAN",   RGB(237,245,247), RGB(225,238,242), RGB(213,229,235), RGB(198,219,227), RGB(130,164,174), RGB( 14, 39, 45), RGB( 84,114,121),
       RGB(  0,128,142), RGB(  0, 99,111), RGB(245,251,252), RGB(199, 44, 59), RGB(  0,104,118), RGB(231,241,244) },
+    // v7.1.8: the three new palettes APPEND here -- saved gui_theme indices
+    // 0..7 keep their themes, nothing shifts under an existing ini.
+    { "DARK RED",     RGB( 14,  8,  8), RGB( 22, 13, 13), RGB( 31, 19, 19), RGB( 40, 25, 25), RGB( 60, 37, 37), RGB(235,225,225), RGB(145,124,124),
+      RGB(255, 92, 92), RGB(164, 30, 30), RGB( 28,  6,  6), RGB(255,105,115), RGB(226,150,150), RGB(  8,  5,  5) },
+    { "DARK ORANGE",  RGB( 14, 10,  6), RGB( 22, 16, 10), RGB( 31, 23, 15), RGB( 40, 30, 20), RGB( 60, 46, 30), RGB(236,229,216), RGB(146,132,110),
+      RGB(255,150, 40), RGB(164, 86, 10), RGB( 28, 16,  4), RGB(255,105,115), RGB(230,190,140), RGB(  8,  6,  4) },
+    { "LIGHT RED",    RGB(248,241,241), RGB(240,230,230), RGB(231,218,218), RGB(220,205,205), RGB(180,148,148), RGB( 48, 22, 22), RGB(136,104,104),
+      RGB(202, 52, 52), RGB(156, 36, 36), RGB(250,244,244), RGB(199, 38, 52), RGB(140, 44, 48), RGB(244,238,238) },
 };
 static int g_theme = 0;   // active kThemes index
 
@@ -3485,14 +3549,16 @@ enum {
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
     IDC_CHIMGAIN,               // v7.1.7: IDC_KAHZ/IDC_KAGAIN retired (keepalive built in)
     // page: center eq
-    IDC_TGL_EQ, IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS, IDC_PRE_WARM,
+    IDC_TGL_EQ,
+    IDC_SLOT1, IDC_SLOT2, IDC_SLOT3, IDC_SLOT4, IDC_SLOT5,   // v7.1.8: save slots
+                                                             // (IDC_PRE_FLAT..IDC_PRE_WARM retired)
     IDC_SLD_FREQ, IDC_SLD_GAIN, IDC_SLD_Q,
     IDC_LBL_FREQ, IDC_LBL_GAIN, IDC_LBL_Q,
 };
 
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
-static HFONT     g_fCapX = nullptr, g_fUI = nullptr, g_fUIb = nullptr,
+static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
                  g_fSml = nullptr, g_fMono = nullptr,
                  g_fTitle = nullptr;   // v7.1.0: the bar's "TwinSpeak" title
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
@@ -3519,7 +3585,7 @@ static COLORREF guiLerpRGB(COLORREF a, COLORREF b, double t) {
                GetBValue(a) + (int)((GetBValue(b) - GetBValue(a)) * t));
 }
 static std::map<int, bool> g_tog;            // toggle button states
-static int       g_eqPreset      = 1;          // active preset index (-1 = custom)
+static int       g_eqSlot        = -1;         // v7.1.8: active save slot (-1 = custom)
 static std::vector<HWND> g_pageHw[5];          // children per page (show/hide)
 static HANDLE    g_engThread     = nullptr;
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
@@ -3583,7 +3649,7 @@ static constexpr unsigned long long kBootWindowMs = 120000;   // 2 min after the
 
 // v6.6.1 forward decls (helpers defined below the page builder)
 static void guiRepaint(HWND w, int id);
-static void guiRepaintPresets(HWND w);
+static void guiRepaintSlots(HWND w);
 static void trayAdd(bool hint);
 static void trayRemove();
 static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on demand
@@ -3618,32 +3684,63 @@ static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
     const RECT r = { (wr.right - wr.left) - 46, 0, wr.right - wr.left, kCapH };
     return r;
 }
-// Paints the bar straight to the screen with GetWindowDC -- usable from any
-// context (theme click, WM_NCPAINT, hover), never needs an invalidate.
+// Paints the bar from a persistent memory buffer -- usable from any context
+// (theme click, WM_NCPAINT, hover), never needs an invalidate.
 // v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
 // let one GDI+ guest draw the title; v7.1.3 hands every pixel to a SINGLE
 // Gdiplus::Graphics -- the face is a subtle top-lit vertical gradient (the
 // theme bg lifted toward white, melting back down to cBg by the bottom
-// edge), the 1px bottom edge, the close hover face and the Marlett X are
+// edge), the 1px bottom edge, the close hover face and the close glyph are
 // GDI+ fills, all text renders AntiAliasGridFit (grayscale AA, same family
 // as the buttons since v7.1.2), and the close glyph brightens to the theme
 // accent while hovered.
 // v7.1.4 THE GRAY HAIRLINES: shape antialiasing on integer-aligned fills
 // let the face/edge rectangles pick up half-coverage boundary pixels -- a
 // 1px gray line on some edges (the AA blend against whatever sat under
-// the bar). The fills now go through the INTEGER FillRectangle overloads
-// with a 1px overscan, and SmoothingMode stays OFF for shapes (the Marlett
-// X is TEXT -- its grayscale AA comes from the text hint, untouched).
+// the bar). The fills go through the INTEGER FillRectangle overloads with a
+// 1px overscan; SmoothingMode stays OFF for them (the X is the only AA
+// shape, drawn last, its AA blending against our own face).
 // v7.1.4 THEME-AWARE TITLE: the hard-coded blue->teal gradient is retired.
 // Light themes read "TwinSpeak" in the plain caption text color (the
 // normal look); dark themes get a CYAN-GRAY vertical gradient (cyan-tinted
 // gray, light at the top -> slate at the bottom), keyed to the theme by
 // the bg's luminance instead of hard-coded stops.
-static void guiPaintBar(HWND w) {
-    if (!w || !IsWindow(w)) return;
-    HDC dc = GetWindowDC(w);
-    RECT wr; GetWindowRect(w, &wr);
-    const int ww = wr.right - wr.left;
+// v7.1.8 THE BUFFERED BAR (the text/X flicker fix): every draw above went
+// STRAIGHT to the window DC -- DWM could sample between the gradient pass,
+// the hover face, the glyph and the title, so hover enter/leave, activation
+// changes and theme clicks flashed the bar's text and X. The bar now renders
+// into a persistent memory surface (same model as the frame/button buffers)
+// and lands as ONE BitBlt -- no intermediate state ever exists on screen.
+// v7.1.8 THE X IS BACK TO THE SYSTEM LOOK: the Marlett 'r' DrawString is
+// retired. The close glyph is the modern thin caption X (two 10 px diagonal
+// strokes, the DWM close button's shape since Vista) drawn with an
+// antialiased GDI+ pen -- it still warms to the theme accent while hovered.
+static HDC     g_barDc = nullptr;
+static HBITMAP g_barBm = nullptr, g_barBmOld = nullptr;
+static int     g_barW = 0, g_barH = 0;
+static bool guiBarBufEnsure(int ww, int hh) {
+    if (g_barDc && ww <= g_barW && hh <= g_barH) return true;
+    if (g_barBmOld) {
+        SelectObject(g_barDc, g_barBmOld);
+        DeleteObject(g_barBm);
+        g_barBm = nullptr; g_barBmOld = nullptr;
+    }
+    if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
+    HDC sdc = GetDC(nullptr);
+    g_barDc = CreateCompatibleDC(sdc);
+    g_barBm = CreateCompatibleBitmap(sdc, ww, hh);
+    ReleaseDC(nullptr, sdc);
+    if (!g_barDc || !g_barBm) {
+        if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
+        if (g_barBm) { DeleteObject(g_barBm); g_barBm = nullptr; }
+        return false;
+    }
+    g_barBmOld = (HBITMAP)SelectObject(g_barDc, g_barBm);
+    g_barW = ww; g_barH = hh;
+    return true;
+}
+// renders the whole bar into dc (memory buffer or screen -- identical code)
+static void guiRenderBar(HDC dc, int ww) {
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // the face: the theme bg with a light touch at the top -- depth without
@@ -3661,28 +3758,21 @@ static void guiPaintBar(HWND w) {
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
     g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
-    // the close slot: hover face + the Marlett glyph, both GDI+ -- the
-    // glyph is grayscale-antialiased (smooth like every other glyph in the
-    // app) and warms to the theme accent under the mouse.
-    const RECT cl = guiCapCloseRect(w);
+    // the close slot: hover face + the thin system-style X. Shape smoothing
+    // turns ON for the X's diagonals ONLY -- the two strokes need AA; the
+    // fills above stay integer-exact.
+    const int cx = ww - 23, cy = kCapH / 2;   // slot center (46 x kCapH slot)
     if (g_capHot) {
         Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                               GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-        g.FillRectangle(&hf, (INT)cl.left, (INT)cl.top, (INT)(cl.right - cl.left),
-                        (INT)(cl.bottom - cl.top));
+        g.FillRectangle(&hf, ww - 46, 0, 46, kCapH);
     }
-    if (g_fCapX) {
-        Gdiplus::Font xf(dc, g_fCapX);
-        const COLORREF xcol = g_capHot ? guic::cAccent : guic::cText;
-        Gdiplus::SolidBrush xb(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)));
-        Gdiplus::StringFormat sx;
-        sx.SetAlignment(Gdiplus::StringAlignmentCenter);
-        sx.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        sx.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        const Gdiplus::RectF cx((Gdiplus::REAL)cl.left, (Gdiplus::REAL)cl.top,
-                                (Gdiplus::REAL)(cl.right - cl.left), (Gdiplus::REAL)(cl.bottom - cl.top));
-        g.DrawString(L"r", 1, &xf, cx, &sx, &xb);   // Marlett 'r' = the close X
-    }
+    const COLORREF xcol = g_capHot ? guic::cAccent : guic::cText;
+    Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)), 1.25f);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.DrawLine(&xp, cx - 5, cy - 5, cx + 5, cy + 5);   // the modern thin X --
+    g.DrawLine(&xp, cx + 5, cy - 5, cx - 5, cy + 5);   // the DWM close glyph's
+    g.SetSmoothingMode(Gdiplus::SmoothingModeNone);    // own shape, drawn ours
     // the product name, theme-aware (see the v7.1.4 note above).
     if (g_fTitle) {
         const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
@@ -3705,18 +3795,28 @@ static void guiPaintBar(HWND w) {
             g.DrawString(kCapTitle, -1, &tf, tr, &sf, &nb);
         }
     }
-    ReleaseDC(w, dc);
+}
+static void guiPaintBar(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    HDC wdc = GetWindowDC(w);
+    RECT wr; GetWindowRect(w, &wr);
+    const int ww = wr.right - wr.left;
+    if (ww > 0 && guiBarBufEnsure(ww, kCapH)) {
+        guiRenderBar(g_barDc, ww);
+        BitBlt(wdc, 0, 0, ww, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
+    } else {
+        guiRenderBar(wdc, ww);   // no buffer: draw straight (old path)
+    }
+    ReleaseDC(w, wdc);
 }
 
 // ---- fonts / brushes -------------------------------------------------------
 static void applyTheme(int i);   // v7.0.0: forward decl (defined right below guiMakeGdi)
 static void guiMakeGdi() {
-    // v7.0.9: g_fCapX is Marlett 'r' -- the exact Windows close glyph -- for
-    // the custom titlebar's X. (The Times New Roman header font is retired
-    // with the in-window header text it served.)
-    g_fCapX = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, "Marlett");
+    // v7.1.8: the Marlett close-glyph font is RETIRED -- the bar's X is the
+    // modern thin caption shape, two antialiased GDI+ pen strokes (see
+    // guiRenderBar). (The Times New Roman header font is retired with the
+    // in-window header text it served.)
     g_fUI   = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
@@ -3743,7 +3843,7 @@ static void guiMakeGdi() {
 // v7.0.0: live theme switch -- commit colors + brushes, then ONE synchronous
 // repaint of the whole tree, bar included, so nothing can show old colors.
 static void applyTheme(int i) {
-    g_theme = i % 8;
+    g_theme = i % 11;   // v7.1.8: eleven themes
     const GuiTheme& t = kThemes[g_theme];
     guic::cBg = t.bg;           guic::cPanel   = t.panel;   guic::cPanel2 = t.panel2;
     guic::cPanelHi = t.panelHi; guic::cLine    = t.line;    guic::cText   = t.text;
@@ -4169,14 +4269,16 @@ static int qToPos(float q) {
 }
 static float posToQ(int p) { return (float)(0.1 * pow(100.0, (double)p / 1000.0)); }
 
-// ---- the built-in presets ---------------------------------------------------
-struct EqPre { const char* name; bool on; float f, g, q; };
-static const EqPre kEqPre[4] = {
-    { "FLAT",     false, 1800, 4.0f, 0.8f },   // EQ off -- bit-exact out2
-    { "DIALOGUE", true,  1800, 4.0f, 0.8f },   // presence/intelligibility bump
-    { "BASS",     true,    90, 6.0f, 0.7f },   // low-end weight on the center
-    { "WARMTH",   true,   250, 3.0f, 0.9f },   // chest/vocal body
-};
+// ---- v7.1.8 the EQ save slots ----------------------------------------------
+// The four built-in presets (FLAT/DIALOGUE/BASS/WARMTH) are retired: the five
+// buttons are USER slots now. Left-click applies a slot (empty slots say so);
+// right-click (WM_CONTEXTMENU) saves the current sliders + the EQ pill into
+// it and splices the ini immediately -- same save model as the theme button.
+// Slot 1 ships reserved with the field's dialogue curve: 387 Hz, +3.5 dB,
+// Q 0.30. freq <= 0 marks an empty slot.
+static bool guiSaveIni();                 // fwd: defined below the ini section
+static void guiRepaintSlots(HWND w);      // fwd: defined with the repaint helpers
+static void guiSetStatus(HWND w, const char* s);   // fwd: defined in the frame section
 
 static void guiUpdateEqLabels(HWND w) {
     char b[96];
@@ -4193,15 +4295,47 @@ static void guiUpdateEqLabels(HWND w) {
     SetWindowTextA(GetDlgItem(w, IDC_LBL_Q), b);
 }
 
-static void guiApplyPreset(HWND w, int i) {
-    g_tog[IDC_TGL_EQ] = kEqPre[i].on;
-    sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(kEqPre[i].f), TRUE);
-    sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(kEqPre[i].g * 2.0f), TRUE);
-    sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(kEqPre[i].q), TRUE);
-    g_eqPreset = i;
+static void guiApplySlot(HWND w, int i) {
+    if (g_cfg.eqSlotF[i] <= 0.0f) {   // empty slot -- nothing saved there yet
+        char b[96];
+        snprintf(b, sizeof(b), "slot %d is empty -- right-click it to save the current curve",
+                 i + 1);
+        guiSetStatus(w, b);
+        return;
+    }
+    g_tog[IDC_TGL_EQ] = g_cfg.eqSlotOn[i];
+    sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(g_cfg.eqSlotF[i]), TRUE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(g_cfg.eqSlotG[i] * 2.0f), TRUE);
+    sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(g_cfg.eqSlotQ[i]), TRUE);
+    g_eqSlot = i;
     guiUpdateEqLabels(w);
-    guiRepaint(w, IDC_TGL_EQ);   // v6.6.1: preset + toggle pills repaint themselves
-    guiRepaintPresets(w);
+    guiRepaint(w, IDC_TGL_EQ);   // v6.6.1: pill + slots repaint themselves
+    guiRepaintSlots(w);
+}
+
+// right-click a slot: the sliders' current curve + the EQ pill land in the
+// slot and the ini is spliced at once (v7.1.8; same model as the theme click).
+static void guiSaveSlot(HWND w, int i) {
+    g_cfg.eqSlotOn[i] = g_tog[IDC_TGL_EQ];
+    g_cfg.eqSlotF[i]  = posToFreq(sldGetPos(GetDlgItem(w, IDC_SLD_FREQ)));
+    g_cfg.eqSlotG[i]  = sldGetPos(GetDlgItem(w, IDC_SLD_GAIN)) * 0.5f;
+    g_cfg.eqSlotQ[i]  = posToQ(sldGetPos(GetDlgItem(w, IDC_SLD_Q)));
+    // the live EQ mirrors what is on screen, so the saved ini stays coherent
+    g_cfg.centerEq     = g_tog[IDC_TGL_EQ];
+    g_cfg.centerEqFreq = g_cfg.eqSlotF[i];
+    g_cfg.centerEqGain = g_cfg.eqSlotG[i];
+    g_cfg.centerEqQ    = g_cfg.eqSlotQ[i];
+    g_eqSlot = i;
+    const bool ok = guiSaveIni();
+    guiUpdateEqLabels(w);
+    guiRepaint(w, IDC_TGL_EQ);
+    guiRepaintSlots(w);
+    char b[128];
+    snprintf(b, sizeof(b),
+             "%s to slot %d: %.0f Hz / %+.1f dB / Q %.2f",
+             ok ? "saved" : "save FAILED", i + 1,
+             g_cfg.eqSlotF[i], g_cfg.eqSlotG[i], g_cfg.eqSlotQ[i]);
+    guiSetStatus(w, b);
 }
 
 // ---- live device enumeration for the pickers -------------------------------
@@ -4253,6 +4387,16 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
     else if (key == "center_eq_q")       { snprintf(b, 64, "%g", g_cfg.centerEqQ); return b; }
+    // v7.1.8: the five EQ save slots
+    else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
+             key[7] >= '1' && key[7] <= '5') {
+        const int n = key[7] - '1';
+        const std::string t = key.substr(8);
+        if      (t == "_on")   return boolText(g_cfg.eqSlotOn[n]);
+        else if (t == "_freq") { snprintf(b, 64, "%g", g_cfg.eqSlotF[n]); return b; }
+        else if (t == "_gain") { snprintf(b, 64, "%g", g_cfg.eqSlotG[n]); return b; }
+        else if (t == "_q")    { snprintf(b, 64, "%g", g_cfg.eqSlotQ[n]); return b; }
+    }
     else if (key == "drift_correct_ms")  { snprintf(b, 64, "%g", g_cfg.driftCorrectMs); return b; }
     else if (key == "ks_period_frames")  { snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); return b; }
     else if (key == "ks_periods")        { snprintf(b, 64, "%u", g_cfg.ksPeriods); return b; }
@@ -4282,6 +4426,11 @@ static const char* kIniKeys[] = {
     "input_device", "output_device1", "output_device2",
     "gain_l", "gain_r", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
+    "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
+    "eq_slot2_on", "eq_slot2_freq", "eq_slot2_gain", "eq_slot2_q",
+    "eq_slot3_on", "eq_slot3_freq", "eq_slot3_gain", "eq_slot3_q",
+    "eq_slot4_on", "eq_slot4_freq", "eq_slot4_gain", "eq_slot4_q",
+    "eq_slot5_on", "eq_slot5_freq", "eq_slot5_gain", "eq_slot5_q",
     "volume_follow", "volume_endpoint", "out2_first",
     "chimes", "chime_gain",
     "backend1", "backend2", "ks_period_frames", "ks_periods",
@@ -4428,12 +4577,13 @@ static void controlsFromCfg(HWND w) {
     sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(g_cfg.centerEqFreq), FALSE);
     sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(g_cfg.centerEqGain * 2.0f), FALSE);
     sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(g_cfg.centerEqQ), FALSE);
-    g_eqPreset = -1;   // custom unless the values match a preset exactly
-    for (int i = 0; i < 4; ++i) {
-        if (g_cfg.centerEq     == kEqPre[i].on &&
-            fabsf(g_cfg.centerEqFreq - kEqPre[i].f) < 1.0f &&
-            fabsf(g_cfg.centerEqGain - kEqPre[i].g) < 0.26f &&
-            fabsf(g_cfg.centerEqQ    - kEqPre[i].q) < 0.02f) { g_eqPreset = i; break; }
+    g_eqSlot = -1;   // custom unless the values match a saved slot exactly
+    for (int i = 0; i < 5; ++i) {
+        if (g_cfg.eqSlotF[i] > 0.0f &&
+            g_cfg.centerEq     == g_cfg.eqSlotOn[i] &&
+            fabsf(g_cfg.centerEqFreq - g_cfg.eqSlotF[i]) < 1.0f &&
+            fabsf(g_cfg.centerEqGain - g_cfg.eqSlotG[i]) < 0.26f &&
+            fabsf(g_cfg.centerEqQ    - g_cfg.eqSlotQ[i]) < 0.02f) { g_eqSlot = i; break; }
     }
     guiUpdateEqLabels(w);
     InvalidateRect(w, nullptr, TRUE);
@@ -4559,7 +4709,10 @@ static void guiStopEngine() {
 static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
 // v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
 // (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
-static const int kTabW[5] = { 160, 160, 160, 160, 160 };
+// v7.1.8: the five faces widen +8 px each (160 -> 168) -- they fill more of
+// the client; 5 x 168 + 4 x 4 gaps + 5 px left pad ends at 861, and the
+// strip grows to 866 so the selected face's 5 px halo still fits inside.
+static const int kTabW[5] = { 168, 168, 168, 168, 168 };
 
 static void comboRow(HWND w, int colX, int y, const char* label, int id,
                      bool listOnly, const char* cur) {
@@ -4657,10 +4810,14 @@ static void guiBuildPages(HWND w) {
     // ============ page 4: CENTER EQ ============
     g_tab = 4;
     tglRow(w, COLA_X, 114, "center EQ (out2 only)", IDC_TGL_EQ, g_cfg.centerEq);
-    // v7.0.6: CINEMA is retired; the four remaining presets are uniform and
-    // span the sliders' 400 px exactly -- 4 x 97 px faces + 3 x 4 px gaps.
-    for (int i = 0; i < 4; ++i)
-        regPage(mkBtn(w, IDC_PRE_FLAT + i, COLA_X + i * 101, 148, 97, 26, kEqPre[i].name));
+    // v7.1.8: the four built-in presets are GONE -- five user save slots,
+    // uniform like they were: 5 x 76 px faces + 4 x 5 px gaps span the
+    // sliders' 400 px exactly. Left-click applies; right-click saves.
+    for (int i = 0; i < 5; ++i) {
+        char nm[16];
+        snprintf(nm, sizeof(nm), "SLOT %d", i + 1);
+        regPage(mkBtn(w, IDC_SLOT1 + i, COLA_X + i * 81, 148, 76, 26, nm));
+    }
     mkLabel(w, IDC_LBL_FREQ, COLA_X, 204, 400, "PEAK FREQUENCY", g_fUIb, 16);
     mkSlider(w, IDC_SLD_FREQ, COLA_X, 222, 400, 0, 1000);
     mkLabel(w, IDC_LBL_GAIN, COLA_X, 258, 400, "BOOST", g_fUIb, 16);
@@ -4673,10 +4830,13 @@ static void guiBuildPages(HWND w) {
          "A KS/WaveRT leg bypasses the Windows audio engine, so system-wide\n"
          "EQs (Equalizer APO and friends) can never see this stream. The\n"
          "boost lives here instead.\n\n"
-         "FLAT turns the EQ off -- out2 returns to the bit-exact path.\n\n"
+         "SLOTS: left-click applies a slot; right-click saves the sliders\n"
+         "+ the EQ pill into it (ini updated at once). Slot 1 ships with\n"
+         "387 Hz / +3.5 dB / Q 0.30. The pill above is the off switch --\n"
+         "EQ off = the bit-exact path.\n\n"
          "The boost stacks with gain_center; the mix clamps at full scale,\n"
          "so loud center peaks may clip first -- lower gain_center if they\n"
-         "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 12);
+         "do. Keep-alive and chime are NOT equalized (UI cues, not dialogue).", 13);
 }
 
 // ---- v7.0.4: the tab strip is ONE custom control ----------------------------
@@ -4705,7 +4865,7 @@ static Gdiplus::GraphicsPath* guiRoundPathRaw(const Gdiplus::RectF& r, float rad
 // left edge of its slot and 6 px down -- so a 5 px halo fits inside the
 // control on every side. Faces keep the exact positions (and the 23 px height
 // with its 3 px bottom notch) the old buttons had.
-static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 830, KSTRIP_H = 36;
+static const int KSTRIP_X = 9, KSTRIP_Y = 28, KSTRIP_W = 866, KSTRIP_H = 36;
 static const int KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 
 // ---- v7.0.7: TRUE GPU -- Direct3D 11 + DXGI swap chain + Direct2D 1.1 ------
@@ -5224,10 +5384,8 @@ static void guiShowPage(HWND w, int p) {
 static void guiRepaint(HWND w, int id) {
     if (HWND h = GetDlgItem(w, id)) InvalidateRect(h, nullptr, TRUE);
 }
-static void guiRepaintPresets(HWND w) {
-    static const int ids[4] = { IDC_PRE_FLAT, IDC_PRE_DLG, IDC_PRE_BASS,
-                                IDC_PRE_WARM };
-    for (int i = 0; i < 4; ++i) guiRepaint(w, ids[i]);
+static void guiRepaintSlots(HWND w) {
+    for (int i = 0; i < 5; ++i) guiRepaint(w, IDC_SLOT1 + i);
 }
 
 // ---- v7.0.6: the button render buffer (THE 1PX CLIP FIX) --------------------
@@ -5496,7 +5654,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF(13.5f, 479.5f, 853.0f, 115.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.7  |  %s", g_guiIniPath.c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.1.8  |  %s", g_guiIniPath.c_str());
     const RECT ver = { 300, 8, 866, 30 };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -5751,8 +5909,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         bool accentBtn = false;
-        for (int i = 0; i < 4; ++i)
-            if (id == IDC_PRE_FLAT + i) accentBtn = (g_eqPreset == i);
+        for (int i = 0; i < 5; ++i)
+            if (id == IDC_SLOT1 + i) accentBtn = (g_eqSlot == i);
         // v7.0.0 polish: resting faces are TRANSPARENT -- border + text over
         // the erased surface. Fills survive only where they mean something:
         // the pressed feedback (cPanelHi) and the active EQ preset (cPanel2
@@ -5882,7 +6040,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 guiSetStatus(w,
                     "tempo tick: 120 bpm, 8 beats (4 s) -- raw, all four channels");
                 return 0; }
-            case IDC_THEME: {                  // v7.0.0: cycle the eight themes
+            case IDC_THEME: {                  // v7.0.0: cycle the eleven themes
                 applyTheme(g_theme + 1);
                 // v7.0.4: the theme persists across sessions -- save it (and
                 // everything currently on the controls, exactly like SAVE INI
@@ -5908,20 +6066,29 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 return 0; }
             case IDC_REFRESH:   guiFillCombos(w);     return 0;
-            case IDC_PRE_FLAT:  guiApplyPreset(w, 0); return 0;
-            case IDC_PRE_DLG:   guiApplyPreset(w, 1); return 0;
-            case IDC_PRE_BASS:  guiApplyPreset(w, 2); return 0;
-            case IDC_PRE_WARM:  guiApplyPreset(w, 3); return 0;
+            case IDC_SLOT1: case IDC_SLOT2: case IDC_SLOT3:
+            case IDC_SLOT4: case IDC_SLOT5:           // v7.1.8: apply the slot
+                guiApplySlot(w, id - IDC_SLOT1);      return 0;
         }
         break; }
     case WM_HSCROLL: {
         const int id = GetDlgCtrlID((HWND)lp);
         if (id == IDC_SLD_FREQ || id == IDC_SLD_GAIN || id == IDC_SLD_Q) {
-            g_eqPreset = -1;                       // manual = CUSTOM
+            g_eqSlot = -1;                         // manual = CUSTOM
             guiUpdateEqLabels(w);
-            guiRepaintPresets(w);                  // v6.6.1: highlight -> CUSTOM
+            guiRepaintSlots(w);                    // v6.6.1: highlight -> CUSTOM
         }
         return 0; }
+    case WM_CONTEXTMENU: {
+        // v7.1.8: right-click an EQ save slot = SAVE the current sliders +
+        // the EQ pill into it (left-click applies). wParam names the child
+        // the click landed on; anything else falls through to DefWindowProc.
+        const int id = GetDlgCtrlID((HWND)wp);
+        if (id >= IDC_SLOT1 && id <= IDC_SLOT5) {
+            guiSaveSlot(w, id - IDC_SLOT1);
+            return 0;
+        }
+        break; }
     case WM_GETMINMAXINFO: {
         // v6.6.3 polish, v6.6.5 size: the layout is hand-placed at fixed
         // coordinates and there is no WM_SIZE reflow -- lock the frame to the
@@ -6812,7 +6979,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.8        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
