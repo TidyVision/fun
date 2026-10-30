@@ -6,8 +6,8 @@
 1 ICON "twinspeak.ico"
 
 1 VERSIONINFO
-FILEVERSION     7,0,7,0
-PRODUCTVERSION  7,0,7,0
+FILEVERSION     7,0,9,0
+PRODUCTVERSION  7,0,9,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TidyVision TwinSpeak"
-            VALUE "FileVersion",      "7.0.7.0"
+            VALUE "FileVersion",      "7.0.9.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.0.7.0"
+            VALUE "ProductVersion",   "7.0.9.0"
         END
     END
     BLOCK "VarFileInfo"

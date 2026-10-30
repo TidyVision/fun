@@ -1,26 +1,24 @@
 // ============================================================================
-//  twinspeak v7.0.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.0.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
-//  v7.0.7 (THE TAB STRIP STOPS FIGHTING ITSELF. Field: theme clicks left the
-//          tabbar in the old colors, the tab buttons flickered and the CPU
-//          still worked for its frames. Root: v7.0.6's FLIP-model swap chain
-//          on a CHILD window keeps its front buffer alive at DWM while the
-//          per-paint GDI FillRect kept drawing into the same HWND's
-//          redirection surface -- GDI and flip presentation on one HWND do
-//          not mix, so frames alternated (the flicker), theme repaints lost
-//          to the stale flip frame (the stuck colors) and the churn burned
-//          CPU. v7.0.7: bitblt-model swap chain (DXGI_SWAP_EFFECT_DISCARD)
-//          -- DEFINED GDI interop, no persistent front buffer, still 100%
-//          GPU-rasterized; Present(0,0) so synchronous repaints never block
-//          on vsync; the per-paint GDI fill is a ONE-TIME pre-present cover;
-//          ONE cached brush with SetColor per draw replaces ~16 brush
-//          allocations per frame; the six labels are widened once; per-
-//          primitive antialiasing is explicit; applyTheme invalidates the
-//          strip directly so the tabbar ALWAYS follows the theme; the 250 ms
-//          status setter only touches the STATIC on real text changes. The
-//          D3D11 + D2D 1.1 + DirectWrite stack is untouched. No engine DSP
+//  v7.0.9 (SYNC THEME PAINT + FLUSHED ATOMIC SWITCH + SERIF HEADER. (1) The
+//          tabbar's new theme colors must be on screen the moment the theme
+//          click lands -- three field reports in a row said it landed late,
+//          so applyTheme now finishes with an explicit InvalidateRect +
+//          UpdateWindow on the strip: a synchronous WM_PAINT that runs the
+//          GPU pass and its Present INSIDE the click handler, with the new
+//          colors already copied. No dependency on RDW paint ordering or DWM
+//          catching up. (2) Field directive "make sure every render updates
+//          before the atomic repaint": guiShowPage now opens with
+//          UpdateWindow -- every pending invalidated region paints under the
+//          OLD page before the WM_SETREDRAW freeze, so nothing stale can
+//          land during or after the switch and flicker. (3) The in-window
+//          header "TIDYVISION TWINSPEAK" is Times New Roman bold. The NATIVE
+//          caption's font, though, is drawn by DWM from the system theme and
+//          has no font API -- changing it means replacing the whole
+//          nonclient area with a custom-drawn titlebar. No engine DSP
 //          changed in this version: the audio path is byte-identical to
-//          v7.0.6.)
+//          v7.0.8.)
 //
 //  v7.0.5 (THE STRIP RENDERS ON THE GPU. The tab strip -- halo, faces,
 //          borders -- now draws through Direct2D: a DC render target backed
@@ -3719,7 +3717,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.0.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.0.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4699,9 +4697,12 @@ static const DWORD kGuiFrame = WS_CAPTION | WS_SYSMENU;
 // ---- fonts / brushes -------------------------------------------------------
 static void applyTheme(int i);   // v7.0.0: forward decl (defined right below guiMakeGdi)
 static void guiMakeGdi() {
-    g_fHead = CreateFontA(-21, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+    // v7.0.9: the in-window header ("TIDYVISION TWINSPEAK") is Times New
+    // Roman bold now -- the user asked for a serif title. FW_BOLD, not
+    // FW_SEMIBOLD: Times has no semibold weight and GDI would guess.
+    g_fHead = CreateFontA(-21, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+                          DEFAULT_PITCH | FF_DONTCARE, "Times New Roman");
     g_fUI   = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
@@ -4761,14 +4762,18 @@ static void applyTheme(int i) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
         RedrawWindow(g_hwnd, nullptr, nullptr,
                      RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
-        // v7.0.7: the strip gets its OWN explicit invalidate on top of the
-        // RDW_ALLCHILDREN pass. v7.0.6's field report ("when I click on the
-        // theme button, the tabbar doesn't update its color") came from the
-        // flip chain outvoting the repaint -- with the bitblt chain the
-        // explicit invalidate makes sure the strip's WM_PAINT always runs
-        // and the GPU pass redraws from the LIVE guic:: colors.
-        if (HWND ts = GetDlgItem(g_hwnd, IDC_TABSTRIP))
+        // v7.0.9: the tabbar's new colors must be ON SCREEN before the click
+        // handler returns. The RDW_ALLCHILDREN pass above repaints the strip
+        // in theory, but three field reports in a row say the tabbar lands
+        // late on real hardware -- so the strip now gets an EXPLICIT
+        // invalidate + UpdateWindow: a synchronous WM_PAINT that runs the
+        // GPU pass and its Present right here, with the new guic:: colors
+        // already copied. No dependency on paint ordering, RDW flags or DWM
+        // catching up.
+        if (HWND ts = GetDlgItem(g_hwnd, IDC_TABSTRIP)) {
             InvalidateRect(ts, nullptr, FALSE);
+            UpdateWindow(ts);
+        }
         guiCaptionTheme(t.bg);      // v7.0.6: the caption follows the theme
     }
 }
@@ -6026,6 +6031,13 @@ static void guiBuildControls(HWND w) {
 }
 
 static void guiShowPage(HWND w, int p) {
+    // v7.0.9: FLUSH EVERY PENDING RENDER FIRST (field directive: "make sure
+    // every render updates before the atomic repaint"). Any window still
+    // holding an invalidated region -- a half-finished owner-draw button,
+    // a queued log/status paint -- paints NOW, before the freeze, under the
+    // old page. Nothing stale can land during or after the switch and
+    // flicker; the atomic repaint below then starts from a clean slate.
+    UpdateWindow(w);
     // v7.0.6: the page switch is ATOMIC. The old hide-then-show let the
     // exposed parent rects hit the screen between the two ShowWindow passes
     // -- one frame of blank background before the new page's children
@@ -6040,10 +6052,19 @@ static void guiShowPage(HWND w, int p) {
             ShowWindow(g_pageHw[i][k], i == p ? SW_SHOW : SW_HIDE);
     SendMessageA(w, WM_SETREDRAW, TRUE, 0);
     g_tab = p;
+    // v7.0.8: the fade anchor MUST be stamped BEFORE the atomic repaint.
+    // v7.0.6's rewrite painted the strip first and anchored second -- the
+    // synchronous pass read the STALE anchor (fs = 1.0 full glow), the next
+    // 16 ms tick read fs = 0 (glow gone), then the ramp climbed back: full
+    // -> off -> fade-in on every tab click. That flash is the "glow fading
+    // flicker". v7.0.4's ordering (anchor, then one strip invalidate) never
+    // had it because there was no full-frame repaint in between; the atomic
+    // switch re-introduced one. Anchor first = the atomic paint is already
+    // fs ~ 0 and the glow climbs monotonically.
+    g_tabAnimStart = GetTickCount64();
     RedrawWindow(w, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     // v7.0.4/v7.0.5: the selected tab FADES IN, and ONLY the strip animates.
-    g_tabAnimStart = GetTickCount64();
     // v7.0.5: 1 ms system timer resolution for the life of the animation. A
     // 16 ms WM_TIMER otherwise lands on the ~15.6 ms default tick and the
     // eased ramp quantizes into visible steps. One begin per animation run,
@@ -6208,7 +6229,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const RECT hdr = { 18, 0, 420, 32 };
         guiAAString(g, dc, hdr, "TIDYVISION TWINSPEAK", guic::cAccent, g_fHead, 1);
         char vbuf[640];
-        snprintf(vbuf, sizeof(vbuf), "v7.0.7  |  %s", g_guiIniPath.c_str());
+        snprintf(vbuf, sizeof(vbuf), "v7.0.9  |  %s", g_guiIniPath.c_str());
         const RECT ver = { 300, 8, 866, 30 };
         guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
         guiWatermark(g);
@@ -7250,7 +7271,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.0.7        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.0.9        : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
