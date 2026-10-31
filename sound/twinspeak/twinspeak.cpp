@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.24 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.25 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,30 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.25 TWO FIELD BUGS, ONE DARK-THEME, ONE SHELL. (a) THE TOP EDGE:
+//            "the top edge of the window being black", dark themes ONLY.
+//            The v7.1.24 fake top shadow (main.c's 1 px row) went out as
+//            cPanel2 pushed 45% toward black -- a plausible shadow on the
+//            light themes, near-BLACK on every dark one (the field's DARK
+//            BLUE measured RGB(12,15,22) against a RGB(25,27,33) face
+//            top -- exactly the formula's output). The example itself
+//            licenses the recolor ("you might need to tweak the colors
+//            here based on the color scheme of your app"): the row now
+//            paints PLAIN cPanel2 -- the theme edge color the bar's 1 px
+//            bottom edge already uses -- so top and bottom chrome match,
+//            nothing blends toward a color the theme does not own, and
+//            the inactive blend (toward the face top) only softens it.
+//            (b) THE TASKBAR LABEL: "the taskbar name being a single
+//            letter" AGAIN, with the v7.1.23 process AUMID verbatim in
+//            the binary. The process-wide claim is kept (hardened with a
+//            LoadLibrary fallback, both outcomes logged), but the shell
+//            reads a WINDOW's identity off the window itself now: the
+//            panel claims System.AppUserModel.ID = "TidyVision.TwinSpeak"
+//            through SHGetPropertyStoreForWindow + IPropertyStore::
+//            SetValue -- the same property a Start-menu shortcut carries,
+//            resolved dynamically (the house ITaskbarList trick), no new
+//            headers, set before the first paint and before tbShowTab.
+//            out1/out2 sample paths untouched.
 //    v7.1.24 KEEP-ALIVE 40 Hz @ 0.005 + THE WINDOW IS main.c: two field
 //            asks. (a) THE KEEP-ALIVE: the built-in out2 tone moves from
 //            1 Hz @ 0.0001 (~-80 dBFS) to 40 Hz @ 0.005 (0.5%, ~-46 dBFS)
@@ -4151,7 +4175,17 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // v7.1.24 main.c: the fake top shadow -- the frame inset removed the
     // window's real top border; the example paints its own 1 px line
     // (focused: the plain shadow; unfocused: blended toward the face top).
-    const COLORREF shTop = guiLerpRGB(guic::cPanel2, RGB(0, 0, 0), 0.45);
+    // v7.1.25 THE DARK-THEME FIX, from the field: the row went out as
+    // cPanel2 pushed 45% toward black -- a plausible shadow on the light
+    // themes, a BLACK hairline on every dark one (DARK BLUE measured
+    // RGB(12,15,22) under a RGB(25,27,33) face top -- the formula's own
+    // output). The example's note licenses the recolor: the line is the
+    // theme's edge color, PLAIN cPanel2 -- the exact row the bar's 1 px
+    // bottom edge already paints -- so top and bottom chrome match and no
+    // theme darkens toward a color it does not own. Inactive still blends
+    // toward the face top (the example's rule); with a real edge color
+    // that only softens the line further.
+    const COLORREF shTop = guic::cPanel2;
     const COLORREF shCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
     Gdiplus::SolidBrush shadow(Gdiplus::Color(255, GetRValue(shCol),
                                               GetGValue(shCol), GetBValue(shCol)));
@@ -6072,6 +6106,8 @@ static void guiCaptureWindowPos(HWND w) {
 // so nothing takes a taskbar slot; the moment the panel opens it gets its
 // taskbar button (and Alt-Tab entry) so it can be seen and reached like any
 // window; closing hides it and the button goes away -- the tray icon remains.
+// v7.1.25: fwd -- the definition sits with the ITaskbarList helpers below.
+static void tsSetWindowAumid(HWND w, const wchar_t* id);
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
@@ -6090,6 +6126,13 @@ static bool guiCreateRealWindow() {
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
+    // v7.1.25 THE TASKBAR LABEL, window-level: the process AUMID alone
+    // left the Win11 labeled taskbar free to shrink this button to a
+    // one-letter stub on the field machine. The per-window
+    // System.AppUserModel.ID is the identity the shell reads for THIS
+    // window's grouping and label; set it BEFORE the first paint and
+    // before tbShowTab ever runs.
+    tsSetWindowAumid(g_hwnd, L"TidyVision.TwinSpeak");
     {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
         // The window carries NO region and NO WS_CAPTION -- the shadow
         // lives on WS_THICKFRAME, and the DWM composites its standard drop
@@ -6189,6 +6232,64 @@ static void tbHideTab(HWND w) {   // panel hidden: the slot goes with it
     if (v && g_tbList && w) v->DeleteTab(g_tbList, w);
 }
 
+// ---- v7.1.25: the taskbar label, claimed at the WINDOW level ----------------
+// The process-wide AppUserModelID (guiMain, before any window -- v7.1.23)
+// did not reach every shell path: the field machine still saw Win11's
+// labeled taskbar shrink the button to a one-letter stub. The per-window
+// property is the identity the shell reads for THIS window's grouping AND
+// label text -- the same System.AppUserModel.ID value a Start-menu
+// shortcut carries -- set through SHGetPropertyStoreForWindow +
+// IPropertyStore::SetValue (shell32 export, Win7+; resolved dynamically so
+// the header surface stays untouched -- the same house trick as the
+// ITaskbarList vtable above). The value replaces nothing: the process
+// claim, the grouping, the jumplist and the label all read the same id.
+static const IID kTSIID_PropertyStore =
+    { 0x886d8eeb, 0x8cf2, 0x4446, { 0x8d, 0x02, 0xdb, 0xba, 0x10, 0x72, 0x22, 0x1f } };
+static const GUID kTSPKEY_AppUserModel_ID =
+    { 0x9f4c2855, 0x9f79, 0x4b39, { 0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3 } };
+struct TS_PROPERTYKEY { GUID fmtid; DWORD pid; };
+struct TS_PROPVARIANT {          // x64 PROPVARIANT, VT_LPWSTR slice:
+    WORD   vt;                   // offset 0  (VT_LPWSTR = 31)
+    WORD   r1, r2, r3;           // offsets 2..6 (reserved)
+    LPWSTR pwszVal;              // offset 8  (the union's pointer arm)
+};
+struct TS_IPropertyStoreVtbl {
+    HRESULT (__stdcall *QueryInterface)(void*, const IID&, void**);
+    ULONG   (__stdcall *AddRef)(void*);
+    ULONG   (__stdcall *Release)(void*);
+    HRESULT (__stdcall *GetCount)(void*, DWORD*);
+    HRESULT (__stdcall *GetAt)(void*, DWORD, TS_PROPERTYKEY*);
+    HRESULT (__stdcall *GetValue)(void*, const TS_PROPERTYKEY&, TS_PROPVARIANT*);
+    HRESULT (__stdcall *SetValue)(void*, const TS_PROPERTYKEY&, const TS_PROPVARIANT&);
+    HRESULT (__stdcall *Commit)(void*);
+};
+static void tsSetWindowAumid(HWND w, const wchar_t* id) {
+    if (!w || !id) return;
+    typedef HRESULT (WINAPI *TS_SGPSFW)(HWND, const IID&, void**);
+    HMODULE sh = GetModuleHandleA("shell32.dll");
+    if (!sh) sh = LoadLibraryA("shell32.dll");
+    if (!sh) { tlog("[twinspeak] gui           : window AppUserModelID skipped -- shell32 unreachable\n"); return; }
+    const TS_SGPSFW getStore =
+        (TS_SGPSFW)(void*)GetProcAddress(sh, "SHGetPropertyStoreForWindow");
+    if (!getStore) { tlog("[twinspeak] gui           : window AppUserModelID skipped -- no SHGetPropertyStoreForWindow\n"); return; }
+    void* ps = nullptr;
+    if (FAILED(getStore(w, kTSIID_PropertyStore, &ps)) || !ps) {
+        tlog("[twinspeak] gui           : window AppUserModelID failed -- no property store\n");
+        return;
+    }
+    TS_IPropertyStoreVtbl* v = (TS_IPropertyStoreVtbl*)*(void**)ps;
+    TS_PROPERTYKEY key; key.fmtid = kTSPKEY_AppUserModel_ID; key.pid = 5;
+    TS_PROPVARIANT val; ZeroMemory(&val, sizeof(val));
+    val.vt      = 31;              // VT_LPWSTR
+    val.pwszVal = (LPWSTR)id;      // const cast: SetValue copies the string
+    const HRESULT hr = v->SetValue(ps, key, val);
+    if (SUCCEEDED(hr)) v->Commit(ps);
+    v->Release(ps);
+    tlog("[twinspeak] gui           : window AppUserModelID %s (0x%08lX) -- the taskbar label\n"
+         "                            reads the window's own identity now\n",
+         SUCCEEDED(hr) ? "set" : "FAILED", (unsigned long)hr);
+}
+
 static void guiRestoreWindow() {
     // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
     // tray menu, second instance); every later ask just shows it.
@@ -6256,7 +6357,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.24  |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.1.25  |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7135,12 +7236,24 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // taskbar grouping, the jumplist and the balloon notifications all
     // hang off it. (shell32 export, Win7+; resolved dynamically so the
     // header surface stays untouched.)
+    // v7.1.25 STILL ONE LETTER ON THE FIELD even with this call verbatim
+    // in the binary -- so the claim is now made in TWO places: this
+    // process-wide one (hardened with a LoadLibrary fallback, its outcome
+    // logged) and the per-window property on the panel itself
+    // (tsSetWindowAumid in guiCreateRealWindow). The shell reads the
+    // window's own System.AppUserModel.ID for the label; the process id
+    // stays for grouping, the jumplist and the balloons.
     {
         typedef HRESULT (WINAPI *TS_SCAPID)(PCWSTR);
+        HMODULE sh = GetModuleHandleA("shell32.dll");
+        if (!sh) sh = LoadLibraryA("shell32.dll");
         const TS_SCAPID setAppId = (TS_SCAPID)(void*)GetProcAddress(
-            GetModuleHandleA("shell32.dll"),
+            sh ? sh : GetModuleHandleA(nullptr),
             "SetCurrentProcessExplicitAppUserModelID");
-        if (setAppId) setAppId(L"TidyVision.TwinSpeak");
+        const HRESULT aumidHr =
+            setAppId ? setAppId(L"TidyVision.TwinSpeak") : (HRESULT)0x80004005L;
+        tlog("[twinspeak] gui           : process AppUserModelID TidyVision.TwinSpeak -> 0x%08lX%s\n",
+             (unsigned long)aumidHr, SUCCEEDED(aumidHr) ? "" : " (FAILED)");
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
     guiInitDpi();          // v7.1.20: FIRST geometry act -- scale every constant + font

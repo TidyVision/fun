@@ -1,5 +1,5 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.1.24: version bump
-// (v7.1.21: the manifest; v7.1.22..24: cpp-side window fixes only).
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.1.25: version bump
+// (v7.1.21: the manifest; v7.1.22..25: cpp-side window fixes only).
 // Task Manager (and Explorer > Properties > Details) read FileDescription
 // below: "TwinSpeak". No windows.h include needed -- the VERSIONINFO and
 // RT_MANIFEST forms used here are RC syntax, not C macros, so both windres
@@ -13,8 +13,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,1,24,0
-PRODUCTVERSION  7,1,24,0
+FILEVERSION     7,1,25,0
+PRODUCTVERSION  7,1,25,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -25,12 +25,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TidyVision TwinSpeak"
-            VALUE "FileVersion",      "7.1.24.0"
+            VALUE "FileVersion",      "7.1.25.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.1.24.0"
+            VALUE "ProductVersion",   "7.1.25.0"
         END
     END
     BLOCK "VarFileInfo"
