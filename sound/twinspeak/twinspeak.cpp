@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.27 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.29 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,36 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.29 THE ALPHA NEVER LEFT THE BUILDING. Field screenshot, window
+//            unfocused: the top row read #FFFFFF (the bare light-mode
+//            sheet) while the DWM's own left/right edges read #AAAAAA.
+//            Root cause: the bar buffer was a CreateCompatibleBitmap DDB
+//            -- DDBs cannot hold an alpha channel, so v7.1.28's half-
+//            alpha row reached the redirection surface as alpha 0 =
+//            fully transparent = the bare sheet. Fix: the buffer is a
+//            32bpp top-down DIB section now, and after the GDI+ pass the
+//            sheet row is written BYTE-DIRECT in the recipe's premulti-
+//            plied form -- active BGRA(0,0,0,0), inactive BGRA(43,43,43,
+//            128) (= gray85 at 50%: "multiply it by the alpha", 85*0.5 =
+//            43). Over the field's white desktop the row now composites
+//            to ~#AAAAAA, the same as the DWM's own edges.
+//    v7.1.28 THE INACTIVE TOP BORDER. The field: "when the window turns
+//            unfocused, I still see the top border not proper like the
+//            left, right and bottom." v7.1.27 composited the inactive row
+//            as an OPAQUE lerp toward RGB(85,85,85) -- a fixed color that
+//            can never track what is behind the window, unlike the DWM's
+//            own semi-transparent borders on the three NC strips. The
+//            recipe is explicit: inactive, you draw a gray SEMITRANSPAR-
+//            ENT border -- gray = roundf(85*0.5) = 43, alpha = 0.5, i.e.
+//            RGBA(43,43,43,128). The pixel's ALPHA is the delivery: the
+//            DWM blends the extended sheet row with the client pixel by
+//            that alpha, so the row composites 50/50 with the sheet --
+//            the same semi-transparent inactive border the strips carry.
+//            To let GDI+ actually write that alpha (src-over onto opaque
+//            pixels would flatten it back to 255) the bar DIB is now
+//            cleared transparent every frame before the face repaints it
+//            opaque. Also: the in-app version string still said v7.1.25
+//            (missed two bumps) -- fixed.
 //    v7.1.27 THE REAL TOP BORDER, VANILLA AT LAST. From the field: with
 //            Windows' "show accent color on the following surfaces: title
 //            bars and window borders" the LEFT/RIGHT/BOTTOM border pieces
@@ -4173,17 +4203,38 @@ static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product n
 static HDC     g_barDc = nullptr;
 static HBITMAP g_barBm = nullptr, g_barBmOld = nullptr;
 static int     g_barW = 0, g_barH = 0;
+static BYTE*   g_barBits = nullptr;   // v7.1.29: the DIB's pixels -- the
+                                      // sheet row is patched byte-direct
 static bool guiBarBufEnsure(int ww, int hh) {
     if (g_barDc && ww <= g_barW && hh <= g_barH) return true;
     if (g_barBmOld) {
         SelectObject(g_barDc, g_barBmOld);
         DeleteObject(g_barBm);
-        g_barBm = nullptr; g_barBmOld = nullptr;
+        g_barBm = nullptr; g_barBmOld = nullptr; g_barBits = nullptr;
     }
     if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
     HDC sdc = GetDC(nullptr);
     g_barDc = CreateCompatibleDC(sdc);
-    g_barBm = CreateCompatibleBitmap(sdc, ww, hh);
+    // v7.1.29 THE ALPHA ONLY SURVIVES IN A DIB SECTION. The bar was a
+    // CreateCompatibleBitmap DDB: DDBs have no alpha channel -- v7.1.28's
+    // half-alpha row reached the redirection surface as alpha 0, the DWM
+    // read "fully transparent", and the BARE SHEET showed: the field
+    // screenshot measured the top row at #FFFFFF (the light-mode sheet's
+    // white) while the DWM's own left/right edges read #AAAAAA. A 32bpp
+    // top-down DIB section holds real per-pixel alpha and the SRCCOPY
+    // blit copies all 32 bits -- the carrier the sheet recipe assumes.
+    // (Same pattern as the tab strip's DIB.)
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = ww;
+    bi.bmiHeader.biHeight      = -hh;          // top-down: row 0 = the border
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;           // BGRA, pitch = ww * 4
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    g_barBm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    g_barBits = (BYTE*)bits;
     ReleaseDC(nullptr, sdc);
     if (!g_barDc || !g_barBm) {
         if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
@@ -4195,11 +4246,14 @@ static bool guiBarBufEnsure(int ww, int hh) {
     return true;
 }
 // v7.1.27: set when the DWM glass sheet (DwmExtendFrameIntoClientArea
-// {0,0,1,0}) is confirmed on the panel window -- row 0 then paints the
-// REAL top border (pure black while active, the hand-composited vanilla
-// gray while inactive). Without the sheet the v7.1.26 fake-shadow recipe
-// stays the fallback, so a failed extend can never paint a dead black
-// line into the bar.
+// {0,0,1,0}) is confirmed on the panel window -- row 0 then carries the
+// REAL top border: byte-direct BGRA(0,0,0,0) while active (bare glass, the
+// DWM paints its active border) and since v7.1.29 byte-direct premultiplied
+// BGRA(43,43,43,128) while inactive (gray85 at 50% -- the DWM composites
+// that alpha over the sheet, the same way it draws the left/right/bottom
+// NC strips). Without the sheet the v7.1.26 fake-shadow recipe stays the
+// fallback, so a failed extend can never paint a dead black line into the
+// bar.
 static bool g_glassSheet = false;
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
@@ -4211,9 +4265,10 @@ static bool g_glassSheet = false;
 // that fed it -- the example acts on WM_NCLBUTTONUP while the slot is
 // hovered, so the hover face IS the press feedback now. Row 0 is the
 // window's REAL top border since v7.1.27: the DWM glass sheet shows
-// through a pure black row while active (the accent color with the
-// Windows override, the default semi-transparent gray without), and the
-// vanilla inactive gray is composited over the face top while inactive.
+// through the row while active (the accent color with the Windows
+// override, the default semi-transparent gray without), and since
+// v7.1.29 the recipe's premultiplied half-alpha gray BGRA(43,43,43,128)
+// -- composited BY THE DWM over the sheet -- while inactive.
 // The bar also dims when the window is INACTIVE
 // (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
 // active vs. inactive like every native caption does.
@@ -4221,6 +4276,20 @@ static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
 static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    // v7.1.28 THE ALPHA CHANNEL IS THE DELIVERY. The DWM blends the sheet
+    // row with the client pixel BY THE PIXEL'S ALPHA (the recipe: "if you
+    // use another alpha value, you will blend your client area with the
+    // DWM frame according to the alpha value"), and the inactive row must
+    // reach the surface at HALF alpha. But this bar renders into a
+    // PERSISTENT DIB and GDI+ blends src-over: a half-alpha brush over
+    // last frame's opaque pixels flattens straight back to alpha 255 and
+    // the DWM would blend nothing -- the exact opaque-row failure the
+    // field reported. So every frame starts TRANSPARENT; the face, edge
+    // and chrome below repaint every one of those pixels opaque again in
+    // the same breath, and only row 0 is left carrying the recipe's
+    // alpha. (The straight-to-screen fallback takes the same path; its
+    // row brush is opaque, so nothing changes there.)
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
     // the face: the theme bg with a light touch at the top -- depth without
     // inventing a color the theme does not own (guiLerpRGB toward white).
     // Integer fill + overscan: every bar pixel is covered exactly once, no
@@ -4244,35 +4313,49 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
     g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
-    // v7.1.27 THE REAL TOP BORDER -- the fake shadow is retired. Row 0 is
-    // the DWM glass sheet (DwmExtendFrameIntoClientArea {0,0,1,0}, set at
-    // creation). ACTIVE + sheet: the row is filled PURE BLACK -- black on
-    // the sheet IS the DWM frame, so the window's REAL top border shows
-    // there: the accent color when Windows' "title bars and window
-    // borders" override is on, the default SEMI-TRANSPARENT gray when it
-    // is not -- the same native border the left/right/bottom NC strips
-    // already carry. Vanilla on all four sides. The black must be EXACT
-    // (0,0,0) in the redirection surface: the opaque integer fill plus the
-    // single SRCCOPY blit in guiPaintBar guarantee it. INACTIVE: the DWM
-    // draws no border on the sheet (the same observation the native
-    // surfaces made), so the vanilla inactive border is composited BY
-    // HAND -- the face top blended 50% toward a neutral RGB(85,85,85), the
-    // same quiet gray on light and dark faces, like vanilla. NO sheet
-    // (the extend call failed): the v7.1.26 fake-shadow recipe stays as
-    // the fallback -- a failed extend can never paint a dead black line.
-    // The v7.1.26 gradient offset stays: the face starts 1px down, so
-    // this row belongs to the border alone.
-    COLORREF rowCol;
+    // v7.1.28 THE INACTIVE ROW -- the recipe's exact RGBA. The field:
+    // unfocused, the top border still read "not proper like the left,
+    // right and bottom" -- v7.1.27 painted an OPAQUE lerp toward
+    // RGB(85,85,85), a fixed color that can never follow what is behind
+    // the window the way a real border does. The recipe (File Pilot, via
+    // Simon Anciaux) is explicit: when INACTIVE you draw a gray SEMI-
+    // TRANSPARENT border --
+    //     gray  = roundf(85 * 0.5) = 43
+    //     alpha = 0.5
+    // -- RGBA(43,43,43,128), PREMULTIPLIED: the stored RGB is already
+    // half of 85 (the recipe: "the colors needed to be pre-multiplied
+    // ... multiply it by the alpha: (85.0f * 0.5f)/255.0f"), so the
+    // bytes are BGRA(43,43,43,128). v7.1.29: those bytes are written
+    // DIRECTLY into the 32bpp DIB after the GDI+ pass
+    // (guiBarPatchSheetRow in guiPaintBar) -- GDI+ on an HDC-backed
+    // surface cannot be trusted with the alpha byte, and on the old DDB
+    // it had nowhere to land at all (the field screenshot caught the
+    // result: the bare sheet's WHITE row). The single SRCCOPY blit
+    // carries the real alpha into the redirection surface, and the DWM
+    // composites the row 50/50 with the sheet -- the same semi-transparent inactive
+    // border the left/right/bottom NC strips carry, tracking the desktop
+    // behind the window exactly like theirs. ACTIVE keeps the field-
+    // proven opaque black: black on the sheet IS the DWM frame, so the
+    // window's REAL top border shows there -- the accent color when
+    // Windows' "title bars and window borders" override is on, the
+    // default semi-transparent gray when it is not. NO sheet (the extend
+    // call failed): the v7.1.26 fake-shadow recipe stays as the fallback
+    // -- a failed extend can never paint a dead black line. The v7.1.26
+    // gradient offset stays: the face starts 1px down, so this row
+    // belongs to the border alone.
+    Gdiplus::Color rowCol;
     if (g_glassSheet) {
-        rowCol = active ? RGB(0, 0, 0)                       // the DWM frame
-                        : guiLerpRGB(bgTop, RGB(85, 85, 85), 0.5);
+        rowCol = active ? Gdiplus::Color(255, 0, 0, 0)       // the DWM frame
+                        : Gdiplus::Color(128, 43, 43, 43);   // RGBA(43, 0.5)
     } else {
         const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
-        rowCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
+        const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
+        rowCol = active ? Gdiplus::Color(255, GetRValue(shTop),
+                                        GetGValue(shTop), GetBValue(shTop))
+                        : Gdiplus::Color(255, GetRValue(li),
+                                        GetGValue(li), GetBValue(li));
     }
-    Gdiplus::SolidBrush rowBrush(Gdiplus::Color(255, GetRValue(rowCol),
-                                                GetGValue(rowCol),
-                                                GetBValue(rowCol)));
+    Gdiplus::SolidBrush rowBrush(rowCol);
     g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
     // v7.1.24 main.c: the caption buttons -- hover face + glyphs. The fills
     // stay integer-exact; shape smoothing turns ON for the X's diagonals
@@ -4342,6 +4425,40 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
         }
     }
 }
+// v7.1.29 THE SHEET ROW, BYTE-EXACT. GDI+ brushes cannot be trusted to
+// write the alpha byte of an HDC-backed surface (and on the old DDB there
+// was no alpha byte at all) -- but the sheet recipe lives or dies on that
+// byte. So after the GDI+ pass, row 0 of the 32bpp DIB is written
+// DIRECTLY, in the premultiplied form the redirection surface expects
+// (the recipe: "the colors needed to be pre-multiplied ... instead of
+// passing 85.0f/255.0f for R, G and B, we need to multiply it by the
+// alpha: (85.0f * 0.5f)/255.0f"):
+//   ACTIVE   : BGRA(0, 0, 0, 0)      -- the recipe's RGBA(0,0,0,0):
+//                                      fully transparent black = bare
+//                                      glass, and the DWM paints its
+//                                      ACTIVE border there (the accent
+//                                      color with the Windows override,
+//                                      the default gray without).
+//   INACTIVE : BGRA(43, 43, 43, 128) -- gray85 at half alpha,
+//                                      premultiplied (85*0.5 = 42.5 ->
+//                                      roundf -> 43): the DWM blends it
+//                                      50/50 with the sheet -- the same
+//                                      semi-transparent inactive border
+//                                      the left/right/bottom NC strips
+//                                      carry. Over the field's white
+//                                      desktop that composites to
+//                                      ~#AAAAAA, exactly what the
+//                                      screenshot measured on the DWM's
+//                                      own edges.
+// Byte order in the DIB is little-endian BGRA, so one u32 covers a pixel;
+// the row is <= ~900 pixels, the patch costs nothing next to GDI+.
+static void guiBarPatchSheetRow(int cw, bool active) {
+    if (!g_barBits || !g_glassSheet || cw <= 0) return;
+    const unsigned px = active ? 0x00000000u        // BGRA(0, 0, 0, 0)
+                               : 0x802B2B2Bu;       // BGRA(43, 43, 43, 128)
+    unsigned* row = (unsigned*)g_barBits;           // top-down: row 0 first
+    for (int x = 0; x < cw; ++x) row[x] = px;
+}
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
     // v7.1.24: the hovered slot rides GWLP_USERDATA exactly like main.c;
@@ -4356,6 +4473,7 @@ static void guiPaintBar(HWND w) {
     if (!wdc) return;
     if (guiBarBufEnsure(cw, kCapH)) {
         guiRenderBar(g_barDc, cw, hovered, active);
+        guiBarPatchSheetRow(cw, active);   // v7.1.29: the alpha IS the delivery
         BitBlt(wdc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
     } else {
         guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
@@ -6451,7 +6569,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.25  |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.1.29  |  %s",   // v7.1.29 (v7.1.28 fixed the stale v7.1.25)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
