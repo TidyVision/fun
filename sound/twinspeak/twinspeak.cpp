@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,34 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.6 THE FRAME'S OWN INPUTS. The field: "This just makes the
+//            top border bar look hideous now... I want specifically
+//            that top bar of the custom window border to be like the
+//            left, right, and bottom edges, to make it accurate like
+//            on the windows 10 window style. Right now, the window's
+//            top border is white, which it shouldn't be." The v7.2.5
+//            strip sampler was blind from birth: GetPixel off a
+//            screen DC reads the GDI surface, and the DWM's frame
+//            drawing lives only in the compositor -- at the strip
+//            coordinates the GDI sees our own redirection surface,
+//            which nobody ever paints. White. (The tapes could
+//            measure #777777/#A7A2A1 because SCREENSHOTS see the
+//            composite; GetPixel never will.) So the row stops being
+//            a photograph of the strips and becomes their sibling:
+//            the colors are computed from the same inputs the DWM
+//            itself reads when it paints them -- high contrast's
+//            caption colors; the Settings accent override
+//            (ColorPrevalence bit 0 + AccentColor, ColorizationColor
+//            as the older-build fallback); and the stock dark-scheme
+//            grays the field's own tapes measured off THIS window's
+//            strips (it sets DWMWA_USE_IMMERSIVE_DARK_MODE, so those
+//            ARE its strip colors). Timer 5 drops to a 1000 ms
+//            registry poll that repaints only on change; the
+//            sampler, the stability gate, the 250 ms grace window
+//            and the move re-tint are all retired with it. The
+//            NC-flip present is untouched: face and row still land
+//            at the flip compose, instant both directions. Version
+//            steps to 7.2.6.
 //    v7.2.5 THE OWNED ROW. The field: "My only issue now is that the
 //            window's deactivate frame shows a stale frame for up to
 //            a few frames before finally going to the official
@@ -4356,9 +4384,10 @@ static void guiCalcFrameInsets() {
 // v7.1.24 (main.c): the caption buttons; the 1px row the example paints
 // its fake shadow into. v7.1.27..v7.2.4 let the DWM glass sheet own that
 // row (transparent black = the real border through the glass); v7.2.5 owns
-// it outright: plain opaque client pixels in the DWM strips' own measured
-// color (see guiRenderBar + guiSampleBorderStrips). Keep at 1: row 0 is
-// the top border, and the face gradient (offset 1px down) leans on it.
+// it outright: plain opaque client pixels, v7.2.6 painted in the colors
+// the DWM itself reads (see guiRenderBar + guiBorderColorsFromSystem).
+// Keep at 1: row 0 is the top border, and the face gradient (offset 1px
+// down) leans on it.
 #define WIN32_FAKE_SHADOW_HEIGHT 1
 enum {
     CustomTitleBarHoveredButton_None = 0,
@@ -4477,29 +4506,31 @@ static bool guiBarBufEnsure(int ww, int hh) {
 // {0,0,1,0}) is RETIRED: it made the top border the DWM's own visual, and
 // during the activation transition the compositor owns that region -- the
 // face (plain client) always landed at the flip compose while the sheet row
-// never did, on tape after tape. The row is painted OPAQUE in both states
-// now, and the colors are not guesses: they are SAMPLED off the DWM's own
-// left/right NC strips -- the two edges the top border must read as the
-// fourth side of -- so the frame stays one seamless color whether the
-// accent override is on, off, dark mode, light mode, any build. The
-// defaults below are the field's own measurements (v7.2.3/v7.2.4 tapes:
-// active composite L=119 ~ #777777, settled inactive #A7A2A1) and hold
-// only until the first sample lands (~50 ms after launch).
-static COLORREF g_borderActive   = RGB(0x77, 0x77, 0x77);  // measured off our L/R strips while active
-static COLORREF g_borderInactive = RGB(0xA7, 0xA7, 0xA7);  // measured off our L/R strips while inactive
-// the strip sampler's stability gate: a sample must repeat once (two
-// consecutive equal reads) before it may own a cache slot. This is what
-// makes the sampler safe against reading a pre-compose desktop pixel at
-// startup, a mid-fade strip tint after an activation flip, or any other
-// transient -- a wrong value never repeats.
-static COLORREF g_borderLastSample = CLR_INVALID;
-// the grace window anchor: the tick of the last activation flip. Within
-// ~250 ms of a flip the row shows the color WM_NCACTIVATE painted (the
-// instant target, cached); samples may only seed the stability gate, never
-// repaint -- so if the DWM fades its strips on focus gain, the row cannot
-// be yanked off its instant color mid-fade (and equally cannot dip and
-// climb -- no flash-down-then-up).
-static ULONGLONG g_ncFlipTick = 0;
+// never did, on tape after tape. The row is painted OPAQUE in both states.
+// v7.2.6 THE FRAME'S OWN INPUTS: the colors are not SAMPLED anymore -- the
+// field reported the owned row WHITE, and the channel was never going to
+// work: GetPixel off a screen DC reads the GDI surface, and the DWM's
+// frame drawing lives only in the compositor. At the strip coordinates
+// the GDI sees our own redirection surface, which nobody ever paints.
+// (The tapes could measure the strips because SCREENSHOTS see the
+// composite; GetPixel never will.) So the row stops being a photograph
+// of the strips and becomes their SIBLING: the colors are computed from
+// the same inputs the DWM itself reads when it paints our left/right/
+// bottom strips (see guiBorderColorsFromSystem):
+//   * high contrast: the HC theme's caption colors;
+//   * the accent override: ColorPrevalence bit 0 + AccentColor (the
+//     exact pair the Settings toggle writes for the compositor),
+//     ColorizationColor as the older-build fallback;
+//   * stock: the dark-scheme frame grays measured off THIS window's own
+//     strips on the field's tapes (v7.2.3/v7.2.4: active composite
+//     L=119 ~ #777777, settled inactive #A7A2A1) -- this window sets
+//     DWMWA_USE_IMMERSIVE_DARK_MODE, so its strips ARE the dark-scheme
+//     grays; the constants are this configuration's own truth.
+// A 1000 ms registry poll (timer 5) re-runs the compute and repaints
+// only when a color actually changed. No sampling, no stability gate,
+// no grace window, no move re-tint: nothing reads the screen anymore.
+static COLORREF g_borderActive   = RGB(0x77, 0x77, 0x77);  // measured: this window's strips, active
+static COLORREF g_borderInactive = RGB(0xA7, 0xA2, 0xA1);  // measured: this window's strips, settled inactive
 // v7.2.5: WM_NCACTIVATE paints the INCOMING state inside the transaction
 // (GetActiveWindow still answers the OLD truth until the handler returns):
 // 1 = force the ACTIVE face/row, 2 = force the INACTIVE one, 0 = read the
@@ -4575,17 +4606,18 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // WM_NCACTIVATE before DefWindowProc) landed on the FIRST compose
     // every single time. So the sheet is retired and the row joins the
     // face: PLAIN OPAQUE CLIENT PIXELS, painted in the same breath, riding
-    // the same blit, landing at the same flip compose. The color is not a
-    // fixed guess -- the v7.1.28 objection ("a fixed color that can never
-    // follow what is behind the window") is answered with the v7.2.0
-    // measure discipline pointed at a surface that holds still: the DWM's
-    // OWN left/right NC strips, sampled off the screen (guarded), because
-    // they are exactly what the top edge must read as the fourth side of.
-    // ACTIVE paints the measured active strip color (the accent when the
-    // Windows override is on, the default frame gray when it is not),
-    // INACTIVE the measured inactive gray -- and the 50 ms tracker
-    // (timer 5) + the move handler keep both caches honest, so the frame
-    // reads one seamless border on any accent, any mode, any build.
+    // the same blit, landing at the same flip compose. v7.2.6 names the
+    // color: not a photograph of the strips (GetPixel cannot see the
+    // DWM's frame drawing -- it read our own unpainted redirection
+    // surface and the row went white) but the DWM's own INPUTS, the
+    // same ones the compositor reads when it paints the left/right/
+    // bottom strips: the HC caption colors, the Settings accent
+    // override, else the field-measured dark-scheme grays this
+    // window's strips actually wear. ACTIVE paints the active color
+    // (the accent when the Windows override is on, the default frame
+    // gray when it is not), INACTIVE the inactive gray -- and the
+    // 1000 ms poll (timer 5) keeps both honest, so the frame reads
+    // one seamless border on any accent, any mode, any build.
     // v7.1.26's gradient offset stays: the face starts 1px down, so this
     // row belongs to the border alone.
     const COLORREF rowC = active ? g_borderActive : g_borderInactive;
@@ -4666,75 +4698,71 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // delivery question that consumed v7.1.29..v7.2.4 -- WHICH bytes, WHICH
 // alpha, WHEN do they reach the surface -- collapses to "in the same
 // blit as the face".)
-static void guiPaintBar(HWND w);   // fwd: the tracker repaints through it
-// v7.2.5 THE STRIP SAMPLER. The owned row's colors are not guessed and not
-// fixed: they are READ off the DWM's own left/right NC strips -- the two
-// edges the top border must match to read as the fourth side of the frame.
-// One pixel from the middle of each strip (x = the window edge plus half
-// the inset -- always inside the DWM's border, never a client pixel, never
-// a child), guarded with WindowFromPoint == our hwnd so a covering window
-// can never donate its pixels, read with GetPixel off the screen DC (the
-// COMPOSITED desktop, exactly the v7.2.0 measure discipline -- pointed now
-// at a surface that holds still: the strips are one flat color along
-// their whole height, unlike the old row's backdrop-varied blend that
-// broke v7.2.4's +/-2 gate). Left wins, right is the fallback for a
-// covered left edge. CLR_INVALID = no sample this tick.
-static COLORREF guiSampleBorderStrips() {
-    if (!g_hwnd || !IsWindow(g_hwnd)) return CLR_INVALID;
-    if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return CLR_INVALID;
-    RECT wr;
-    if (!GetWindowRect(g_hwnd, &wr)) return CLR_INVALID;
-    const int   y  = wr.top + (wr.bottom - wr.top) / 2;    // mid-height: clear of bar, buttons and log
-    const POINT pl = { wr.left + g_frmInsX / 2, y };       // inside the LEFT strip
-    const POINT pr = { wr.right - 1 - g_frmInsX / 2, y };  // inside the RIGHT strip
-    HDC sdc = GetDC(nullptr);
-    if (!sdc) return CLR_INVALID;
-    COLORREF v = CLR_INVALID;
-    if (WindowFromPoint(pl) == g_hwnd) v = GetPixel(sdc, pl.x, pl.y);
-    if (v == CLR_INVALID && WindowFromPoint(pr) == g_hwnd)
-        v = GetPixel(sdc, pr.x, pr.y);
-    ReleaseDC(nullptr, sdc);
-    return v;
+static void guiPaintBar(HWND w);   // fwd: the poll repaints through it
+// v7.2.6: one DWORD out of the DWM's own key, REG_DWORD or nothing.
+static bool guiRegDword(const wchar_t* name, DWORD* out) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM",
+                      0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, size = sizeof(DWORD), v = 0;
+    const bool ok = RegQueryValueExW(k, name, nullptr, &type,
+                                     (LPBYTE)&v, &size) == ERROR_SUCCESS
+                    && type == REG_DWORD;
+    RegCloseKey(k);
+    if (ok) *out = v;
+    return ok;
 }
-// v7.2.5 THE TRACKER. Keeps both border caches honest and the row on the
-// strips' color, on three schedules:
-//   * timer 5 (50 ms, always on while visible): the idle track. A sample
-//     must pass the STABILITY GATE -- two consecutive equal reads -- before
-//     it may own the cache slot. A pre-compose desktop pixel read in the
-//     first ticks after launch, a mid-fade tint after a flip, a menu's
-//     shadow crossing the strip: none of them repeat, so none of them ever
-//     reach the row. (The successor of v7.2.4's "trust the guarded center
-//     sample", with the guard aimed at the real enemy: transients, not
-//     legitimate variation.)
-//   * WM_WINDOWPOSCHANGED (immediate): a move just re-tinted the strips
-//     over a new backdrop -- no gate, no grace, sample and repaint NOW;
-//     the row must not wait a tick when the whole frame has moved. (A
-//     position change is not a fade; the gate exists for time-transients.)
-//   * the 250 ms GRACE window after each activation flip (g_ncFlipTick):
-//     during it the row shows exactly what WM_NCACTIVATE painted -- the
-//     instant target -- and samples may only seed the gate, never repaint,
-//     so if the DWM fades its strips on focus gain the row simply leads
-//     the fade (Chrome's own top bar does the same) instead of being
-//     yanked off its color mid-fade or dipping-and-climbing.
-// Accent changes, dark/light mode flips: self-healed within one stable
-// pair of samples (<=100 ms). A covered strip retries on the next tick,
-// forever -- nothing to arm, nothing to expire.
-static void guiTrackBorderRow(HWND w, bool immediate) {
-    if (!w || !IsWindow(w)) return;
-    if (!IsWindowVisible(w) || IsIconic(w)) return;
-    const COLORREF s = guiSampleBorderStrips();
-    if (s == CLR_INVALID) { g_borderLastSample = CLR_INVALID; return; }
-    const bool grace = !immediate
-        && GetTickCount64() - g_ncFlipTick < 250;   // inside the flip's own window
-    if (immediate || s == g_borderLastSample) {     // a color that may own the cache
-        const bool active = (GetActiveWindow() != nullptr);
-        COLORREF&   tgt   = active ? g_borderActive : g_borderInactive;
-        if (tgt != s) {
-            tgt = s;
-            if (!grace) guiPaintBar(w);   // grace: the row keeps its instant color
-        }
+// v7.2.6 THE FRAME'S OWN INPUTS -- the compute (see the globals block for
+// the whole story). Pure: no window, no screen, no state but the two
+// colors it writes. The v7.2.5 sampler this replaces photographed the
+// strips and got WHITE -- GetPixel reads the GDI surface, the DWM's frame
+// drawing lives only in the compositor, and what the GDI sees at the
+// strip coordinates is our own never-painted redirection surface.
+static void guiBorderColorsFromSystem() {
+    // (1) high contrast: the DWM frame follows the HC theme's captions.
+    HIGHCONTRASTW hc; ZeroMemory(&hc, sizeof(hc)); hc.cbSize = sizeof(hc);
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0)
+        && (hc.dwFlags & HCF_HIGHCONTRASTON)) {
+        g_borderActive   = GetSysColor(COLOR_ACTIVECAPTION);
+        g_borderInactive = GetSysColor(COLOR_INACTIVECAPTION);
+        return;
     }
-    g_borderLastSample = s;
+    // (2) the accent override: ColorPrevalence bit 0 is the Settings
+    //     toggle "show accent color on title bars and window borders";
+    //     AccentColor is the DWORD that toggle writes for the DWM
+    //     (0xAABBGGRR -- COLORREF's own byte order under an alpha byte);
+    //     older builds keep ColorizationColor. Inactive keeps the
+    //     measured gray: the override paints the ACTIVE frame, and no
+    //     tape ever caught an accent-machine's inactive strip.
+    DWORD prevalence = 0, accent = 0;
+    if (guiRegDword(L"ColorPrevalence", &prevalence) && (prevalence & 1)
+        && (guiRegDword(L"AccentColor", &accent)
+            || guiRegDword(L"ColorizationColor", &accent))) {
+        g_borderActive   = (COLORREF)(accent & 0x00FFFFFF);
+        g_borderInactive = RGB(0xA7, 0xA2, 0xA1);
+        return;
+    }
+    // (3) stock: this window's own dark-scheme strip grays -- the field's
+    //     tapes, and the reason they are right: the window sets
+    //     DWMWA_USE_IMMERSIVE_DARK_MODE, so its strips ARE these.
+    g_borderActive   = RGB(0x77, 0x77, 0x77);
+    g_borderInactive = RGB(0xA7, 0xA2, 0xA1);
+}
+// v7.2.6 THE POLL. Timer 5, 1000 ms: recompute from the registry, repaint
+// only when a color actually changed and the window can show it. An
+// accent twist, a mode flip, a HC toggle: self-healed within a second,
+// idle or not. The 50 ms tracker, the stability gate, the 250 ms grace
+// window and the move re-tint are all retired with the sampler -- there
+// is nothing on the screen left to read.
+static void guiReloadBorderColors(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    const COLORREF a0 = g_borderActive, i0 = g_borderInactive;
+    guiBorderColorsFromSystem();
+    if ((g_borderActive != a0 || g_borderInactive != i0)
+        && IsWindowVisible(w) && !IsIconic(w)) {
+        guiPaintBar(w);
+    }
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -4765,7 +4793,7 @@ static void guiPaintBar(HWND w) {
     // v7.2.2: gdi32 batches drawing calls per thread -- without a flush the
     // blit can sit in user memory while the caller moves on. GdiFlush is a
     // no-op when nothing is batched, so every presentation -- the NC-flip
-    // present, WM_ACTIVATE's blit, WM_PAINT, the tracker -- is in the
+    // present, WM_ACTIVATE's blit, WM_PAINT, the poll -- is in the
     // win32k redirection surface before this call returns. (v7.2.5: the
     // flush's original customer, the v7.2.1 mouse hook, is retired; the
     // ordering guarantee it bought for the NC-flip present stays.)
@@ -6693,16 +6721,19 @@ static bool guiCreateRealWindow() {
             // unconditional hold) could not make it land at the flip
             // compose the way the FACE -- plain client pixels -- always
             // did. v7.2.5 OWNS the row: no extend call, row 0 is ordinary
-            // client, painted opaque in the DWM strips' own measured
-            // color (guiRenderBar + guiSampleBorderStrips + timer 5).
-            // The strips and the shadow keep drawing themselves; the top
-            // edge reads as the fourth side because it wears their exact
-            // color, not because it is their glass.
+            // client, painted opaque. v7.2.6 names its colors from the
+            // DWM's own inputs (guiRenderBar +
+            // guiBorderColorsFromSystem + the timer 5 poll). The strips
+            // and the shadow keep drawing themselves; the top edge reads
+            // as the fourth side because it wears the same colors the
+            // compositor reads, not because it is their glass.
             // v7.1.27 part two stays: DWMWA_USE_IMMERSIVE_DARK_MODE, always
             // on. Without it the DWM paints the frame WHITE in light mode
             // (the documented light-mode border bug); with it the border
-            // renders correctly. It also governs the side strips the
-            // sampler reads, so the row follows it automatically.
+            // renders correctly. It is also WHY the stock constants are
+            // what they are: this window's strips are the DARK-scheme
+            // grays (#777777 / #A7A2A1 on the field's tapes), and the
+            // compute's stock branch carries exactly those.
             // Attribute 20 since Win10 1903, 19 on the early Insider
             // builds: try 20 first.
             const int darkOn = 1;
@@ -6728,16 +6759,18 @@ static bool guiCreateRealWindow() {
     // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
     // redirection surface now, so the first frame DWM composites is the
     // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
+    // v7.2.6: the border colors are computed BEFORE that first render --
+    // an accent-machine's row must wear the accent in the very first
+    // composite, not the stock gray for a tick.
+    guiBorderColorsFromSystem();
     RedrawWindow(g_hwnd, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
-    // v7.2.5: timer 5 = the border tracker, 50 ms for as long as the window
-    // exists (it self-guards: hidden/minimized ticks are two cheap bails).
-    // The first stable pair of samples lands ~100 ms after launch and takes
-    // the row off its defaults; every later tick just keeps the caches
-    // honest (accent twists, mode flips, backdrop changes under the
-    // translucent strips).
-    SetTimer(g_hwnd, 5, 50, nullptr);
+    // v7.2.6: timer 5 = the border-color poll, 1000 ms for as long as the
+    // window exists -- three registry reads and a compare per tick, a
+    // repaint only when a color actually changed (accent twists, mode
+    // flips, HC toggles self-heal within a second).
+    SetTimer(g_hwnd, 5, 1000, nullptr);
     // the whole boot log -- everything the engine said while tray-only --
     // lands in the pane in one flush, oldest first, nothing lost.
     guiFlushLogRing();
@@ -6822,17 +6855,22 @@ static void guiRestoreWindow() {
     // tray menu, second instance); every later ask just shows it.
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
+    // v7.2.6: the poll slept while hidden -- recompute before the show so
+    // an accent twist or mode flip made while tray-only is already worn by
+    // the first composite after the show (the compute is pure, and the
+    // window is still hidden, so no repaint rides this call).
+    guiBorderColorsFromSystem();
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
-    // v7.2.5: the border tracker returns with the window -- it slept while
-    // hidden like the 250 ms tick (a hidden window has no strips to sample;
+    // v7.2.6: the color poll returns with the window -- it slept while
+    // hidden like the 250 ms tick (a hidden window has nothing to repaint;
     // re-arming here costs nothing and the first tick after the show
-    // re-validates both caches against whatever the desktop looks like now).
-    SetTimer(g_hwnd, 5, 50, nullptr);
+    // re-validates the pair against whatever the settings look like now).
+    SetTimer(g_hwnd, 5, 1000, nullptr);
 }
 
 // ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
@@ -6890,7 +6928,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.5  |  %s",   // v7.2.5 the owned row (v7.2.4 opaque hold, cache or not)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.6  |  %s",   // v7.2.6 the frame's own inputs (v7.2.5 owned row)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6967,8 +7005,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // gap the DWM decides the client no longer covers the caption and
         // paints a ghost caption OUTSIDE the window rect (see the v7.1.27
         // notes). v7.2.5: the real top border is the OWNED row -- plain
-        // client pixels in the DWM strips' measured color (see
-        // guiRenderBar/guiSampleBorderStrips), no glass sheet involved.
+        // client pixels; v7.2.6 paints them in the DWM's own input colors
+        // (see guiRenderBar/guiBorderColorsFromSystem), no glass sheet
+        // involved.
         if (!wp) break;   // wParam FALSE: DefWindowProc
         int frame_x = GetSystemMetrics(SM_CXFRAME);
         int frame_y = GetSystemMetrics(SM_CYFRAME);
@@ -7073,19 +7112,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // Chrome-instant, clicks and Alt-Tab/taskbar alike (the old hook
         // never covered the latter; the present covers every path). The
         // direction follows the message: wp != 0 = activating, so the row
-        // goes to the measured ACTIVE strip color in the same blit that
-        // undims the face -- symmetric, instant both ways (the field's
-        // call; if the DWM fades its own strips on focus gain the row
-        // simply leads by the fade's length, exactly what Chrome's own
-        // top bar does). The 250 ms grace anchor is set so the tracker
-        // cannot yank the row off this instant color mid-fade.
+        // goes to the ACTIVE border color in the same blit that undims the
+        // face -- symmetric, instant both ways (the field's call; if the
+        // DWM fades its own strips on focus gain the row simply leads by
+        // the fade's length, exactly what Chrome's own top bar does).
+        // v7.2.6: the colors are the DWM's own inputs now (computed, not
+        // sampled), so there is no tracker to gate and no grace anchor to
+        // set -- the flip present is the row's only write path.
         // DefWindowProc still runs -- the case breaks to the common tail;
         // swallowing the message would freeze the frame state.
         if (IsWindowVisible(w) && !IsIconic(w)) {
-            g_forceFace   = wp ? 1 : 2;    // paint the INCOMING state
+            g_forceFace = wp ? 1 : 2;      // paint the INCOMING state
             guiPaintBar(w);               // face + row 0, one blit, GdiFlush
-            g_forceFace   = 0;
-            g_ncFlipTick  = GetTickCount64();   // the grace window opens
+            g_forceFace = 0;
         }
         break;
     case WM_ACTIVATE:
@@ -7101,12 +7140,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // whose last state wins here). The v7.1.30..v7.2.4 settle burst is
         // RETIRED: it existed to re-present the sheet row across the DWM's
         // fade, and there is no sheet row anymore -- the owned row landed
-        // at the flip compose and the 50 ms tracker (timer 5) owns its
-        // color from here on. The stability gate resets: the strips just
-        // changed state, so the last sample belongs to the old state.
+        // at the flip compose, and its colors are the DWM's own inputs
+        // (v7.2.6), kept honest by the timer 5 poll, not by this message.
         guiPaintBar(w);
-        g_borderLastSample = CLR_INVALID;
-        g_ncFlipTick = GetTickCount64();   // belt: even a flip that skipped NC opens the grace
         break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
@@ -7123,19 +7159,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             p->cy = KCLI_H + kCapH + g_frmInsY;
         }
         break; }
-    case WM_WINDOWPOSCHANGED:
-        // v7.2.5 THE MOVE RE-TINT. The DWM's side strips are translucent
-        // over the desktop (the field's own numbers: #AAAAAA over a white
-        // desktop, #A7A2A1 over the pinkish one), so every move re-tints
-        // them over the new backdrop -- and the owned row must not wait
-        // for the 50 ms tick to follow. This fires once per move message
-        // during a drag (the strips re-tint per frame; two GetPixels and
-        // a repaint only when the color actually changed -- the same
-        // render the hover path already does per mouse move). The case
-        // BREAKS to the common tail on purpose: DefWindowProc owns the
-        // WM_MOVE/WM_SIZE fan-out this message carries.
-        guiTrackBorderRow(w, true);
-        break;
     case WM_SYSCOMMAND: {
         // v7.1.20: the fixed layout cannot survive a resize or a maximize,
         // so refuse those commands outright (keyboard Win+arrows included);
@@ -7592,20 +7615,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
-        // v7.2.5: timer 5 = the border tracker, the owned row's one
-        // maintenance channel (see guiTrackBorderRow). 50 ms, always on
-        // while the window is visible: two guarded GetPixels off the DWM's
-        // own side strips, the stability gate, a repaint only when the
-        // cached color actually changed and the flip's grace window is
-        // past. It replaces the whole v7.1.30..v7.2.4 circus -- the settle
-        // bake, the twenty-tick burst, the burst-tail handover, the
-        // g_measurePending retry -- because none of those jobs exist
-        // anymore: there is no sheet row to re-present across a fade, the
-        // row lands at the flip compose with the face, and the only thing
-        // left to do is keep the two cached colors honest. (Timer 4 is
-        // retired with the burst; the id stays unused on purpose.)
+        // v7.2.6: timer 5 = the border-color poll, the owned row's one
+        // maintenance channel (see guiReloadBorderColors). 1000 ms: three
+        // registry reads and a compare, a repaint only when a color
+        // actually changed -- accent twists, mode flips, HC toggles
+        // self-heal within a second. v7.2.5's 50 ms strip tracker is
+        // retired with the sampler it served (GetPixel could not see the
+        // DWM's frame drawing; it read our own unpainted redirection
+        // surface and the row went white), and with it the whole
+        // v7.1.30..v7.2.4 circus it had inherited -- the settle bake, the
+        // twenty-tick burst, the burst-tail handover, the g_measurePending
+        // retry, the stability gate, the grace window, the move re-tint.
+        // (Timer 4 stays retired; the id stays unused on purpose.)
         if (wp == 5) {
-            guiTrackBorderRow(w, false);
+            guiReloadBorderColors(w);
             return 0;
         }
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
@@ -7776,7 +7799,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (w == g_trayWnd) return 0;
         guiCaptureWindowPos(w);
         KillTimer(w, 1);
-        KillTimer(w, 5);   // v7.2.5: the border tracker sleeps while hidden
+        KillTimer(w, 5);   // v7.2.6: the color poll sleeps while hidden
                             // (guiRestoreWindow re-arms it with the show)
         // v7.1.26: no DeleteTab -- hiding a window removes its native
         // taskbar button by itself.
@@ -8073,7 +8096,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         DispatchMessageA(&m);
     }
     KillTimer(g_hwnd, 1);
-    KillTimer(g_hwnd, 5);   // v7.2.5: the border tracker dies with the loop
+    KillTimer(g_hwnd, 5);   // v7.2.6: the color poll dies with the loop
     // (v7.2.1's hook unhook lived here; the hook is retired with the sheet.)
     // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
     // UI is gone anyway). v7.1.26: the taskbar-list COM object is retired
