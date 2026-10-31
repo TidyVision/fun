@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,39 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.4 THE OPAQUE HOLD, CACHE OR NOT. The field: "Even then, it
+//            still doesn't do it. That's solely the only thing I'm
+//            focusing on." The second 60 fps video, decoded: the
+//            v7.2.3 NC-flip present DOES land (the face flips on the
+//            FIRST flash frame -- ordering was never the problem left)
+//            -- but the row still goes to the BARE SHEET for three
+//            composes (#F8F1F0: the sheet reads pinkish-white over
+//            this desktop) before landing on the settled gray
+//            (#A7A2A1). Two reasons, both fixed. (a) The no-cache
+//            path presented the recipe's HALF-ALPHA row at the flip
+//            compose and expected it to ride the fade like the DWM's
+//            own strips; it does not -- during the deactivation fade
+//            the glass blend owns alpha-carrying pixels and shows the
+//            bare sheet (the flash). An OPAQUE pixel has no glass in
+//            its composite and nothing to fade (the v7.1.28-era
+//            opaque row never flashed); so g_instantHold now latches
+//            on EVERY deactivation (cache or not) and the hold branch
+//            writes row 0 opaque ALWAYS -- the measured settled color
+//            when the cache exists, else the recipe's own
+//            white-desktop composite (43 + 0.498*255 = 170 =
+//            RGB(170,170,170), #AAAAAA -- within 9/255 of this
+//            desktop's settled #A7A2A1). The burst tail still hands
+//            the row back to the recipe bytes at ~400 ms and
+//            re-measures. (b) The measurement's +/-2 agreement gate
+//            was structural poison: the sheet blend varies along the
+//            row with the blurred backdrop behind it, three samples
+//            spread across the row never agreed within 2, the cache
+//            could not seed (both taped sessions ran cache-less, so
+//            every deactivation flashed). The measure now trusts the
+//            guarded CENTER sample; the side samples are fallbacks.
+//            First success seeds the cache; every later deactivation
+//            replays the MEASURED color from the flip compose on.
+//            Version steps to 7.2.4.
 //    v7.2.3 THE NC-FLIP PRESENT. The field: "the top bar still doesn't
 //            want to cooperate. On google chrome, the top bar going to
 //            the inactive state is instant. Look at the frames from the
@@ -4428,8 +4461,12 @@ static unsigned g_bakeTicks = 0;
 // WM_ACTIVATE latches the hold for the whole fade window; the burst's
 // tail hands the row back to the recipe bytes and re-measures one tick
 // later, so the cache never goes stale on purpose.
+// v7.2.4: the hold latches on EVERY deactivation (cache or not) -- the
+// fade owns alpha-carrying row bytes, so inside the fade window the row
+// must be OPAQUE, measured color or (until the first measure lands) the
+// recipe's own white-desktop composite #AAAAAA.
 static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
-static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
+static bool     g_instantHold    = false; // v7.2.4: the fade window -- row 0 is OPAQUE inside it (cache color, else #AAAAAA)
 static bool     g_forceInstantRow = false; // v7.2.1: hook early-present -- one opaque row even while active
 static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
                                              // inactive face INSIDE the deactivation
@@ -4656,7 +4693,12 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // the first frame. The burst's tail clears the hold and hands the row
 // back to the recipe bytes once the fade has settled;
 // guiMeasureInstantRow re-reads the settled composite one tick later
-// and refreshes the cache.
+// and refreshes the cache. v7.2.4: the hold latches on EVERY
+// deactivation, cache or not -- the fade owns alpha-carrying bytes
+// (the half-alpha row IS the bright flash both videos caught), so
+// inside the fade window the row is opaque PERIOD: the cached color
+// when measured, else #AAAAAA (the recipe's own white-desktop
+// composite: 43 + 0.498*255 = 170).
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
     // v7.2.1: the opaque cached color, BGRA-packed -- shared by the hold
@@ -4676,10 +4718,16 @@ static void guiBarPatchSheetRow(int cw, bool active) {
         px = instantPx;
     } else if (active) {
         px = 0x00000000u;                            // the recipe: bare glass = the DWM's active frame
-    } else if (g_instantHold && g_instantInactive) {
-        // v7.2.0 THE INSTANT ROW: opaque replay of the settled composite
-        // measured at the end of the previous burst.
-        px = instantPx;
+    } else if (g_instantHold) {
+        // v7.2.0 THE INSTANT ROW, v7.2.4 CACHE OR NOT: inside the fade
+        // window the row is OPAQUE -- the settled composite measured at
+        // the end of the previous burst when the cache exists, else the
+        // recipe's own white-desktop composite (43 + 0.498*255 = 170 =
+        // RGB(170,170,170)) packed opaque BGRA. The fade owns
+        // alpha-carrying bytes (the half-alpha row IS the bright flash
+        // the videos caught); an opaque non-black pixel is shown AS-IS
+        // from the flip compose on -- no glass, no fade, no flash.
+        px = g_instantInactive ? instantPx : 0xFFAAAAAAu;
     } else {
         px = 0x802B2B2Bu;                            // the recipe: BGRA(43, 43, 43, 128)
     }
@@ -4693,10 +4741,14 @@ static void guiBarPatchSheetRow(int cw, bool active) {
 // the window's top row -- WM_NCCALCSIZE insets left/right/bottom only)
 // are sampled off the screen DC, which returns the COMPOSITED desktop
 // pixel. Every point is guarded with WindowFromPoint first -- if another
-// window covers us, its pixels must never enter the cache -- and all
-// three samples must agree within +/-2 per channel (the row is a flat
-// blend; disagreement means a transient or a polluted read). Only a
-// settled, inactive, visible, non-minimized window measures.
+// window covers us, its pixels must never enter the cache. v7.2.4: the
+// old "all three must agree within +/-2" gate is GONE -- it was
+// structural poison: the blend varies along the row with the blurred
+// backdrop behind it, so three samples spread across the row never
+// agreed on a busy desktop, the cache could not seed and every
+// deactivation rode the fade. The guarded CENTER sample is the cache
+// now; the side samples are fallbacks for a center whose guard failed.
+// Only a settled, inactive, visible, non-minimized window measures.
 static void guiMeasureInstantRow() {
     if (!g_glassSheet || !g_hwnd || !IsWindow(g_hwnd)) return;
     if (GetActiveWindow() != nullptr) return;         // meaningful while inactive only
@@ -4706,25 +4758,21 @@ static void guiMeasureInstantRow() {
     const int xs[3] = { 40, (wr.right - wr.left) / 2, (wr.right - wr.left) - 40 };
     HDC sdc = GetDC(nullptr);
     if (!sdc) return;
-    COLORREF v[3];
-    bool ok = true;
-    for (int i = 0; i < 3 && ok; ++i) {
+    COLORREF v[3] = { 0, 0, 0 };
+    bool got[3] = { false, false, false };
+    for (int i = 0; i < 3; ++i) {
         const POINT p = { wr.left + xs[i], wr.top };
-        if (WindowFromPoint(p) != g_hwnd) ok = false; // covered: never cache another window's pixels
-        else {
-            v[i] = GetPixel(sdc, p.x, p.y);
-            if (v[i] == CLR_INVALID) ok = false;
-        }
+        if (WindowFromPoint(p) != g_hwnd) continue;  // covered: never cache another window's pixels
+        v[i] = GetPixel(sdc, p.x, p.y);
+        if (v[i] != CLR_INVALID) got[i] = true;
     }
     ReleaseDC(nullptr, sdc);
-    if (!ok) return;
-    for (int i = 1; i < 3; ++i) {
-        const int dr = (int)(v[i] & 0xFF)         - (int)(v[0] & 0xFF);
-        const int dg = (int)((v[i] >> 8) & 0xFF)  - (int)((v[0] >> 8) & 0xFF);
-        const int db = (int)((v[i] >> 16) & 0xFF) - (int)((v[0] >> 16) & 0xFF);
-        if (dr < -2 || dr > 2 || dg < -2 || dg > 2 || db < -2 || db > 2) return;
-    }
-    g_instantInactive = v[0];
+    // v7.2.4: the guarded CENTER sample wins; the sides only back it up
+    // when the center's own guard failed. No agreement gate -- the blend
+    // legitimately varies along the row with the backdrop (block above).
+    if      (got[1]) g_instantInactive = v[1];
+    else if (got[0]) g_instantInactive = v[0];
+    else if (got[2]) g_instantInactive = v[2];
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -6952,7 +7000,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.3  |  %s",   // v7.2.3 NC-flip present (v7.2.2 flushed early present)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.4  |  %s",   // v7.2.4 opaque hold, cache or not (v7.2.3 NC-flip present)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7135,15 +7183,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // transaction until this WndProc returns. The flip compose reads
         // inactive bytes by ordering: no glass frame, no stale face, one
         // composed frame, Chrome-instant -- with or without the cache (with
-        // it, row 0 is the opaque settled color via g_instantHold; without,
-        // the recipe bytes ride the fade like a native frame's own strips).
+        // it, row 0 is the opaque settled color via g_instantHold; without
+        // it, v7.2.4: the recipe's white-desktop composite #AAAAAA goes up
+        // OPAQUE -- the half-alpha bytes would ride the fade, the bright
+        // flash the second video still caught).
         // Activation (wParam != 0) needs none of this: the active look IS
         // the glass and the DWM's own fade draws it (the video shows that
         // direction is already instant). DefWindowProc still runs -- the
         // case falls to the common tail; swallowing the message would
         // freeze the frame state.
         if (!wp && IsWindowVisible(w) && !IsIconic(w)) {
-            g_instantHold = (g_instantInactive != 0);   // same latch rule as WM_ACTIVATE
+            g_instantHold = true;                       // v7.2.4: the fade window latches on EVERY
+                                                        // deactivation -- the hold branch picks the
+                                                        // measured color or the opaque #AAAAAA fallback
             g_forceInactiveFace = true;                 // the face must be the INACTIVE one
             guiPaintBar(w);                             // face + row 0 + GdiFlush
             g_forceInactiveFace = false;
@@ -7175,14 +7227,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // deactivation latches g_instantHold so EVERY presentation in the
         // fade window writes row 0 as the OPAQUE cached composite -- the
         // border is correct on the first frame, no glass fade involved.
-        // At the burst's tail the hold clears and the row returns to the
+        // v7.2.4: the hold latches on EVERY deactivation (cache or not) --
+        // without a cache the hold writes the recipe's white-desktop
+        // composite #AAAAAA opaque; the half-alpha bytes would ride the
+        // fade (the bright flash the second video still caught). At the
+        // burst's tail the hold clears and the row returns to the
         // recipe's half-alpha bytes (an invisible swap when the backdrop
         // is unchanged: the recipe then settles on the same color), and
         // one tick later guiMeasureInstantRow refreshes the cache. No
-        // cache yet (first run): the hold stays off and v7.1.31's tracked
-        // fade runs once to seed it.
-        if (LOWORD(wp) == WA_INACTIVE && g_instantInactive) g_instantHold = true;
-        else g_instantHold = false;
+        // cache yet (first run): the hold still latches (v7.2.4) and the
+        // #AAAAAA fallback covers the fade; the tracked recipe fade then
+        // runs once at the burst tail and seeds the cache.
+        g_instantHold = (LOWORD(wp) == WA_INACTIVE);   // v7.2.4: EVERY deactivation opens the fade window
         g_measurePending = false;
         guiPaintBar(w);
         g_bakeTicks = 0;
@@ -7663,10 +7719,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // 20 ms re-blits spanning ~400 ms -- so the sheet row is
         // re-presented continuously across the DWM's ~200 ms activation
         // fade and tracks it frame by frame (the immediate WM_ACTIVATE
-        // blit lands mid-fade; see WM_ACTIVATE). v7.2.0: when a cache
-        // exists the burst presents the OPAQUE cached row through the
-        // fade (g_instantHold, see WM_ACTIVATE) -- instant instead of
-        // tracked. The last tick clears the hold and presents the
+        // blit lands mid-fade; see WM_ACTIVATE). v7.2.0/7.2.4: the burst
+        // presents the OPAQUE row through the fade (g_instantHold, see
+        // WM_ACTIVATE) -- the cached color when measured, the #AAAAAA
+        // fallback when not -- instant instead of tracked. The last tick
+        // clears the hold and presents the
         // recipe's half-alpha row against the SETTLED glass, and one
         // further tick later (g_measurePending -- the DWM needs a
         // composition to land the new row on screen) the row is re-read
@@ -7680,10 +7737,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 KillTimer(w, 4);
                 guiMeasureInstantRow();   // the settled composite is on screen now
                 // v7.2.3 THE MEASURE RETRY: the measurement is guarded --
-                // WindowFromPoint must return us at all three samples (a
-                // raised window over the row, a menu closing), the samples
-                // must agree within +/-2 (a compose in flight fails this).
-                // One bail used to leave the cache empty until the NEXT
+                // WindowFromPoint must return us at a sample (a raised
+                // window over the row, a menu closing). v7.2.4: the
+                // +/-2 agreement gate is gone (structural poison -- the
+                // blend varies along the row with the backdrop; both
+                // taped sessions ran cache-less because of it). One bail
+                // used to leave the cache empty until the NEXT
                 // full deactivation burst -- the field's video ran a whole
                 // session with no cache, so the v7.2.1 hook and the
                 // v7.2.0 hold never engaged. While the window stays
