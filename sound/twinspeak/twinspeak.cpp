@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.25 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.26 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,35 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.26 THE GRADIENT LEAVES ROW 0 + THE WINDOW IS UNICODE, END TO END.
+//            (a) THE TOP EDGE, from the field: the top thin border still
+//            shows "color" instead of the half-transparent gray. The bar
+//            face's LinearGradientBrush STARTED at row 0, so its tinted
+//            top stop colored the shadow line's row on every dark theme.
+//            The gradient fill is offset 1px DOWN and runs 1px SHORTER
+//            (the brush rides along) -- row 0 belongs to the fake top
+//            shadow alone -- and the shadow line goes back to the
+//            example's own recipe VERBATIM: a NEUTRAL RGB(100,100,100)
+//            (a soft shadow on light faces, a quiet gray edge on dark
+//            ones, never a theme tint), blended 50/50 toward the face top
+//            while inactive. (b) THE "T" LABEL: the field still saw the
+//            one-letter taskbar stub AND Task Manager listing the window
+//            as "T". Two roots, both ours. FIRST, the window was an A/W
+//            hybrid: the class registered RegisterClassExW, the window
+//            created CreateWindowExA, and guiWndProc's fall-through ran
+//            DefWindowProcA -- so the shell's title reads crossed the A/W
+//            boundary, and an ANSI read of a UTF-16 title returns exactly
+//            the FIRST CHARACTER ("T") and stops at the NUL -- the
+//            byte-level signature both shell surfaces showed. The window
+//            is Unicode end to end now: CreateWindowExW + DefWindowProcW,
+//            and the title is the full brand "TidyVision TwinSpeak" (the
+//            bar keeps drawing its own text). SECOND, the redundant
+//            ITaskbarList::AddTab/ActivateTab registration is RETIRED: a
+//            visible top-level window gets its native taskbar button
+//            anyway, and Win11's labeled taskbar renders AddTab items as
+//            minimal-width TABS (icon + first letter) -- the stub's other
+//            half. Hiding still removes the button natively. out1/out2
+//            sample paths untouched.
 //    v7.1.25 TWO FIELD BUGS, ONE DARK-THEME, ONE SHELL. (a) THE TOP EDGE:
 //            "the top edge of the window being black", dark themes ONLY.
 //            The v7.1.24 fake top shadow (main.c's 1 px row) went out as
@@ -4161,13 +4190,20 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // inventing a color the theme does not own (guiLerpRGB toward white).
     // Integer fill + overscan: every bar pixel is covered exactly once, no
     // boundary blend, no gray hairline.
+    // v7.1.26, from the field: the gradient STARTED at row 0, so its tinted
+    // top stop colored the fake top shadow's row on every dark theme (the
+    // field read it as "color on the top thin border"). The fill is offset
+    // 1px DOWN and runs 1px SHORTER -- row 0 belongs to the shadow line
+    // alone -- and the brush rides along (same height, one row down), so
+    // the face still melts to cBg exactly at the bottom edge. The bottom
+    // overscan row past the edge line stays covered.
     const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), active ? 0.07 : 0.03);
     Gdiplus::LinearGradientBrush face(
-        Gdiplus::Rect(0, 0, ww + 1, kCapH + 1),
+        Gdiplus::Rect(0, 1, ww + 1, kCapH),
         Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
         Gdiplus::Color(255, GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg)),
         Gdiplus::LinearGradientModeVertical);
-    g.FillRectangle(&face, -1, -1, ww + 2, kCapH + 2);
+    g.FillRectangle(&face, -1, 1, ww + 2, kCapH);
     // 1px bottom edge: chrome, not dead space (same cPanel2 as v7.0.9).
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
@@ -4175,17 +4211,16 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // v7.1.24 main.c: the fake top shadow -- the frame inset removed the
     // window's real top border; the example paints its own 1 px line
     // (focused: the plain shadow; unfocused: blended toward the face top).
-    // v7.1.25 THE DARK-THEME FIX, from the field: the row went out as
-    // cPanel2 pushed 45% toward black -- a plausible shadow on the light
-    // themes, a BLACK hairline on every dark one (DARK BLUE measured
-    // RGB(12,15,22) under a RGB(25,27,33) face top -- the formula's own
-    // output). The example's note licenses the recolor: the line is the
-    // theme's edge color, PLAIN cPanel2 -- the exact row the bar's 1 px
-    // bottom edge already paints -- so top and bottom chrome match and no
-    // theme darkens toward a color it does not own. Inactive still blends
-    // toward the face top (the example's rule); with a real edge color
-    // that only softens the line further.
-    const COLORREF shTop = guic::cPanel2;
+    // v7.1.26 THE EXAMPLE'S RECIPE, VERBATIM: v7.1.24's 45%-toward-black
+    // blend read as a BLACK hairline on dark themes, and v7.1.25's cPanel2
+    // read as the theme's own color (the field: "color ... instead of the
+    // half-transparent gray"). Both abandoned the line the example
+    // actually ships: a NEUTRAL RGB(100,100,100) -- against a light face a
+    // soft shadow, against a dark face a quiet gray edge, never a theme
+    // tint. Inactive keeps the example's rule: blend 50/50 toward the face
+    // top. With the gradient off row 0 (above), the example's line is the
+    // ONLY thing that ever paints this row.
+    const COLORREF shTop = RGB(100, 100, 100);
     const COLORREF shCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
     Gdiplus::SolidBrush shadow(Gdiplus::Color(255, GetRValue(shCol),
                                               GetGValue(shCol), GetBValue(shCol)));
@@ -6117,11 +6152,20 @@ static bool guiCreateRealWindow() {
     // insets. No AdjustWindowRect: the insets ARE the contract (the helper
     // would reserve a caption that never exists), and the DWM shadow is
     // drawn OUTSIDE the window rect.
+    // v7.1.26 THE WINDOW IS UNICODE, END TO END: the class is registered
+    // RegisterClassExW, but this creation ran CreateWindowExA and the
+    // wndproc fell through to DefWindowProcA -- an A/W hybrid. The shell's
+    // own title reads crossed that boundary, and an ANSI read of a UTF-16
+    // title yields exactly the FIRST CHARACTER ("T", the byte after it is
+    // the NUL): the byte-level signature the taskbar label AND Task
+    // Manager's window entry both showed. CreateWindowExW + DefWindowProcW
+    // close the hybrid. The title is the full brand -- the string the
+    // taskbar and Alt-Tab show (the bar keeps drawing its own text).
     const int kww = KCLI_W + 2 * g_frmInsX, kwh = KCLI_H + kCapH + g_frmInsY;
-    g_hwnd = CreateWindowExA(0, "twinspeak.control",
-                             "TwinSpeak",   // v7.1.23: compact -- the taskbar
-                                            // label reads THIS string; the bar
-                                            // draws its own brand text anyway
+    g_hwnd = CreateWindowExW(0, L"twinspeak.control",
+                             L"TidyVision TwinSpeak",   // the shell's label for
+                                                        // this window: the full
+                                                        // brand, Alt-Tab too
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
@@ -6130,8 +6174,7 @@ static bool guiCreateRealWindow() {
     // left the Win11 labeled taskbar free to shrink this button to a
     // one-letter stub on the field machine. The per-window
     // System.AppUserModel.ID is the identity the shell reads for THIS
-    // window's grouping and label; set it BEFORE the first paint and
-    // before tbShowTab ever runs.
+    // window's grouping and label; set it BEFORE the first paint.
     tsSetWindowAumid(g_hwnd, L"TidyVision.TwinSpeak");
     {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
         // The window carries NO region and NO WS_CAPTION -- the shadow
@@ -6189,48 +6232,19 @@ static bool guiCreateRealWindow() {
     return true;
 }
 
-// ---- v7.1.7: the taskbar slot, managed explicitly ---------------------------
-// The panel is shown with SW_SHOWNA (the v6.6.5 no-activate show), and a
-// no-activate show can leave the taskbar button missing until the shell
-// next re-enumerates tabs or the user clicks the window -- the field wanted
-// the slot the moment the panel opens. ITaskbarList::AddTab creates the
-// button NOW; ActivateTab marks it the active one; DeleteTab removes it
-// when the panel hides back to the tray (the tray icon remains). The
-// vtable is hand-rolled -- no __uuidof, no uuid pragma, every toolchain
-// links identically (the same trick as the D2D IIDs above).
-static const CLSID kTSCLSID_TaskbarList =
-    { 0x56fdf344, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
-static const IID   kTSIID_ITaskbarList =
-    { 0x56fdf342, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
-struct TS_ITaskbarListVtbl {
-    HRESULT (__stdcall *QueryInterface)(void*, const IID&, void**);
-    ULONG   (__stdcall *AddRef)(void*);
-    ULONG   (__stdcall *Release)(void*);
-    HRESULT (__stdcall *HrInit)(void*);
-    HRESULT (__stdcall *AddTab)(void*, HWND);
-    HRESULT (__stdcall *DeleteTab)(void*, HWND);
-    HRESULT (__stdcall *ActivateTab)(void*, HWND);
-    HRESULT (__stdcall *SetActiveAlt)(void*, HWND);
-};
-static void* g_tbList = nullptr;   // ITaskbarList* (lazy, GUI thread only)
-static TS_ITaskbarListVtbl* tbVtbl() {
-    if (g_tbList) return (TS_ITaskbarListVtbl*)*(void**)g_tbList;
-    void* p = nullptr;
-    if (FAILED(CoCreateInstance(kTSCLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
-                                kTSIID_ITaskbarList, &p)))
-        return nullptr;            // pre-Win7 or COM trouble: stock behavior
-    g_tbList = p;
-    ((TS_ITaskbarListVtbl*)*(void**)p)->HrInit(p);   // tell the shell we manage tabs
-    return (TS_ITaskbarListVtbl*)*(void**)p;
-}
-static void tbShowTab(HWND w) {   // panel open: the slot exists THIS instant
-    TS_ITaskbarListVtbl* v = tbVtbl();
-    if (v && g_tbList && w) { v->AddTab(g_tbList, w); v->ActivateTab(g_tbList, w); }
-}
-static void tbHideTab(HWND w) {   // panel hidden: the slot goes with it
-    TS_ITaskbarListVtbl* v = tbVtbl();
-    if (v && g_tbList && w) v->DeleteTab(g_tbList, w);
-}
+// ---- v7.1.7 was: the taskbar slot, managed explicitly. RETIRED v7.1.26. -----
+// The panel used to register itself through ITaskbarList::AddTab on every
+// show (a v7.1.7 workaround for a button that lagged behind a no-activate
+// show) and DeleteTab on every hide. On Win11's labeled taskbar that
+// registration is WORSE than redundant: the shell files the button as a
+// TAB, and tabs render as minimal-width items -- icon + first letter of
+// the title -- which is exactly the one-letter stub the field kept seeing
+// through v7.1.23's process AUMID and v7.1.25's per-window AUMID. A normal
+// visible top-level window gets its NATIVE button when shown (full size,
+// full label, native active highlight) and loses it when hidden, with zero
+// registration from us. The whole hand-rolled ITaskbarList vtable goes with
+// it; the per-window System.AppUserModel.ID (v7.1.25) stays -- it is the
+// documented grouping/label identity and costs nothing.
 
 // ---- v7.1.25: the taskbar label, claimed at the WINDOW level ----------------
 // The process-wide AppUserModelID (guiMain, before any window -- v7.1.23)
@@ -6297,7 +6311,8 @@ static void guiRestoreWindow() {
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
-    tbShowTab(g_hwnd);    // v7.1.7: the taskbar slot exists THIS instant
+    // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
+    // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
@@ -6458,7 +6473,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // buttons ride HTCAPTION exactly like the example (their clicks
         // are intercepted in the NC button messages via the hovered slot).
         // No HTMAXBUTTON hook: there is no maximize button (no SnapLayout).
-        LRESULT hit = DefWindowProc(w, msg, wp, lp);
+        LRESULT hit = DefWindowProcW(w, msg, wp, lp);   // v7.1.26: W -- the window is Unicode
         switch (hit) {
             case HTNOWHERE:
             case HTRIGHT:
@@ -6517,7 +6532,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)new_hovered_button);
             guiPaintBar(w);
         }
-        return DefWindowProc(w, msg, wp, lp); }
+        return DefWindowProcW(w, msg, wp, lp); }   // v7.1.26: W, not the A macro
     case WM_ACTIVATE:
         // v7.1.20: the bar dims when the window loses activation -- re-blit
         // it on every activation change (DefWindowProc still runs). The
@@ -7150,7 +7165,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (w == g_trayWnd) return 0;
         guiCaptureWindowPos(w);
         KillTimer(w, 1);
-        tbHideTab(w);
+        // v7.1.26: no DeleteTab -- hiding a window removes its native
+        // taskbar button by itself.
         trayAdd(true);
         ShowWindow(w, SW_HIDE);
         return 0;
@@ -7159,7 +7175,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         PostQuitMessage(0);
         return 0;
     }
-    return DefWindowProcA(w, msg, wp, lp);
+    // v7.1.26: DefWindowProcW, not DefWindowProcA -- the class is Unicode,
+    // and the A default proc put every shell title read through an A/W
+    // round trip (an ANSI read of the UTF-16 title returns "T" and stops).
+    return DefWindowProcW(w, msg, wp, lp);
 }
 
 // ---- entry ------------------------------------------------------------------
@@ -7329,7 +7348,8 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // the real panel is built the first time the user clicks the icon
         // (guiCreateRealWindow, on demand). FindWindowA-based duplicate
         // detection still works -- the surrogate carries the class.
-        g_trayWnd = CreateWindowExA(0, "twinspeak.control", "TidyVision TwinSpeak: Tray",
+        g_trayWnd = CreateWindowExW(0, L"twinspeak.control",
+                                    L"TidyVision TwinSpeak: Tray",   // v7.1.26: W
                                     WS_OVERLAPPED, 0, 0, 0, 0,
                                     nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
@@ -7364,7 +7384,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // pre-render already made activation safe.
         SetForegroundWindow(g_hwnd);
         SetActiveWindow(g_hwnd);
-        tbShowTab(g_hwnd);               // v7.1.7: the taskbar slot exists THIS instant
+        // v7.1.26: no AddTab -- the native button arrives with the show.
         guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
         g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
@@ -7423,12 +7443,9 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     KillTimer(g_hwnd, 1);
     // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
-    // UI is gone anyway), then release the taskbar-list COM object.
+    // UI is gone anyway). v7.1.26: the taskbar-list COM object is retired
+    // with the AddTab machinery; nothing to release.
     guiStopEngineJoin();
-    if (g_tbList) {
-        ((TS_ITaskbarListVtbl*)*(void**)g_tbList)->Release(g_tbList);
-        g_tbList = nullptr;
-    }
     if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }   // v6.6.5
     if (mutex) CloseHandle(mutex);
     return 0;
