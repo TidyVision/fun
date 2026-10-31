@@ -1,4 +1,5 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.4: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.5: version bump
+// (the owned row). v7.2.4: version bump
 // (the opaque hold). v7.2.3: version bump
 // (the NC-flip present). v7.2.2: version bump
 // + the name split: FileDescription stays the PROCESS name Task Manager
@@ -19,8 +20,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,2,4,0
-PRODUCTVERSION  7,2,4,0
+FILEVERSION     7,2,5,0
+PRODUCTVERSION  7,2,5,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -31,12 +32,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.2.4.0"
+            VALUE "FileVersion",      "7.2.5.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.2.4.0"
+            VALUE "ProductVersion",   "7.2.5.0"
         END
     END
     BLOCK "VarFileInfo"
