@@ -1,9 +1,11 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.0: version bump
-// + the app title (FileDescription/ProductName are "Twinspeak Control
-// Panel" now -- Task Manager reads FileDescription).
-// (v7.1.21: the manifest; v7.1.22..31: cpp-side window fixes only).
-// Task Manager (and Explorer > Properties > Details) read FileDescription
-// below: "Twinspeak Control Panel" (v7.2.0). No windows.h include needed -- the VERSIONINFO and
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.1: version bump
+// + the name split: FileDescription stays the PROCESS name Task Manager
+// reads ("TwinSpeak Control Panel"); ProductName takes the brand
+// ("TidyVision TwinSpeak") -- the same split the windows carry (the taskbar
+// window is "TidyVision TwinSpeak", the hidden tray surrogate is "TwinSpeak
+// Control Panel").
+// (v7.1.21: the manifest; v7.1.22..v7.2.0: window-side fixes only).
+// No windows.h include needed -- the VERSIONINFO and
 // RT_MANIFEST forms used here are RC syntax, not C macros, so both windres
 // and zig rc accept this file as-is.
 // v7.1.20: `1 24` embeds twinspeak.manifest (RT_MANIFEST = 24, id 1) --
@@ -15,8 +17,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,2,0,0
-PRODUCTVERSION  7,2,0,0
+FILEVERSION     7,2,1,0
+PRODUCTVERSION  7,2,1,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -26,13 +28,13 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "TidyVision"
-            VALUE "FileDescription",  "Twinspeak Control Panel"
-            VALUE "FileVersion",      "7.2.0.0"
+            VALUE "FileDescription",  "TwinSpeak Control Panel"
+            VALUE "FileVersion",      "7.2.1.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
-            VALUE "ProductName",      "Twinspeak Control Panel"
-            VALUE "ProductVersion",   "7.2.0.0"
+            VALUE "ProductName",      "TidyVision TwinSpeak"
+            VALUE "ProductVersion",   "7.2.1.0"
         END
     END
     BLOCK "VarFileInfo"

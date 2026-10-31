@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,33 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.1 THE ZERO-FRAME ROW + THE NAME SPLIT + A CLEAN KILL. The
+//            field: "I still see the inactive window painted one frame
+//            late." It does: WM_ACTIVATE hops the message queue AFTER
+//            win32k has already flipped the DWM's own border strips, so
+//            the first presentation that could carry the row always
+//            misses the activation frame by one hop. v7.2.1 buys the
+//            hop back with a low-level mouse hook on the (idle,
+//            pumping) GUI thread: a button-down OUTSIDE our window
+//            arrives BEFORE the activation transaction starts, and the
+//            hook presents the measured inactive row right there -- the
+//            border is on screen in the same composed frame as the
+//            DWM's own flip (zero-frame). A click that never deactivates
+//            us (menus and other non-activating surfaces) self-heals
+//            within one 20 ms burst tick; Alt-Tab and programmatic
+//            switches keep the queue path (one frame -- there is no
+//            earlier signal a window can see). Naming: taskbar,
+//            Alt-Tab, the duplicate-instance box, the tray icon and the
+//            bar's brand text become "TidyVision TwinSpeak"; the hidden
+//            tray surrogate window and the PE FileDescription keep
+//            "TwinSpeak Control Panel" (Task Manager's window/process
+//            entries). Tray ghosts: a force-killed twin (taskkill /F)
+//            never runs WM_DESTROY, so its icon sits in the tray until
+//            hovered -- every extra launch then reads as "another
+//            icon". New `twinspeak.exe --exit` asks the running
+//            instance (WM_APP+6, UIPI-allowed) to stop cleanly and
+//            remove its icon; the duplicate box now recommends it
+//            instead of taskkill. Version steps to 7.2.1.
 //    v7.2.0 THE INSTANT INACTIVE BORDER + THE NEW NAME. The field: "for
 //            the real challenge, make it so the inactive-window borders
 //            show instantly", the app title becomes "Twinspeak Control
@@ -4228,7 +4255,8 @@ set_menu_item_state(HMENU menu, MENUITEMINFO* menuItemInfo, UINT item,
     SetMenuItemInfo(menu, item, false, menuItemInfo);
 }
 
-static const wchar_t* kCapTitle = L"Twinspeak Control Panel";   // v7.2.0: the app title (was L"TwinSpeak")
+static const wchar_t* kCapTitle = L"TidyVision TwinSpeak";   // v7.2.1: the bar's brand text
+                                              // (v7.2.0: L"Twinspeak Control Panel")
 // Paints the bar from a persistent memory buffer -- usable from any context
 // (theme click, WM_NCPAINT, hover), never needs an invalidate.
 // v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
@@ -4337,6 +4365,8 @@ static unsigned g_bakeTicks = 0;
 // later, so the cache never goes stale on purpose.
 static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
 static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
+static bool     g_forceInstantRow = false; // v7.2.1: hook early-present -- one opaque row even while active
+static HHOOK    g_mouseHook      = nullptr; // v7.2.1: the early-present mouse hook (see guiMain)
 static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
@@ -4558,18 +4588,27 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // and refreshes the cache.
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
+    // v7.2.1: the opaque cached color, BGRA-packed -- shared by the hold
+    // branch and the hook's early present. Never pure black: the blend is
+    // 50% gray85, so >= RGB(21,21,21) -- the "black = glass" key can
+    // never trigger.
+    const unsigned c = (unsigned)g_instantInactive;
+    const unsigned instantPx = 0xFF000000u | ((c >> 16) & 0xFFu)   // B -> byte 0
+                                             | (c & 0xFF00u)       // G -> byte 1
+                                             | ((c & 0xFFu) << 16);// R -> byte 2
     unsigned px;
-    if (active) {
+    if (g_forceInstantRow && g_instantInactive) {
+        // v7.2.1 THE EARLY PRESENT (tsEarlyMouseHook): the click that will
+        // deactivate us is seen BEFORE the activation transaction -- write
+        // the settled inactive row while the window is still active, so it
+        // lands in the same composed frame as the DWM's own border flip.
+        px = instantPx;
+    } else if (active) {
         px = 0x00000000u;                            // the recipe: bare glass = the DWM's active frame
     } else if (g_instantHold && g_instantInactive) {
         // v7.2.0 THE INSTANT ROW: opaque replay of the settled composite
-        // measured at the end of the previous burst (never pure black:
-        // the blend is 50% gray85, so >= RGB(21,21,21) -- the "black =
-        // glass" key can never trigger).
-        const unsigned c = (unsigned)g_instantInactive;
-        px = 0xFF000000u | ((c >> 16) & 0xFFu)       // B -> byte 0
-                        | (c & 0xFF00u)              // G -> byte 1
-                        | ((c & 0xFFu) << 16);       // R -> byte 2
+        // measured at the end of the previous burst.
+        px = instantPx;
     } else {
         px = 0x802B2B2Bu;                            // the recipe: BGRA(43, 43, 43, 128)
     }
@@ -4636,6 +4675,50 @@ static void guiPaintBar(HWND w) {
         guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
     }
     ReleaseDC(w, wdc);
+}
+// v7.2.1 THE ZERO-FRAME ROW, the early present: WM_ACTIVATE always hops the
+// message queue AFTER win32k has already told the DWM about the activation,
+// so the first presentation that could carry the inactive row misses the
+// DWM's own border flip by one frame (the field: "painted one frame late").
+// This hook sees the click BEFORE the activation transaction starts and
+// presents the measured row right there: the border is on screen in the
+// same composed frame as the DWM's flip -- zero frames late. Constraints
+// honored: WH_MOUSE_LL is answered on the installing thread (the idle,
+// pumping GUI thread -- the only state this handler acts in), the handler
+// runs no message dispatch (a render + one blit, ~1 ms, far under the hook
+// timeout), and everything bails instantly unless our window is the ACTIVE
+// window with a measured cache. Alt-Tab and programmatic deactivations have
+// no earlier signal a window can see: they keep the WM_ACTIVATE path (one
+// frame). If the hook never installed (policy, AV), nothing changes.
+static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION) {
+        const UINT m = (UINT)wp;
+        if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN
+            || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN) {
+            const MSLLHOOKSTRUCT* e = (const MSLLHOOKSTRUCT*)lp;
+            if (e && g_hwnd && IsWindow(g_hwnd)
+                && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)
+                && GetActiveWindow() == g_hwnd        // we hold activation: the click may take it
+                && g_instantInactive) {               // only with a measured cache
+                const HWND hit = WindowFromPoint(e->pt);
+                if (!hit || GetAncestor(hit, GA_ROOT) != g_hwnd) {
+                    // A click outside our tree: present the settled inactive
+                    // row NOW, while the bar face is still the active one (the
+                    // face itself flips when WM_ACTIVATE arrives, as always).
+                    g_forceInstantRow = true;
+                    guiPaintBar(g_hwnd);
+                    g_forceInstantRow = false;
+                    // Self-heal: if this click never deactivates us (menus
+                    // and other non-activating surfaces), the burst's first
+                    // tick re-presents the truth within 20 ms; if it does
+                    // deactivate, WM_ACTIVATE re-arms the burst itself.
+                    g_bakeTicks = 0;
+                    SetTimer(g_hwnd, 4, 20, nullptr);
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wp, lp);
 }
 
 // ---- fonts / brushes -------------------------------------------------------
@@ -6339,8 +6422,8 @@ static void startupSet(bool on) {
 static void trayUpdateTip(bool running) {
     if (!g_trayVisible) return;
     g_nid.uFlags = NIF_TIP;
-    lstrcpynA(g_nid.szTip, running ? "Twinspeak Control Panel -- engine running"
-                                   : "Twinspeak Control Panel -- engine stopped",
+    lstrcpynA(g_nid.szTip, running ? "TidyVision TwinSpeak -- engine running"
+                                   : "TidyVision TwinSpeak -- engine stopped",
               (int)sizeof(g_nid.szTip));
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
@@ -6360,7 +6443,7 @@ static void trayAdd(bool hint) {
     g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
                                     IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
-    lstrcpynA(g_nid.szTip, "Twinspeak Control Panel", (int)sizeof(g_nid.szTip));
+    lstrcpynA(g_nid.szTip, "TidyVision TwinSpeak", (int)sizeof(g_nid.szTip));
     g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
     if (!g_trayVisible) {
         // v7.1.20: the shell was not ready (a sign-in launch can beat the
@@ -6373,7 +6456,7 @@ static void trayAdd(bool hint) {
     if (hint && g_closeHints < 3) {   // v7.1.20: explain the first 3 closes, not once ever
         ++g_closeHints;
         g_nid.uFlags       = NIF_INFO;
-        lstrcpynA(g_nid.szInfoTitle, "Twinspeak Control Panel", (int)sizeof(g_nid.szInfoTitle));
+        lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
         lstrcpynA(g_nid.szInfo,
                   "Still running -- the engine stays up.\n"
                   "Click this icon to reopen the window; "
@@ -6389,7 +6472,7 @@ static void trayAdd(bool hint) {
 static void trayBalloon(const char* text) {
     if (!g_trayVisible) return;
     g_nid.uFlags       = NIF_INFO;
-    lstrcpynA(g_nid.szInfoTitle, "Twinspeak Control Panel", (int)sizeof(g_nid.szInfoTitle));
+    lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
     lstrcpynA(g_nid.szInfo, text, (int)sizeof(g_nid.szInfo));
     g_nid.dwInfoFlags = NIIF_INFO;
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
@@ -6413,6 +6496,7 @@ static void tsAllowUiMessages(HWND w) {
     f(w, g_taskbarCreated, MSGFLT_ALLOW, (TS_CFS*)nullptr);
     f(w, WM_APP + 4,       MSGFLT_ALLOW, (TS_CFS*)nullptr);
     f(w, WM_APP + 5,       MSGFLT_ALLOW, (TS_CFS*)nullptr);
+    f(w, WM_APP + 6,       MSGFLT_ALLOW, (TS_CFS*)nullptr);   // v7.2.1: --exit clean stop
 }
 // A real, keyboard-reachable quit: "Exit twinspeak" joins the system menu
 // (Alt+Space, or right-click the bar) next to Close -- the only quit was
@@ -6487,9 +6571,13 @@ static bool guiCreateRealWindow() {
     // taskbar and Alt-Tab show (the bar keeps drawing its own text).
     const int kww = KCLI_W + 2 * g_frmInsX, kwh = KCLI_H + kCapH + g_frmInsY;
     g_hwnd = CreateWindowExW(0, L"twinspeak.control",
-                             L"Twinspeak Control Panel",   // v7.2.0: the app title
-                                                        // (was the full brand);
-                                                        // taskbar + Alt-Tab read it
+                             L"TidyVision TwinSpeak",     // v7.2.1: the brand the taskbar,
+                                                          // Alt-Tab and Task Manager's app
+                                                          // entry read; the hidden tray
+                                                          // surrogate carries "TwinSpeak
+                                                          // Control Panel" for the window
+                                                          // list, the PE FileDescription
+                                                          // the process entry
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
@@ -6726,7 +6814,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.0  |  %s",   // v7.2.0 instant inactive border (v7.1.28 fixed the stale v7.1.25)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.1  |  %s",   // v7.2.1 zero-frame row (v7.1.28 fixed the stale v7.1.25)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7570,6 +7658,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             ShowWindow(w, SW_HIDE);
         }
         return 0; }
+    case WM_APP + 6: {                                 // v7.2.1: --exit clean stop
+        // `twinspeak.exe --exit` (and the duplicate box's advice) asks the
+        // running instance to quit the way the tray Exit does: icon removed
+        // (g_nid remembers the true owner -- panel or surrogate), engine
+        // stopped, position captured, WM_DESTROY ends the loop. Reaching
+        // here from an elevated caller works because tsAllowUiMessages
+        // opened WM_APP+6 on every window of this class. DestroyWindow
+        // targets the real panel (or the surrogate when no panel was ever
+        // built); whichever window received the message dies with it.
+        trayRemove();
+        if (g_engState.load() != 0) guiStopEngine();
+        guiCaptureWindowPos(g_hwnd);
+        DestroyWindow(g_hwnd ? g_hwnd : w);
+        return 0; }
     case WM_CLOSE:
         // v6.6.1: closing hides to the tray -- the engine keeps running.
         // Real exit lives in the tray menu (Exit) and the system menu's
@@ -7660,8 +7762,18 @@ static int guiMain(const std::string& iniPath, bool startTray) {
             }
             Sleep(50);
         }
-        MessageBoxA(nullptr, "twinspeak is already running.\n\nStop the running copy first:\n  taskkill /IM twinspeak.exe",
-                    "Twinspeak Control Panel", MB_ICONINFORMATION);
+        // v7.2.1: the advice is a CLEAN stop now -- taskkill's /F form
+        // never runs WM_DESTROY, so the tray icon orphans and sits in the
+        // tray until hovered (the "duplicating icons" the field saw).
+        // --exit (WM_APP+6, UIPI-allowed below) removes the icon properly.
+        MessageBoxA(nullptr,
+                    "TidyVision TwinSpeak is already running.\n\n"
+                    "Bring it up:  click its tray icon (or launch it again).\n\n"
+                    "Stop it cleanly (removes the tray icon):\n"
+                    "  right-click the tray icon -> Exit\n"
+                    "  twinspeak.exe --exit\n\n"
+                    "Avoid taskkill /F -- it leaves a stale tray icon behind.",
+                    "TidyVision TwinSpeak", MB_ICONINFORMATION);
         CloseHandle(mutex);
         return 1;
     }
@@ -7766,7 +7878,10 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // (guiCreateRealWindow, on demand). FindWindowA-based duplicate
         // detection still works -- the surrogate carries the class.
         g_trayWnd = CreateWindowExW(0, L"twinspeak.control",
-                                    L"Twinspeak Control Panel: Tray",   // v7.2.0: app title
+                                    L"TwinSpeak Control Panel",   // v7.2.1: Task Manager's
+                                                                  // window entry (the hidden
+                                                                  // surrogate); v7.2.0:
+                                                                  // "...Panel: Tray"
                                     WS_OVERLAPPED, 0, 0, 0, 0,
                                     nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
@@ -7807,6 +7922,17 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
+    // v7.2.1 THE ZERO-FRAME ROW, delivery: the hook lives on THIS thread --
+    // the GUI thread, which sits idle in GetMessage exactly while our window
+    // is active (the only state the hook acts in). A button-down outside our
+    // tree is seen BEFORE win32k starts the activation transaction, so the
+    // early-presented row rides the same composed frame as the DWM's own
+    // border flip. If it could not be installed (policy, AV) the
+    // WM_ACTIVATE path still runs -- one frame late, never worse.
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, tsEarlyMouseHook, nullptr, 0);
+    if (!g_mouseHook)
+        tlog("[twinspeak] gui           : early-present mouse hook not installed -- the\n"
+             "                            inactive row falls back to the WM_ACTIVATE path\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
         // v7.1.5 CTRL+TAB cycles pages: Ctrl+Tab = next, Ctrl+Shift+Tab =
@@ -7858,6 +7984,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }   // v7.2.1
     KillTimer(g_hwnd, 1);
     // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
     // UI is gone anyway). v7.1.26: the taskbar-list COM object is retired
@@ -7906,6 +8033,7 @@ int main(int argc, char** argv) {
     std::string iniPath;
     bool doList = false, doListKS = false, fgForce = false, allowMulti = false;
     bool wantGui = false, startTray = false;   // v6.6.1: --gui / --tray
+    bool doExit = false;                       // v7.2.1: --exit (clean remote stop)
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--list")) doList = true;
         else if (!strcmp(argv[i], "--list-ks")) doListKS = true;   // v6.3
@@ -7914,6 +8042,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--multi"))      allowMulti = true; // v6.2
         else if (!strcmp(argv[i], "--gui"))      wantGui = true;      // v6.6.0: explicit, same as default
         else if (!strcmp(argv[i], "--tray"))     { wantGui = true; startTray = true; }   // v6.6.1: window hidden in the tray
+        else if (!strcmp(argv[i], "--exit"))     doExit = true;      // v7.2.1: clean remote stop
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             tlog("usage: twinspeak [--list] [--list-ks] [--ini path] [--foreground] [--multi]\n"
                  "  (no args)     the control window -- every ini option + START/STOP + live log\n"
@@ -7922,6 +8051,9 @@ int main(int argc, char** argv) {
                  "                click the tray icon (never a taskbar button; this is what\n"
                  "                the tray's 'Run at Windows startup' writes -- use it for\n"
                  "                Task Scheduler sign-in tasks too)\n"
+                 "  --exit        ask an already-running instance to exit CLEANLY -- tray icon\n"
+                 "                removed, engine stopped (use this instead of taskkill /F,\n"
+                 "                which orphans the tray icon until it is hovered)\n"
                  "  --list        show every WASAPI endpoint (the usual device needles)\n"
                  "  --list-ks     show every WDM-KS render filter with its pins/formats (v6.3)\n"
                  "  --foreground  ignore background = on for this run (keep the console)\n"
@@ -7939,6 +8071,30 @@ int main(int argc, char** argv) {
 
     if (doList) { listDevices(); return 0; }
     if (doListKS) { ksListKs(); return 0; }   // v6.3
+    // v7.2.1: --exit -- ask the running instance to stop CLEANLY (tray icon
+    // removed, engine stopped, window position captured) instead of the old
+    // advice, taskkill, whose /F form orphans the tray icon until hovered
+    // (the field's "tray icons duplicating": every force-killed twin left
+    // one behind). Both windows of the class hear WM_APP+6 -- the surrogate
+    // included -- and tsAllowUiMessages opened it through UIPI, so an
+    // elevated twin answers a non-elevated --exit too.
+    if (doExit) {
+        HWND other = nullptr;
+        for (int i = 0; i < 6 && !other; ++i) {          // ~1.2 s: a booting twin
+            other = FindWindowA("twinspeak.control", nullptr);
+            if (!other) Sleep(200);
+        }
+        if (!other) {
+            tlog("[twinspeak] --exit      : no running instance found (nothing to stop).\n");
+            return 1;
+        }
+        DWORD_PTR res = 0;
+        const BOOL ok = SendMessageTimeoutA(other, WM_APP + 6, 0, 0,
+                                            SMTO_ABORTIFHUNG, 4000, &res);
+        tlog(ok ? "[twinspeak] --exit      : asked the running instance to exit cleanly.\n"
+                : "[twinspeak] --exit      : could not reach the running instance (UIPI or hung).\n");
+        return ok ? 0 : 1;
+    }
 
     // v6.6.0: NO ARGUMENTS = the control window. The console modes all keep
     // their exact behavior behind explicit flags. v6.6.1: --gui is the same
@@ -7956,8 +8112,9 @@ int main(int argc, char** argv) {
         hInstance = CreateMutexA(nullptr, TRUE, "Local\\twinspeak.instance");
         if (hInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
             tlog( "[twinspeak] already running -- twinspeak is single-instance.\n"
-                            "            stop the running copy first:  taskkill /IM twinspeak.exe\n"
-                            "            (a deliberate second copy: add --multi)\n");
+                            "            stop the running copy cleanly:  twinspeak.exe --exit\n"
+                            "            (taskkill /F works but orphans the tray icon until hovered;\n"
+                            "            a deliberate second copy: add --multi)\n");
             return 1;
         }
     }
