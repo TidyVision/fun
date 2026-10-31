@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.22 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.23 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,36 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.23 SQUARE + SHADOW + LABEL + FLICKER, ALL FOUR CLOSED: the field
+//            asked for square corners and the Windows default drop shadow
+//            back, and reported two regressions -- the taskbar label
+//            collapsed to one letter ("T") and FLICKERS of the classic
+//            edges. Four roots, four fixes. (a) THE LABEL: the window
+//            carried no AppUserModelID, so Win11's labeled taskbar ran the
+//            generic-window path and shrank the button to a one-letter stub
+//            while AUMID apps (Chrome, GitHub Desktop) kept full labels --
+//            SetCurrentProcessExplicitAppUserModelID("TidyVision.TwinSpeak")
+//            claims the identity before any window exists, and the window
+//            title compacts to "TwinSpeak" (the bar draws its own brand
+//            text; the shell's label reads this one). (b) THE FLICKER: the
+//            last classic painter was DefWindowProc(WM_NCACTIVATE) itself
+//            -- on the customized-visual-style machine the themed frame
+//            painter runs inside it even with lParam -1, and the v7.1.22
+//            heal overwrote the strike a frame later: flicker. The default
+//            proc is not called at all now (return TRUE; no NC area, so no
+//            painter -- themed or classic -- is ever invoked). (c) SQUARE:
+//            corner preference back to DWMWCP_DONOTROUND. (d) THE SHADOW:
+//            v7.1.22's DWMWA_COLOR_NONE removed the border line and took
+//            the DWM drop shadow with it on the field machine -- the call
+//            is retired (default border + default shadow return, the pair
+//            every normal window carries) and CS_DROPSHADOW rejoins the
+//            class style (dormant under DWM composition, the legacy soft
+//            shadow when the composition effects are off, and with square
+//            corners there is no rounded notch left for it to fill -- the
+//            reason v7.1.20 retired it is gone). PLUS the close X gets a
+//            PRESSED face -- vertical gradient, top brighter, bottom
+//            darker -- and the close fires on RELEASE inside the slot,
+//            like every caption button. DSP byte-identical to v7.1.4.
 //    v7.1.22 THE LAST EDGE PAINTER: the field still saw a Windows-2000-
 //            style hard ring on the window edges. With no NC area, no
 //            caption and no region, one persistent painter remained: the
@@ -3892,6 +3922,7 @@ static const DWORD kGuiFrame = WS_SYSMENU | WS_THICKFRAME;
 // their old content-space meaning: the creation helpers add kCapH and the
 // frame paint shifts by kCapH -- no layout literal moved.
 static bool       g_capHot = false;   // mouse over the close glyph
+static bool       g_capDown = false;  // v7.1.23: mouse PRESSING the close glyph
 // (kCapH is defined -- and scaled -- in the v7.1.20 DPI block above.)
 static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
 static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
@@ -3983,7 +4014,19 @@ static void guiRenderBar(HDC dc, int ww) {
     // fills above stay integer-exact.
     const int slotW = S(46);
     const int cx = ww - S(23), cy = kCapH / 2;   // slot center (46 x kCapH slot)
-    if (g_capHot && active) {
+    if (g_capDown && g_capHot && active) {
+        // v7.1.23 THE PRESSED FACE: a vertical gradient -- TOP brighter,
+        // BOTTOM darker (the user asked for exactly this) -- built from
+        // the theme's own panel color, so every theme presses sensibly.
+        const COLORREF pfTop = guiLerpRGB(guic::cPanel2, RGB(255, 255, 255), 0.16);
+        const COLORREF pfBot = guiLerpRGB(guic::cPanel2, RGB(0, 0, 0), 0.30);
+        Gdiplus::LinearGradientBrush pf(
+            Gdiplus::Rect(ww - slotW, 0, slotW, kCapH),
+            Gdiplus::Color(255, GetRValue(pfTop), GetGValue(pfTop), GetBValue(pfTop)),
+            Gdiplus::Color(255, GetRValue(pfBot), GetGValue(pfBot), GetBValue(pfBot)),
+            Gdiplus::LinearGradientModeVertical);
+        g.FillRectangle(&pf, ww - slotW, 0, slotW, kCapH);
+    } else if (g_capHot && active) {
         Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                               GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
         g.FillRectangle(&hf, ww - slotW, 0, slotW, kCapH);
@@ -5872,41 +5915,37 @@ static bool guiCreateRealWindow() {
     // for, and the DWM shadow is drawn OUTSIDE the window rect.
     const int kww = KCLI_W, kwh = KCLI_H + kCapH;
     g_hwnd = CreateWindowExA(0, "twinspeak.control",
-                             "TidyVision TwinSpeak: Control Panel",
+                             "TwinSpeak",   // v7.1.23: compact -- the taskbar
+                                            // label reads THIS string; the bar
+                                            // draws its own brand text anyway
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
     {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
-        // The window carries NO region (v7.1.18: and no WS_CAPTION -- the
-        // shadow lives on WS_THICKFRAME), so the DWM composites its standard
-        // Win10 drop shadow around the window rect
-        // -- the same shadow every default white/black titlebar window
-        // gets. v7.1.19: the corners go back to DWM-ROUNDED, all four of
-        // them (DWMWCP_ROUND rounds top AND bottom edges -- the user asked
-        // for exactly that) -- with no region and no caption the rounding
-        // is pure DWM geometry now, it clips the window alpha shape and
-        // costs nothing. The call fails harmlessly pre-Win11, which is
-        // square anyway.
-        // v7.1.22 THE LAST EDGE PAINTER: the shadow came with the DWM's
-        // own 1px border line drawn just inside the window rect -- on a
-        // machine with a customized visual style that line renders in the
-        // theme's hard classic gray and reads Windows-2000. DWMWA_COLOR
-        // _NONE retires the line (shadow + rounded shape are separate
-        // attributes and both survive); DWMNCRP_ENABLED pins nonclient
-        // rendering to the DWM so no theme/classic engine can claim the
-        // edge again.
+        // The window carries NO region and NO WS_CAPTION -- the shadow
+        // lives on WS_THICKFRAME, and the DWM composites its standard drop
+        // shadow around the window rect, the same shadow every default
+        // titlebar window gets.
+        // v7.1.23 SQUARE + THE DEFAULT SHADOW, AS ASKED: the corner
+        // preference goes back to DWMWCP_DONOTROUND -- the user wants the
+        // square window. And v7.1.22's DWMWA_COLOR_NONE is RETIRED: with
+        // the border line gone, the DWM drop shadow went with it on the
+        // field machine, and the user asked for the WINDOWS DEFAULT DROP
+        // SHADOW back -- the default is the default border color + the DWM
+        // shadow, the exact pair every normal window carries (the shadow
+        // follows the square shape now). DWMNCRP_ENABLED stays: nonclient
+        // rendering is pinned to the DWM so no theme or classic engine can
+        // claim the edge. Pre-Win11 the corner call fails harmlessly
+        // (square anyway).
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
         if (dwmSet) {
-            const int round = 2;   // DWMWCP_ROUND -- all four corners
+            const int corner = 1;   // DWMWCP_DONOTROUND -- square corners
             dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                   &round, sizeof(round));
-            const DWORD noBorder = 0xFFFFFFFEu;   // DWMWA_COLOR_NONE
-            dwmSet(g_hwnd, 34 /* DWMWA_BORDER_COLOR */,
-                   &noBorder, sizeof(noBorder));
-            const int ncrp = 2;                   // DWMNCRP_ENABLED
+                   &corner, sizeof(corner));
+            const int ncrp = 2;     // DWMNCRP_ENABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
                    &ncrp, sizeof(ncrp));
         }
@@ -6065,7 +6104,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.22  |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.1.23  |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6143,23 +6182,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         guiPaintBar(w);                 // the bar is ours; never the classic frame
         return 0;
     case WM_NCACTIVATE:
-        // lParam -1: DefWindowProc must not repaint the (retired) frame on
-        // activation changes. v7.1.18 ORDER FIX: the bar used to be blitted
-        // BEFORE DefWindowProc -- on themed machines the deactivation path
-        // could still land a Luna caption over it, and the stale frame
-        // survived (nothing repainted after). Now DefWindowProc runs first
-        // and the bar is re-blitted AFTER it -- whatever the system drew in
-        // the message gets overwritten by our one blit. (With WS_CAPTION
-        // gone there is no caption at all.) v7.1.22: the heal widens from
-        // the top bar to the WHOLE face -- the same machines strike into
-        // the client edges too, and the left/right/bottom rows had nobody
-        // to overwrite them.
-        {
-            const LRESULT r = DefWindowProcA(w, msg, wp, -1);
-            guiBlitFullFace(w);   // v7.1.22: heal ALL edges, not just the top
-            guiPaintBar(w);
-            return r;
-        }
+        // v7.1.23 THE FLICKER WAS THE DEFAULT PROC ITSELF: on the
+        // customized-visual-style machine the themed frame painter runs
+        // INSIDE DefWindowProc(WM_NCACTIVATE) -- even with lParam -1 (the
+        // v7.1.18 field note said exactly this) -- striking the hard
+        // classic frame over the edges; the v7.1.22 full-face heal then
+        // overwrote the strike one frame later, which the field saw as
+        // FLICKERS of the Windows-2000 edges. So the default proc is NOT
+        // CALLED AT ALL: returning TRUE keeps the activation state, the
+        // window has no NC area to repaint, and no painter -- themed or
+        // classic -- is ever invoked. The heal blits stay as pure
+        // insurance (they are no-ops when nobody struck).
+        guiBlitFullFace(w);
+        guiPaintBar(w);
+        return TRUE;
     case WM_NCHITTEST: {
         // v7.1.17: the bar is CLIENT pixels now, so the drag answer is
         // EXPLICIT (DefWindowProc's frame logic no longer owns any strip).
@@ -6441,22 +6477,50 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE; }
     case WM_LBUTTONDOWN: {
         // v7.1.17: the bar is client pixels -- the close slot arrives with
-        // client coords y 0..kCapH (the legacy negative-y NC path is kept
-        // as insurance). A click there closes -- which hides to the tray,
-        // engine stays up.
+        // client coords y 0..kCapH. v7.1.23: the X has a PRESSED face now,
+        // so it behaves like every caption button since forever -- press
+        // arms it (capture held), release INSIDE the slot fires the close
+        // (which hides to the tray, engine stays up); release outside
+        // cancels. Clicks on the rest of the bar stay inert.
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
         RECT cl = guiCapCloseRect(w);   // client == window rect now
-        if ((cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right) || cy < 0) {
-            if (cx >= cl.left && cx < cl.right) PostMessageA(w, WM_CLOSE, 0, 0);
+        if (cy < kCapH) {
+            if (cx >= cl.left && cx < cl.right) {
+                g_capDown = true;
+                g_capHot  = true;
+                SetCapture(w);
+                guiPaintBar(w);
+            }
             return 0;
         }
         break; }
+    case WM_LBUTTONUP: {
+        // v7.1.23: fire on release-inside; the pressed face dies here
+        // either way.
+        if (!g_capDown) break;
+        g_capDown = false;
+        RECT cl = guiCapCloseRect(w);
+        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
+        const bool inside = (cx >= cl.left && cx < cl.right) && cy < kCapH;
+        if (GetCapture() == w) ReleaseCapture();
+        guiPaintBar(w);
+        if (inside) PostMessageA(w, WM_CLOSE, 0, 0);
+        return 0; }
+    case WM_CAPTURECHANGED:
+        // v7.1.23: the capture was taken from us (a menu, a system dialog)
+        // -- the pressed face must not stick.
+        if (g_capDown) { g_capDown = false; guiPaintBar(w); }
+        return 0;
     case WM_MOUSEMOVE: {
-        // hover feedback for the bar's X; TrackMouseEvent arms the leave
+        // hover feedback for the bar's X; TrackMouseEvent arms the leave.
+        // v7.1.23: the hot test is the STRICT slot rect -- during a press
+        // (capture held) the coords can land far outside the window, and
+        // the old "negative-y counts" legacy row would have kept the face
+        // lit while dragging above the window; a pressed button unlights
+        // the moment the cursor leaves the slot.
         const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
         RECT cl = guiCapCloseRect(w);   // client == window rect now
-        const bool hot = (cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right)
-                      || (cy < 0 && cx >= cl.left && cx < cl.right);   // legacy NC path
+        const bool hot = (cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right);
         if (hot != g_capHot) {
             g_capHot = hot;
             if (hot) { TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, w, 0 }; TrackMouseEvent(&t); }
@@ -6464,7 +6528,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break; }
     case WM_MOUSELEAVE:
-        if (g_capHot) { g_capHot = false; guiPaintBar(w); }
+        if (g_capHot || g_capDown) { g_capHot = false; g_capDown = false; guiPaintBar(w); }
         break;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
@@ -6758,6 +6822,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (w == g_trayWnd) return 0;
         guiCaptureWindowPos(w);
         g_capHot = false;
+        g_capDown = false;   // v7.1.23: never hide with a stuck press face
         KillTimer(w, 1);
         tbHideTab(w);
         trayAdd(true);
@@ -6838,6 +6903,20 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         CloseHandle(mutex);
         return 1;
     }
+    // v7.1.23 THE TASKBAR LABEL: the window had no AppUserModelID, so
+    // Win11's labeled taskbar ran the generic-window path and collapsed
+    // the button to a one-letter stub ("T") while AUMID-bearing apps kept
+    // full labels. Claim the identity BEFORE any window exists -- the
+    // taskbar grouping, the jumplist and the balloon notifications all
+    // hang off it. (shell32 export, Win7+; resolved dynamically so the
+    // header surface stays untouched.)
+    {
+        typedef HRESULT (WINAPI *TS_SCAPID)(PCWSTR);
+        const TS_SCAPID setAppId = (TS_SCAPID)(void*)GetProcAddress(
+            GetModuleHandleA("shell32.dll"),
+            "SetCurrentProcessExplicitAppUserModelID");
+        if (setAppId) setAppId(L"TidyVision.TwinSpeak");
+    }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
     guiInitDpi();   // v7.1.20: FIRST geometry act -- scale every constant + font
     // v7.1.5 boot pop, round two (winner side): a PLAIN launch that beats the
@@ -6864,14 +6943,16 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
     // v7.1.20: WNDCLASSEXW (a true small icon -- hIconSm -- for the taskbar /
-    // Alt-Tab instead of a scaled 32 px) and CS_DROPSHADOW is GONE: the legacy
-    // shadow draws from the SQUARE window rect along the bottom edge and its
-    // silhouette filled the DWM-rounded bottom-corner notches -- the reason
-    // the window read as rounded on the top half only. The DWM shadow from
-    // WS_THICKFRAME follows the rounded shape and is the only shadow now.
+    // Alt-Tab instead of a scaled 32 px). v7.1.23: CS_DROPSHADOW is BACK --
+    // the user asked for the Windows default drop shadow. Under DWM
+    // composition the class style is dormant (the DWM shadow from
+    // WS_THICKFRAME is THE shadow); when the composition effects are off
+    // (the customized-visual-style machine) it draws the legacy soft shadow
+    // again, and with the corners pinned SQUARE there is no rounded notch
+    // for it to fill -- the reason v7.1.20 retired it is gone.
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
     wc.lpfnWndProc = guiWndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.hIcon = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
