@@ -66,7 +66,7 @@ speaker(768, 344, CYAN)
 speaker(768, 680, AMBER)
 
 # ---- outputs ------------------------------------------------------------------
-ico_path = '/home/z/my-project/work/ts652/twinspeak.ico'
+ico_path = 'twinspeak.ico'
 img.save(ico_path, format='ICO',
          sizes=[(256, 256), (128, 128), (64, 64), (48, 48),
                 (32, 32), (24, 24), (16, 16)])
