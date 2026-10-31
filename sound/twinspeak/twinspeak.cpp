@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.31 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,31 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.0 THE INSTANT INACTIVE BORDER + THE NEW NAME. The field: "for
+//            the real challenge, make it so the inactive-window borders
+//            show instantly", the app title becomes "Twinspeak Control
+//            Panel", version steps to 7.2.0. The burst (v7.1.31) still
+//            converges through the DWM's ~200 ms glass fade -- the border
+//            arrives WITH the fade, not before it. The way out: an OPAQUE
+//            non-black pixel on the sheet displays AS-IS (no glass in the
+//            composite, nothing to fade), and the right color is knowable
+//            -- it is what the settled recipe composite ACTUALLY
+//            produced. So v7.2.0 measures it and replays it: at the end
+//            of every burst (settled, inactive, visible, uncovered --
+//            WindowFromPoint guards every sample) three GetPixel points
+//            along the window's top row are read off the screen DC;
+//            agreeing within +/-2 per channel they become
+//            g_instantInactive. The NEXT deactivation holds row 0 opaque
+//            at that color through the whole fade window -- the border
+//            simply is there on the first frame -- then hands it back to
+//            the recipe's half-alpha form once the fade has settled (an
+//            invisible swap over an unchanged backdrop; a one-snap
+//            re-convergence over a changed one) and re-measures one tick
+//            later. The first deactivation ever has no cache: v7.1.31's
+//            tracked fade runs once and seeds it. Titles: window, bar,
+//            tray tooltip/balloons and the PE FileDescription/ProductName
+//            now say "Twinspeak Control Panel" (AppUserModelID, company,
+//            copyright and exe name untouched).
 //    v7.1.31 THE SETTLE BURST. The field: "make it so that when the
 //            window goes unfocused that it immediately updates the
 //            window." v7.1.30's single 400 ms bake worked but read as a
@@ -4203,7 +4228,7 @@ set_menu_item_state(HMENU menu, MENUITEMINFO* menuItemInfo, UINT item,
     SetMenuItemInfo(menu, item, false, menuItemInfo);
 }
 
-static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
+static const wchar_t* kCapTitle = L"Twinspeak Control Panel";   // v7.2.0: the app title (was L"TwinSpeak")
 // Paints the bar from a persistent memory buffer -- usable from any context
 // (theme click, WM_NCPAINT, hover), never needs an invalidate.
 // v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
@@ -4298,6 +4323,21 @@ static bool g_glassSheet = false;
 // WM_ACTIVATE zeroes it and arms timer 4; each tick re-presents the bar
 // and consumes one, twenty in total (~400 ms of fade tracking).
 static unsigned g_bakeTicks = 0;
+// v7.2.0 THE INSTANT INACTIVE BORDER -- measure the settled composite,
+// replay it opaquely. The recipe's inactive row is half-alpha ON PURPOSE
+// (it composites 50/50 with the sheet so the border tracks what is behind
+// the window), but alpha means the DWM's glass fade owns the row's first
+// ~200 ms. The way out: an OPAQUE non-black pixel on the sheet is shown
+// AS-IS -- no glass in the composite, nothing to fade -- and the exact
+// color to show is not a guess: it is what the settled composite
+// produced last cycle, read back off the screen (guiMeasureInstantRow)
+// and replayed by guiBarPatchSheetRow while g_instantHold is set.
+// WM_ACTIVATE latches the hold for the whole fade window; the burst's
+// tail hands the row back to the recipe bytes and re-measures one tick
+// later, so the cache never goes stale on purpose.
+static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
+static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
+static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
 // (no maximize -- the size lock refuses it), hover faces driven by the
@@ -4508,13 +4548,73 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // 20 ms ticks) that re-runs this patch + the blit continuously across
 // the DWM's activation fade, because the DWM bakes the sheet blend at
 // presentation time and the immediate WM_ACTIVATE blit lands mid-fade
-// (see WM_ACTIVATE).
+// (see WM_ACTIVATE). v7.2.0: while g_instantHold is set (a CACHED
+// deactivation) the INACTIVE row is the opaque cached composite instead
+// of the recipe's half-alpha bytes -- opaque non-black shows as-is on
+// the sheet, so the border needs no glass and no fade: it is correct on
+// the first frame. The burst's tail clears the hold and hands the row
+// back to the recipe bytes once the fade has settled;
+// guiMeasureInstantRow re-reads the settled composite one tick later
+// and refreshes the cache.
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
-    const unsigned px = active ? 0x00000000u        // BGRA(0, 0, 0, 0)
-                               : 0x802B2B2Bu;       // BGRA(43, 43, 43, 128)
+    unsigned px;
+    if (active) {
+        px = 0x00000000u;                            // the recipe: bare glass = the DWM's active frame
+    } else if (g_instantHold && g_instantInactive) {
+        // v7.2.0 THE INSTANT ROW: opaque replay of the settled composite
+        // measured at the end of the previous burst (never pure black:
+        // the blend is 50% gray85, so >= RGB(21,21,21) -- the "black =
+        // glass" key can never trigger).
+        const unsigned c = (unsigned)g_instantInactive;
+        px = 0xFF000000u | ((c >> 16) & 0xFFu)       // B -> byte 0
+                        | (c & 0xFF00u)              // G -> byte 1
+                        | ((c & 0xFFu) << 16);       // R -> byte 2
+    } else {
+        px = 0x802B2B2Bu;                            // the recipe: BGRA(43, 43, 43, 128)
+    }
     unsigned* row = (unsigned*)g_barBits;           // top-down: row 0 first
     for (int x = 0; x < cw; ++x) row[x] = px;
+}
+// v7.2.0 THE MEASUREMENT: the instant border's color is not guessed, it
+// is READ BACK from the screen. Called one tick after the burst handed
+// row 0 back to the recipe (the DWM has composited the settled blend by
+// then): three points along the window's TOP ROW (the client's row 0 IS
+// the window's top row -- WM_NCCALCSIZE insets left/right/bottom only)
+// are sampled off the screen DC, which returns the COMPOSITED desktop
+// pixel. Every point is guarded with WindowFromPoint first -- if another
+// window covers us, its pixels must never enter the cache -- and all
+// three samples must agree within +/-2 per channel (the row is a flat
+// blend; disagreement means a transient or a polluted read). Only a
+// settled, inactive, visible, non-minimized window measures.
+static void guiMeasureInstantRow() {
+    if (!g_glassSheet || !g_hwnd || !IsWindow(g_hwnd)) return;
+    if (GetActiveWindow() != nullptr) return;         // meaningful while inactive only
+    if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
+    RECT wr;
+    if (!GetWindowRect(g_hwnd, &wr)) return;
+    const int xs[3] = { 40, (wr.right - wr.left) / 2, (wr.right - wr.left) - 40 };
+    HDC sdc = GetDC(nullptr);
+    if (!sdc) return;
+    COLORREF v[3];
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) {
+        const POINT p = { wr.left + xs[i], wr.top };
+        if (WindowFromPoint(p) != g_hwnd) ok = false; // covered: never cache another window's pixels
+        else {
+            v[i] = GetPixel(sdc, p.x, p.y);
+            if (v[i] == CLR_INVALID) ok = false;
+        }
+    }
+    ReleaseDC(nullptr, sdc);
+    if (!ok) return;
+    for (int i = 1; i < 3; ++i) {
+        const int dr = (int)(v[i] & 0xFF)         - (int)(v[0] & 0xFF);
+        const int dg = (int)((v[i] >> 8) & 0xFF)  - (int)((v[0] >> 8) & 0xFF);
+        const int db = (int)((v[i] >> 16) & 0xFF) - (int)((v[0] >> 16) & 0xFF);
+        if (dr < -2 || dr > 2 || dg < -2 || dg > 2 || db < -2 || db > 2) return;
+    }
+    g_instantInactive = v[0];
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -6239,8 +6339,8 @@ static void startupSet(bool on) {
 static void trayUpdateTip(bool running) {
     if (!g_trayVisible) return;
     g_nid.uFlags = NIF_TIP;
-    lstrcpynA(g_nid.szTip, running ? "TidyVision TwinSpeak -- engine running"
-                                   : "TidyVision TwinSpeak -- engine stopped",
+    lstrcpynA(g_nid.szTip, running ? "Twinspeak Control Panel -- engine running"
+                                   : "Twinspeak Control Panel -- engine stopped",
               (int)sizeof(g_nid.szTip));
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
@@ -6260,7 +6360,7 @@ static void trayAdd(bool hint) {
     g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
                                     IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
-    lstrcpynA(g_nid.szTip, "TidyVision TwinSpeak", (int)sizeof(g_nid.szTip));
+    lstrcpynA(g_nid.szTip, "Twinspeak Control Panel", (int)sizeof(g_nid.szTip));
     g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
     if (!g_trayVisible) {
         // v7.1.20: the shell was not ready (a sign-in launch can beat the
@@ -6273,7 +6373,7 @@ static void trayAdd(bool hint) {
     if (hint && g_closeHints < 3) {   // v7.1.20: explain the first 3 closes, not once ever
         ++g_closeHints;
         g_nid.uFlags       = NIF_INFO;
-        lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
+        lstrcpynA(g_nid.szInfoTitle, "Twinspeak Control Panel", (int)sizeof(g_nid.szInfoTitle));
         lstrcpynA(g_nid.szInfo,
                   "Still running -- the engine stays up.\n"
                   "Click this icon to reopen the window; "
@@ -6289,7 +6389,7 @@ static void trayAdd(bool hint) {
 static void trayBalloon(const char* text) {
     if (!g_trayVisible) return;
     g_nid.uFlags       = NIF_INFO;
-    lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
+    lstrcpynA(g_nid.szInfoTitle, "Twinspeak Control Panel", (int)sizeof(g_nid.szInfoTitle));
     lstrcpynA(g_nid.szInfo, text, (int)sizeof(g_nid.szInfo));
     g_nid.dwInfoFlags = NIIF_INFO;
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
@@ -6387,9 +6487,9 @@ static bool guiCreateRealWindow() {
     // taskbar and Alt-Tab show (the bar keeps drawing its own text).
     const int kww = KCLI_W + 2 * g_frmInsX, kwh = KCLI_H + kCapH + g_frmInsY;
     g_hwnd = CreateWindowExW(0, L"twinspeak.control",
-                             L"TidyVision TwinSpeak",   // the shell's label for
-                                                        // this window: the full
-                                                        // brand, Alt-Tab too
+                             L"Twinspeak Control Panel",   // v7.2.0: the app title
+                                                        // (was the full brand);
+                                                        // taskbar + Alt-Tab read it
                              kGuiFrame | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
@@ -6626,7 +6726,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.31  |  %s",   // v7.1.31 settle burst (v7.1.28 fixed the stale v7.1.25)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.0  |  %s",   // v7.2.0 instant inactive border (v7.1.28 fixed the stale v7.1.25)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6812,6 +6912,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // default. Counter + timer re-arm on rapid toggles, the last
         // activation state wins; the immediate blit stays (the face
         // dim/undim must be instant).
+        // v7.2.0 THE INSTANT ROW: when a measured cache exists, a
+        // deactivation latches g_instantHold so EVERY presentation in the
+        // fade window writes row 0 as the OPAQUE cached composite -- the
+        // border is correct on the first frame, no glass fade involved.
+        // At the burst's tail the hold clears and the row returns to the
+        // recipe's half-alpha bytes (an invisible swap when the backdrop
+        // is unchanged: the recipe then settles on the same color), and
+        // one tick later guiMeasureInstantRow refreshes the cache. No
+        // cache yet (first run): the hold stays off and v7.1.31's tracked
+        // fade runs once to seed it.
+        if (LOWORD(wp) == WA_INACTIVE && g_instantInactive) g_instantHold = true;
+        else g_instantHold = false;
+        g_measurePending = false;
         guiPaintBar(w);
         g_bakeTicks = 0;
         SetTimer(w, 4, 20, nullptr);
@@ -7291,11 +7404,28 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // 20 ms re-blits spanning ~400 ms -- so the sheet row is
         // re-presented continuously across the DWM's ~200 ms activation
         // fade and tracks it frame by frame (the immediate WM_ACTIVATE
-        // blit lands mid-fade; see WM_ACTIVATE). Kills itself after the
-        // last tick.
+        // blit lands mid-fade; see WM_ACTIVATE). v7.2.0: when a cache
+        // exists the burst presents the OPAQUE cached row through the
+        // fade (g_instantHold, see WM_ACTIVATE) -- instant instead of
+        // tracked. The last tick clears the hold and presents the
+        // recipe's half-alpha row against the SETTLED glass, and one
+        // further tick later (g_measurePending -- the DWM needs a
+        // composition to land the new row on screen) the row is re-read
+        // off the screen and the cache refreshed. Kills itself after the
+        // measurement.
         if (wp == 4) {
             guiPaintBar(w);
-            if (++g_bakeTicks >= 20) { KillTimer(w, 4); g_bakeTicks = 0; }
+            if (g_measurePending) {
+                g_measurePending = false;
+                g_bakeTicks = 0;
+                KillTimer(w, 4);
+                guiMeasureInstantRow();   // the settled composite is on screen now
+            } else if (++g_bakeTicks >= 20) {
+                g_instantHold = false;    // fade window over: hand the row back
+                g_bakeTicks = 0;
+                guiPaintBar(w);           // present the recipe row against settled glass
+                g_measurePending = true;  // measure it on the next tick
+            }
             return 0;
         }
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
@@ -7531,7 +7661,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
             Sleep(50);
         }
         MessageBoxA(nullptr, "twinspeak is already running.\n\nStop the running copy first:\n  taskkill /IM twinspeak.exe",
-                    "TidyVision TwinSpeak", MB_ICONINFORMATION);
+                    "Twinspeak Control Panel", MB_ICONINFORMATION);
         CloseHandle(mutex);
         return 1;
     }
@@ -7636,7 +7766,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // (guiCreateRealWindow, on demand). FindWindowA-based duplicate
         // detection still works -- the surrogate carries the class.
         g_trayWnd = CreateWindowExW(0, L"twinspeak.control",
-                                    L"TidyVision TwinSpeak: Tray",   // v7.1.26: W
+                                    L"Twinspeak Control Panel: Tray",   // v7.2.0: app title
                                     WS_OVERLAPPED, 0, 0, 0, 0,
                                     nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
