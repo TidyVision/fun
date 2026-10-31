@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.23 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.24 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -14,7 +14,7 @@
 //      +--> leg2.raw ring --> pump 2 (FIRST + higher priority)
 //             gates: ch3 zero -> nothing; ch3 == Windows stereo-upmix
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
-//             + 40 Hz @ 1% keep-alive at the device layer
+//             + 40 Hz @ 0.5% keep-alive at the device layer
 //    playback callbacks = the ASIO buffer switch: gated excess drop +
 //    last-buffer replay. WASAPI exclusive is INTEGRATED (v6.6.8): both legs
 //    open exclusive together (shared fallback reopens BOTH), capture pin
@@ -23,6 +23,44 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.24 KEEP-ALIVE 40 Hz @ 0.005 + THE WINDOW IS main.c: two field
+//            asks. (a) THE KEEP-ALIVE: the built-in out2 tone moves from
+//            1 Hz @ 0.0001 (~-80 dBFS) to 40 Hz @ 0.005 (0.5%, ~-46 dBFS)
+//            -- a wobble the cheap USB amp's front end can actually grip,
+//            still far below hearing; the cycle table is generic in the
+//            rate (48000/40 = a 1200-sample cycle), phase-continuous as
+//            always, post-mix as always. Banner prints 40 Hz @ 0.50%.
+//            (b) THE WINDOW: the hand-rolled v7.0.9 caption (client ==
+//            window, HTCAPTION strip, the 0x00AE/0x00AF + WM_NCPAINT +
+//            WM_NCACTIVATE self-heal circus, the v7.1.23 pressed face) is
+//            REPLACED with the proven Win32 custom title bar example the
+//            field supplied (main.c): WS_THICKFRAME|WS_SYSMENU|
+//            WS_MAXIMIZEBOX|WS_MINIMIZEBOX; WM_NCCALCSIZE insets the frame
+//            left/right/bottom so the DWM border + shadow own a real NC
+//            strip and no frame painter can strike into client pixels;
+//            WM_NCHITTEST defers to DefWindowProc for the resize edges,
+//            re-answers HTTOP for the top band, HTCAPTION across the bar;
+//            caption buttons MINIMIZE + CLOSE (no maximize -- the size
+//            lock refuses SC_MAXIMIZE/SC_SIZE and a dead button is a lie)
+//            with the hovered slot in GWLP_USERDATA fed by WM_NCMOUSEMOVE
+//            and dispatched in WM_NCLBUTTONUP; WM_NCRBUTTONUP opens the
+//            system menu with the item states the size lock honors (one
+//            deviation: return 0 -- DefWindowProc would stack its own
+//            SC_MOUSEMENU menu on top); WM_SETCURSOR answers the arrow;
+//            WM_CREATE nudges the frame; the example's fake top shadow
+//            survives in the theme's edge color; the bar's buffered theme
+//            renderer keeps its gradient, title and dimming; the close
+//            hover is the example's red with a white X (the pressed face
+//            retires with the client-side click machinery -- the example
+//            acts on NCLBUTTONUP while hovered); the creation size, the
+//            WM_WINDOWPOSCHANGING pin and WM_GETMINMAXINFO grow by the
+//            insets so the designed 880x620 CLIENT is untouched; SC_RESTORE
+//            passes again (the taskbar's restore click serves the new
+//            minimize). The theme-measured caption height, the theme's
+//            DrawThemeTextEx title and the HTMAXBUTTON/SnapLayout hook are
+//            deliberately NOT adopted: kCapH is the layout contract, the
+//            bar keeps its own brand text, and there is no maximize button
+//            to serve. out1/out2 sample paths unchanged except the tone.
 //    v7.1.23 SQUARE + SHADOW + LABEL + FLICKER, ALL FOUR CLOSED: the field
 //            asked for square corners and the Windows default drop shadow
 //            back, and reported two regressions -- the taskbar label
@@ -509,19 +547,21 @@ static constexpr int      kOutCh2        = 2;      // leg2: stereo center speake
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
 
-// output2 keep-alive tone: 1 Hz at 0.01% gain (0.0001, ~-80 dBFS, far below
+// output2 keep-alive tone: 40 Hz at 0.5% gain (0.005, ~-46 dBFS, far below
 // hearing) summed onto BOTH channels at the DEVICE layer -- every frame,
 // silence or not, underrun or not, phase-continuous. Rendered from a
-// precomputed 48000-sample cycle table (48000/1 = exactly one cycle) instead
-// of calling sin() per frame. v7.1.7: BUILT IN -- the ini keys and UI rows
-// are gone (the field never needed to move them; 1 Hz wobble holds every
-// amp awake and is inaudible on any driver). POST-MIX by construction: the
-// tone is summed in the leg2 OUTPUT callbacks, after the mix, so it can
-// never enter the capture stream an OBS display-capture records.
+// precomputed cycle table (48000/40 = a 1200-sample cycle) instead of
+// calling sin() per frame. v7.1.7: BUILT IN -- the ini keys and UI rows are
+// gone (the field never needed to move them). v7.1.24: the field asked for
+// the tone back at 40 Hz @ 0.005 -- a wobble the cheap USB amp's front end
+// can actually grip, still inaudible on any driver. POST-MIX by
+// construction: the tone is summed in the leg2 OUTPUT callbacks, after the
+// mix, so it can never enter the capture stream an OBS display-capture
+// records.
 static constexpr double   kTwoPi             = 6.283185307179586;
-static constexpr unsigned kKeepAliveTableMax = 48000;  // one 1 Hz cycle @ 48 kHz
-static constexpr float    kKeepAliveHz       = 1.0f;    // v7.1.7: built in
-static constexpr float    kKeepAliveGain     = 0.0001f; // v7.1.7: built in
+static constexpr unsigned kKeepAliveTableMax = 48000;  // capacity: the 1 Hz worst case
+static constexpr float    kKeepAliveHz       = 40.0f;   // v7.1.24: 40 Hz @ 0.005
+static constexpr float    kKeepAliveGain     = 0.005f;  // (0.5%, ~-46 dBFS)
 static float              g_kaHz   = kKeepAliveHz;
 static float              g_kaGain = kKeepAliveGain;
 static unsigned           g_kaLen  = 48000;   // samples per cycle: round(48000 / g_kaHz)
@@ -613,7 +653,8 @@ struct Config {
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
     // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
-    // kKeepAliveGain, 1 Hz @ 0.0001) -- no struct fields, no ini key, no UI.
+    // kKeepAliveGain; v7.1.24: 40 Hz @ 0.005) -- no struct fields, no ini
+    // key, no UI.
     bool        background     = true;   // v6.2: detach the console after a
                                           //       successful start; log to file
                                           // v6.6.8: INTEGRATED -- always on
@@ -2911,9 +2952,10 @@ static void writeTemplate(const char* path) {
         "\n"
         "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI): out2 sums a sine on\n"
         "; both channels every frame (silence or not) so the center device\n"
-        "; never sees digital silence. 1 Hz @ 0.0001 (-80 dBFS) -- far below\n"
-        "; hearing, and a wobble every amp's sleep timer treats as signal.\n"
-        "; The watchdog reopens out2 automatically whenever it comes back.\n"
+        "; never sees digital silence. 40 Hz @ 0.5%% (0.005, -46 dBFS) since\n"
+        "; v7.1.24 -- far below hearing, and a wobble every amp's sleep timer\n"
+        "; treats as signal. The watchdog reopens out2 automatically whenever\n"
+        "; it comes back.\n"
         "; POST-MIX: the tone and the chime are summed in the out2 OUTPUT\n"
         "; callbacks, after the mix -- they never enter the capture stream an\n"
         "; OBS capture records.\n"
@@ -3121,8 +3163,8 @@ static void writeTemplate(const char* path) {
         ";   a clone of the program audio. The startup banner prints the route\n"
         ";   map on every launch.\n"
         ";\n"
-        "; NOTE: output2 always sums the keep-alive sine (BUILT IN, v7.1.7:\n"
-        "; 1 Hz @ 0.01%%) onto both channels, every\n"
+        "; NOTE: output2 always sums the keep-alive sine (BUILT IN, v7.1.24:\n"
+        "; 40 Hz @ 0.5%%) onto both channels, every\n"
         "; frame, so the center device NEVER sees digital silence -- and when\n"
         "; the center gates mute a block, the keep-alive is ALL that block\n"
         "; carries. The out2 pump also runs FIRST and at the higher priority\n"
@@ -3912,24 +3954,112 @@ static void guiInitDpi() {
     KSTRIP_FACE_Y = S(6);
 }
 
-static const DWORD kGuiFrame = WS_SYSMENU | WS_THICKFRAME;
+// v7.1.24 THE WINDOW IS THE Win32 CUSTOM TITLE BAR EXAMPLE (main.c): the
+// hand-rolled v7.0.9 bar -- client == window, an HTCAPTION strip, the
+// 0x00AE/0x00AF + WM_NCPAINT + WM_NCACTIVATE self-heal circus, pressed
+// faces -- is retired wholesale and replaced with the proven recipe the
+// field supplied (main.c):
+//   * style WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX
+//     (visibility stays ours, WS_CLIPCHILDREN stays for the children);
+//   * WM_NCCALCSIZE insets the frame on the LEFT/RIGHT/BOTTOM (top only
+//     when maximized) -- the DWM border + drop shadow own a real NC strip
+//     again and no frame painter can strike into the client pixels;
+//   * WM_NCHITTEST defers to DefWindowProc for the resize edges, re-answers
+//     HTTOP for the top band the inset confuses, HTCAPTION across the bar,
+//     HTCLIENT below;
+//   * the caption buttons are MINIMIZE + CLOSE (no maximize: the v7.1.20
+//     size lock refuses SC_MAXIMIZE/SC_SIZE and a dead button is a lie),
+//     hovered state tracked in GWLP_USERDATA from WM_NCMOUSEMOVE and
+//     dispatched in WM_NCLBUTTONUP, exactly like the example; the close
+//     still posts WM_CLOSE (hide to tray, engine keeps running);
+//   * WM_NCRBUTTONUP opens the system menu with the item states the size
+//     lock actually honors (one documented deviation: return 0, so
+//     DefWindowProc cannot stack its own SC_MOUSEMENU menu on top);
+//   * WM_SETCURSOR answers the arrow; WM_CREATE nudges the frame once.
+// The bar's FACE is still twinspeak's: the buffered theme-aware renderer
+// below keeps its gradient, title, inactive dimming and 1px bottom edge;
+// the geometry and the input model are the example's. The example's fake
+// top shadow (WIN32_FAKE_SHADOW_HEIGHT) survives too, in the theme's own
+// edge color. kCapH stays the bar height -- the whole child layout hangs
+// off it (the example measures its caption from the theme; that function
+// is deliberately NOT adopted). The example's HTMAXBUTTON/SnapLayout hook
+// has no maximize button to serve and is not adopted either.
+static const DWORD kGuiFrame
+    = WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX;
 
-// v7.0.9 THE CUSTOM TITLEBAR (v7.1.17: now a client strip): the top 31 px of
-// the CLIENT is our own bar -- theme colors painted directly, so a theme
-// click recolors it the same instant as the rest of the client. Drag answers
-// HTCAPTION explicitly (WM_NCHITTEST); the close slot answers HTCLIENT so
-// its clicks, hover and leave tracking stay ours. Child coordinates keep
-// their old content-space meaning: the creation helpers add kCapH and the
-// frame paint shifts by kCapH -- no layout literal moved.
-static bool       g_capHot = false;   // mouse over the close glyph
-static bool       g_capDown = false;  // v7.1.23: mouse PRESSING the close glyph
-// (kCapH is defined -- and scaled -- in the v7.1.20 DPI block above.)
-static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
-static RECT guiCapCloseRect(HWND w) {  // window coords, the X button slot
-    RECT wr; GetWindowRect(w, &wr);
-    const RECT r = { (wr.right - wr.left) - S(46), 0, wr.right - wr.left, kCapH };
-    return r;
+// main.c: signed cursor extraction (multi-monitor coordinates can be
+// negative; windowsx.h defines these but we don't want the whole header).
+#ifndef GET_X_PARAM
+#define GET_X_PARAM(lp) ((int)(short)LOWORD(lp))
+#endif
+#ifndef GET_Y_PARAM
+#define GET_Y_PARAM(lp) ((int)(short)HIWORD(lp))
+#endif
+
+// main.c verbatim: the maximized state (WM_NCCALCSIZE's top inset,
+// WM_NCHITTEST's top-band guard, the sysmenu item states).
+static bool
+win32_window_is_maximized(HWND handle) {
+    WINDOWPLACEMENT placement = {0};
+    placement.length = sizeof(WINDOWPLACEMENT);
+    if (GetWindowPlacement(handle, &placement)) {
+        return placement.showCmd == SW_SHOWMAXIMIZED;
+    }
+    return false;
 }
+
+// v7.1.24: the frame insets WM_NCCALCSIZE removes on left/right (X) and
+// bottom (Y) -- computed once after guiInitDpi and reused by the creation
+// size, the WM_WINDOWPOSCHANGING pin and WM_GETMINMAXINFO, so the designed
+// 880x620+kCapH CLIENT survives inside a window that owns a real frame.
+// System-DPI-aware process: GetSystemMetrics IS the ForDpi value here --
+// the same numbers main.c gets from GetSystemMetricsForDpi(..., windowDpi).
+static int g_frmInsX = 0, g_frmInsY = 0;
+static void guiCalcFrameInsets() {
+    const int frameX = GetSystemMetrics(SM_CXFRAME);
+    const int frameY = GetSystemMetrics(SM_CYFRAME);
+    const int pad    = GetSystemMetrics(SM_CXPADDEDBORDER);
+    g_frmInsX = frameX + pad;
+    g_frmInsY = frameY + pad;
+}
+
+// v7.1.24 (main.c): the caption buttons. Set to 0 to remove the fake shadow
+// painting (kept at the example's 1).
+#define WIN32_FAKE_SHADOW_HEIGHT 1
+enum {
+    CustomTitleBarHoveredButton_None = 0,
+    CustomTitleBarHoveredButton_Minimize,
+    CustomTitleBarHoveredButton_Close,
+};
+struct CustomTitleBarButtonRects {
+    RECT close;
+    RECT minimize;
+};
+// main.c's win32_get_title_bar_button_rects over the kCapH bar in CLIENT
+// coordinates ("Sadly SM_CXSIZE does not result in the right size buttons
+// for Win10" -- the example scales 47 px per button; so do we, via S()).
+static CustomTitleBarButtonRects
+win32_get_title_bar_button_rects(HWND handle, const RECT* title_bar_rect) {
+    (void)handle;
+    CustomTitleBarButtonRects button_rects;
+    const int button_width = S(47);
+    button_rects.close = *title_bar_rect;
+    button_rects.close.top += WIN32_FAKE_SHADOW_HEIGHT;
+    button_rects.close.left = button_rects.close.right - button_width;
+    button_rects.minimize = button_rects.close;
+    button_rects.minimize.left  -= button_width;
+    button_rects.minimize.right -= button_width;
+    return button_rects;
+}
+// main.c verbatim: the system-menu item states the size lock honors.
+static void
+set_menu_item_state(HMENU menu, MENUITEMINFO* menuItemInfo, UINT item,
+                    bool enabled) {
+    menuItemInfo->fState = enabled ? MF_ENABLED : MF_DISABLED;
+    SetMenuItemInfo(menu, item, false, menuItemInfo);
+}
+
+static const wchar_t* kCapTitle = L"TwinSpeak";   // v7.1.0: the bar's product name
 // Paints the bar from a persistent memory buffer -- usable from any context
 // (theme click, WM_NCPAINT, hover), never needs an invalidate.
 // v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
@@ -3986,12 +4116,21 @@ static bool guiBarBufEnsure(int ww, int hh) {
     return true;
 }
 // renders the whole bar into dc (memory buffer or screen -- identical code)
-// v7.1.20: all geometry goes through the DPI scale; the bar also dims when
-// the window is INACTIVE (GetActiveWindow) -- flat bg, dim title -- so the
-// chrome reads active vs. inactive like every native caption does.
+// v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
+// (no maximize -- the size lock refuses it), hover faces driven by the
+// GWLP_USERDATA slot the example's WM_NCMOUSEMOVE maintains, the close
+// hover in the example's RED with a white X (the close convention the
+// example follows), the minimize glyph as the example's 10x1 px line. The
+// v7.1.23 pressed face is retired with the client-side click machinery
+// that fed it -- the example acts on WM_NCLBUTTONUP while the slot is
+// hovered, so the hover face IS the press feedback now. The example's fake
+// top shadow (WIN32_FAKE_SHADOW_HEIGHT) paints over the face's first row,
+// dimmed when inactive by the example's blend rule, in the theme's own
+// edge color. The bar also dims when the window is INACTIVE
+// (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
+// active vs. inactive like every native caption does.
 static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
-static void guiRenderBar(HDC dc, int ww) {
-    const bool active = (GetActiveWindow() != nullptr);   // GUI thread only
+static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // the face: the theme bg with a light touch at the top -- depth without
@@ -4009,35 +4148,55 @@ static void guiRenderBar(HDC dc, int ww) {
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
     g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
-    // the close slot: hover face + the thin system-style X. Shape smoothing
-    // turns ON for the X's diagonals ONLY -- the two strokes need AA; the
-    // fills above stay integer-exact.
-    const int slotW = S(46);
-    const int cx = ww - S(23), cy = kCapH / 2;   // slot center (46 x kCapH slot)
-    if (g_capDown && g_capHot && active) {
-        // v7.1.23 THE PRESSED FACE: a vertical gradient -- TOP brighter,
-        // BOTTOM darker (the user asked for exactly this) -- built from
-        // the theme's own panel color, so every theme presses sensibly.
-        const COLORREF pfTop = guiLerpRGB(guic::cPanel2, RGB(255, 255, 255), 0.16);
-        const COLORREF pfBot = guiLerpRGB(guic::cPanel2, RGB(0, 0, 0), 0.30);
-        Gdiplus::LinearGradientBrush pf(
-            Gdiplus::Rect(ww - slotW, 0, slotW, kCapH),
-            Gdiplus::Color(255, GetRValue(pfTop), GetGValue(pfTop), GetBValue(pfTop)),
-            Gdiplus::Color(255, GetRValue(pfBot), GetGValue(pfBot), GetBValue(pfBot)),
-            Gdiplus::LinearGradientModeVertical);
-        g.FillRectangle(&pf, ww - slotW, 0, slotW, kCapH);
-    } else if (g_capHot && active) {
+    // v7.1.24 main.c: the fake top shadow -- the frame inset removed the
+    // window's real top border; the example paints its own 1 px line
+    // (focused: the plain shadow; unfocused: blended toward the face top).
+    const COLORREF shTop = guiLerpRGB(guic::cPanel2, RGB(0, 0, 0), 0.45);
+    const COLORREF shCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
+    Gdiplus::SolidBrush shadow(Gdiplus::Color(255, GetRValue(shCol),
+                                              GetGValue(shCol), GetBValue(shCol)));
+    g.FillRectangle(&shadow, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
+    // v7.1.24 main.c: the caption buttons -- hover face + glyphs. The fills
+    // stay integer-exact; shape smoothing turns ON for the X's diagonals
+    // ONLY (the two strokes need AA, the fills above do not).
+    const RECT bar = { 0, 0, ww, kCapH };
+    const CustomTitleBarButtonRects br =
+        win32_get_title_bar_button_rects(nullptr, &bar);
+    const COLORREF item = active ? guic::cText : guic::cDim;  // main.c's item color
+    const int buttonW   = br.close.right - br.close.left;
+    if (hovered == CustomTitleBarHoveredButton_Minimize) {
         Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                               GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-        g.FillRectangle(&hf, ww - slotW, 0, slotW, kCapH);
+        g.FillRectangle(&hf, br.minimize.left, br.minimize.top, buttonW,
+                        br.minimize.bottom - br.minimize.top);
     }
-    const COLORREF xcol = (g_capHot && active) ? guic::cAccent : guic::cText;
-    Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol), GetGValue(xcol), GetBValue(xcol)),
-                    Sf(1.25f) < 1.0f ? 1.0f : Sf(1.25f));
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.DrawLine(&xp, cx - S(5), cy - S(5), cx + S(5), cy + S(5));   // the modern thin X --
-    g.DrawLine(&xp, cx + S(5), cy - S(5), cx - S(5), cy + S(5));   // the DWM close glyph's
-    g.SetSmoothingMode(Gdiplus::SmoothingModeNone);    // own shape, drawn ours
+    {   // minimize glyph: main.c's 10x1 px line, centered in the button.
+        const int lineW = S(10);
+        const int cx = br.minimize.left + buttonW / 2;
+        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2;
+        Gdiplus::SolidBrush glyph(Gdiplus::Color(255, GetRValue(item),
+                                                 GetGValue(item), GetBValue(item)));
+        g.FillRectangle(&glyph, cx - lineW / 2, cy, lineW, 1);
+    }
+    if (hovered == CustomTitleBarHoveredButton_Close) {
+        // main.c's close hover: the red face, the white X.
+        Gdiplus::SolidBrush rf(Gdiplus::Color(255, 0xCC, 0, 0));
+        g.FillRectangle(&rf, br.close.left, br.close.top, buttonW,
+                        br.close.bottom - br.close.top);
+    }
+    {
+        const int cx = br.close.left + buttonW / 2;
+        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
+        const COLORREF xcol = (hovered == CustomTitleBarHoveredButton_Close)
+                            ? RGB(0xFF, 0xFF, 0xFF) : item;
+        Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol),
+                                       GetGValue(xcol), GetBValue(xcol)),
+                        Sf(1.25f) < 1.0f ? 1.0f : Sf(1.25f));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.DrawLine(&xp, cx - S(5), cy - S(5), cx + S(5), cy + S(5));   // the modern thin X --
+        g.DrawLine(&xp, cx + S(5), cy - S(5), cx - S(5), cy + S(5));   // the DWM close glyph's
+        g.SetSmoothingMode(Gdiplus::SmoothingModeNone);                // own shape, drawn ours
+    }
     // the product name, theme-aware (see the v7.1.4 note above).
     if (g_fTitle) {
         const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
@@ -4067,14 +4226,21 @@ static void guiRenderBar(HDC dc, int ww) {
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
-    HDC wdc = GetWindowDC(w);
-    RECT wr; GetWindowRect(w, &wr);
-    const int ww = wr.right - wr.left;
-    if (ww > 0 && guiBarBufEnsure(ww, kCapH)) {
-        guiRenderBar(g_barDc, ww);
-        BitBlt(wdc, 0, 0, ww, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
+    // v7.1.24: the hovered slot rides GWLP_USERDATA exactly like main.c;
+    // the blit target is the CLIENT dc -- the window owns a real frame now,
+    // so the bar is client pixels at (0,0), not window pixels.
+    const int  hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
+    const bool active = (GetActiveWindow() != nullptr);   // GUI thread only
+    RECT cr; GetClientRect(w, &cr);
+    const int cw = cr.right - cr.left;
+    if (cw <= 0) return;
+    HDC wdc = GetDC(w);
+    if (!wdc) return;
+    if (guiBarBufEnsure(cw, kCapH)) {
+        guiRenderBar(g_barDc, cw, hovered, active);
+        BitBlt(wdc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
     } else {
-        guiRenderBar(wdc, ww);   // no buffer: draw straight (old path)
+        guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
     }
     ReleaseDC(w, wdc);
 }
@@ -5104,7 +5270,7 @@ static void guiBuildPages(HWND w) {
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
     note(w, COLB_X, 226,
-         "The keep-alive tone is BUILT IN (1 Hz @ 0.01%): out2 never sees\n"
+         "The keep-alive tone is BUILT IN (40 Hz @ 0.5%): out2 never sees\n"
          "digital silence, so the center speaker stays awake. POST-MIX: the\n"
          "tone and the chime are summed in the out2 OUTPUT callbacks, after\n"
          "the mix -- they never enter the stream an OBS capture records.\n"
@@ -5909,11 +6075,13 @@ static void guiCaptureWindowPos(HWND w) {
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
-    // v7.1.17: the client IS the window (WM_NCCALCSIZE answers 0) -- create
-    // it at the exact final size: the designed 880x620 content + the 31 px
-    // bar on top. No AdjustWindowRect: there is no frame to reserve space
-    // for, and the DWM shadow is drawn OUTSIDE the window rect.
-    const int kww = KCLI_W, kwh = KCLI_H + kCapH;
+    // v7.1.24 (main.c): the window owns a real frame again -- WM_NCCALCSIZE
+    // insets LEFT/RIGHT/BOTTOM (frame + padded border), so the OUTER size is
+    // the designed client (880x620 content + the 31 px bar) plus those
+    // insets. No AdjustWindowRect: the insets ARE the contract (the helper
+    // would reserve a caption that never exists), and the DWM shadow is
+    // drawn OUTSIDE the window rect.
+    const int kww = KCLI_W + 2 * g_frmInsX, kwh = KCLI_H + kCapH + g_frmInsY;
     g_hwnd = CreateWindowExA(0, "twinspeak.control",
                              "TwinSpeak",   // v7.1.23: compact -- the taskbar
                                             // label reads THIS string; the bar
@@ -5937,7 +6105,9 @@ static bool guiCreateRealWindow() {
         // follows the square shape now). DWMNCRP_ENABLED stays: nonclient
         // rendering is pinned to the DWM so no theme or classic engine can
         // claim the edge. Pre-Win11 the corner call fails harmlessly
-        // (square anyway).
+        // (square anyway). v7.1.24: with the WM_NCCALCSIZE insets there is
+        // a real NC strip again, so the DWM border line + shadow arrive
+        // through main.c's recipe -- these two attributes are pure style.
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
         const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
             LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
@@ -6056,24 +6226,6 @@ static bool guiFrameBufEnsure(int w, int h) {
     g_frmW = w; g_frmH = h;
     return true;
 }
-// v7.1.22 THE FULL-FRAME SELF-HEAL: WM_NCACTIVATE/WM_NCPAINT re-blit the
-// whole buffered face -- not just the bar -- so a themed engine that strikes
-// into any client edge (the machine that grew a Luna caption out of nowhere
-// proved they strike into CLIENT pixels) has its vandalism overwritten
-// before the message returns. One BitBlt; the buffer holds exactly what the
-// last WM_PAINT put on screen, so the blit is a no-op except where someone
-// drew over us. Gated on g_frmFaceReady: until the first WM_PAINT has
-// rendered the face there is nothing to heal with.
-static bool g_frmFaceReady = false;
-static void guiBlitFullFace(HWND w) {
-    if (!g_frmFaceReady || !g_frmDc) return;
-    RECT crc; GetClientRect(w, &crc);
-    HDC dc = GetDC(w);
-    if (dc) {
-        BitBlt(dc, 0, 0, crc.right, crc.bottom, g_frmDc, 0, 0, SRCCOPY);
-        ReleaseDC(w, dc);
-    }
-}
 // v7.1.20: long ini paths used to run off the version line and clip mid-glyph.
 // Middle-truncate so BOTH ends stay visible (the drive and the file name).
 static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
@@ -6104,7 +6256,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.23  |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.1.24  |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6156,69 +6308,120 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
-    case WM_NCCALCSIZE:
-        // v7.1.17 THE STRUCTURAL FIX: when wParam is TRUE, return 0 -- the
-        // client area is the WHOLE window. The v7.0.9 top-inset kept a real
-        // NC strip (top + the old frame edges), and GDI could still
-        // classic-paint it on drag start / activation / NC recalcs -- that
-        // was the XP caption, no matter how many messages we swallowed.
-        // With the client covering everything there is no NC area for ANY
-        // frame painter to draw into: the custom bar is the only chrome
-        // that can ever appear. (wParam FALSE: DefWindowProc.)
-        if (wp) return 0;
+    case WM_CREATE:
+        // v7.1.24 (main.c): inform the application of the frame change to
+        // force redrawing with the new client area that the WM_NCCALCSIZE
+        // insets define. (The tray surrogate takes the same nudge -- a
+        // hidden 0x0 window, harmless.)
+        SetWindowPos(
+          w, NULL,
+          0, 0, 0, 0,
+          SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+        );
         break;
-    case 0x00AE:   // WM_NCUAHDRAWCAPTION (undocumented)
-    case 0x00AF: { // WM_NCUAHDRAWFRAME   (undocumented)
-        // v7.1.0 THE FIRST-DRAG XP BAR: on the first drag (and some
-        // activations) Windows paints its XP-era themed caption through
-        // these two messages -- NOT through WM_NCPAINT -- so the retired
-        // caption flashed back over our bar exactly once per session.
-        // Both are answered with 0: the bar is ours, nobody else draws it.
+    case WM_NCCALCSIZE: {
+        // v7.1.24 (main.c verbatim): when wParam is TRUE the client is the
+        // whole window MINUS the frame insets on left/right/bottom (top
+        // only when maximized -- unreachable here, the size lock refuses
+        // every maximize). The DWM border + drop shadow own a real NC
+        // strip again, and no frame painter -- themed, classic, or the
+        // undocumented 0x00AE/0x00AF pair -- can strike into the client
+        // pixels anymore: there is simply no client pixel it may paint.
+        // The designed 880x620+kCapH client survives because the creation
+        // size grew by the same insets (guiCalcFrameInsets).
+        if (!wp) break;   // wParam FALSE: DefWindowProc
+        int frame_x = GetSystemMetrics(SM_CXFRAME);
+        int frame_y = GetSystemMetrics(SM_CYFRAME);
+        int padding = GetSystemMetrics(SM_CXPADDEDBORDER);
+
+        NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
+        RECT* requested_client_rect = params->rgrc;
+
+        requested_client_rect->right  -= frame_x + padding;
+        requested_client_rect->left   += frame_x + padding;
+        requested_client_rect->bottom -= frame_y + padding;
+
+        if (win32_window_is_maximized(w)) {
+            requested_client_rect->top += frame_y + padding;
+        }
+
         return 0; }
-    case WM_NCPAINT:
-        // v7.1.22: an NC recalc is exactly when a themed engine strikes --
-        // heal the whole face first, then re-land the bar.
-        guiBlitFullFace(w);
-        guiPaintBar(w);                 // the bar is ours; never the classic frame
-        return 0;
-    case WM_NCACTIVATE:
-        // v7.1.23 THE FLICKER WAS THE DEFAULT PROC ITSELF: on the
-        // customized-visual-style machine the themed frame painter runs
-        // INSIDE DefWindowProc(WM_NCACTIVATE) -- even with lParam -1 (the
-        // v7.1.18 field note said exactly this) -- striking the hard
-        // classic frame over the edges; the v7.1.22 full-face heal then
-        // overwrote the strike one frame later, which the field saw as
-        // FLICKERS of the Windows-2000 edges. So the default proc is NOT
-        // CALLED AT ALL: returning TRUE keeps the activation state, the
-        // window has no NC area to repaint, and no painter -- themed or
-        // classic -- is ever invoked. The heal blits stay as pure
-        // insurance (they are no-ops when nobody struck).
-        guiBlitFullFace(w);
-        guiPaintBar(w);
-        return TRUE;
     case WM_NCHITTEST: {
-        // v7.1.17: the bar is CLIENT pixels now, so the drag answer is
-        // EXPLICIT (DefWindowProc's frame logic no longer owns any strip).
-        // Top 31 px: the close slot stays HTCLIENT (clicks + hover stay
-        // ours), everything else is HTCAPTION -- drag, snap, Alt+Space and
-        // the WS_SYSMENU right-click all work through it. v7.1.18: below
-        // the bar the answer is a flat HTCLIENT -- the style now carries
-        // WS_THICKFRAME, and DefWindowProc would answer resize hittests at
-        // the edges (HTBOTTOMRIGHT & co.) for a window that cannot resize.
-        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-        RECT wr; GetWindowRect(w, &wr);
-        if (pt.y - wr.top >= 0 && pt.y - wr.top < kCapH) {
-            if (pt.x - wr.left >= (wr.right - wr.left) - S(46))
-                return HTCLIENT;
+        // v7.1.24 (main.c): let the default procedure handle the resizing
+        // areas (the v7.1.20 size lock still refuses every actual resize,
+        // so an edge drag ends where it started). Then the example's
+        // manual fix for the top hit area the NCCALCSIZE adjustment
+        // confuses, then the caption: the whole bar strip (client
+        // y < kCapH) is HTCAPTION -- drag, snap, Alt+Space and the
+        // right-click system menu all work through it, and the caption
+        // buttons ride HTCAPTION exactly like the example (their clicks
+        // are intercepted in the NC button messages via the hovered slot).
+        // No HTMAXBUTTON hook: there is no maximize button (no SnapLayout).
+        LRESULT hit = DefWindowProc(w, msg, wp, lp);
+        switch (hit) {
+            case HTNOWHERE:
+            case HTRIGHT:
+            case HTLEFT:
+            case HTTOPLEFT:
+            case HTTOP:
+            case HTTOPRIGHT:
+            case HTBOTTOMRIGHT:
+            case HTBOTTOM:
+            case HTBOTTOMLEFT: {
+                return hit;
+            }
+        }
+        POINT cursor_point = {0};
+        cursor_point.x = GET_X_PARAM(lp);
+        cursor_point.y = GET_Y_PARAM(lp);
+        ScreenToClient(w, &cursor_point);
+        // We should not return HTTOP when hit-testing a maximized window
+        if (!win32_window_is_maximized(w) && cursor_point.y > 0 &&
+            cursor_point.y < g_frmInsY) {
+            return HTTOP;
+        }
+
+        // Since we are drawing our own caption, this needs a custom test
+        if (cursor_point.y < kCapH) {
             return HTCAPTION;
         }
+
         return HTCLIENT; }
-    case WM_NCMOUSEMOVE:
-        if (g_capHot) { g_capHot = false; guiPaintBar(w); }   // left the X onto the drag area
-        break;
+    case WM_NCMOUSEMOVE: {
+        // v7.1.24 (main.c): track which caption button the mouse is over
+        // -- the hovered slot rides GWLP_USERDATA, exactly like the
+        // example. The buffered bar repaints as ONE blit on every change
+        // (the example invalidates the three button rects; the buffered
+        // full-bar blit lands the same pixels with no intermediate state).
+        POINT cursor_point;
+        GetCursorPos(&cursor_point);
+        ScreenToClient(w, &cursor_point);
+
+        RECT cr; GetClientRect(w, &cr);
+        const RECT bar = { 0, 0, cr.right, kCapH };
+        const CustomTitleBarButtonRects button_rects =
+            win32_get_title_bar_button_rects(w, &bar);
+
+        int new_hovered_button = CustomTitleBarHoveredButton_None;
+        if (PtInRect(&button_rects.close, cursor_point)) {
+            new_hovered_button = CustomTitleBarHoveredButton_Close;
+        } else if (PtInRect(&button_rects.minimize, cursor_point)) {
+            new_hovered_button = CustomTitleBarHoveredButton_Minimize;
+        }
+        if (new_hovered_button != (int)GetWindowLongPtrW(w, GWLP_USERDATA)) {
+            // v7.1.24: the slot updates FIRST, then the bar repaints -- the
+            // buffered blit is synchronous and would otherwise land the
+            // STALE face (the example's InvalidateRect is async, so its
+            // invalidate-before-set order never shows the old state).
+            SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)new_hovered_button);
+            guiPaintBar(w);
+        }
+        return DefWindowProc(w, msg, wp, lp); }
     case WM_ACTIVATE:
         // v7.1.20: the bar dims when the window loses activation -- re-blit
-        // it on every activation change (DefWindowProc still runs).
+        // it on every activation change (DefWindowProc still runs). The
+        // example invalidates the bar rect here; the buffered blit is the
+        // same pixels without the invalidation round-trip.
         guiPaintBar(w);
         break;
     case WM_WINDOWPOSCHANGING: {
@@ -6228,10 +6431,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // the designed size in every sizing pass so the fixed layout cannot
         // be stretched by the shell. (WM_SYSCOMMAND refuses SC_SIZE and
         // SC_MAXIMIZE on top; WM_GETMINMAXINFO stays as the third belt.)
+        // v7.1.24: the designed size is now the CLIENT plus the frame
+        // insets WM_NCCALCSIZE takes back out.
         WINDOWPOS* p = (WINDOWPOS*)lp;
         if (p && !(p->flags & SWP_NOSIZE)) {
-            p->cx = KCLI_W;
-            p->cy = KCLI_H + kCapH;
+            p->cx = KCLI_W + 2 * g_frmInsX;
+            p->cy = KCLI_H + kCapH + g_frmInsY;
         }
         break; }
     case WM_SYSCOMMAND: {
@@ -6240,8 +6445,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // IDM_TRAY_EXIT from the appended system-menu item is the real quit.
         // NOTE: the 0xFFF0 mask is only for the built-in SC_* values -- the
         // custom menu id must compare against the full wParam.
+        // v7.1.24: SC_RESTORE passes again -- the main.c caption brings the
+        // minimize button, and the taskbar's restore click rides SC_RESTORE.
         const int sc = (int)(wp & 0xFFF0);
-        if (sc == SC_MAXIMIZE || sc == SC_SIZE || sc == SC_RESTORE) return 0;
+        if (sc == SC_MAXIMIZE || sc == SC_SIZE) return 0;
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
             if (g_engState.load() != 0) guiStopEngine();
@@ -6277,7 +6484,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int cw = crc.right, ch = crc.bottom;
         if (guiFrameBufEnsure(cw, ch)) {
             guiPaintFrame(g_frmDc, cw, ch);
-            g_frmFaceReady = true;   // v7.1.22: the heal source exists
             BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                    g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
@@ -6475,60 +6681,81 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
-    case WM_LBUTTONDOWN: {
-        // v7.1.17: the bar is client pixels -- the close slot arrives with
-        // client coords y 0..kCapH. v7.1.23: the X has a PRESSED face now,
-        // so it behaves like every caption button since forever -- press
-        // arms it (capture held), release INSIDE the slot fires the close
-        // (which hides to the tray, engine stays up); release outside
-        // cancels. Clicks on the rest of the bar stay inert.
-        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        RECT cl = guiCapCloseRect(w);   // client == window rect now
-        if (cy < kCapH) {
-            if (cx >= cl.left && cx < cl.right) {
-                g_capDown = true;
-                g_capHot  = true;
-                SetCapture(w);
-                guiPaintBar(w);
-            }
+    case WM_NCLBUTTONDOWN:
+        // v7.1.24 (main.c): clicks on the caption buttons are handled in
+        // WM_NCLBUTTONUP, but the DOWN must not count as a drag start --
+        // swallow it when a button slot is hovered. Everything else keeps
+        // the default handling (dragging, and the double-click maximize
+        // that the size lock refuses anyway). Ideally you also want to
+        // check that the mouse hasn't moved out or too much between DOWN
+        // and UP messages -- the example's own caveat, kept: the hovered
+        // slot re-evaluates on every NC mouse move, so a release off the
+        // button simply dispatches nowhere.
+        if (GetWindowLongPtrW(w, GWLP_USERDATA)) {
+            return 0;
+        }
+        break;
+    // v7.1.24 (main.c): map the button clicks to the right messages. The
+    // close posts WM_CLOSE -- twinspeak's WM_CLOSE hides to the tray with
+    // the engine still running, unchanged. Minimize is new (the example's
+    // SW_MINIMIZE; the taskbar button restores it via SC_RESTORE, which
+    // WM_SYSCOMMAND passes again). There is no maximize branch: no
+    // maximize button is drawn, the size lock refuses SC_MAXIMIZE.
+    case WM_NCLBUTTONUP: {
+        const int hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
+        if (hovered == CustomTitleBarHoveredButton_Close) {
+            PostMessageA(w, WM_CLOSE, 0, 0);
+            return 0;
+        } else if (hovered == CustomTitleBarHoveredButton_Minimize) {
+            ShowWindow(w, SW_MINIMIZE);
             return 0;
         }
         break; }
-    case WM_LBUTTONUP: {
-        // v7.1.23: fire on release-inside; the pressed face dies here
-        // either way.
-        if (!g_capDown) break;
-        g_capDown = false;
-        RECT cl = guiCapCloseRect(w);
-        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        const bool inside = (cx >= cl.left && cx < cl.right) && cy < kCapH;
-        if (GetCapture() == w) ReleaseCapture();
-        guiPaintBar(w);
-        if (inside) PostMessageA(w, WM_CLOSE, 0, 0);
-        return 0; }
-    case WM_CAPTURECHANGED:
-        // v7.1.23: the capture was taken from us (a menu, a system dialog)
-        // -- the pressed face must not stick.
-        if (g_capDown) { g_capDown = false; guiPaintBar(w); }
-        return 0;
-    case WM_MOUSEMOVE: {
-        // hover feedback for the bar's X; TrackMouseEvent arms the leave.
-        // v7.1.23: the hot test is the STRICT slot rect -- during a press
-        // (capture held) the coords can land far outside the window, and
-        // the old "negative-y counts" legacy row would have kept the face
-        // lit while dragging above the window; a pressed button unlights
-        // the moment the cursor leaves the slot.
-        const int cx = (short)LOWORD(lp), cy = (short)HIWORD(lp);
-        RECT cl = guiCapCloseRect(w);   // client == window rect now
-        const bool hot = (cy >= 0 && cy < kCapH && cx >= cl.left && cx < cl.right);
-        if (hot != g_capHot) {
-            g_capHot = hot;
-            if (hot) { TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, w, 0 }; TrackMouseEvent(&t); }
+    case WM_NCRBUTTONUP:
+        // v7.1.24 (main.c): right-click the caption -- the system menu with
+        // the item states the size lock actually honors. The example
+        // enables Move/Size/Maximize on a non-maximized window; here the
+        // v7.1.20 size lock refuses Size and Maximize outright, so those
+        // two are DISABLED (a dead menu item is the same lie as a dead
+        // button) while Move (dragging works), Minimize, Close and the
+        // appended "Exit twinspeak" (IDM_TRAY_EXIT through WM_SYSCOMMAND)
+        // stay real. ONE further deviation from the example: the handled
+        // case returns 0, because DefWindowProc(WM_NCRBUTTONUP) posts its
+        // own SC_MOUSEMENU menu on top of the one already shown.
+        if (wp == HTCAPTION) {
+            BOOL const isMaximized = IsZoomed(w);
+            MENUITEMINFO menu_item_info;
+            memset(&menu_item_info, 0, sizeof(menu_item_info));
+            menu_item_info.cbSize = sizeof(menu_item_info);
+            menu_item_info.fMask  = MIIM_STATE;
+            HMENU const sys_menu = GetSystemMenu(w, false);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_RESTORE,  isMaximized);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_MOVE,     true);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_SIZE,     false);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_MINIMIZE, true);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_MAXIMIZE, false);
+            set_menu_item_state(sys_menu, &menu_item_info, SC_CLOSE,    true);
+            BOOL const result = TrackPopupMenu(sys_menu, TPM_RETURNCMD,
+                                               GET_X_PARAM(lp), GET_Y_PARAM(lp),
+                                               0, w, NULL);
+            if (result != 0) {
+                PostMessageA(w, WM_SYSCOMMAND, result, 0);
+            }
+            return 0;
+        }
+        break;
+    case WM_SETCURSOR:
+        // v7.1.24 (main.c): show an arrow instead of the busy cursor.
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        break;
+    case WM_MOUSEMOVE:
+        // v7.1.24 (main.c): if the mouse gets into the client area then no
+        // caption button is hovered -- reset the hover state.
+        if (GetWindowLongPtrW(w, GWLP_USERDATA)) {
+            SetWindowLongPtrW(w, GWLP_USERDATA,
+                              (LONG_PTR)CustomTitleBarHoveredButton_None);
             guiPaintBar(w);
         }
-        break; }
-    case WM_MOUSELEAVE:
-        if (g_capHot || g_capDown) { g_capHot = false; g_capDown = false; guiPaintBar(w); }
         break;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
@@ -6660,12 +6887,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break; }
     case WM_GETMINMAXINFO: {
-        // v6.6.3 polish, v6.6.5 size; v7.1.17: the client IS the window --
-        // the frame is the designed 880x620 content plus the 31 px bar.
-        // min == max == no resizing at all.
+        // v6.6.3 polish, v6.6.5 size; v7.1.24: the WINDOW is the designed
+        // 880x620 client + the 31 px bar + the frame insets (WM_NCCALCSIZE
+        // takes the insets back out). min == max == no resizing at all.
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
-        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = KCLI_W;
-        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH;
+        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = KCLI_W + 2 * g_frmInsX;
+        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
@@ -6815,14 +7042,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // Real exit lives in the tray menu (Exit) and the system menu's
         // "Exit twinspeak" (v7.1.20). A balloon tells the user where the
         // window went (the first three closes per session).
-        // v7.1.20: capture the position for the ini, clear the stale X hover,
-        // and let the 250 ms tick sleep while hidden (it returns in
-        // guiRestoreWindow). The hidden tray surrogate ignores WM_CLOSE
-        // entirely (taskkill broadcasts reach it too).
+        // v7.1.20: capture the position for the ini, and let the 250 ms
+        // tick sleep while hidden (it returns in guiRestoreWindow). The
+        // hidden tray surrogate ignores WM_CLOSE entirely (taskkill
+        // broadcasts reach it too).
         if (w == g_trayWnd) return 0;
         guiCaptureWindowPos(w);
-        g_capHot = false;
-        g_capDown = false;   // v7.1.23: never hide with a stuck press face
         KillTimer(w, 1);
         tbHideTab(w);
         trayAdd(true);
@@ -6918,7 +7143,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         if (setAppId) setAppId(L"TidyVision.TwinSpeak");
     }
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
-    guiInitDpi();   // v7.1.20: FIRST geometry act -- scale every constant + font
+    guiInitDpi();          // v7.1.20: FIRST geometry act -- scale every constant + font
+    guiCalcFrameInsets();  // v7.1.24: SECOND geometry act -- the frame insets
+                           // (SM_CXFRAME/CYFRAME + CXPADDEDBORDER, already in
+                           // real pixels for a System-DPI-aware process) that
+                           // WM_NCCALCSIZE removes and the creation size adds.
     // v7.1.5 boot pop, round two (winner side): a PLAIN launch that beats the
     // Run-key --tray instance to the mutex shows its window and lets the real
     // startup twin die silently -- the boot pop, from the other direction.
@@ -7298,7 +7527,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_qpcBoot = c;
     }
 
-    // keep-alive cycle table (v7.1.7: BUILT IN -- 1 Hz @ 0.0001, no ini, no UI)
+    // keep-alive cycle table (BUILT IN -- v7.1.24: 40 Hz @ 0.005, no ini, no UI)
     g_kaHz = kKeepAliveHz;
     g_kaGain = kKeepAliveGain;
     g_kaLen = (unsigned)((double)kSampleRate / (double)g_kaHz + 0.5);
