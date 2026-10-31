@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,45 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.3 THE NC-FLIP PRESENT. The field: "the top bar still doesn't
+//            want to cooperate. On google chrome, the top bar going to
+//            the inactive state is instant. Look at the frames from the
+//            video and you'll see what I mean." The frames, decoded at
+//            60 fps: deactivating, the border row sits on its active
+//            composite for one frame, then goes BARE GLASS -- brighter
+//            than either endpoint -- for two to three frames, and only
+//            then lands on the settled inactive gray; the bar face (the
+//            title text) flips on that same last frame. Activating is
+//            already instant. The reason: the DWM re-bakes the extended
+//            sheet row at the compose that carries the activation flip,
+//            and that compose happens INSIDE the deactivation
+//            transaction -- WM_NCACTIVATE is sent within it, WM_ACTIVATE
+//            is only POSTED after it -- so the flip compose always reads
+//            the row the ACTIVE state last wrote: alpha 0, bare glass
+//            (the bright flash), and the inactive bytes every later path
+//            writes (the v7.2.2 flushed hook present, WM_ACTIVATE's blit,
+//            the burst) land one to three composes late. The fix rides
+//            the one message that arrives in time: WM_NCACTIVATE(FALSE).
+//            BEFORE DefWindowProc flips the frame state, the handler
+//            paints the WHOLE bar inactive -- face and row 0 -- into the
+//            buffer and GdiFlush()es it into the redirection surface;
+//            win32k cannot resume the transaction until the WndProc
+//            returns, so the flip compose reads inactive bytes BY
+//            ORDERING: no glass frame, no stale face, one composed frame
+//            -- Chrome-instant -- with or without the measured cache
+//            (with it, row 0 is the opaque settled color; without it, the
+//            recipe bytes ride the fade exactly like a native frame's
+//            own strips do). The v7.2.1 mouse hook stays as the belt for
+//            the click paths; WM_ACTIVATE still arms the burst (its
+//            blit now repaints an already-inactive face -- a visual
+//            no-op that keeps the fade tracking). And the cache seed
+//            learns to RETRY: the burst-tail measurement bails on
+//            transient guards (a covered row, a compose in flight), and
+//            one bail used to leave the cache empty until the next full
+//            burst; while the window sits inactive with no cache the
+//            measure now re-arms at 250 ms until it succeeds, so the
+//            opaque instant row engages from the first steady
+//            deactivation. Version steps to 7.2.3.
 //    v7.2.2 THE FLUSHED EARLY PRESENT. The field: "I still see that when
 //            the window goes unfocused that it still shows the stale
 //            version which immediately goes to the official unfocused
@@ -4392,6 +4431,12 @@ static unsigned g_bakeTicks = 0;
 static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
 static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
 static bool     g_forceInstantRow = false; // v7.2.1: hook early-present -- one opaque row even while active
+static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
+                                             // inactive face INSIDE the deactivation
+                                             // transaction (GetActiveWindow still
+                                             // returns us until the handler returns;
+                                             // without the force the pre-flip present
+                                             // would repaint the ACTIVE face)
 static HHOOK    g_mouseHook      = nullptr; // v7.2.1: the early-present mouse hook (see guiMain)
 static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
 // renders the whole bar into dc (memory buffer or screen -- identical code)
@@ -4687,7 +4732,11 @@ static void guiPaintBar(HWND w) {
     // the blit target is the CLIENT dc -- the window owns a real frame now,
     // so the bar is client pixels at (0,0), not window pixels.
     const int  hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
-    const bool active = (GetActiveWindow() != nullptr);   // GUI thread only
+    // v7.2.3: g_forceInactiveFace -- WM_NCACTIVATE(FALSE) runs BEFORE the
+    // deactivation completes, so GetActiveWindow() still returns this window
+    // and the plain read would repaint the ACTIVE face into what must be the
+    // pre-flip INACTIVE present. The force wins over the queue read.
+    const bool active = !g_forceInactiveFace && (GetActiveWindow() != nullptr);   // GUI thread only
     RECT cr; GetClientRect(w, &cr);
     const int cw = cr.right - cr.left;
     if (cw <= 0) return;
@@ -6903,7 +6952,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.2  |  %s",   // v7.2.2 flushed early present (v7.1.28 fixed the stale v7.1.25)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.3  |  %s",   // v7.2.3 NC-flip present (v7.2.2 flushed early present)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7069,6 +7118,39 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             guiPaintBar(w);
         }
         return DefWindowProcW(w, msg, wp, lp); }   // v7.1.26: W, not the A macro
+    case WM_NCACTIVATE:
+        // v7.2.3 THE NC-FLIP PRESENT. The video's frames, decoded: on
+        // deactivation the DWM re-bakes the extended-sheet row at the
+        // compose that carries the activation flip, and that compose is
+        // part of the transaction win32k is still running -- WM_NCACTIVATE
+        // is SENT inside it, WM_ACTIVATE is only QUEUED behind it -- so the
+        // flip compose always sampled the row the ACTIVE state last wrote
+        // (alpha 0 = bare glass, the bright flash), and the inactive bytes
+        // the later paths write landed one to three composes late, taking
+        // the bar face with them. This message is the one signal a window
+        // gets IN time: painting the whole bar inactive here -- face and
+        // row 0, GdiFlush()ed (guiPaintBar ends with it since v7.2.2) --
+        // puts the bytes in the redirection surface BEFORE DefWindowProc
+        // below tells the frame to flip, and win32k cannot resume the
+        // transaction until this WndProc returns. The flip compose reads
+        // inactive bytes by ordering: no glass frame, no stale face, one
+        // composed frame, Chrome-instant -- with or without the cache (with
+        // it, row 0 is the opaque settled color via g_instantHold; without,
+        // the recipe bytes ride the fade like a native frame's own strips).
+        // Activation (wParam != 0) needs none of this: the active look IS
+        // the glass and the DWM's own fade draws it (the video shows that
+        // direction is already instant). DefWindowProc still runs -- the
+        // case falls to the common tail; swallowing the message would
+        // freeze the frame state.
+        if (!wp && IsWindowVisible(w) && !IsIconic(w)) {
+            g_instantHold = (g_instantInactive != 0);   // same latch rule as WM_ACTIVATE
+            g_forceInactiveFace = true;                 // the face must be the INACTIVE one
+            guiPaintBar(w);                             // face + row 0 + GdiFlush
+            g_forceInactiveFace = false;
+            g_bakeTicks = 0;
+            SetTimer(w, 4, 20, nullptr);                // the burst still tracks the fade
+        }
+        break;
     case WM_ACTIVATE:
         // v7.1.20: the bar dims when the window loses activation -- re-blit
         // it on every activation change (DefWindowProc still runs). The
@@ -7597,6 +7679,24 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g_bakeTicks = 0;
                 KillTimer(w, 4);
                 guiMeasureInstantRow();   // the settled composite is on screen now
+                // v7.2.3 THE MEASURE RETRY: the measurement is guarded --
+                // WindowFromPoint must return us at all three samples (a
+                // raised window over the row, a menu closing), the samples
+                // must agree within +/-2 (a compose in flight fails this).
+                // One bail used to leave the cache empty until the NEXT
+                // full deactivation burst -- the field's video ran a whole
+                // session with no cache, so the v7.2.1 hook and the
+                // v7.2.0 hold never engaged. While the window stays
+                // inactive, re-arm softly: 250 ms, pending flag set, so
+                // the next tick is a bare re-measure (no burst). The first
+                // success leaves the flag clear and the timer dead;
+                // WM_ACTIVATE resets the flag and re-arms the 20 ms burst
+                // as always, so the fade tracking is untouched.
+                if (!g_instantInactive && GetActiveWindow() == nullptr
+                    && IsWindowVisible(w) && !IsIconic(w)) {
+                    g_measurePending = true;
+                    SetTimer(w, 4, 250, nullptr);
+                }
             } else if (++g_bakeTicks >= 20) {
                 g_instantHold = false;    // fade window over: hand the row back
                 g_bakeTicks = 0;
