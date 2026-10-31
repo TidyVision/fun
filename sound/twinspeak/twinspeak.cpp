@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.29 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.31 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,41 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.31 THE SETTLE BURST. The field: "make it so that when the
+//            window goes unfocused that it immediately updates the
+//            window." v7.1.30's single 400 ms bake worked but read as a
+//            visible delay: the row sat on its mid-fade composite for
+//            two fifths of a second, then snapped. Fix: WM_ACTIVATE now
+//            arms a BURST -- timer 4 at 20 ms, twenty re-presents
+//            (~400 ms) -- so the sheet row is presented continuously
+//            across the DWM's ~200 ms activation fade and tracks it
+//            frame by frame, reading inactive the moment the fade lands
+//            (the same schedule the DWM's own NC strips follow; nothing
+//            snaps). The counter re-arms with the timer on rapid focus
+//            toggles, last state wins.
+//    v7.1.30 THE SETTLE BAKE. The field (v7.1.29, bytes verified right):
+//            "Maybe try RGB(0, 0, 0) regardless of active? Btw, when I
+//            hover the close button, the inactive border color's top
+//            piece actually cooperates. Why is this?" Answer: the row
+//            bytes are IDENTICAL with or without the hover -- same bytes,
+//            wrong color at deactivation, right color seconds later, so
+//            the TIMING is the bug. The DWM evaluates the extended-sheet
+//            blend WHEN THE WINDOW PRESENTS NEW PIXELS for the row, not
+//            continuously while its activation state settles. WM_ACTIVATE
+//            arrives BEFORE the DWM's ~200 ms activation fade has run, so
+//            the deactivation blit baked the 50/50 blend against the
+//            STILL-ACTIVE sheet and the wrong composite stuck (nothing
+//            re-presented the row). The close hover re-presents the bar
+//            seconds later -- DWM fully inactive by then -- and the same
+//            bytes bake correctly. Fix: WM_ACTIVATE schedules a one-shot
+//            400 ms re-blit (timer 4) that presents the row against the
+//            SETTLED state (both directions; focus gain has the same race
+//            in reverse). Opaque black regardless of active is NOT
+//            adopted: black serves the ACTIVE sheet only (black = show
+//            the glass = the accent frame); inactive, the bare sheet has
+//            no border color at all (v7.1.29's screenshot measured
+//            #FFFFFF on it), so the semi-transparent premultiplied gray
+//            IS the delivery.
 //    v7.1.29 THE ALPHA NEVER LEFT THE BUILDING. Field screenshot, window
 //            unfocused: the top row read #FFFFFF (the bare light-mode
 //            sheet) while the DWM's own left/right edges read #AAAAAA.
@@ -4253,8 +4288,16 @@ static bool guiBarBufEnsure(int ww, int hh) {
 // that alpha over the sheet, the same way it draws the left/right/bottom
 // NC strips). Without the sheet the v7.1.26 fake-shadow recipe stays the
 // fallback, so a failed extend can never paint a dead black line into the
-// bar.
+// bar. v7.1.30: the bytes are final; the remaining variable is WHEN the
+// DWM sees them -- it bakes the sheet blend when the window presents
+// pixels, and the WM_ACTIVATE blit lands mid-fade, so WM_ACTIVATE arms
+// a settle BURST (timer 4): twenty 20 ms re-presents that track the
+// fade frame by frame (see WM_ACTIVATE).
 static bool g_glassSheet = false;
+// v7.1.31: the settle burst's remaining ticks (see WM_ACTIVATE/WM_TIMER):
+// WM_ACTIVATE zeroes it and arms timer 4; each tick re-presents the bar
+// and consumes one, twenty in total (~400 ms of fade tracking).
+static unsigned g_bakeTicks = 0;
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
 // (no maximize -- the size lock refuses it), hover faces driven by the
@@ -4340,8 +4383,16 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // Windows' "title bars and window borders" override is on, the
     // default semi-transparent gray when it is not. NO sheet (the extend
     // call failed): the v7.1.26 fake-shadow recipe stays as the fallback
-    // -- a failed extend can never paint a dead black line. The v7.1.26
-    // gradient offset stays: the face starts 1px down, so this row
+    // -- a failed extend can never paint a dead black line. v7.1.30: the
+    // DWM bakes this blend when the window PRESENTS pixels, and the
+    // WM_ACTIVATE blit lands before the ~200 ms activation fade finishes
+    // -- the mid-transition composite sticks until some later update
+    // re-presents the row (the field: "when I hover the close button the
+    // inactive top piece actually cooperates"). v7.1.31: WM_ACTIVATE arms
+    // a settle burst (timer 4, twenty 20 ms re-presents) so the row is
+    // presented continuously across the fade and tracks it frame by
+    // frame -- inactive the moment the fade lands, nothing snaps. The
+    // v7.1.26 gradient offset stays: the face starts 1px down, so this row
     // belongs to the border alone.
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
@@ -4452,6 +4503,12 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 //                                      own edges.
 // Byte order in the DIB is little-endian BGRA, so one u32 covers a pixel;
 // the row is <= ~900 pixels, the patch costs nothing next to GDI+.
+// v7.1.30: the bytes are unchanged -- the fix is WHEN they reach the
+// screen. v7.1.31: WM_ACTIVATE arms a settle burst (timer 4, twenty
+// 20 ms ticks) that re-runs this patch + the blit continuously across
+// the DWM's activation fade, because the DWM bakes the sheet blend at
+// presentation time and the immediate WM_ACTIVATE blit lands mid-fade
+// (see WM_ACTIVATE).
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
     const unsigned px = active ? 0x00000000u        // BGRA(0, 0, 0, 0)
@@ -6569,7 +6626,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.1.29  |  %s",   // v7.1.29 (v7.1.28 fixed the stale v7.1.25)
+    snprintf(vbuf, sizeof(vbuf), "v7.1.31  |  %s",   // v7.1.31 settle burst (v7.1.28 fixed the stale v7.1.25)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -6740,7 +6797,24 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // it on every activation change (DefWindowProc still runs). The
         // example invalidates the bar rect here; the buffered blit is the
         // same pixels without the invalidation round-trip.
+        // v7.1.30 THE SETTLE BAKE, v7.1.31 THE SETTLE BURST: this blit
+        // lands BEFORE the DWM's ~200 ms activation fade has run, and the
+        // DWM evaluates the extended-sheet blend when the window presents
+        // pixels -- so the immediate blit bakes the sheet row against the
+        // OLD activation state and the wrong composite sticks (the field:
+        // the row only looked right after hovering a caption button
+        // re-presented it). One late bake (v7.1.30) read as a visible
+        // delay-and-snap, so the re-presentation is a BURST now: timer 4
+        // at 20 ms, twenty ticks -- the row is presented continuously
+        // across the fade, tracks it frame by frame, and reads inactive
+        // the moment the fade lands. The field's close-button hover was
+        // this exact re-present, performed by accident; now it is the
+        // default. Counter + timer re-arm on rapid toggles, the last
+        // activation state wins; the immediate blit stays (the face
+        // dim/undim must be instant).
         guiPaintBar(w);
+        g_bakeTicks = 0;
+        SetTimer(w, 4, 20, nullptr);
         break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
@@ -7213,6 +7287,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
+        // v7.1.30: timer 4 = the settle bake. v7.1.31: a BURST -- twenty
+        // 20 ms re-blits spanning ~400 ms -- so the sheet row is
+        // re-presented continuously across the DWM's ~200 ms activation
+        // fade and tracks it frame by frame (the immediate WM_ACTIVATE
+        // blit lands mid-fade; see WM_ACTIVATE). Kills itself after the
+        // last tick.
+        if (wp == 4) {
+            guiPaintBar(w);
+            if (++g_bakeTicks >= 20) { KillTimer(w, 4); g_bakeTicks = 0; }
+            return 0;
+        }
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
         // re-tries every 2 s until the shell accepts it).
         if (wp == 3) {
