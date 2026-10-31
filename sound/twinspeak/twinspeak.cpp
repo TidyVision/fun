@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,130 +23,47 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.2.7 THE STAGED SHEET. The field: "I want all four strips
-//            to be truly accurate. The top bar is not opaque on
-//            true DWM (if at all). I can clearly tell... The top
-//            strip needs to look like the bottom strip where it's
-//            just normal." The real top border is the DWM's own
-//            translucent sheet -- the same backdrop-tinting material
-//            the sides wear (#AAAAAA over a white desktop, #A7A2A1
-//            over the pinkish one, the field's tapes) -- and no
-//            owned color can imitate a composite; but the sheet's
-//            transition lag (v7.1.27..v7.2.4, eight versions of
-//            tapes) was real too. So the ownership is STAGED: through
-//            every activation flip the row is ours -- sheet
-//            retracted, opaque cover, the NC-flip present that is
-//            two tapes proven at the flip compose; +250 ms the sheet
-//            is re-extended UNDER the still-opaque row (arming);
-//            +150 ms more row 0 goes transparent and the DWM's real
-//            border owns the top edge (glass) -- all four strips one
-//            material, truly accurate by construction, because it
-//            IS the border. Timer 6 walks the schedule; shows
-//            restage it; a no-DWM machine stays covered (the v7.2.6
-//            look). The computed pair (HC captions / the accent
-//            override / the stock dark grays) and the 1000 ms poll
-//            stay, feeding the covers. Version steps to 7.2.7.
-//    v7.2.6 THE FRAME'S OWN INPUTS. The field: "This just makes the
-//            top border bar look hideous now... I want specifically
-//            that top bar of the custom window border to be like the
-//            left, right, and bottom edges, to make it accurate like
-//            on the windows 10 window style. Right now, the window's
-//            top border is white, which it shouldn't be." The v7.2.5
-//            strip sampler was blind from birth: GetPixel off a
-//            screen DC reads the GDI surface, and the DWM's frame
-//            drawing lives only in the compositor -- at the strip
-//            coordinates the GDI sees our own redirection surface,
-//            which nobody ever paints. White. (The tapes could
-//            measure #777777/#A7A2A1 because SCREENSHOTS see the
-//            composite; GetPixel never will.) So the row stops being
-//            a photograph of the strips and becomes their sibling:
-//            the colors are computed from the same inputs the DWM
-//            itself reads when it paints them -- high contrast's
-//            caption colors; the Settings accent override
-//            (ColorPrevalence bit 0 + AccentColor, ColorizationColor
-//            as the older-build fallback); and the stock dark-scheme
-//            grays the field's own tapes measured off THIS window's
-//            strips (it sets DWMWA_USE_IMMERSIVE_DARK_MODE, so those
-//            ARE its strip colors). Timer 5 drops to a 1000 ms
-//            registry poll that repaints only on change; the
-//            sampler, the stability gate, the 250 ms grace window
-//            and the move re-tint are all retired with it. The
-//            NC-flip present is untouched: face and row still land
-//            at the flip compose, instant both directions. Version
-//            steps to 7.2.6.
-//    v7.2.5 THE OWNED ROW. The field: "My only issue now is that the
-//            window's deactivate frame shows a stale frame for up to
-//            a few frames before finally going to the official
-//            deactivate frame." The tapes, decoded across v7.2.3 and
-//            v7.2.4, always said the same thing: the FACE -- plain
-//            client pixels, presented inside WM_NCACTIVATE before
-//            DefWindowProc flips the frame -- lands on the FIRST
-//            compose every time, on every path; the top border ROW --
-//            the DWM glass sheet's 1 px extension into the client --
-//            never does. Half-alpha bytes ride the fade to the bare
-//            sheet (v7.2.3's tape), and even OPAQUE bytes arrive late
-//            (v7.2.4's field): during the activation transition the
-//            extended-frame region is the DWM's own visual, it is the
-//            one strip of the window the compositor will not re-read
-//            on our schedule, and no ordering trick can change whose
-//            visual it is. So the sheet goes: no more
-//            DwmExtendFrameIntoClientArea -- row 0 is PLAIN CLIENT,
-//            the same proven channel the face rides. The colors are
-//            not guessed: they are SAMPLED off the DWM's own
-//            left/right NC strips (they are what the top edge must
-//            read as the fourth side of) -- guarded WindowFromPoint,
-//            one strip pixel each side, exactly the v7.2.0 measure
-//            discipline pointed at a surface that actually holds
-//            still. WM_NCACTIVATE now paints the INCOMING state both
-//            directions (active and inactive) before DefWindowProc,
-//            so the whole chrome -- face and row, one blit -- rides
-//            the flip compose: Chrome-instant on deactivate AND
-//            activate, clicks and Alt-Tab alike. A 50 ms tracker
-//            re-samples the strips (stability-gated: two consecutive
-//            equal samples before a color may own the cache), moves
-//            re-tint immediately (WM_WINDOWPOSCHANGED), and a 250 ms
-//            grace window after each flip keeps a strip-side fade
-//            from yanking the row off its instant color. RETIRED
-//            with the sheet: the WH_MOUSE_LL hook and its DwmFlush
-//            (it existed only to pre-feed the glass row -- and its
-//            compose wait added up to a frame of input latency to
-//            every qualifying click in the system), the byte-direct
-//            row surgery, g_instantHold, the 20-tick settle burst,
-//            the #AAAAAA fallback and the measure-retry circus.
-//            Version steps to 7.2.5.
-//    v7.2.4 THE OPAQUE HOLD, CACHE OR NOT. The field: "Even then, it
-//            still doesn't do it. That's solely the only thing I'm
-//            focusing on." The second 60 fps video, decoded: the
-//            v7.2.3 NC-flip present DOES land (the face flips on the
-//            FIRST flash frame -- ordering was never the problem left)
-//            -- but the row still goes to the BARE SHEET for three
-//            composes (#F8F1F0: the sheet reads pinkish-white over
-//            this desktop) before landing on the settled gray
-//            (#A7A2A1). Two reasons, both fixed. (a) The no-cache
-//            path presented the recipe's HALF-ALPHA row at the flip
-//            compose and expected it to ride the fade like the DWM's
-//            own strips; it does not -- during the deactivation fade
-//            the glass blend owns alpha-carrying pixels and shows the
-//            bare sheet (the flash). An OPAQUE pixel has no glass in
-//            its composite and nothing to fade (the v7.1.28-era
-//            opaque row never flashed); so g_instantHold now latches
-//            on EVERY deactivation (cache or not) and the hold branch
-//            writes row 0 opaque ALWAYS -- the measured settled color
-//            when the cache exists, else the recipe's own
-//            white-desktop composite (43 + 0.498*255 = 170 =
-//            RGB(170,170,170), #AAAAAA -- within 9/255 of this
-//            desktop's settled #A7A2A1). The burst tail still hands
-//            the row back to the recipe bytes at ~400 ms and
-//            re-measures. (b) The measurement's +/-2 agreement gate
-//            was structural poison: the sheet blend varies along the
-//            row with the blurred backdrop behind it, three samples
-//            spread across the row never agreed within 2, the cache
-//            could not seed (both taped sessions ran cache-less, so
-//            every deactivation flashed). The measure now trusts the
-//            guarded CENTER sample; the side samples are fallbacks.
-//            First success seeds the cache; every later deactivation
-//            replays the MEASURED color from the flip compose on.
-//            Version steps to 7.2.4.
+//    v7.2.8 BACK TO THE 7.2.3 BASE + THE POST-FLIP NCPAINT. The field:
+//            "Go back to here, because that was when I had almost
+//            had it. Make v7.2.8 with it. And lastly, make it so the
+//            ncpaint happens immediately after you deactivate the
+//            window." The v7.2.5..v7.2.7 strip experiments are
+//            RETIRED whole (the side-strip samplers, the staged
+//            sheet, the computed covers): GetPixel reads the GDI
+//            surface, the DWM's border lives only in the compositor,
+//            and no owned opaque color imitates a blend -- every one
+//            of those covers was a guess wearing the border's
+//            clothes. The base is v7.2.3 VERBATIM: the NC-flip
+//            present at WM_NCACTIVATE(FALSE) (the proven pre-flip
+//            present, two tapes clean), the opaque hold ONLY with a
+//            measured cache, and the settled row = the recipe's
+//            half-alpha BGRA(43,43,43,128) -- the REAL translucent
+//            border the DWM composites over the sheet, the same
+//            material the left/right/bottom strips carry: "almost
+//            had it." What the 7.2.3 tape still caught was the row
+//            BETWEEN states in the first post-flip composes, and the
+//            fix is the field's own last ask, verbatim: WM_NCPAINT is
+//            now HANDLED -- the message win32k sends when it redraws
+//            the frame right after the activation change -- and the
+//            bar (face + row 0) is repainted INSIDE that pass, with
+//            the frame's own redraw, not a queue hop behind it. The
+//            plain truth paints itself there: post-deactivation the
+//            transaction has closed, GetActiveWindow() has moved on,
+//            and guiPaintBar's plain read picks the inactive face;
+//            post-activation it picks the active one (row 0 black =
+//            the glass = the DWM's own frame). Belt: WA_INACTIVE (the
+//            first message AFTER the transaction) also FORCES the
+//            frame paint synchronously -- RedrawWindow RDW_FRAME |
+//            RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE dispatches
+//            WM_NCPAINT inside the WM_ACTIVATE call stack, because
+//            the DWM can draw the flip without ever asking us to
+//            repaint -- so the NC paint happens IMMEDIATELY after
+//            the deactivation, by construction, on every path a
+//            window can see. Idempotent with the burst and every
+//            other presenting path (same buffered bytes, GdiFlush()
+//            at the end of guiPaintBar); DefWindowProc still draws
+//            the real frame from the common tail. Version steps to
+//            7.2.8.
 //    v7.2.3 THE NC-FLIP PRESENT. The field: "the top bar still doesn't
 //            want to cooperate. On google chrome, the top bar going to
 //            the inactive state is instant. Look at the frames from the
@@ -4405,13 +4322,11 @@ static void guiCalcFrameInsets() {
 }
 
 // v7.1.24 (main.c): the caption buttons; the 1px row the example paints
-// its fake shadow into (the example's own comment: "Paint fake top shadow.
-// Original is missing because of the client rect extension."). v7.1.27..v7.2.4
-// the DWM glass sheet owned the row; v7.2.5/v7.2.6 owned it outright, opaque;
-// v7.2.7 STAGES it -- the opaque cover through every activation transition,
-// the sheet's real border in the steady state (see the globals block).
-// Keep at 1: row 0 is the top border, and the face gradient (offset 1px
-// down) leans on it.
+// its fake shadow into. v7.1.27: that row is the window's REAL top border
+// now -- the DWM glass sheet shows through pure black while active (see
+// guiCreateRealWindow + guiRenderBar), and the vanilla inactive gray is
+// composited while inactive. Keep at 1: row 0 must exist to carry the
+// border, and the face gradient (offset 1px down) leans on it.
 #define WIN32_FAKE_SHADOW_HEIGHT 1
 enum {
     CustomTitleBarHoveredButton_None = 0,
@@ -4482,15 +4397,14 @@ static const wchar_t* kCapTitle = L"TidyVision TwinSpeak";   // v7.2.1: the bar'
 static HDC     g_barDc = nullptr;
 static HBITMAP g_barBm = nullptr, g_barBmOld = nullptr;
 static int     g_barW = 0, g_barH = 0;
-// (v7.1.29's g_barBits -- the DIB's pixel pointer for the byte-direct sheet
-// row surgery -- is retired with the sheet; the 32bpp DIB itself stays: it
-// is the flicker-free carrier the whole bar blits through.)
+static BYTE*   g_barBits = nullptr;   // v7.1.29: the DIB's pixels -- the
+                                      // sheet row is patched byte-direct
 static bool guiBarBufEnsure(int ww, int hh) {
     if (g_barDc && ww <= g_barW && hh <= g_barH) return true;
     if (g_barBmOld) {
         SelectObject(g_barDc, g_barBmOld);
         DeleteObject(g_barBm);
-        g_barBm = nullptr; g_barBmOld = nullptr;
+        g_barBm = nullptr; g_barBmOld = nullptr; g_barBits = nullptr;
     }
     if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
     HDC sdc = GetDC(nullptr);
@@ -4514,7 +4428,7 @@ static bool guiBarBufEnsure(int ww, int hh) {
     bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     g_barBm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    (void)bits;   // v7.2.5: nobody patches bytes anymore; the DIB is just the carrier
+    g_barBits = (BYTE*)bits;
     ReleaseDC(nullptr, sdc);
     if (!g_barDc || !g_barBm) {
         if (g_barDc) { DeleteDC(g_barDc); g_barDc = nullptr; }
@@ -4525,78 +4439,47 @@ static bool guiBarBufEnsure(int ww, int hh) {
     g_barW = ww; g_barH = hh;
     return true;
 }
-// v7.2.7 THE STAGED SHEET. The field's verdict on the whole owned-row line
-// (v7.2.5's white, v7.2.6's accurate-but-opaque): "I want all four strips
-// to be truly accurate. The top bar is not opaque on true DWM (if at all).
-// I can clearly tell... The top strip needs to look like the bottom strip
-// where it's just normal." The real Win10 top border is the DWM's own
-// translucent sheet -- the same backdrop-tinting material the left/right/
-// bottom strips are made of (the field's tapes: #AAAAAA over a white
-// desktop, #A7A2A1 over the pinkish one) -- and no owned color can imitate
-// a thing that is not a color but a composite. But the sheet's one
-// documented failure is real too: during the activation transition the
-// compositor owns the extended-frame region and lands it late (v7.1.27..
-// v7.2.4, eight versions of tapes -- the stale row, the #F8F1F0 bare-sheet
-// flash). The resolution is not to pick a side but to STAGE the ownership:
-//   OWNED  -- the transition cover: sheet RETRACTED, row 0 plain opaque
-//             client pixels in the computed state color, riding the
-//             NC-flip present (two tapes proven at the flip compose).
-//   ARMING -- +250 ms after the flip: the sheet is re-extended UNDER the
-//             still-opaque row; the DWM rebuilds its frame rendering with
-//             nothing to show through yet.
-//   GLASS  -- +150 ms more: row 0 goes back to transparent black (g.Clear's
-//             own zeros -- the v7.1.27 carrier) and the DWM's REAL border
-//             owns the top edge. Translucent, backdrop-tinted, the fourth
-//             side of the very strips it sits between -- "truly accurate"
-//             by construction, because it IS the border.
-// Timer 6 walks the schedule; every WM_NCACTIVATE (and every show)
-// restages from OWNED. The cover colors stay v7.2.6's computed pair:
-// high contrast's caption colors; the Settings accent override
-// (ColorPrevalence bit 0 + AccentColor, ColorizationColor as the
-// older-build fallback); else the stock dark-scheme grays the field's own
-// tapes measured off THIS window's strips (active composite L=119 ~
-// #777777, settled inactive #A7A2A1 -- the window sets
-// DWMWA_USE_IMMERSIVE_DARK_MODE, so its strips ARE the dark-scheme grays;
-// the constants are this configuration's own truth). The 1000 ms registry
-// poll (timer 5) keeps the pair honest for the next cover. No sampling,
-// no screen reads -- the steady state is not painted at all; it is the
-// DWM's own border.
-static COLORREF g_borderActive   = RGB(0x77, 0x77, 0x77);  // measured: this window's strips, active
-static COLORREF g_borderInactive = RGB(0xA7, 0xA2, 0xA1);  // measured: this window's strips, settled inactive
-// the row's phase in the staged-sheet schedule (the block above).
-enum { kRowOwned = 0, kRowArming = 1, kRowGlass = 2 };
-static int g_rowPhase = kRowOwned;   // born covered: opaque + correct in the FIRST composite
-// v7.2.5: WM_NCACTIVATE paints the INCOMING state inside the transaction
-// (GetActiveWindow still answers the OLD truth until the handler returns):
-// 1 = force the ACTIVE face/row, 2 = force the INACTIVE one, 0 = read the
-// queue truth. Replaces v7.2.3's bool (which only ever forced inactive).
-static int g_forceFace = 0;
-// v7.2.7: DwmExtendFrameIntoClientArea, resolved once at first use (the
-// house style -- the header surface stays untouched, no new lib; MARGINS
-// laid out by hand).
-typedef HRESULT (WINAPI *TS_DWMEFICA)(HWND, const void*);
-struct TS_MARGINS { int cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight; };
-static TS_DWMEFICA guiDwmExtendFn() {
-    static TS_DWMEFICA fn = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        HMODULE m = GetModuleHandleA("dwmapi.dll");
-        if (!m) m = LoadLibraryA("dwmapi.dll");
-        if (m) fn = (TS_DWMEFICA)GetProcAddress(m, "DwmExtendFrameIntoClientArea");
-    }
-    return fn;
-}
-// extend ({0,0,1,0}) or retract ({0,0,0,0}) the sheet behind row 0. True
-// only when the DWM accepted the call: a no-DWM machine (Basic theme, a
-// down-level session) never leaves OWNED, which is exactly the v7.2.6
-// look -- never a broken reveal.
-static bool guiSheetSet(HWND w, bool on) {
-    TS_DWMEFICA fn = guiDwmExtendFn();
-    if (!fn || !w || !IsWindow(w)) return false;
-    TS_MARGINS m = { 0, 0, on ? 1 : 0, 0 };
-    return SUCCEEDED(fn(w, &m));
-}
+// v7.1.27: set when the DWM glass sheet (DwmExtendFrameIntoClientArea
+// {0,0,1,0}) is confirmed on the panel window -- row 0 then carries the
+// REAL top border: byte-direct BGRA(0,0,0,0) while active (bare glass, the
+// DWM paints its active border) and since v7.1.29 byte-direct premultiplied
+// BGRA(43,43,43,128) while inactive (gray85 at 50% -- the DWM composites
+// that alpha over the sheet, the same way it draws the left/right/bottom
+// NC strips). Without the sheet the v7.1.26 fake-shadow recipe stays the
+// fallback, so a failed extend can never paint a dead black line into the
+// bar. v7.1.30: the bytes are final; the remaining variable is WHEN the
+// DWM sees them -- it bakes the sheet blend when the window presents
+// pixels, and the WM_ACTIVATE blit lands mid-fade, so WM_ACTIVATE arms
+// a settle BURST (timer 4): twenty 20 ms re-presents that track the
+// fade frame by frame (see WM_ACTIVATE).
+static bool g_glassSheet = false;
+// v7.1.31: the settle burst's remaining ticks (see WM_ACTIVATE/WM_TIMER):
+// WM_ACTIVATE zeroes it and arms timer 4; each tick re-presents the bar
+// and consumes one, twenty in total (~400 ms of fade tracking).
+static unsigned g_bakeTicks = 0;
+// v7.2.0 THE INSTANT INACTIVE BORDER -- measure the settled composite,
+// replay it opaquely. The recipe's inactive row is half-alpha ON PURPOSE
+// (it composites 50/50 with the sheet so the border tracks what is behind
+// the window), but alpha means the DWM's glass fade owns the row's first
+// ~200 ms. The way out: an OPAQUE non-black pixel on the sheet is shown
+// AS-IS -- no glass in the composite, nothing to fade -- and the exact
+// color to show is not a guess: it is what the settled composite
+// produced last cycle, read back off the screen (guiMeasureInstantRow)
+// and replayed by guiBarPatchSheetRow while g_instantHold is set.
+// WM_ACTIVATE latches the hold for the whole fade window; the burst's
+// tail hands the row back to the recipe bytes and re-measures one tick
+// later, so the cache never goes stale on purpose.
+static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
+static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
+static bool     g_forceInstantRow = false; // v7.2.1: hook early-present -- one opaque row even while active
+static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
+                                             // inactive face INSIDE the deactivation
+                                             // transaction (GetActiveWindow still
+                                             // returns us until the handler returns;
+                                             // without the force the pre-flip present
+                                             // would repaint the ACTIVE face)
+static HHOOK    g_mouseHook      = nullptr; // v7.2.1: the early-present mouse hook (see guiMain)
+static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
 // (no maximize -- the size lock refuses it), hover faces driven by the
@@ -4615,7 +4498,7 @@ static bool guiSheetSet(HWND w, bool on) {
 // (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
 // active vs. inactive like every native caption does.
 static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
-static void guiRenderBar(HDC dc, int ww, int hovered, bool active, bool rowGlass) {
+static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // v7.1.28 THE ALPHA CHANNEL IS THE DELIVERY. The DWM blends the sheet
@@ -4655,26 +4538,58 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active, bool rowGlass
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
     g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
-    // v7.2.7 THE STAGED ROW. GLASS: row 0 keeps the transparent black
-    // g.Clear left -- through the extended frame the DWM paints its REAL
-    // top border there, the same translucent, backdrop-tinting material
-    // the left/right/bottom strips are made of (the field's demand: "all
-    // four strips truly accurate... the top strip needs to look like the
-    // bottom strip where it's just normal"; the field's tapes: the strips
-    // micro-tint with the desktop, #AAAAAA over white, #A7A2A1 over the
-    // pinkish one -- an owned color can never follow that). OWNED/ARMING
-    // (the transition cover, and the cover that hides the sheet while it
-    // rebuilds): the computed state color, opaque -- the NC-flip present's
-    // payload, two tapes proven at the flip compose, colors from
-    // guiBorderColorsFromSystem (v7.2.6's compute, unchanged). The steady
-    // state is new; the cover is exactly v7.2.5/v7.2.6's proven row.
-    // v7.1.26's gradient offset stays: the face starts 1px down, so this
-    // row belongs to the border alone.
-    if (!rowGlass) {
-        const COLORREF rowC = active ? g_borderActive : g_borderInactive;
-        Gdiplus::SolidBrush rowBrush(GCol(rowC));
-        g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
+    // v7.1.28 THE INACTIVE ROW -- the recipe's exact RGBA. The field:
+    // unfocused, the top border still read "not proper like the left,
+    // right and bottom" -- v7.1.27 painted an OPAQUE lerp toward
+    // RGB(85,85,85), a fixed color that can never follow what is behind
+    // the window the way a real border does. The recipe (File Pilot, via
+    // Simon Anciaux) is explicit: when INACTIVE you draw a gray SEMI-
+    // TRANSPARENT border --
+    //     gray  = roundf(85 * 0.5) = 43
+    //     alpha = 0.5
+    // -- RGBA(43,43,43,128), PREMULTIPLIED: the stored RGB is already
+    // half of 85 (the recipe: "the colors needed to be pre-multiplied
+    // ... multiply it by the alpha: (85.0f * 0.5f)/255.0f"), so the
+    // bytes are BGRA(43,43,43,128). v7.1.29: those bytes are written
+    // DIRECTLY into the 32bpp DIB after the GDI+ pass
+    // (guiBarPatchSheetRow in guiPaintBar) -- GDI+ on an HDC-backed
+    // surface cannot be trusted with the alpha byte, and on the old DDB
+    // it had nowhere to land at all (the field screenshot caught the
+    // result: the bare sheet's WHITE row). The single SRCCOPY blit
+    // carries the real alpha into the redirection surface, and the DWM
+    // composites the row 50/50 with the sheet -- the same semi-transparent inactive
+    // border the left/right/bottom NC strips carry, tracking the desktop
+    // behind the window exactly like theirs. ACTIVE keeps the field-
+    // proven opaque black: black on the sheet IS the DWM frame, so the
+    // window's REAL top border shows there -- the accent color when
+    // Windows' "title bars and window borders" override is on, the
+    // default semi-transparent gray when it is not. NO sheet (the extend
+    // call failed): the v7.1.26 fake-shadow recipe stays as the fallback
+    // -- a failed extend can never paint a dead black line. v7.1.30: the
+    // DWM bakes this blend when the window PRESENTS pixels, and the
+    // WM_ACTIVATE blit lands before the ~200 ms activation fade finishes
+    // -- the mid-transition composite sticks until some later update
+    // re-presents the row (the field: "when I hover the close button the
+    // inactive top piece actually cooperates"). v7.1.31: WM_ACTIVATE arms
+    // a settle burst (timer 4, twenty 20 ms re-presents) so the row is
+    // presented continuously across the fade and tracks it frame by
+    // frame -- inactive the moment the fade lands, nothing snaps. The
+    // v7.1.26 gradient offset stays: the face starts 1px down, so this row
+    // belongs to the border alone.
+    Gdiplus::Color rowCol;
+    if (g_glassSheet) {
+        rowCol = active ? Gdiplus::Color(255, 0, 0, 0)       // the DWM frame
+                        : Gdiplus::Color(128, 43, 43, 43);   // RGBA(43, 0.5)
+    } else {
+        const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
+        const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
+        rowCol = active ? Gdiplus::Color(255, GetRValue(shTop),
+                                        GetGValue(shTop), GetBValue(shTop))
+                        : Gdiplus::Color(255, GetRValue(li),
+                                        GetGValue(li), GetBValue(li));
     }
+    Gdiplus::SolidBrush rowBrush(rowCol);
+    g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
     // v7.1.24 main.c: the caption buttons -- hover face + glyphs. The fills
     // stay integer-exact; shape smoothing turns ON for the X's diagonals
     // ONLY (the two strokes need AA, the fills above do not).
@@ -4743,78 +4658,114 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active, bool rowGlass
         }
     }
 }
-// (v7.1.29's guiBarPatchSheetRow -- the byte-direct premultiplied row
-// surgery, active BGRA(0,0,0,0) / inactive BGRA(43,43,43,128) -- is
-// RETIRED with the sheet: an owned opaque row has no alpha byte to
-// deliver, and the GDI+ brush writes it like any other pixel. The whole
-// delivery question that consumed v7.1.29..v7.2.4 -- WHICH bytes, WHICH
-// alpha, WHEN do they reach the surface -- collapses to "in the same
-// blit as the face".)
-static void guiPaintBar(HWND w);   // fwd: the poll repaints through it
-// v7.2.6: one DWORD out of the DWM's own key, REG_DWORD or nothing.
-static bool guiRegDword(const wchar_t* name, DWORD* out) {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM",
-                      0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return false;
-    DWORD type = 0, size = sizeof(DWORD), v = 0;
-    const bool ok = RegQueryValueExW(k, name, nullptr, &type,
-                                     (LPBYTE)&v, &size) == ERROR_SUCCESS
-                    && type == REG_DWORD;
-    RegCloseKey(k);
-    if (ok) *out = v;
-    return ok;
+// v7.1.29 THE SHEET ROW, BYTE-EXACT. GDI+ brushes cannot be trusted to
+// write the alpha byte of an HDC-backed surface (and on the old DDB there
+// was no alpha byte at all) -- but the sheet recipe lives or dies on that
+// byte. So after the GDI+ pass, row 0 of the 32bpp DIB is written
+// DIRECTLY, in the premultiplied form the redirection surface expects
+// (the recipe: "the colors needed to be pre-multiplied ... instead of
+// passing 85.0f/255.0f for R, G and B, we need to multiply it by the
+// alpha: (85.0f * 0.5f)/255.0f"):
+//   ACTIVE   : BGRA(0, 0, 0, 0)      -- the recipe's RGBA(0,0,0,0):
+//                                      fully transparent black = bare
+//                                      glass, and the DWM paints its
+//                                      ACTIVE border there (the accent
+//                                      color with the Windows override,
+//                                      the default gray without).
+//   INACTIVE : BGRA(43, 43, 43, 128) -- gray85 at half alpha,
+//                                      premultiplied (85*0.5 = 42.5 ->
+//                                      roundf -> 43): the DWM blends it
+//                                      50/50 with the sheet -- the same
+//                                      semi-transparent inactive border
+//                                      the left/right/bottom NC strips
+//                                      carry. Over the field's white
+//                                      desktop that composites to
+//                                      ~#AAAAAA, exactly what the
+//                                      screenshot measured on the DWM's
+//                                      own edges.
+// Byte order in the DIB is little-endian BGRA, so one u32 covers a pixel;
+// the row is <= ~900 pixels, the patch costs nothing next to GDI+.
+// v7.1.30: the bytes are unchanged -- the fix is WHEN they reach the
+// screen. v7.1.31: WM_ACTIVATE arms a settle burst (timer 4, twenty
+// 20 ms ticks) that re-runs this patch + the blit continuously across
+// the DWM's activation fade, because the DWM bakes the sheet blend at
+// presentation time and the immediate WM_ACTIVATE blit lands mid-fade
+// (see WM_ACTIVATE). v7.2.0: while g_instantHold is set (a CACHED
+// deactivation) the INACTIVE row is the opaque cached composite instead
+// of the recipe's half-alpha bytes -- opaque non-black shows as-is on
+// the sheet, so the border needs no glass and no fade: it is correct on
+// the first frame. The burst's tail clears the hold and hands the row
+// back to the recipe bytes once the fade has settled;
+// guiMeasureInstantRow re-reads the settled composite one tick later
+// and refreshes the cache.
+static void guiBarPatchSheetRow(int cw, bool active) {
+    if (!g_barBits || !g_glassSheet || cw <= 0) return;
+    // v7.2.1: the opaque cached color, BGRA-packed -- shared by the hold
+    // branch and the hook's early present. Never pure black: the blend is
+    // 50% gray85, so >= RGB(21,21,21) -- the "black = glass" key can
+    // never trigger.
+    const unsigned c = (unsigned)g_instantInactive;
+    const unsigned instantPx = 0xFF000000u | ((c >> 16) & 0xFFu)   // B -> byte 0
+                                             | (c & 0xFF00u)       // G -> byte 1
+                                             | ((c & 0xFFu) << 16);// R -> byte 2
+    unsigned px;
+    if (g_forceInstantRow && g_instantInactive) {
+        // v7.2.1 THE EARLY PRESENT (tsEarlyMouseHook): the click that will
+        // deactivate us is seen BEFORE the activation transaction -- write
+        // the settled inactive row while the window is still active, so it
+        // lands in the same composed frame as the DWM's own border flip.
+        px = instantPx;
+    } else if (active) {
+        px = 0x00000000u;                            // the recipe: bare glass = the DWM's active frame
+    } else if (g_instantHold && g_instantInactive) {
+        // v7.2.0 THE INSTANT ROW: opaque replay of the settled composite
+        // measured at the end of the previous burst.
+        px = instantPx;
+    } else {
+        px = 0x802B2B2Bu;                            // the recipe: BGRA(43, 43, 43, 128)
+    }
+    unsigned* row = (unsigned*)g_barBits;           // top-down: row 0 first
+    for (int x = 0; x < cw; ++x) row[x] = px;
 }
-// v7.2.6 THE FRAME'S OWN INPUTS -- the compute (see the globals block for
-// the whole story). Pure: no window, no screen, no state but the two
-// colors it writes. The v7.2.5 sampler this replaces photographed the
-// strips and got WHITE -- GetPixel reads the GDI surface, the DWM's frame
-// drawing lives only in the compositor, and what the GDI sees at the
-// strip coordinates is our own never-painted redirection surface.
-static void guiBorderColorsFromSystem() {
-    // (1) high contrast: the DWM frame follows the HC theme's captions.
-    HIGHCONTRASTW hc; ZeroMemory(&hc, sizeof(hc)); hc.cbSize = sizeof(hc);
-    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0)
-        && (hc.dwFlags & HCF_HIGHCONTRASTON)) {
-        g_borderActive   = GetSysColor(COLOR_ACTIVECAPTION);
-        g_borderInactive = GetSysColor(COLOR_INACTIVECAPTION);
-        return;
+// v7.2.0 THE MEASUREMENT: the instant border's color is not guessed, it
+// is READ BACK from the screen. Called one tick after the burst handed
+// row 0 back to the recipe (the DWM has composited the settled blend by
+// then): three points along the window's TOP ROW (the client's row 0 IS
+// the window's top row -- WM_NCCALCSIZE insets left/right/bottom only)
+// are sampled off the screen DC, which returns the COMPOSITED desktop
+// pixel. Every point is guarded with WindowFromPoint first -- if another
+// window covers us, its pixels must never enter the cache -- and all
+// three samples must agree within +/-2 per channel (the row is a flat
+// blend; disagreement means a transient or a polluted read). Only a
+// settled, inactive, visible, non-minimized window measures.
+static void guiMeasureInstantRow() {
+    if (!g_glassSheet || !g_hwnd || !IsWindow(g_hwnd)) return;
+    if (GetActiveWindow() != nullptr) return;         // meaningful while inactive only
+    if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
+    RECT wr;
+    if (!GetWindowRect(g_hwnd, &wr)) return;
+    const int xs[3] = { 40, (wr.right - wr.left) / 2, (wr.right - wr.left) - 40 };
+    HDC sdc = GetDC(nullptr);
+    if (!sdc) return;
+    COLORREF v[3];
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) {
+        const POINT p = { wr.left + xs[i], wr.top };
+        if (WindowFromPoint(p) != g_hwnd) ok = false; // covered: never cache another window's pixels
+        else {
+            v[i] = GetPixel(sdc, p.x, p.y);
+            if (v[i] == CLR_INVALID) ok = false;
+        }
     }
-    // (2) the accent override: ColorPrevalence bit 0 is the Settings
-    //     toggle "show accent color on title bars and window borders";
-    //     AccentColor is the DWORD that toggle writes for the DWM
-    //     (0xAABBGGRR -- COLORREF's own byte order under an alpha byte);
-    //     older builds keep ColorizationColor. Inactive keeps the
-    //     measured gray: the override paints the ACTIVE frame, and no
-    //     tape ever caught an accent-machine's inactive strip.
-    DWORD prevalence = 0, accent = 0;
-    if (guiRegDword(L"ColorPrevalence", &prevalence) && (prevalence & 1)
-        && (guiRegDword(L"AccentColor", &accent)
-            || guiRegDword(L"ColorizationColor", &accent))) {
-        g_borderActive   = (COLORREF)(accent & 0x00FFFFFF);
-        g_borderInactive = RGB(0xA7, 0xA2, 0xA1);
-        return;
+    ReleaseDC(nullptr, sdc);
+    if (!ok) return;
+    for (int i = 1; i < 3; ++i) {
+        const int dr = (int)(v[i] & 0xFF)         - (int)(v[0] & 0xFF);
+        const int dg = (int)((v[i] >> 8) & 0xFF)  - (int)((v[0] >> 8) & 0xFF);
+        const int db = (int)((v[i] >> 16) & 0xFF) - (int)((v[0] >> 16) & 0xFF);
+        if (dr < -2 || dr > 2 || dg < -2 || dg > 2 || db < -2 || db > 2) return;
     }
-    // (3) stock: this window's own dark-scheme strip grays -- the field's
-    //     tapes, and the reason they are right: the window sets
-    //     DWMWA_USE_IMMERSIVE_DARK_MODE, so its strips ARE these.
-    g_borderActive   = RGB(0x77, 0x77, 0x77);
-    g_borderInactive = RGB(0xA7, 0xA2, 0xA1);
-}
-// v7.2.6 THE POLL. Timer 5, 1000 ms: recompute from the registry, repaint
-// only when a color actually changed and the window can show it. An
-// accent twist, a mode flip, a HC toggle: self-healed within a second,
-// idle or not. The 50 ms tracker, the stability gate, the 250 ms grace
-// window and the move re-tint are all retired with the sampler -- there
-// is nothing on the screen left to read.
-static void guiReloadBorderColors(HWND w) {
-    if (!w || !IsWindow(w)) return;
-    const COLORREF a0 = g_borderActive, i0 = g_borderInactive;
-    guiBorderColorsFromSystem();
-    if ((g_borderActive != a0 || g_borderInactive != i0)
-        && IsWindowVisible(w) && !IsIconic(w)) {
-        guiPaintBar(w);
-    }
+    g_instantInactive = v[0];
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -4822,54 +4773,132 @@ static void guiPaintBar(HWND w) {
     // the blit target is the CLIENT dc -- the window owns a real frame now,
     // so the bar is client pixels at (0,0), not window pixels.
     const int  hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
-    // v7.2.5: g_forceFace -- WM_NCACTIVATE runs INSIDE the activation
-    // transaction, so GetActiveWindow() still answers the OLD truth until
-    // the handler returns; the force paints the INCOMING state instead
-    // (1 = active, 2 = inactive, 0 = the queue truth).
-    const bool active = g_forceFace ? (g_forceFace == 1) : (GetActiveWindow() != nullptr);   // GUI thread only
+    // v7.2.3: g_forceInactiveFace -- WM_NCACTIVATE(FALSE) runs BEFORE the
+    // deactivation completes, so GetActiveWindow() still returns this window
+    // and the plain read would repaint the ACTIVE face into what must be the
+    // pre-flip INACTIVE present. The force wins over the queue read.
+    const bool active = !g_forceInactiveFace && (GetActiveWindow() != nullptr);   // GUI thread only
     RECT cr; GetClientRect(w, &cr);
     const int cw = cr.right - cr.left;
     if (cw <= 0) return;
     HDC wdc = GetDC(w);
     if (!wdc) return;
     if (guiBarBufEnsure(cw, kCapH)) {
-        guiRenderBar(g_barDc, cw, hovered, active,
-                     g_rowPhase == kRowGlass);   // v7.2.7: GLASS leaves row 0
-                                                       // transparent for the sheet to
-                                                       // show through; every cover
-                                                       // phase paints it opaque
+        guiRenderBar(g_barDc, cw, hovered, active);
+        guiBarPatchSheetRow(cw, active);   // v7.1.29: the alpha IS the delivery
         BitBlt(wdc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
-                                                       // (all 32 bits -- the row's
-                                                       // alpha rides it, v7.1.29's
-                                                       // DIB proof)
     } else {
-        guiRenderBar(wdc, cw, hovered, active, false);   // no buffer: no alpha channel
-                                                       // to carry -- paint the cover
-                                                       // color opaque (the v7.2.6 look)
+        guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
     }
     ReleaseDC(w, wdc);
     // v7.2.2: gdi32 batches drawing calls per thread -- without a flush the
-    // blit can sit in user memory while the caller moves on. GdiFlush is a
-    // no-op when nothing is batched, so every presentation -- the NC-flip
-    // present, WM_ACTIVATE's blit, WM_PAINT, the poll -- is in the
-    // win32k redirection surface before this call returns. (v7.2.5: the
-    // flush's original customer, the v7.2.1 mouse hook, is retired; the
-    // ordering guarantee it bought for the NC-flip present stays.)
+    // blit can sit in user memory while the caller moves on (the early hook
+    // used to return to win32k with the row still batched; the flip compose
+    // then read the OLD row -- see tsEarlyMouseHook). GdiFlush is a no-op
+    // when nothing is batched, so every presentation -- the WM_ACTIVATE
+    // blit, the burst ticks, WM_PAINT -- is in the redirection surface
+    // before this call returns.
     GdiFlush();
 }
-// (v7.2.1/v7.2.2's tsEarlyMouseHook -- the WH_MOUSE_LL early present, the
-// DwmFlush, the 1 px strip blit, tsDwmFlushFn/tsDwmFlushTried -- is RETIRED
-// with the glass row it existed to feed. Its whole purpose was to get the
-// sheet row's bytes to the surface before the activation transaction: with
-// the row owned as plain client pixels, the NC-flip present (WM_NCACTIVATE,
-// field-proven on the face since v7.2.3) carries it by ordering, on every
-// deactivation path alike -- clicks, Alt-Tab, taskbar, programmatic. What
-// the hook bought that the present could not: nothing, anymore. What it
-// cost: a DwmFlush (up to one full compose period) inside a LOW-LEVEL hook
-// on every qualifying click anywhere in the system while our window was
-// active with a cache -- system-wide input latency for a frame race it no
-// longer runs -- plus the quiet fragilities of LL hooks (the silent
-// disconnect after a timeout, the AV policies that strip them). Gone.)
+// v7.2.1 THE ZERO-FRAME ROW, the early present: WM_ACTIVATE always hops the
+// message queue AFTER win32k has already told the DWM about the activation,
+// so the first presentation that could carry the inactive row misses the
+// DWM's own border flip by one frame (the field: "painted one frame late").
+// This hook sees the click BEFORE the activation transaction starts and
+// presents the measured row right there: the border is on screen in the
+// same composed frame as the DWM's flip -- zero frames late.
+// v7.2.2 THE FLUSHED EARLY PRESENT -- the field: "it still shows the stale
+// version which immediately goes to the official unfocused window frame
+// exactly one refresh frame later." The early present was real, but its
+// bytes were not first: two gaps sat between the BitBlt and the surface
+// the DWM samples. (a) THE GDI BATCH: gdi32 batches drawing calls per
+// thread and an unflushed BitBlt never reaches the win32k redirection
+// surface -- the v7.2.1 hook returned with the row still in user memory,
+// win32k resumed the activation transaction and told the DWM, the flip
+// composed against the old row, and the batch landed one composed frame
+// later. Every time. (b) THE COMPOSE IN FLIGHT: a composition that started
+// before the click already sampled the old row, and one still running when
+// the DWM learns of the activation can carry the flip without the row.
+// The fix is ORDERING, not speed -- three steps, all inside the hook,
+// because the hook return is the last point we own before win32k resumes:
+//   1. DwmFlush() waits out the composition in flight; a compose boundary
+//      has just passed when it returns, so every compose that can carry
+//      the flip starts AFTER our write and must sample it. (DWM refuses
+//      or is absent: the wait is skipped and v7.2.1's window stays --
+//      never wider. The wait costs at most one compose period, ~7-17 ms,
+//      and only on a qualifying click.)
+//   2. The present shrinks to its actual work: patch row 0 of the
+//      EXISTING bar buffer and blit the 1 px strip -- microseconds, not
+//      v7.2.1's full GDI+ re-render (~2 ms of unguarded time; the face
+//      must stay the active one until WM_ACTIVATE anyway).
+//   3. GdiFlush() puts the bytes in the redirection surface BEFORE the
+//      hook returns; win32k cannot resume the transaction until then,
+//      so the flip compose reads the row BY CONSTRUCTION.
+// Constraints honored: WH_MOUSE_LL is answered on the installing thread
+// (the idle, pumping GUI thread -- the only state this handler acts in),
+// the handler runs no message dispatch and stays far under the hook
+// timeout, and everything bails instantly unless our window is the ACTIVE
+// window with a measured cache. Alt-Tab and programmatic deactivations
+// have no earlier signal a window can see: they keep the WM_ACTIVATE path
+// (one frame). If the hook never installed (policy, AV), nothing changes.
+static HRESULT (WINAPI* tsDwmFlushFn)() = nullptr;   // v7.2.2: resolved once,
+static bool      tsDwmFlushTried    = false;         // dwmapi is LoadLibrary'd
+static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION) {
+        const UINT m = (UINT)wp;
+        if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN
+            || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN) {
+            const MSLLHOOKSTRUCT* e = (const MSLLHOOKSTRUCT*)lp;
+            if (e && g_hwnd && IsWindow(g_hwnd)
+                && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)
+                && GetActiveWindow() == g_hwnd        // we hold activation: the click may take it
+                && g_instantInactive) {               // only with a measured cache
+                const HWND hit = WindowFromPoint(e->pt);
+                if (!hit || GetAncestor(hit, GA_ROOT) != g_hwnd) {
+                    // A click outside our tree: present the settled inactive
+                    // row NOW, while the bar face is still the active one (the
+                    // face itself flips when WM_ACTIVATE arrives, as always).
+                    // v7.2.2: the three ordered steps -- see the block above.
+                    if (!tsDwmFlushTried) {              // every other dwmapi
+                        tsDwmFlushTried = true;          // import in this file
+                        tsDwmFlushFn = (HRESULT (WINAPI*)())GetProcAddress(  // is
+                            LoadLibraryA("dwmapi.dll"), "DwmFlush");         // lazy
+                    }
+                    if (tsDwmFlushFn) tsDwmFlushFn();    // 1. wait out the compose
+                    bool done = false;                   // 2. the 1 px strip
+                    if (g_glassSheet && g_barBits && g_barDc) {
+                        RECT cr;
+                        if (GetClientRect(g_hwnd, &cr) && cr.right > 0
+                            && guiBarBufEnsure(cr.right, kCapH)) {
+                            g_forceInstantRow = true;
+                            guiBarPatchSheetRow(cr.right, true);  // row 0 -> cache
+                            HDC wdc = GetDC(g_hwnd);
+                            if (wdc) {
+                                if (BitBlt(wdc, 0, 0, cr.right, 1,
+                                           g_barDc, 0, 0, SRCCOPY)) done = true;
+                                ReleaseDC(g_hwnd, wdc);
+                            }
+                            g_forceInstantRow = false;
+                        }
+                    }
+                    if (!done) {                         // no buffer / no sheet:
+                        g_forceInstantRow = true;        // v7.2.1's full render
+                        guiPaintBar(g_hwnd);
+                        g_forceInstantRow = false;
+                    }
+                    GdiFlush();                          // 3. bytes in the surface
+                    // Self-heal: if this click never deactivates us (menus
+                    // and other non-activating surfaces), the burst's first
+                    // tick re-presents the truth within 20 ms; if it does
+                    // deactivate, WM_ACTIVATE re-arms the burst itself.
+                    g_bakeTicks = 0;
+                    SetTimer(g_hwnd, 4, 20, nullptr);
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wp, lp);
+}
 
 // ---- fonts / brushes -------------------------------------------------------
 static void applyTheme(int i);   // v7.0.0: forward decl (defined right below guiMakeGdi)
@@ -6766,31 +6795,31 @@ static bool guiCreateRealWindow() {
             const int ncrp = 2;     // DWMNCRP_ENABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
                    &ncrp, sizeof(ncrp));
-            // v7.2.7 THE STAGED SHEET. The glass sheet (extend the DWM
-            // frame 1 px into the client's top row) is BACK for the steady
-            // state -- the field's demand: "I want all four strips to be
-            // truly accurate. The top bar is not opaque on true DWM (if at
-            // all)... The top strip needs to look like the bottom strip
-            // where it's just normal." The sheet IS the real border --
-            // translucent, backdrop-tinting, the strips' own material.
-            // What killed it through v7.1.27..v7.2.4 was only the
-            // activation transition, where the compositor owns the
-            // extended region and lands it late; v7.2.7 owns the row
-            // through the transition (WM_NCACTIVATE: opaque cover, sheet
-            // retracted) and hands it back once the sheet has settled
-            // (timer 6 -- see the globals block). Nothing to extend HERE
-            // at creation: the row is born covered and the schedule arms
-            // it, so the first composite carries a correct opaque row
-            // (the white-flash guarantee holds).
-            // v7.1.27 part two stays: DWMWA_USE_IMMERSIVE_DARK_MODE, always
-            // on. Without it the DWM paints the frame WHITE in light mode
-            // (the documented light-mode border bug); with it the border
-            // renders correctly. It is also WHY the stock constants are
-            // what they are: this window's strips are the DARK-scheme
-            // grays (#777777 / #A7A2A1 on the field's tapes), and the
-            // compute's stock branch carries exactly those.
-            // Attribute 20 since Win10 1903, 19 on the early Insider
-            // builds: try 20 first.
+            // v7.1.27 THE REAL TOP BORDER, part one: the DWM glass sheet
+            // extends 1px into the client's top row. Row 0 painted PURE
+            // BLACK (guiRenderBar, active) makes the sheet show the DWM's
+            // REAL border there -- the accent color with the Windows
+            // "title bars and window borders" override, the default
+            // semi-transparent gray without -- the vanilla top edge the
+            // fake shadow could only imitate. (Margins are L, R, top,
+            // bottom; the struct is spelled out because dwmapi.h is not
+            // included -- the same house trick as the attribute calls.)
+            typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
+            typedef struct { int cxLeftWidth, cxRightWidth,
+                             cyTopHeight, cyBottomHeight; } TS_MARGINS;
+            const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
+                LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+            if (dwmExtend) {
+                const TS_MARGINS sheet = { 0, 0, 1, 0 };
+                g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+            }
+            // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
+            // Without it the DWM paints the extended sheet WHITE in light
+            // mode (the documented light-mode border bug); with it the
+            // border renders correctly -- the dark-mode border color is
+            // slightly different from the light one and close enough, the
+            // same trade the native surfaces make. Attribute 20 since
+            // Win10 1903, 19 on the early Insider builds: try 20 first.
             const int darkOn = 1;
             if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
                               &darkOn, sizeof(darkOn)))) {
@@ -6814,25 +6843,9 @@ static bool guiCreateRealWindow() {
     // v6.6.5 WHITE-FLASH FIX: render the ENTIRE tree into the (still hidden)
     // redirection surface now, so the first frame DWM composites is the
     // finished UI; SW_SHOWNA then costs no extra activate/erase cycle.
-    // v7.2.6: the border colors are computed BEFORE that first render --
-    // an accent-machine's row must wear the accent in the very first
-    // composite, not the stock gray for a tick.
-    guiBorderColorsFromSystem();
     RedrawWindow(g_hwnd, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
-    // v7.2.6: timer 5 = the border-color poll, 1000 ms for as long as the
-    // window exists -- three registry reads and a compare per tick, a
-    // repaint only when a color actually changed (accent twists, mode
-    // flips, HC toggles self-heal within a second).
-    SetTimer(g_hwnd, 5, 1000, nullptr);
-    // v7.2.7: timer 6 = the row handback schedule. The row is born OWNED
-    // (above: opaque, correct in the first composite); +250 ms this timer
-    // extends the sheet UNDER the cover (arming), +150 ms more the row
-    // goes transparent and the DWM's real border owns the top edge. The
-    // window may still be hidden at the first tick -- the timer self-
-    // guards and the show restages it (guiRestoreWindow).
-    SetTimer(g_hwnd, 6, 250, nullptr);
     // the whole boot log -- everything the engine said while tray-only --
     // lands in the pane in one flush, oldest first, nothing lost.
     guiFlushLogRing();
@@ -6917,32 +6930,12 @@ static void guiRestoreWindow() {
     // tray menu, second instance); every later ask just shows it.
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
-    // v7.2.6: the poll slept while hidden -- recompute before the show so
-    // an accent twist or mode flip made while tray-only is already worn by
-    // the first composite after the show (the compute is pure, and the
-    // window is still hidden, so no repaint rides this call).
-    guiBorderColorsFromSystem();
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
-    // v7.2.6: the color poll returns with the window -- it slept while
-    // hidden like the 250 ms tick (a hidden window has nothing to repaint;
-    // re-arming here costs nothing and the first tick after the show
-    // re-validates the pair against whatever the settings look like now).
-    SetTimer(g_hwnd, 5, 1000, nullptr);
-    // v7.2.7: if the hide caught the schedule mid-cover (phase OWNED or
-    // ARMING, timer 6 dead or reset by its hidden guard), restage it from
-    // the cover -- the show's own WM_NCACTIVATE presents the row; this
-    // belt covers the no-activate paths. A row that was already GLASS
-    // needs nothing: the sheet renders on the shown window exactly as it
-    // did before the hide.
-    if (g_rowPhase != kRowGlass) {
-        g_rowPhase = kRowOwned;
-        SetTimer(g_hwnd, 6, 250, nullptr);
-    }
 }
 
 // ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
@@ -7000,7 +6993,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.7  |  %s",   // v7.2.7 the staged sheet (v7.2.6 computed covers)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.8  |  %s",   // v7.2.8 post-flip NCPAINT on the 7.2.3 base (v7.2.3 NC-flip present)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7076,9 +7069,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v7.1.27: the TOP stays client-covered on purpose -- with any top
         // gap the DWM decides the client no longer covers the caption and
         // paints a ghost caption OUTSIDE the window rect (see the v7.1.27
-        // notes). v7.2.7: row 0 is client pixels in the cover phases and the
-        // DWM sheet's 1px extension in the steady state (guiRenderBar + the
-        // staged schedule in the globals block) -- never an NC gap.
+        // notes). The real top border arrives through the DWM glass sheet
+        // (DwmExtendFrameIntoClientArea in guiCreateRealWindow) instead.
         if (!wp) break;   // wParam FALSE: DefWindowProc
         int frame_x = GetSystemMetrics(SM_CXFRAME);
         int frame_y = GetSystemMetrics(SM_CYFRAME);
@@ -7168,43 +7160,63 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(w, msg, wp, lp); }   // v7.1.26: W, not the A macro
     case WM_NCACTIVATE:
-        // v7.2.3 THE NC-FLIP PRESENT, v7.2.5 BOTH DIRECTIONS, v7.2.7 THE
-        // COVER. WM_NCACTIVATE is the one signal a window receives INSIDE
-        // the activation transaction -- WM_ACTIVATE is only queued behind
-        // it -- so painting here lands the bytes in the redirection surface
-        // BEFORE DefWindowProc (the common tail below) tells the DWM to
-        // flip the frame state, and win32k cannot resume the transaction
-        // until this WndProc returns: the flip compose reads the incoming
-        // state BY ORDERING. v7.2.3 proved it on tape for the FACE; v7.2.5
-        // extended it to the whole chrome; v7.2.7 keeps that flip exactly
-        // as it was and adds the handoff AROUND it: the sheet is retracted
-        // for the transition, so the one region the compositor owns late
-        // -- the extended frame -- simply does not exist at the flip
-        // compose. Steady state: the row is GLASS (the DWM's real border,
-        // the field's demand); the flip takes it back for a beat, and
-        // timer 6 hands it to the sheet again once the transition has
-        // settled (see the globals block).
-        // The order inside the cover is BLIT-THEN-RETRACT on purpose: the
-        // blit lands the opaque row while the sheet is still extended (a
-        // steady-state compose shows opaque client bytes as-is -- the
-        // documented extended-frame behavior), and only then does the
-        // retract hand the region to plain client. The reverse order
-        // would leave a window, however thin, where a compose could catch
-        // the retracted row still carrying GLASS's alpha-0 bytes -- plain
-        // client black, one frame of it. This order cannot.
-        // DefWindowProc still runs -- the case breaks to the common tail;
-        // swallowing the message would freeze the frame state.
+        // v7.2.3 THE NC-FLIP PRESENT. The video's frames, decoded: on
+        // deactivation the DWM re-bakes the extended-sheet row at the
+        // compose that carries the activation flip, and that compose is
+        // part of the transaction win32k is still running -- WM_NCACTIVATE
+        // is SENT inside it, WM_ACTIVATE is only QUEUED behind it -- so the
+        // flip compose always sampled the row the ACTIVE state last wrote
+        // (alpha 0 = bare glass, the bright flash), and the inactive bytes
+        // the later paths write landed one to three composes late, taking
+        // the bar face with them. This message is the one signal a window
+        // gets IN time: painting the whole bar inactive here -- face and
+        // row 0, GdiFlush()ed (guiPaintBar ends with it since v7.2.2) --
+        // puts the bytes in the redirection surface BEFORE DefWindowProc
+        // below tells the frame to flip, and win32k cannot resume the
+        // transaction until this WndProc returns. The flip compose reads
+        // inactive bytes by ordering: no glass frame, no stale face, one
+        // composed frame, Chrome-instant -- with or without the cache (with
+        // it, row 0 is the opaque settled color via g_instantHold; without,
+        // the recipe bytes ride the fade like a native frame's own strips).
+        // Activation (wParam != 0) needs none of this: the active look IS
+        // the glass and the DWM's own fade draws it (the video shows that
+        // direction is already instant). DefWindowProc still runs -- the
+        // case falls to the common tail; swallowing the message would
+        // freeze the frame state.
+        if (!wp && IsWindowVisible(w) && !IsIconic(w)) {
+            g_instantHold = (g_instantInactive != 0);   // same latch rule as WM_ACTIVATE
+            g_forceInactiveFace = true;                 // the face must be the INACTIVE one
+            guiPaintBar(w);                             // face + row 0 + GdiFlush
+            g_forceInactiveFace = false;
+            g_bakeTicks = 0;
+            SetTimer(w, 4, 20, nullptr);                // the burst still tracks the fade
+        }
+        break;
+    case WM_NCPAINT:
+        // v7.2.8 THE POST-FLIP NCPAINT. The field: "make it so the ncpaint
+        // happens immediately after you deactivate the window" -- on the
+        // v7.2.3 base (the version that almost had it: the NC-flip present
+        // lands, and the settled row is the recipe's real half-alpha
+        // border, the same translucent gray the DWM's own strips carry).
+        // What the 7.2.3 tapes still caught was the row BETWEEN states in
+        // the first post-flip composes -- and the one redraw signal that
+        // rides the flip itself is this message: win32k sends WM_NCPAINT
+        // when it redraws the frame right after the activation change, so
+        // the bar is repainted HERE, inside the frame's own pass, with the
+        // strips -- not a queue hop behind them. The paint is the plain
+        // truth by construction: post-deactivation the transaction has
+        // already closed, GetActiveWindow() has moved on, and the plain
+        // read inside guiPaintBar picks the INACTIVE face; post-activation
+        // it picks the active one (row 0 black = the glass = the DWM's own
+        // frame, which is exactly what the activation fade draws).
+        // Idempotent with the burst and every other presenting path: the
+        // same buffered bytes, GdiFlush()ed (guiPaintBar ends with it), so
+        // however many paths present the bar, nothing flickers and nothing
+        // fights. DefWindowProc still runs from the common tail below --
+        // it owns the real frame drawing; swallowing this message would
+        // blank the strips.
         if (IsWindowVisible(w) && !IsIconic(w)) {
-            const bool hadSheet = (g_rowPhase != kRowOwned);
-            g_rowPhase  = kRowOwned;          // the render paints the row opaque
-            g_forceFace = wp ? 1 : 2;         // paint the INCOMING state
-            guiPaintBar(w);                   // face + OPAQUE row 0, one blit, GdiFlush
-            g_forceFace = 0;
-            if (hadSheet) guiSheetSet(w, false);   // row 0 = plain client again
-            // the handback schedule: +250 ms the sheet rebuilds UNDER the
-            // still-opaque cover (arming), +150 ms more the row goes
-            // transparent and the DWM's real border owns the top edge.
-            SetTimer(w, 6, 250, nullptr);
+            guiPaintBar(w);                             // face + row 0, with the frame's own redraw
         }
         break;
     case WM_ACTIVATE:
@@ -7212,18 +7224,58 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // it on every activation change (DefWindowProc still runs). The
         // example invalidates the bar rect here; the buffered blit is the
         // same pixels without the invalidation round-trip.
-        // v7.2.5: the NC-flip present already landed the incoming state at
-        // the flip compose (WM_NCACTIVATE, sent inside the transaction, runs
-        // first); this re-present rides the now-truthful GetActiveWindow and
-        // is a visual no-op in the normal case -- it exists for the paths
-        // where NC and ACTIVATE disagree (a canceled flip, a rapid toggle
-        // whose last state wins here). The v7.1.30..v7.2.4 settle burst is
-        // RETIRED: it existed to re-present the sheet row across the DWM's
-        // fade. v7.2.7: the row lands covered at the flip compose (the
-        // staged sheet's OWNED phase -- see WM_NCACTIVATE), this re-present
-        // rides the same cover, and timer 6 -- not this message -- hands
-        // the row back to the sheet once the transition has settled.
+        // v7.1.30 THE SETTLE BAKE, v7.1.31 THE SETTLE BURST: this blit
+        // lands BEFORE the DWM's ~200 ms activation fade has run, and the
+        // DWM evaluates the extended-sheet blend when the window presents
+        // pixels -- so the immediate blit bakes the sheet row against the
+        // OLD activation state and the wrong composite sticks (the field:
+        // the row only looked right after hovering a caption button
+        // re-presented it). One late bake (v7.1.30) read as a visible
+        // delay-and-snap, so the re-presentation is a BURST now: timer 4
+        // at 20 ms, twenty ticks -- the row is presented continuously
+        // across the fade, tracks it frame by frame, and reads inactive
+        // the moment the fade lands. The field's close-button hover was
+        // this exact re-present, performed by accident; now it is the
+        // default. Counter + timer re-arm on rapid toggles, the last
+        // activation state wins; the immediate blit stays (the face
+        // dim/undim must be instant).
+        // v7.2.0 THE INSTANT ROW: when a measured cache exists, a
+        // deactivation latches g_instantHold so EVERY presentation in the
+        // fade window writes row 0 as the OPAQUE cached composite -- the
+        // border is correct on the first frame, no glass fade involved.
+        // At the burst's tail the hold clears and the row returns to the
+        // recipe's half-alpha bytes (an invisible swap when the backdrop
+        // is unchanged: the recipe then settles on the same color), and
+        // one tick later guiMeasureInstantRow refreshes the cache. No
+        // cache yet (first run): the hold stays off and v7.1.31's tracked
+        // fade runs once to seed it.
+        if (LOWORD(wp) == WA_INACTIVE && g_instantInactive) g_instantHold = true;
+        else g_instantHold = false;
+        g_measurePending = false;
         guiPaintBar(w);
+        g_bakeTicks = 0;
+        SetTimer(w, 4, 20, nullptr);
+        // v7.2.8 THE FORCED FRAME PAINT. The DWM can draw the activation
+        // flip without ever asking us to repaint the frame -- win32k's own
+        // WM_NCPAINT is not guaranteed on the deactivation path -- and the
+        // field's ask is that the NC paint happen IMMEDIATELY after the
+        // window deactivates. WA_INACTIVE is the first message that runs
+        // AFTER the transaction has closed (the flip is already on screen
+        // when this handler starts), so the frame paint is FORCED here,
+        // synchronously: RedrawWindow with RDW_UPDATENOW dispatches
+        // WM_NCPAINT inside THIS call stack -- the case above answers it
+        // with the immediate bar paint -- and the frame redraws now, in
+        // the same pass as the bar bytes: no posted message, no queue hop,
+        // no compose left that can sample a between-states row. RDW_NOERASE
+        // keeps the synchronous client repaint from erasing first (the
+        // panel paints buffered, top to bottom, nothing to erase).
+        // Activation needs no force -- the active look is the glass, the
+        // DWM's own fade draws it, and the 7.2.3 tape showed that
+        // direction was already instant.
+        if (LOWORD(wp) == WA_INACTIVE && IsWindowVisible(w) && !IsIconic(w)) {
+            RedrawWindow(w, nullptr, nullptr,
+                         RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        }
         break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
@@ -7696,57 +7748,50 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
-        // v7.2.7: timer 6 = the row handback schedule (the staged sheet --
-        // see the globals block for the whole story). OWNED -> ARMING at
-        // +250 ms: the transition is long over (the sheet's own flip lag
-        // was "up to a few frames"; 250 ms is five times that), so the
-        // sheet is re-extended UNDER the opaque cover -- nothing to see
-        // yet, the DWM just rebuilds its frame rendering. ARMING -> GLASS
-        // at +150 ms more: the fresh sheet has had its composes; row 0
-        // goes transparent (the reveal blit) and the DWM's real border
-        // owns the top edge. Hidden or iconic ticks kill the schedule and
-        // park the row at OWNED; the next show or flip restages it. A
-        // no-DWM machine (the extend call fails) stays OWNED forever --
-        // the computed colors, never a broken reveal.
-        if (wp == 6) {
-            if (!IsWindowVisible(w) || IsIconic(w)) {
-                KillTimer(w, 6);
-                g_rowPhase = kRowOwned;
-                return 0;
-            }
-            if (g_rowPhase == kRowOwned) {
-                if (guiSheetSet(w, true)) {
-                    g_rowPhase = kRowArming;
-                    SetTimer(w, 6, 150, nullptr);
-                } else {
-                    KillTimer(w, 6);   // no sheet to hand back to
+        // v7.1.30: timer 4 = the settle bake. v7.1.31: a BURST -- twenty
+        // 20 ms re-blits spanning ~400 ms -- so the sheet row is
+        // re-presented continuously across the DWM's ~200 ms activation
+        // fade and tracks it frame by frame (the immediate WM_ACTIVATE
+        // blit lands mid-fade; see WM_ACTIVATE). v7.2.0: when a cache
+        // exists the burst presents the OPAQUE cached row through the
+        // fade (g_instantHold, see WM_ACTIVATE) -- instant instead of
+        // tracked. The last tick clears the hold and presents the
+        // recipe's half-alpha row against the SETTLED glass, and one
+        // further tick later (g_measurePending -- the DWM needs a
+        // composition to land the new row on screen) the row is re-read
+        // off the screen and the cache refreshed. Kills itself after the
+        // measurement.
+        if (wp == 4) {
+            guiPaintBar(w);
+            if (g_measurePending) {
+                g_measurePending = false;
+                g_bakeTicks = 0;
+                KillTimer(w, 4);
+                guiMeasureInstantRow();   // the settled composite is on screen now
+                // v7.2.3 THE MEASURE RETRY: the measurement is guarded --
+                // WindowFromPoint must return us at all three samples (a
+                // raised window over the row, a menu closing), the samples
+                // must agree within +/-2 (a compose in flight fails this).
+                // One bail used to leave the cache empty until the NEXT
+                // full deactivation burst -- the field's video ran a whole
+                // session with no cache, so the v7.2.1 hook and the
+                // v7.2.0 hold never engaged. While the window stays
+                // inactive, re-arm softly: 250 ms, pending flag set, so
+                // the next tick is a bare re-measure (no burst). The first
+                // success leaves the flag clear and the timer dead;
+                // WM_ACTIVATE resets the flag and re-arms the 20 ms burst
+                // as always, so the fade tracking is untouched.
+                if (!g_instantInactive && GetActiveWindow() == nullptr
+                    && IsWindowVisible(w) && !IsIconic(w)) {
+                    g_measurePending = true;
+                    SetTimer(w, 4, 250, nullptr);
                 }
-            } else if (g_rowPhase == kRowArming) {
-                g_rowPhase = kRowGlass;
-                KillTimer(w, 6);
-                guiPaintBar(w);       // the reveal: row 0 transparent now
-            } else {
-                KillTimer(w, 6);
+            } else if (++g_bakeTicks >= 20) {
+                g_instantHold = false;    // fade window over: hand the row back
+                g_bakeTicks = 0;
+                guiPaintBar(w);           // present the recipe row against settled glass
+                g_measurePending = true;  // measure it on the next tick
             }
-            return 0;
-        }
-        // v7.2.6: timer 5 = the border-color poll, the COVER's one
-        // maintenance channel (see guiReloadBorderColors). 1000 ms: three
-        // registry reads and a compare, a repaint only when a color
-        // actually changed -- accent twists, mode flips, HC toggles
-        // self-heal within a second, so the next cover wears the right
-        // pair. (In GLASS the poll changes nothing visible: the row is
-        // the DWM's, and the DWM already knows its own colors.) v7.2.5's
-        // 50 ms strip tracker is retired with the sampler it served
-        // (GetPixel could not see the DWM's frame drawing; it read our
-        // own unpainted redirection surface and the row went white), and
-        // with it the whole v7.1.30..v7.2.4 circus it had inherited --
-        // the settle bake, the twenty-tick burst, the burst-tail
-        // handover, the g_measurePending retry, the stability gate, the
-        // grace window, the move re-tint. (Timer 4 stays retired; the id
-        // stays unused on purpose.)
-        if (wp == 5) {
-            guiReloadBorderColors(w);
             return 0;
         }
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
@@ -7917,11 +7962,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (w == g_trayWnd) return 0;
         guiCaptureWindowPos(w);
         KillTimer(w, 1);
-        KillTimer(w, 5);   // v7.2.6: the color poll sleeps while hidden
-                            // (guiRestoreWindow re-arms it with the show)
-        KillTimer(w, 6);   // v7.2.7: the row schedule too (the show
-                            // restages it; a hidden window has no
-                            // composites to schedule)
         // v7.1.26: no DeleteTab -- hiding a window removes its native
         // taskbar button by itself.
         trayAdd(true);
@@ -8160,11 +8200,20 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
-    // (v7.2.1's WH_MOUSE_LL early-present hook is RETIRED with the glass
-    // row it fed -- see the note above tsEarlyMouseHook's old home. The
-    // NC-flip present owns every deactivation path now, so there is
-    // nothing to install, nothing to unhook, and no compose wait riding
-    // the system's input pipeline.)
+    // v7.2.1 THE ZERO-FRAME ROW, delivery: the hook lives on THIS thread --
+    // the GUI thread, which sits idle in GetMessage exactly while our window
+    // is active (the only state the hook acts in). A button-down outside our
+    // tree is seen BEFORE win32k starts the activation transaction, so the
+    // early-presented row rides the same composed frame as the DWM's own
+    // border flip. v7.2.2: inside the hook the present is DwmFlush'd,
+    // minimal (the 1 px strip) and GdiFlush'd, so riding that frame is an
+    // ordering guarantee, not a race win (see tsEarlyMouseHook). If it
+    // could not be installed (policy, AV) the WM_ACTIVATE path still
+    // runs -- one frame late, never worse.
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, tsEarlyMouseHook, nullptr, 0);
+    if (!g_mouseHook)
+        tlog("[twinspeak] gui           : early-present mouse hook not installed -- the\n"
+             "                            inactive row falls back to the WM_ACTIVATE path\n");
     MSG m;
     while (GetMessageA(&m, nullptr, 0, 0) > 0) {
         // v7.1.5 CTRL+TAB cycles pages: Ctrl+Tab = next, Ctrl+Shift+Tab =
@@ -8216,10 +8265,8 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }   // v7.2.1
     KillTimer(g_hwnd, 1);
-    KillTimer(g_hwnd, 5);   // v7.2.6: the color poll dies with the loop
-    KillTimer(g_hwnd, 6);   // v7.2.7: so does the row handback schedule
-    // (v7.2.1's hook unhook lived here; the hook is retired with the sheet.)
     // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
     // UI is gone anyway). v7.1.26: the taskbar-list COM object is retired
     // with the AddTab machinery; nothing to release.
