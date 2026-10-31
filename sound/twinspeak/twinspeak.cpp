@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,32 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.2 THE FLUSHED EARLY PRESENT. The field: "I still see that when
+//            the window goes unfocused that it still shows the stale
+//            version which immediately goes to the official unfocused
+//            window frame exactly one refresh frame later." The v7.2.1
+//            hook fired and patched the row, but its bytes were not
+//            first to the surface: gdi32 BATCHES drawing calls per
+//            thread, so the hook's unflushed BitBlt sat in user memory
+//            while win32k resumed the activation transaction, the DWM
+//            composed the flip against the OLD row, and the batch landed
+//            one composed frame later -- deterministically. And a
+//            composition already in flight when the click landed sampled
+//            the old row before the click existed, yet can still carry
+//            the flip. The hook now orders three steps before it
+//            returns: DwmFlush() waits out the in-flight compose (after
+//            it, every compose that can carry the flip starts after our
+//            write and must sample it), the present shrinks to its actual
+//            work -- patch row 0 of the existing bar buffer and blit the
+//            1 px strip (the face stays active until WM_ACTIVATE anyway;
+//            v7.2.1's full GDI+ re-render bought ~2 ms of unguarded
+//            time) -- and GdiFlush() puts the bytes in the win32k
+//            redirection surface BEFORE the hook returns; win32k cannot
+//            resume the transaction until then, so the flip compose
+//            reads the row by ordering, not by luck. guiPaintBar ends
+//            with GdiFlush() too, so the WM_ACTIVATE blit and the burst
+//            ticks stop waiting for an arbitrary batch flush. Version
+//            steps to 7.2.2.
 //    v7.2.1 THE ZERO-FRAME ROW + THE NAME SPLIT + A CLEAN KILL. The
 //            field: "I still see the inactive window painted one frame
 //            late." It does: WM_ACTIVATE hops the message queue AFTER
@@ -4675,6 +4701,14 @@ static void guiPaintBar(HWND w) {
         guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
     }
     ReleaseDC(w, wdc);
+    // v7.2.2: gdi32 batches drawing calls per thread -- without a flush the
+    // blit can sit in user memory while the caller moves on (the early hook
+    // used to return to win32k with the row still batched; the flip compose
+    // then read the OLD row -- see tsEarlyMouseHook). GdiFlush is a no-op
+    // when nothing is batched, so every presentation -- the WM_ACTIVATE
+    // blit, the burst ticks, WM_PAINT -- is in the redirection surface
+    // before this call returns.
+    GdiFlush();
 }
 // v7.2.1 THE ZERO-FRAME ROW, the early present: WM_ACTIVATE always hops the
 // message queue AFTER win32k has already told the DWM about the activation,
@@ -4682,14 +4716,43 @@ static void guiPaintBar(HWND w) {
 // DWM's own border flip by one frame (the field: "painted one frame late").
 // This hook sees the click BEFORE the activation transaction starts and
 // presents the measured row right there: the border is on screen in the
-// same composed frame as the DWM's flip -- zero frames late. Constraints
-// honored: WH_MOUSE_LL is answered on the installing thread (the idle,
-// pumping GUI thread -- the only state this handler acts in), the handler
-// runs no message dispatch (a render + one blit, ~1 ms, far under the hook
-// timeout), and everything bails instantly unless our window is the ACTIVE
-// window with a measured cache. Alt-Tab and programmatic deactivations have
-// no earlier signal a window can see: they keep the WM_ACTIVATE path (one
-// frame). If the hook never installed (policy, AV), nothing changes.
+// same composed frame as the DWM's flip -- zero frames late.
+// v7.2.2 THE FLUSHED EARLY PRESENT -- the field: "it still shows the stale
+// version which immediately goes to the official unfocused window frame
+// exactly one refresh frame later." The early present was real, but its
+// bytes were not first: two gaps sat between the BitBlt and the surface
+// the DWM samples. (a) THE GDI BATCH: gdi32 batches drawing calls per
+// thread and an unflushed BitBlt never reaches the win32k redirection
+// surface -- the v7.2.1 hook returned with the row still in user memory,
+// win32k resumed the activation transaction and told the DWM, the flip
+// composed against the old row, and the batch landed one composed frame
+// later. Every time. (b) THE COMPOSE IN FLIGHT: a composition that started
+// before the click already sampled the old row, and one still running when
+// the DWM learns of the activation can carry the flip without the row.
+// The fix is ORDERING, not speed -- three steps, all inside the hook,
+// because the hook return is the last point we own before win32k resumes:
+//   1. DwmFlush() waits out the composition in flight; a compose boundary
+//      has just passed when it returns, so every compose that can carry
+//      the flip starts AFTER our write and must sample it. (DWM refuses
+//      or is absent: the wait is skipped and v7.2.1's window stays --
+//      never wider. The wait costs at most one compose period, ~7-17 ms,
+//      and only on a qualifying click.)
+//   2. The present shrinks to its actual work: patch row 0 of the
+//      EXISTING bar buffer and blit the 1 px strip -- microseconds, not
+//      v7.2.1's full GDI+ re-render (~2 ms of unguarded time; the face
+//      must stay the active one until WM_ACTIVATE anyway).
+//   3. GdiFlush() puts the bytes in the redirection surface BEFORE the
+//      hook returns; win32k cannot resume the transaction until then,
+//      so the flip compose reads the row BY CONSTRUCTION.
+// Constraints honored: WH_MOUSE_LL is answered on the installing thread
+// (the idle, pumping GUI thread -- the only state this handler acts in),
+// the handler runs no message dispatch and stays far under the hook
+// timeout, and everything bails instantly unless our window is the ACTIVE
+// window with a measured cache. Alt-Tab and programmatic deactivations
+// have no earlier signal a window can see: they keep the WM_ACTIVATE path
+// (one frame). If the hook never installed (policy, AV), nothing changes.
+static HRESULT (WINAPI* tsDwmFlushFn)() = nullptr;   // v7.2.2: resolved once,
+static bool      tsDwmFlushTried    = false;         // dwmapi is LoadLibrary'd
 static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION) {
         const UINT m = (UINT)wp;
@@ -4705,9 +4768,35 @@ static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
                     // A click outside our tree: present the settled inactive
                     // row NOW, while the bar face is still the active one (the
                     // face itself flips when WM_ACTIVATE arrives, as always).
-                    g_forceInstantRow = true;
-                    guiPaintBar(g_hwnd);
-                    g_forceInstantRow = false;
+                    // v7.2.2: the three ordered steps -- see the block above.
+                    if (!tsDwmFlushTried) {              // every other dwmapi
+                        tsDwmFlushTried = true;          // import in this file
+                        tsDwmFlushFn = (HRESULT (WINAPI*)())GetProcAddress(  // is
+                            LoadLibraryA("dwmapi.dll"), "DwmFlush");         // lazy
+                    }
+                    if (tsDwmFlushFn) tsDwmFlushFn();    // 1. wait out the compose
+                    bool done = false;                   // 2. the 1 px strip
+                    if (g_glassSheet && g_barBits && g_barDc) {
+                        RECT cr;
+                        if (GetClientRect(g_hwnd, &cr) && cr.right > 0
+                            && guiBarBufEnsure(cr.right, kCapH)) {
+                            g_forceInstantRow = true;
+                            guiBarPatchSheetRow(cr.right, true);  // row 0 -> cache
+                            HDC wdc = GetDC(g_hwnd);
+                            if (wdc) {
+                                if (BitBlt(wdc, 0, 0, cr.right, 1,
+                                           g_barDc, 0, 0, SRCCOPY)) done = true;
+                                ReleaseDC(g_hwnd, wdc);
+                            }
+                            g_forceInstantRow = false;
+                        }
+                    }
+                    if (!done) {                         // no buffer / no sheet:
+                        g_forceInstantRow = true;        // v7.2.1's full render
+                        guiPaintBar(g_hwnd);
+                        g_forceInstantRow = false;
+                    }
+                    GdiFlush();                          // 3. bytes in the surface
                     // Self-heal: if this click never deactivates us (menus
                     // and other non-activating surfaces), the burst's first
                     // tick re-presents the truth within 20 ms; if it does
@@ -6814,7 +6903,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.1  |  %s",   // v7.2.1 zero-frame row (v7.1.28 fixed the stale v7.1.25)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.2  |  %s",   // v7.2.2 flushed early present (v7.1.28 fixed the stale v7.1.25)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7927,8 +8016,11 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // is active (the only state the hook acts in). A button-down outside our
     // tree is seen BEFORE win32k starts the activation transaction, so the
     // early-presented row rides the same composed frame as the DWM's own
-    // border flip. If it could not be installed (policy, AV) the
-    // WM_ACTIVATE path still runs -- one frame late, never worse.
+    // border flip. v7.2.2: inside the hook the present is DwmFlush'd,
+    // minimal (the 1 px strip) and GdiFlush'd, so riding that frame is an
+    // ordering guarantee, not a race win (see tsEarlyMouseHook). If it
+    // could not be installed (policy, AV) the WM_ACTIVATE path still
+    // runs -- one frame late, never worse.
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, tsEarlyMouseHook, nullptr, 0);
     if (!g_mouseHook)
         tlog("[twinspeak] gui           : early-present mouse hook not installed -- the\n"
