@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,50 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.9 THE ONE-FRAME ROW, TRACED AND KILLED. The field: "I still
+//            see the top bar thing being delayed by one frame. Trace
+//            the exact sequence for deactivation and fix it once you
+//            identify the root cause." Traced, on the field's own 60 fps
+//            tape and in this code: the deactivation sequence is (1)
+//            the click, (2) the WH_MOUSE_LL early present -- SKIPPED,
+//            it requires a measured cache; (3) WM_NCACTIVATE(FALSE)
+//            paints the whole bar inactive inside the transaction: the
+//            FACE is opaque client pixels and displays AS-IS at the
+//            flip compose (the proven titlebar fix), but row 0 without
+//            a cache is the recipe's HALF-ALPHA BGRA(43,43,43,128) --
+//            and alpha-carrying pixels on the extended glass sheet are
+//            owned by the DWM's glass blend while the activation
+//            transition runs, so the row cannot show its settled
+//            composite at the flip compose; (4) the flip compose flips
+//            the DWM's own strips and our face; (5) WM_ACTIVATE -- one
+//            queue hop later -- re-presents the row, which lands the
+//            NEXT compose: ONE FRAME LATE, every time. The root cause
+//            is upstream of all of it: guiMeasureInstantRow could never
+//            seed the cache on this desktop -- it required ALL THREE
+//            fixed points (left-40 / center / right-40) uncovered AND
+//            agreeing within +/-2, and the field's tape shows twinspeak
+//            sitting PARTIALLY BEHIND covering windows (only a sliver
+//            of the top row escapes), so the guards fail, the cache
+//            stays empty, and the hook and the opaque hold -- the two
+//            machines that make the row instant -- never engage. Three
+//            fixes: (a) THE MEASURE SCANS the row every 24 px, keeps
+//            every guarded point, takes the MEDIAN -- any single
+//            visible point seeds the cache, partial cover no longer
+//            starves it (the +/-2 gate is retired with it: the blend
+//            legitimately varies along the row with the backdrop);
+//            (b) WM_NCPAINT now paints the NC-LATCHED state (latched
+//            at WM_NCACTIVATE) whenever the queue has not caught up --
+//            a WM_NCPAINT that arrives INSIDE the transaction can no
+//            longer repaint the STALE face and revert the pre-flip
+//            present; (c) THE SYMMETRIC ACTIVATION PRESENT:
+//            WM_NCACTIVATE(TRUE) paints the ACTIVE bar (row 0 black =
+//            the glass key) before DefWindowProc flips, so activation
+//            gets the same zero-frame ordering deactivation has had
+//            since v7.2.3. With the cache seeded the deactivation row
+//            is the OPAQUE measured composite from the flip compose
+//            on -- no glass, no fade, no frame late; the burst tail
+//            still hands it back to the recipe's real translucent
+//            border once the fade has settled. Version steps to 7.2.9.
 //    v7.2.8 BACK TO THE 7.2.3 BASE + THE POST-FLIP NCPAINT. The field:
 //            "Go back to here, because that was when I had almost
 //            had it. Make v7.2.8 with it. And lastly, make it so the
@@ -4478,6 +4522,18 @@ static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) pai
                                              // returns us until the handler returns;
                                              // without the force the pre-flip present
                                              // would repaint the ACTIVE face)
+static bool     g_forceActiveFace = false;   // v7.2.9: the symmetric force for the
+                                             // ACTIVATION transaction -- and for a
+                                             // WM_NCPAINT that arrives INSIDE either
+                                             // transaction, before the queue has
+                                             // caught up (see WM_NCPAINT)
+static int      g_ncActive = -1;             // v7.2.9: the NC-latched activation state
+                                             // (WM_NCACTIVATE's wParam: 1 active, 0
+                                             // inactive, -1 never seen). The frame's
+                                             // own truth, readable INSIDE the
+                                             // transaction -- unlike GetActiveWindow,
+                                             // which only catches up when WM_ACTIVATE
+                                             // runs after the transaction closes
 static HHOOK    g_mouseHook      = nullptr; // v7.2.1: the early-present mouse hook (see guiMain)
 static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
 // renders the whole bar into dc (memory buffer or screen -- identical code)
@@ -4730,42 +4786,69 @@ static void guiBarPatchSheetRow(int cw, bool active) {
 // v7.2.0 THE MEASUREMENT: the instant border's color is not guessed, it
 // is READ BACK from the screen. Called one tick after the burst handed
 // row 0 back to the recipe (the DWM has composited the settled blend by
-// then): three points along the window's TOP ROW (the client's row 0 IS
-// the window's top row -- WM_NCCALCSIZE insets left/right/bottom only)
-// are sampled off the screen DC, which returns the COMPOSITED desktop
-// pixel. Every point is guarded with WindowFromPoint first -- if another
-// window covers us, its pixels must never enter the cache -- and all
-// three samples must agree within +/-2 per channel (the row is a flat
-// blend; disagreement means a transient or a polluted read). Only a
-// settled, inactive, visible, non-minimized window measures.
+// then): points along the window's TOP ROW (the client's row 0 IS the
+// window's top row -- WM_NCCALCSIZE insets left/right/bottom only) are
+// sampled off the screen DC, which returns the COMPOSITED desktop pixel.
+// Every point is guarded with WindowFromPoint first -- if another window
+// covers us, its pixels must never enter the cache. Only a settled,
+// inactive, visible, non-minimized window measures.
+// v7.2.9 THE SCAN + THE MEDIAN. v7.2.3 sampled three FIXED points
+// (left-40 / center / right-40) and required ALL THREE uncovered AND
+// agreeing within +/-2 per channel -- structural poison twice over:
+// the field's tape catches twinspeak sitting PARTIALLY BEHIND covering
+// windows (only a sliver of the top row escapes), the fixed points
+// fall on the covers, the guards fail and the cache NEVER seeds -- and
+// then the hook and the opaque hold (the two machines that make the
+// row flip with the frame) never engage, and every deactivation rides
+// the DWM's transition blend: the top row one frame late, every time
+// (the +/-2 gate could not seed either: the blend legitimately varies
+// along the row with the blurred backdrop behind it). The measure now
+// SCANS the row every 24 px, keeps every GUARDED point, and takes the
+// MEDIAN -- any single visible point seeds the cache, a stray
+// reflection or a lossy edge cannot move the middle, and a partially
+// covered row still measures through whatever sliver is showing.
 static void guiMeasureInstantRow() {
     if (!g_glassSheet || !g_hwnd || !IsWindow(g_hwnd)) return;
     if (GetActiveWindow() != nullptr) return;         // meaningful while inactive only
     if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
     RECT wr;
     if (!GetWindowRect(g_hwnd, &wr)) return;
-    const int xs[3] = { 40, (wr.right - wr.left) / 2, (wr.right - wr.left) - 40 };
+    const int width = wr.right - wr.left;
+    if (width < 48) return;
     HDC sdc = GetDC(nullptr);
     if (!sdc) return;
-    COLORREF v[3];
-    bool ok = true;
-    for (int i = 0; i < 3 && ok; ++i) {
-        const POINT p = { wr.left + xs[i], wr.top };
-        if (WindowFromPoint(p) != g_hwnd) ok = false; // covered: never cache another window's pixels
-        else {
-            v[i] = GetPixel(sdc, p.x, p.y);
-            if (v[i] == CLR_INVALID) ok = false;
-        }
+    // v7.2.9: the scan -- every 24 px across the row, guarded points only.
+    // 24 px steps give ~36 candidates on the 880 px client: fine enough to
+    // find any visible sliver, coarse enough to stay off glyph kerning.
+    COLORREF v[64];
+    int nv = 0;
+    for (int x = 24; x <= width - 24 && nv < 64; x += 24) {
+        const POINT p = { wr.left + x, wr.top };
+        if (WindowFromPoint(p) != g_hwnd) continue;  // covered: never cache another window's pixels
+        const COLORREF c = GetPixel(sdc, p.x, p.y);
+        if (c == CLR_INVALID) continue;
+        v[nv++] = c;
     }
     ReleaseDC(nullptr, sdc);
-    if (!ok) return;
-    for (int i = 1; i < 3; ++i) {
-        const int dr = (int)(v[i] & 0xFF)         - (int)(v[0] & 0xFF);
-        const int dg = (int)((v[i] >> 8) & 0xFF)  - (int)((v[0] >> 8) & 0xFF);
-        const int db = (int)((v[i] >> 16) & 0xFF) - (int)((v[0] >> 16) & 0xFF);
-        if (dr < -2 || dr > 2 || dg < -2 || dg > 2 || db < -2 || db > 2) return;
+    if (nv == 0) return;                              // fully covered: nothing honest to read
+    // v7.2.9: the MEDIAN by luma -- the blend varies along the row with
+    // the backdrop; the middle sample is the row's honest average. (The
+    // +/-2 agreement gate is retired: on a busy backdrop it could never
+    // pass, and a starving cache was the one-frame row's root cause.)
+    for (int i = 1; i < nv; ++i) {                    // insertion sort (nv <= 64)
+        const COLORREF c = v[i];
+        const int key = (int)((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF));
+        int j = i - 1;
+        while (j >= 0) {
+            const COLORREF d = v[j];
+            const int dl = (int)((d & 0xFF) + ((d >> 8) & 0xFF) + ((d >> 16) & 0xFF));
+            if (dl <= key) break;
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = c;
     }
-    g_instantInactive = v[0];
+    g_instantInactive = v[nv / 2];
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -4777,7 +4860,13 @@ static void guiPaintBar(HWND w) {
     // deactivation completes, so GetActiveWindow() still returns this window
     // and the plain read would repaint the ACTIVE face into what must be the
     // pre-flip INACTIVE present. The force wins over the queue read.
-    const bool active = !g_forceInactiveFace && (GetActiveWindow() != nullptr);   // GUI thread only
+    // v7.2.9: g_forceActiveFace is the symmetric force -- the ACTIVATION
+    // present (WM_NCACTIVATE(TRUE)) and a mid-transaction WM_NCPAINT use
+    // it when the NC state has flipped but the queue has not caught up
+    // (GetActiveWindow still returns the OTHER window there).
+    const bool active = g_forceActiveFace
+                        || (!g_forceInactiveFace
+                            && (GetActiveWindow() != nullptr));   // GUI thread only
     RECT cr; GetClientRect(w, &cr);
     const int cw = cr.right - cr.left;
     if (cw <= 0) return;
@@ -6993,7 +7082,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.8  |  %s",   // v7.2.8 post-flip NCPAINT on the 7.2.3 base (v7.2.3 NC-flip present)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.9  |  %s",   // v7.2.9 the one-frame row traced and killed (v7.2.8 post-flip NCPAINT)
              tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7160,6 +7249,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(w, msg, wp, lp); }   // v7.1.26: W, not the A macro
     case WM_NCACTIVATE:
+        // v7.2.9: latch the frame's OWN state FIRST -- WM_NCACTIVATE's
+        // wParam is the activation state win32k is rolling out RIGHT NOW,
+        // readable inside the transaction, while GetActiveWindow() (the
+        // queue's view) only catches up when WM_ACTIVATE runs after the
+        // transaction closes. WM_NCPAINT uses this latch to refuse to
+        // repaint a stale face mid-transaction.
+        g_ncActive = (wp ? 1 : 0);
         // v7.2.3 THE NC-FLIP PRESENT. The video's frames, decoded: on
         // deactivation the DWM re-bakes the extended-sheet row at the
         // compose that carries the activation flip, and that compose is
@@ -7178,11 +7274,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // composed frame, Chrome-instant -- with or without the cache (with
         // it, row 0 is the opaque settled color via g_instantHold; without,
         // the recipe bytes ride the fade like a native frame's own strips).
-        // Activation (wParam != 0) needs none of this: the active look IS
-        // the glass and the DWM's own fade draws it (the video shows that
-        // direction is already instant). DefWindowProc still runs -- the
-        // case falls to the common tail; swallowing the message would
-        // freeze the frame state.
+        // Activation (wParam != 0) used to need none of this -- the active
+        // look IS the glass and the DWM's own fade drew it -- but v7.2.9
+        // adds the SYMMETRIC PRESENT below: the row is ours, and its
+        // inactive bytes at the flip compose read one frame late without
+        // it. DefWindowProc still runs -- the case falls to the common
+        // tail; swallowing the message would freeze the frame state.
         if (!wp && IsWindowVisible(w) && !IsIconic(w)) {
             g_instantHold = (g_instantInactive != 0);   // same latch rule as WM_ACTIVATE
             g_forceInactiveFace = true;                 // the face must be the INACTIVE one
@@ -7190,6 +7287,33 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_forceInactiveFace = false;
             g_bakeTicks = 0;
             SetTimer(w, 4, 20, nullptr);                // the burst still tracks the fade
+        } else if (wp && IsWindowVisible(w) && !IsIconic(w)) {
+            // v7.2.9 THE SYMMETRIC ACTIVATION PRESENT. The deactivation
+            // direction has had its pre-flip present since v7.2.3 (two
+            // tapes proven: the flip compose reads our bytes by ordering,
+            // the face never shows a stale frame). Activation had a softer
+            // version of the same hole: the DWM's own activation fade
+            // usually covers it, but the ROW is ours -- at the flip
+            // compose it still carries the INACTIVE bytes (the half-alpha
+            // recipe gray, or the opaque hold color on a rapid toggle),
+            // and only the WM_ACTIVATE repaint -- one queue hop later --
+            // writes the ACTIVE row (black = the glass key = the DWM's
+            // own accent frame): one frame of wrong row on every focus
+            // gain, exactly the artifact the field taped on the other
+            // direction. The fix is the symmetric twin: paint the ACTIVE
+            // bar HERE, inside the transaction, before DefWindowProc
+            // flips the frame -- GetActiveWindow() still returns the
+            // other window until the transaction closes, so
+            // g_forceActiveFace carries the state. Row 0 = black needs no
+            // cache and no color of ours: black on the extended sheet IS
+            // the DWM's frame, so the flip compose composites the accent
+            // border through it and the fade animates the row exactly
+            // like the DWM's own three strips.
+            g_forceActiveFace = true;                   // the face must be the ACTIVE one
+            guiPaintBar(w);                             // face + row 0 (black) + GdiFlush
+            g_forceActiveFace = false;
+            g_bakeTicks = 0;
+            SetTimer(w, 4, 20, nullptr);                // the burst tracks this fade too
         }
         break;
     case WM_NCPAINT:
@@ -7198,25 +7322,38 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v7.2.3 base (the version that almost had it: the NC-flip present
         // lands, and the settled row is the recipe's real half-alpha
         // border, the same translucent gray the DWM's own strips carry).
-        // What the 7.2.3 tapes still caught was the row BETWEEN states in
-        // the first post-flip composes -- and the one redraw signal that
-        // rides the flip itself is this message: win32k sends WM_NCPAINT
-        // when it redraws the frame right after the activation change, so
-        // the bar is repainted HERE, inside the frame's own pass, with the
-        // strips -- not a queue hop behind them. The paint is the plain
-        // truth by construction: post-deactivation the transaction has
-        // already closed, GetActiveWindow() has moved on, and the plain
-        // read inside guiPaintBar picks the INACTIVE face; post-activation
-        // it picks the active one (row 0 black = the glass = the DWM's own
-        // frame, which is exactly what the activation fade draws).
-        // Idempotent with the burst and every other presenting path: the
-        // same buffered bytes, GdiFlush()ed (guiPaintBar ends with it), so
-        // however many paths present the bar, nothing flickers and nothing
-        // fights. DefWindowProc still runs from the common tail below --
-        // it owns the real frame drawing; swallowing this message would
+        // win32k sends WM_NCPAINT when it redraws the frame right after
+        // an activation change -- the one redraw signal that rides the
+        // flip itself. The handler repaints the bar (face + row 0) inside
+        // that pass, with the frame's own redraw, not a queue hop behind
+        // it. DefWindowProc still runs from the common tail below -- it
+        // owns the real frame drawing; swallowing this message would
         // blank the strips.
+        // v7.2.9 THE NC-LATCHED STATE. A WM_NCPAINT that arrives INSIDE
+        // the activation transaction (before WM_ACTIVATE has run) sees a
+        // queue that still reports the OLD state: the plain read inside
+        // guiPaintBar would repaint the STALE face -- reverting the
+        // pre-flip present the WM_NCACTIVATE handler just landed, and
+        // handing the flip compose the wrong bytes. So the paint here
+        // follows the NC LATCH (g_ncActive, set at WM_NCACTIVATE)
+        // whenever the two views disagree: mid-deactivation it paints
+        // the INACTIVE bar, mid-activation the ACTIVE one. After the
+        // transaction (the normal case -- WM_ACTIVATE has run, or the
+        // paint is an ordinary frame redraw) the two views agree and
+        // the plain truth paints itself, unchanged from v7.2.8.
         if (IsWindowVisible(w) && !IsIconic(w)) {
-            guiPaintBar(w);                             // face + row 0, with the frame's own redraw
+            const bool queueActive = (GetActiveWindow() != nullptr);
+            if (g_ncActive >= 0 && (g_ncActive != 0) != queueActive) {
+                // MID-TRANSACTION: the frame has flipped, the queue has
+                // not. Paint the NC-latched state, never the stale one.
+                g_forceActiveFace   = (g_ncActive != 0);
+                g_forceInactiveFace = (g_ncActive == 0);
+                guiPaintBar(w);
+                g_forceActiveFace   = false;
+                g_forceInactiveFace = false;
+            } else {
+                guiPaintBar(w);                         // face + row 0, with the frame's own redraw
+            }
         }
         break;
     case WM_ACTIVATE:
