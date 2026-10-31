@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.1.26 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.1.27 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,28 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.1.27 THE REAL TOP BORDER, VANILLA AT LAST. From the field: with
+//            Windows' "show accent color on the following surfaces: title
+//            bars and window borders" the LEFT/RIGHT/BOTTOM border pieces
+//            follow the Windows colors -- they are real NC strips from the
+//            WM_NCCALCSIZE insets, so the DWM draws its real border there
+//            -- while the TOP row stayed our paint (the fake shadow's
+//            opaque gray: never half-transparent, never accent). The top
+//            cannot be inset like the sides (any top gap makes the DWM
+//            paint a ghost caption OUTSIDE the window rect), so the recipe
+//            the native surfaces use is adopted: DwmExtendFrameIntoClient-
+//            Area {0,0,1,0} extends the DWM glass sheet 1px into the
+//            client's top row, and while ACTIVE the bar paints that row
+//            PURE BLACK -- black on the sheet IS the DWM frame, so row 0
+//            shows the window's REAL top border: the accent color when the
+//            Windows override is on, the default SEMI-TRANSPARENT gray
+//            when it is not -- vanilla on all four sides. DWMWA_USE_
+//            IMMERSIVE_DARK_MODE rides along, always on (attribute 20,
+//            fallback 19): without it the DWM paints that sheet WHITE in
+//            light mode. While INACTIVE the DWM draws no border on the
+//            sheet, so the row is composited by hand: the face top blended
+//            50% toward a neutral RGB(85,85,85). The fake-shadow recipe is
+//            retired, kept only as the fallback if the extend call fails.
 //    v7.1.26 THE GRADIENT LEAVES ROW 0 + THE WINDOW IS UNICODE, END TO END.
 //            (a) THE TOP EDGE, from the field: the top thin border still
 //            shows "color" instead of the half-transparent gray. The bar
@@ -4076,8 +4098,12 @@ static void guiCalcFrameInsets() {
     g_frmInsY = frameY + pad;
 }
 
-// v7.1.24 (main.c): the caption buttons. Set to 0 to remove the fake shadow
-// painting (kept at the example's 1).
+// v7.1.24 (main.c): the caption buttons; the 1px row the example paints
+// its fake shadow into. v7.1.27: that row is the window's REAL top border
+// now -- the DWM glass sheet shows through pure black while active (see
+// guiCreateRealWindow + guiRenderBar), and the vanilla inactive gray is
+// composited while inactive. Keep at 1: row 0 must exist to carry the
+// border, and the face gradient (offset 1px down) leans on it.
 #define WIN32_FAKE_SHADOW_HEIGHT 1
 enum {
     CustomTitleBarHoveredButton_None = 0,
@@ -4168,6 +4194,13 @@ static bool guiBarBufEnsure(int ww, int hh) {
     g_barW = ww; g_barH = hh;
     return true;
 }
+// v7.1.27: set when the DWM glass sheet (DwmExtendFrameIntoClientArea
+// {0,0,1,0}) is confirmed on the panel window -- row 0 then paints the
+// REAL top border (pure black while active, the hand-composited vanilla
+// gray while inactive). Without the sheet the v7.1.26 fake-shadow recipe
+// stays the fallback, so a failed extend can never paint a dead black
+// line into the bar.
+static bool g_glassSheet = false;
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
 // (no maximize -- the size lock refuses it), hover faces driven by the
@@ -4176,10 +4209,12 @@ static bool guiBarBufEnsure(int ww, int hh) {
 // example follows), the minimize glyph as the example's 10x1 px line. The
 // v7.1.23 pressed face is retired with the client-side click machinery
 // that fed it -- the example acts on WM_NCLBUTTONUP while the slot is
-// hovered, so the hover face IS the press feedback now. The example's fake
-// top shadow (WIN32_FAKE_SHADOW_HEIGHT) paints over the face's first row,
-// dimmed when inactive by the example's blend rule, in the theme's own
-// edge color. The bar also dims when the window is INACTIVE
+// hovered, so the hover face IS the press feedback now. Row 0 is the
+// window's REAL top border since v7.1.27: the DWM glass sheet shows
+// through a pure black row while active (the accent color with the
+// Windows override, the default semi-transparent gray without), and the
+// vanilla inactive gray is composited over the face top while inactive.
+// The bar also dims when the window is INACTIVE
 // (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
 // active vs. inactive like every native caption does.
 static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
@@ -4193,8 +4228,9 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // v7.1.26, from the field: the gradient STARTED at row 0, so its tinted
     // top stop colored the fake top shadow's row on every dark theme (the
     // field read it as "color on the top thin border"). The fill is offset
-    // 1px DOWN and runs 1px SHORTER -- row 0 belongs to the shadow line
-    // alone -- and the brush rides along (same height, one row down), so
+    // 1px DOWN and runs 1px SHORTER -- row 0 belongs to the top border
+    // row alone (v7.1.27: the DWM glass sheet, see below) -- and the
+    // brush rides along (same height, one row down), so
     // the face still melts to cBg exactly at the bottom edge. The bottom
     // overscan row past the edge line stays covered.
     const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), active ? 0.07 : 0.03);
@@ -4208,23 +4244,36 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
     g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
-    // v7.1.24 main.c: the fake top shadow -- the frame inset removed the
-    // window's real top border; the example paints its own 1 px line
-    // (focused: the plain shadow; unfocused: blended toward the face top).
-    // v7.1.26 THE EXAMPLE'S RECIPE, VERBATIM: v7.1.24's 45%-toward-black
-    // blend read as a BLACK hairline on dark themes, and v7.1.25's cPanel2
-    // read as the theme's own color (the field: "color ... instead of the
-    // half-transparent gray"). Both abandoned the line the example
-    // actually ships: a NEUTRAL RGB(100,100,100) -- against a light face a
-    // soft shadow, against a dark face a quiet gray edge, never a theme
-    // tint. Inactive keeps the example's rule: blend 50/50 toward the face
-    // top. With the gradient off row 0 (above), the example's line is the
-    // ONLY thing that ever paints this row.
-    const COLORREF shTop = RGB(100, 100, 100);
-    const COLORREF shCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
-    Gdiplus::SolidBrush shadow(Gdiplus::Color(255, GetRValue(shCol),
-                                              GetGValue(shCol), GetBValue(shCol)));
-    g.FillRectangle(&shadow, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
+    // v7.1.27 THE REAL TOP BORDER -- the fake shadow is retired. Row 0 is
+    // the DWM glass sheet (DwmExtendFrameIntoClientArea {0,0,1,0}, set at
+    // creation). ACTIVE + sheet: the row is filled PURE BLACK -- black on
+    // the sheet IS the DWM frame, so the window's REAL top border shows
+    // there: the accent color when Windows' "title bars and window
+    // borders" override is on, the default SEMI-TRANSPARENT gray when it
+    // is not -- the same native border the left/right/bottom NC strips
+    // already carry. Vanilla on all four sides. The black must be EXACT
+    // (0,0,0) in the redirection surface: the opaque integer fill plus the
+    // single SRCCOPY blit in guiPaintBar guarantee it. INACTIVE: the DWM
+    // draws no border on the sheet (the same observation the native
+    // surfaces made), so the vanilla inactive border is composited BY
+    // HAND -- the face top blended 50% toward a neutral RGB(85,85,85), the
+    // same quiet gray on light and dark faces, like vanilla. NO sheet
+    // (the extend call failed): the v7.1.26 fake-shadow recipe stays as
+    // the fallback -- a failed extend can never paint a dead black line.
+    // The v7.1.26 gradient offset stays: the face starts 1px down, so
+    // this row belongs to the border alone.
+    COLORREF rowCol;
+    if (g_glassSheet) {
+        rowCol = active ? RGB(0, 0, 0)                       // the DWM frame
+                        : guiLerpRGB(bgTop, RGB(85, 85, 85), 0.5);
+    } else {
+        const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
+        rowCol = active ? shTop : guiLerpRGB(bgTop, shTop, 0.5);
+    }
+    Gdiplus::SolidBrush rowBrush(Gdiplus::Color(255, GetRValue(rowCol),
+                                                GetGValue(rowCol),
+                                                GetBValue(rowCol)));
+    g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
     // v7.1.24 main.c: the caption buttons -- hover face + glyphs. The fills
     // stay integer-exact; shape smoothing turns ON for the X's diagonals
     // ONLY (the two strokes need AA, the fills above do not).
@@ -6204,6 +6253,36 @@ static bool guiCreateRealWindow() {
             const int ncrp = 2;     // DWMNCRP_ENABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
                    &ncrp, sizeof(ncrp));
+            // v7.1.27 THE REAL TOP BORDER, part one: the DWM glass sheet
+            // extends 1px into the client's top row. Row 0 painted PURE
+            // BLACK (guiRenderBar, active) makes the sheet show the DWM's
+            // REAL border there -- the accent color with the Windows
+            // "title bars and window borders" override, the default
+            // semi-transparent gray without -- the vanilla top edge the
+            // fake shadow could only imitate. (Margins are L, R, top,
+            // bottom; the struct is spelled out because dwmapi.h is not
+            // included -- the same house trick as the attribute calls.)
+            typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
+            typedef struct { int cxLeftWidth, cxRightWidth,
+                             cyTopHeight, cyBottomHeight; } TS_MARGINS;
+            const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
+                LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+            if (dwmExtend) {
+                const TS_MARGINS sheet = { 0, 0, 1, 0 };
+                g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+            }
+            // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
+            // Without it the DWM paints the extended sheet WHITE in light
+            // mode (the documented light-mode border bug); with it the
+            // border renders correctly -- the dark-mode border color is
+            // slightly different from the light one and close enough, the
+            // same trade the native surfaces make. Attribute 20 since
+            // Win10 1903, 19 on the early Insider builds: try 20 first.
+            const int darkOn = 1;
+            if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                              &darkOn, sizeof(darkOn)))) {
+                dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
+            }
         }
     }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
@@ -6445,6 +6524,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // pixels anymore: there is simply no client pixel it may paint.
         // The designed 880x620+kCapH client survives because the creation
         // size grew by the same insets (guiCalcFrameInsets).
+        // v7.1.27: the TOP stays client-covered on purpose -- with any top
+        // gap the DWM decides the client no longer covers the caption and
+        // paints a ghost caption OUTSIDE the window rect (see the v7.1.27
+        // notes). The real top border arrives through the DWM glass sheet
+        // (DwmExtendFrameIntoClientArea in guiCreateRealWindow) instead.
         if (!wp) break;   // wParam FALSE: DefWindowProc
         int frame_x = GetSystemMetrics(SM_CXFRAME);
         int frame_y = GetSystemMetrics(SM_CYFRAME);
