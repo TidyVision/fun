@@ -2,6 +2,14 @@ Disclaimer: This tool was made for free, bypassing the requirement of paying for
 
 A GUI should come with twinspeak.exe. And there should be a built-in E.Q. setting to use instead of utilizing Equalizer APO, as that software uses shared-mode, where as this software bypasses all of that by WASAPI Exclusive/KS.
 
+### How is the custom window made? I'm curious
+
+I had GLM 5.3 flash learn about the code from [this github repository](https://github.com/grassator/win32-window-custom-titlebar/tree/main), which demonstrates this perfectly, with faking the windows 10 dwm title bar and borders.
+
+I think it's just beautiful to be honest, like 5 years ago was that a thing. I'm glad to shift to that instead of manual DWM stuff.
+
+I'll be using this fully-polished custom window titlebar and borders for my next projects like this, because it should define how the iconic windows 10 window can be manipulated into looking just as beautiful as this.
+
 ## Overview & Metadata
 
 PROPERTY OF TIDYVISION, GENERATED FROM GLM 5.3 FLASH
