@@ -1,12 +1,12 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.0: version bump
-// (the glass key, BOTH states: row 0 is BGRA(0,0,0,0) active AND
-// inactive -- the DWM paints its own border through the sheet, the same
-// painter that owns the left/right/bottom strips, so the top border is
-// pixel-identical material in both states on every backdrop and nothing
-// of ours blends with it: no half-alpha, no measurement, no hold. The
-// v7.3.0 backdrop estimator and the v7.3.2 hold latch are retired
-// whole; DwmFlush() and the row-first commit stay as the v7.3.1 belts).
-// v7.3.2: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.1: version bump
+// (the inactive row, pinned: on unfocus row 0 is the half-alpha #696969
+// the classic inactive border rides -- the DWM's own recipe, composited
+// by the same DWM over the same glass as the left/right/bottom strips --
+// while the glass key BGRA(0,0,0,0) stays the active row. The v7.3.0
+// backdrop estimator and the v7.3.2 hold latch are retired whole;
+// v7.4.0's alpha-0-both-states row went BLACK on unfocus over a
+// (252,252,252) backdrop -- the field's tape; Discord's custom-frame
+// build carries the same hole). v7.3.2: version bump
 // (the hold that does not expire: the deactivation hold is a LATCH --
 // g_holdLive -- spanning the whole inactive period; the 240 ms
 // wall-clock stamp, the clock checks in all three row writers and the
@@ -73,8 +73,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,4,0,0
-PRODUCTVERSION  7,4,0,0
+FILEVERSION     7,4,1,0
+PRODUCTVERSION  7,4,1,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -85,12 +85,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.0.0"
+            VALUE "FileVersion",      "7.4.1.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.0.0"
+            VALUE "ProductVersion",   "7.4.1.0"
         END
     END
     BLOCK "VarFileInfo"
