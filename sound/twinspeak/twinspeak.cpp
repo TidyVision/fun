@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,28 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.9 THE BORDER THAT COPIES THE BORDER. Field: "This is what the
+//            top border looks like if it's layered on top of a color
+//            252,252,252." And: "Well, I want the window border's top bar
+//            like the left, right and bottom one. Totally accurate."
+//            The three DWM strips are the DWM's OWN border rendering --
+//            a semi-transparent, dark-tinted line that re-blends with
+//            whatever sits behind the window; row 0 can never BE that
+//            rendering (a top NC strip paints the ghost caption outside
+//            the rect -- v7.1.27) and must not SIMULATE it (v7.3.7's
+//            constant read "always black"). It COPIES it: while active,
+//            row 0 is the OPAQUE measured color of the actually rendered
+//            border line on the window's own left strip (one BitBlt off
+//            the composed screen, darkest-of-4-columns per scan row,
+//            median by luma -- the house statistic), kept fresh by the
+//            fade presenter's train behind a 12-tick no-sample gate (the
+//            DWM's ~200 ms activation fade rides the sticky copy -- a
+//            mid-fade sample would flash the row down and back, the
+//            v7.2.10 flash class) and re-kicked on every WM_MOVE, so
+//            dragging the window over complete white re-copies the
+//            border on the way. Inactive keeps the v7.3.2 hold/recipe
+//            byte-for-byte; the glass key survives only as the failed-
+//            sample fallback. Version steps to 7.3.9.
 //    v7.3.8 THE ROW REVERTED, THE SIZE EVENT STAYS. Field: "This just
 //            makes the top border always black. Please revert that top
 //            border change." The v7.3.7 opaque constant row is
@@ -5274,6 +5296,26 @@ static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRea
 // with the timer the field named.
 static std::atomic<int> g_holdLive{0};   // 1 = the tracked opaque row IS the inactive border
 static std::atomic<unsigned> g_holdPx{0};// the held OPAQUE row pixel (BGRA, alpha 255)
+// v7.3.9 THE SIDE-BORDER COPY, the state. While ACTIVE, row 0 is the
+// measured OPAQUE color of the DWM's own rendered border line (the left
+// strip, sampled off the composed screen by guiSideBorderPx below) -- the
+// same rendering the left/right/bottom strips carry, "totally accurate"
+// by being a copy of the real thing instead of a simulation of it.
+// g_sideLive = 1 once a sample landed; g_sidePx = the copied pixel (BGRA,
+// alpha 255 -- an opaque pixel on the sheet displays AS-IS, the v7.2.0
+// finding, so no blend math and no fade can touch it). Written by the
+// fade presenter thread ONLY (the train's active ticks); read by the row
+// writers on the GUI thread (release/acquire, the g_guiRowCommit
+// discipline). g_sideFadeGate = train ticks that must NOT sample:
+// WM_NCACTIVATE(TRUE) stamps 12 (~240 ms, clear of the DWM's ~200 ms
+// activation fade) so the fade rides the STICKY copy -- a mid-fade
+// sample would flash the row down to the dimming line color and back
+// (the v7.2.10 flash class); the train's tail ticks re-sample the
+// settled line. WM_MOVE kicks stamp nothing -- a drag samples
+// immediately, that is the tracking the field asked for.
+static std::atomic<int>      g_sideLive{0};     // 1 = the measured side-border copy IS the active row
+static std::atomic<unsigned> g_sidePx{0};       // the copied OPAQUE side-border pixel (BGRA, alpha 255)
+static std::atomic<int>      g_sideFadeGate{0}; // train ticks that must not sample (the activation fade)
 static unsigned g_holdScan[4 * 512];   // the sparse-scan scratch (guiHoldPxForBackdrop is the only writer)
 static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vanilla recipe row
     HWND w = g_hwnd;
@@ -5357,6 +5399,104 @@ static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vani
     const int cb = 43 + (((int)med & 0xFF) * 127 + 127) / 255;
     return 0xFF000000u | ((unsigned)cr << 16) | ((unsigned)cg << 8) | (unsigned)cb; // BGRA, opaque
 }
+// v7.3.9 THE SIDE-BORDER COPY, the measurement. The field: "I want the
+// window border's top bar like the left, right and bottom one. Totally
+// accurate." The three DWM strips are the DWM's OWN border rendering --
+// a semi-transparent, dark-tinted line that re-blends with whatever sits
+// behind the window. Row 0 cannot BE that rendering (a top NC strip
+// makes the DWM paint a ghost caption OUTSIDE the window rect -- the
+// v7.1.27 lesson) and must not SIMULATE it (v7.3.7's constant read
+// "always black": a model of the border is always one model error away
+// from the border). It COPIES it instead: the actually rendered border
+// line, sampled off the COMPOSED SCREEN on the window's own left strip
+// -- whatever the DWM does to the strips (dark mode tint, an accent
+// override, the system transparency setting, the live backdrop), the
+// copy is byte-for-byte what the strips show.
+// Sampling: ONE BitBlt of a 4 x 60 px block at the window's left edge,
+// 17 scan rows starting 4 px below the top (clear of the corner blend),
+// the DARKEST-by-luma pixel per row (the border line is the darkest
+// element of the strip -- robust to which column DWM draws it on),
+// MEDIAN by luma across the rows (the house statistic -- one hot pixel,
+// a cursor crossing the edge, cannot steer the color). The LEFT edge on
+// purpose: the misanchored reopen shadow (the still-open tray-reopen
+// bug) rides right/down -- the left strip is the clean one. OPAQUE BGRA
+// out (an opaque pixel on the sheet displays as-is -- the v7.2.0
+// finding -- so the copy needs no blend math at all). 0 = no sample
+// (sheet failed, edge off-monitor, BitBlt failed): the writers ride the
+// sticky copy, else the v7.3.8 glass key -- never a made-up color.
+// Threading: the fade presenter thread is the ONLY caller (its active
+// train ticks); the scratch DIB below is its private state, exactly
+// like guiHoldPxForBackdrop's strip DIB is the GUI thread's.
+static unsigned guiSideBorderPx() {
+    HWND w = g_hwnd;
+    if (!w || !g_glassSheet || !IsWindow(w)) return 0;
+    RECT wr;
+    if (!GetWindowRect(w, &wr)) return 0;
+    MONITORINFO mi; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
+    // the whole sampled block must sit on-screen: rows wr.top+4..+52 and
+    // columns wr.left..+3 are all inside the left NC strip.
+    if (wr.left < mi.rcMonitor.left || wr.left + 4 > mi.rcMonitor.right ||
+        wr.top + 60 > mi.rcMonitor.bottom) return 0;
+    // persistent sample DIB, created once (single-threaded owner: no lock).
+    static HDC     s_dibDc = nullptr;
+    static HBITMAP s_bm    = nullptr;
+    static void*   s_bits  = nullptr;
+    if (!s_dibDc) {
+        HDC sdc = GetDC(nullptr);
+        if (!sdc) return 0;
+        s_dibDc = CreateCompatibleDC(sdc);
+        ReleaseDC(nullptr, sdc);
+        if (!s_dibDc) return 0;
+        BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bi.bmiHeader.biWidth       = 4;
+        bi.bmiHeader.biHeight      = -60;            // top-down
+        HDC sdc2 = GetDC(nullptr);
+        s_bm = sdc2 ? CreateDIBSection(sdc2, &bi, DIB_RGB_COLORS, &s_bits, nullptr, 0) : nullptr;
+        if (sdc2) ReleaseDC(nullptr, sdc2);
+        if (!s_bm || !s_bits) { DeleteDC(s_dibDc); s_dibDc = nullptr; return 0; }
+        if (!SelectObject(s_dibDc, s_bm)) {
+            DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr;
+            DeleteDC(s_dibDc); s_dibDc = nullptr; return 0;
+        }
+    }
+    HDC sdc = GetDC(nullptr);
+    if (!sdc) return 0;
+    const BOOL ok = BitBlt(s_dibDc, 0, 0, 4, 60, sdc, wr.left, wr.top, SRCCOPY);
+    ReleaseDC(nullptr, sdc);
+    if (!ok) return 0;
+    // 17 scan rows, 4 px below the top edge, every 3rd row; the darkest
+    // pixel by luma per row (the line), MEDIAN by luma across the rows.
+    unsigned scan[17];
+    unsigned luma[17];
+    int n = 0;
+    for (int ri = 0; ri < 17; ++ri) {
+        const unsigned* row = (const unsigned*)((const unsigned char*)s_bits
+                              + (size_t)(4 + ri * 3) * (size_t)(4 * 4));
+        unsigned best = 0, bestL = 0xFFFFFFFFu;
+        for (int x = 0; x < 4; ++x) {
+            const unsigned p = row[x];
+            const unsigned l = (unsigned)((((int)(p >> 16) & 0xFF) * 77 +  // Rec.601-ish, the
+                                           ((int)(p >> 8) & 0xFF) * 150 + // house weights
+                                           ((int)p & 0xFF) * 29) >> 8);
+            if (l < bestL) { bestL = l; best = p; }
+        }
+        scan[n] = best; luma[n] = bestL; ++n;
+    }
+    // insertion sort of 17 pairs (the hold's sort, verbatim shape).
+    for (int i = 1; i < n; ++i) {
+        const unsigned lv = luma[i], sv = scan[i];
+        int j = i - 1;
+        while (j >= 0 && luma[j] > lv) { luma[j + 1] = luma[j]; scan[j + 1] = scan[j]; --j; }
+        luma[j + 1] = lv; scan[j + 1] = sv;
+    }
+    const unsigned med = scan[n / 2];
+    return 0xFF000000u | (med & 0x00FFFFFFu);        // opaque BGRA
+}
 // v7.3.8 THE REVERT. The field: "This just makes the top border always
 // black." The v7.3.7 opaque constant is withdrawn in full -- the row
 // returns to the exact v7.3.2-recipe behavior: the glass key when
@@ -5368,7 +5508,12 @@ static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
     unsigned px;
     if (active) {
-        px = 0x00000000u;                       // the glass key: the DWM's own frame
+        // v7.3.9: the OPAQUE COPY of the DWM's own rendered side border
+        // (the fade presenter's train keeps g_sidePx fresh; the glass
+        // key rides only before the first sample / a failed one).
+        px = g_sideLive.load(std::memory_order_acquire)
+           ? g_sidePx.load(std::memory_order_acquire)
+           : 0x00000000u;
     } else {
         // v7.3.0: while the deactivation hold is stamped, EVERY painter
         // lands the tracked OPAQUE row (the Chrome contract -- an opaque
@@ -5404,7 +5549,14 @@ static void guiCommitSheetRowFast(HWND w, bool active) {
     if (!g_glassSheet) return;
     unsigned px;
     if (active) {
-        px = 0x00000000u;                     // the glass key: the DWM's own frame (v7.3.8 revert)
+        // v7.3.9: the STICKY side-border copy -- the last SETTLED sample,
+        // correct on the flip frame whenever the backdrop did not change
+        // (the train's tail re-samples after the fade; the writer comment
+        // in guiBarPatchSheetRow carries the full rationale). The glass
+        // key rides only before the first sample / a failed one.
+        px = g_sideLive.load(std::memory_order_acquire)
+           ? g_sidePx.load(std::memory_order_acquire)
+           : 0x00000000u;
     } else {
         px = g_holdLive.load(std::memory_order_relaxed)  // v7.3.2: the latch, not a clock
            ? g_holdPx.load(std::memory_order_relaxed)
@@ -5501,12 +5653,14 @@ static void guiPaintBar(HWND w) {
 // re-presents row 0 from OUTSIDE the message queue.
 //
 // The surface is a PRIVATE 1 px top-down 32bpp DIB section. That is enough
-// because the sheet row is ONE uniform constant in both states
-// (guiBarPatchSheetRow): active BGRA(0,0,0,0) -- the glass key, the DWM's own
-// border -- inactive BGRA(43,43,43,128) -- the recipe's half-alpha gray. The
-// thread never touches the UI thread's bar buffer, so no GDI object is
-// shared: the worst interleaving is a redundant blit of the same bytes the
-// NC latch already chose.
+// because the sheet row is ONE uniform constant per state in
+// (guiBarPatchSheetRow): active the v7.3.9 measured SIDE-BORDER COPY
+// (g_sidePx -- the DWM's own rendered border line, re-sampled below; the
+// glass key only before the first sample / a failed one), inactive
+// BGRA(43,43,43,128) -- the recipe's half-alpha gray. The thread never
+// touches the UI thread's bar buffer, so no GDI object is shared: the
+// worst interleaving is a redundant blit of the same bytes the NC latch
+// already chose.
 //
 // v7.3.0: the inactive constant has TWO forms -- the tracked OPAQUE color
 // while the deactivation hold is stamped, the recipe's half-alpha row
@@ -5514,12 +5668,14 @@ static void guiPaintBar(HWND w) {
 // (g_holdLive) spans the whole inactive period, so the two forms are
 // "inactive with a measurement" vs "inactive without one"; the handover
 // present (the first tick past a 240 ms stamp re-landing the recipe row)
-// is retired with the stamp. The thread never measures and holds no
-// state beyond its DIB: it reads the hold atomics (g_holdLive/g_holdPx,
-// written by WM_NCACTIVATE on the GUI thread; the kick's SetEvent orders
-// the writes before these reads) and mirrors what guiBarPatchSheetRow
-// would write -- the worst interleaving stays a redundant blit of the
-// same bytes.
+// is retired with the stamp. v7.3.9: the thread MEASURES now -- the
+// active ticks sample the DWM's own border line off the composed screen
+// (guiSideBorderPx, a private scratch DIB inside) and keep
+// g_sidePx/g_sideLive fresh; the inactive ticks stay read-only on the
+// hold atomics (g_holdLive/g_holdPx, written by WM_NCACTIVATE on the
+// GUI thread; the kick's SetEvent orders the writes before these reads).
+// Every tick still mirrors what guiBarPatchSheetRow would write -- the
+// worst interleaving stays a redundant blit of the same bytes.
 //
 // Each tick: fill the constant, GetDC(g_hwnd), BitBlt the 1 px strip,
 // ReleaseDC, GdiFlush. GetDC/BitBlt from another thread of the same process
@@ -5575,7 +5731,29 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         unsigned px;
         if (nc != 0) {
             g_holdLive.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
-            px = 0x00000000u;                     // the glass key: the DWM's own frame (v7.3.8 revert)
+            // v7.3.9 THE ACTIVE TICKS SAMPLE THE BORDER. While the fade
+            // gate is up (stamped by WM_NCACTIVATE(TRUE): ~240 ms of
+            // train) the STICKY copy rides -- the DWM's ~200 ms
+            // activation fade animates the strips' own line, and a
+            // mid-fade sample would flash the row down to the dimming
+            // color and back (the v7.2.10 flash class). Past the gate
+            // every tick re-samples the settled line and lands it, so
+            // the copy tracks the backdrop the window sits over -- the
+            // WM_MOVE kicks make a drag over white re-copy the border
+            // on the way. Failed sample: the sticky copy, else the
+            // glass key -- never a made-up color.
+            const int skip = g_sideFadeGate.load(std::memory_order_acquire);
+            if (skip > 0) g_sideFadeGate.store(skip - 1, std::memory_order_release);
+            const unsigned fresh = (skip > 0) ? 0u : guiSideBorderPx();
+            if (fresh) {
+                g_sidePx.store(fresh, std::memory_order_release);
+                g_sideLive.store(1, std::memory_order_release);
+                px = fresh;
+            } else {
+                px = g_sideLive.load(std::memory_order_acquire)
+                   ? g_sidePx.load(std::memory_order_acquire)
+                   : 0x00000000u;
+            }
         } else {
             // v7.3.0: inside the hold window re-present the tracked OPAQUE
             // color. v7.3.2: the hold is the latch, not a clock -- while
@@ -7844,7 +8022,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.3.8  |  %s",  // v7.3.8: the row reverts to the glass key / hold recipe; the size-event reopen stays
+    snprintf(vbuf, sizeof(vbuf), "v7.3.9  |  %s",  // v7.3.9: the active row COPIES the DWM's own rendered side border (measured, not simulated); the hold/recipe inactive row and the size-event reopen stay
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8081,6 +8259,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight (v7.3.0, both directions)
             if (wp) {
                 g_holdLive.store(0, std::memory_order_relaxed); // activation retires the hold
+                // v7.3.9: the activation fade rides the sticky copy --
+                // stamp the train's no-sample lead-in (see the tick
+                // comment in guiFadePresenter).
+                g_sideFadeGate.store(12, std::memory_order_release);
             } else {
                 // v7.3.0: the tracked opaque row, from the live backdrop.
                 // v7.3.2: the hold is the LATCH (no 240 ms stamp, no
@@ -8244,6 +8426,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             RedrawWindow(w, nullptr, nullptr,
                          RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
+        break;
+    case WM_MOVE:
+        // v7.3.9: a MOVE re-kicks the fade presenter's train -- while
+        // active, its past-the-gate ticks re-sample the DWM's own border
+        // line off the composed screen, so dragging the window over a
+        // new backdrop (the field's "layered on top of a color
+        // 252,252,252") re-copies the border on the way: row 0 tracks
+        // the strips' live re-blend at the train's 50 Hz cadence and
+        // settles with it after the drop. Kicks while inactive only
+        // re-land the hold row (the inactive branch never samples).
+        guiFadeKick();
         break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap

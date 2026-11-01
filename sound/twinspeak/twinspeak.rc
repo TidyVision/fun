@@ -1,4 +1,11 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.8: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.9: version bump
+// (the border that copies the border: while ACTIVE row 0 is the measured
+// OPAQUE color of the DWM's own rendered side-border line -- sampled off
+// the composed screen by the fade presenter's train, re-kicked on
+// WM_MOVE -- so the top border is the left/right/bottom border's actual
+// rendering over ANY backdrop, "totally accurate"; the inactive
+// hold/recipe row is untouched and the glass key survives only as the
+// failed-sample fallback). v7.3.8: version bump
 // (the row reverted: the v7.3.7 opaque constant top border is withdrawn
 // -- the glass key / backdrop-tracked hold behavior returns exactly as
 // v7.3.2 left it; the reopen's REAL one-pixel size event, the shadow
@@ -79,8 +86,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,3,8,0
-PRODUCTVERSION  7,3,8,0
+FILEVERSION     7,3,9,0
+PRODUCTVERSION  7,3,9,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -91,12 +98,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.3.8.0"
+            VALUE "FileVersion",      "7.3.9.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.3.8.0"
+            VALUE "ProductVersion",   "7.3.9.0"
         END
     END
     BLOCK "VarFileInfo"
