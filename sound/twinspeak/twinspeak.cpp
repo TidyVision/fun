@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.14 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,34 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.15 THE QUEUE-PROOF FADE, THE QUIET BUTTONS. Field: "now I
+//            sometimes get a deactivate redraw delay" + "some buttons
+//            still flicker". The delay WAS the fade-tracking burst's
+//            ride on WM_TIMER: the lowest-priority message in the
+//            queue, synthesized only when the queue runs empty -- and
+//            while the engine runs the queue is regularly fed (the
+//            250 ms log drains, the status band, the pane repaints),
+//            so burst ticks landed late or in clumps, and each missed
+//            tick left the DWM's presentation-time sheet blend frozen
+//            at the previous compose (v7.1.30). The burst is now a
+//            dedicated PRESENTER THREAD kicked by an event at every
+//            activation change: it owns a private 1 px row DIB (the
+//            row is one uniform constant in both states), re-presents
+//            it twenty times ~20 ms apart with GetDC/BitBlt/GdiFlush
+//            from OUTSIDE the message queue, and a kick landing
+//            mid-run restarts the train (the last state wins). Timer 4
+//            and g_bakeTicks are retired; g_ncActive is atomic (the
+//            thread reads it). The flicker WAS the erase mismatch: the
+//            BUTTON control erases its rect with the WM_CTLCOLORBTN
+//            brush BEFORE sending WM_DRAWITEM, and the answer was
+//            always g_brBg while the drawitem erase paints g_brPanel
+//            under every on-page face -- so toggles, pills and slot
+//            selectors flashed the app background between their own
+//            pixels on every press/toggle/preset repaint. WM_CTLCOLORBTN
+//            now answers the same per-button brush WM_DRAWITEM erases
+//            with (g_brPanel on the panels, g_brBg on the bottom bar):
+//            the erase pass is pixel-identical to the face's own
+//            background and the intermediate frame ceases to exist.
 //    v7.2.14 THE VANILLA DEACTIVATION -- the opaque instant-row machine is
 //            RETIRED. Field: "I still see the top border as opaque. And I
 //            still see a 300ms delay for after deactivation when the
@@ -4678,11 +4706,23 @@ static bool g_glassSheet = false;
 // delay). The deactivated window now presents the recipe's half-alpha
 // row and lets the DWM's own ~200 ms border fade run untouched -- the
 // exact transition every vanilla Windows 10 frame shows. What remains:
-static unsigned g_bakeTicks = 0;    // v7.1.31: the fade-tracking burst's remaining
-                                    // ticks (see WM_NCACTIVATE/WM_ACTIVATE/WM_TIMER):
-                                    // armed to 20 at timer 4 (20 ms); each tick
-                                    // re-presents the 1 px sheet row and consumes
-                                    // one -- ~400 ms of fade tracking
+// v7.2.15 THE FADE PRESENTER (retires the v7.1.31 WM_TIMER burst). The burst
+// moved off the message queue: WM_TIMER is the queue's lowest-priority
+// message, synthesized only when the queue is empty and no paint is
+// pending -- and while the engine runs the queue is regularly fed (the
+// 250 ms log drains, the status band, the pane repaints), so burst ticks
+// landed late or in clumps and each missed tick froze the DWM's
+// presentation-time sheet blend (v7.1.30) at the previous compose: the
+// field's INTERMITTENT deactivation redraw delay. A dedicated thread
+// waits on the kick event below; WM_NCACTIVATE and WM_ACTIVATE SetEvent
+// it after their synchronous presents, and it re-presents the 1 px row
+// twenty times ~20 ms apart (see guiFadePresenter, after guiPaintBar).
+static HANDLE g_fadeKick  = nullptr;   // auto-reset: one SetEvent = one burst
+static HANDLE g_fadeThread = nullptr;  // created with the window, joined at exit
+static std::atomic<bool> g_fadeQuit{false};
+static void guiFadeKick() {            // non-blocking; safe from any message
+    if (g_fadeKick) SetEvent(g_fadeKick);
+}
 static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
                                              // inactive face INSIDE the deactivation
                                              // transaction (GetActiveWindow still
@@ -4694,7 +4734,9 @@ static bool     g_forceActiveFace = false;   // v7.2.9: the symmetric force for 
                                              // WM_NCPAINT that arrives INSIDE either
                                              // transaction, before the queue has
                                              // caught up (see WM_NCPAINT)
-static int      g_ncActive = -1;             // v7.2.9: the NC-latched activation state
+static std::atomic<int> g_ncActive{-1};      // v7.2.9: the NC-latched activation state
+                                             // (std::atomic since v7.2.15: the fade
+                                             // presenter thread reads it)
                                              // (WM_NCACTIVATE's wParam: 1 active, 0
                                              // inactive, -1 never seen). The frame's
                                              // own truth, readable INSIDE the
@@ -5000,6 +5042,88 @@ static void guiPaintBar(HWND w) {
     // blit, the burst ticks, WM_PAINT -- is in the redirection surface
     // before this call returns.
     GdiFlush();
+}
+
+// ---- v7.2.15: THE FADE PRESENTER --------------------------------------------
+// The v7.1.31 fade-tracking train, driven by a thread instead of a WM_TIMER.
+// WHY: WM_TIMER is synthesized only when the queue is empty and no paint is
+// pending; with the engine running, the queue is regularly fed and the burst
+// ticks landed late or in clumps -- every missed tick froze the DWM's
+// presentation-time sheet blend (v7.1.30) at the previous compose, which the
+// field measured as an INTERMITTENT deactivation redraw delay. This thread
+// re-presents row 0 from OUTSIDE the message queue.
+//
+// The surface is a PRIVATE 1 px top-down 32bpp DIB section. That is enough
+// because the sheet row is ONE uniform constant in both states
+// (guiBarPatchSheetRow): active BGRA(0,0,0,0) -- the glass key, the DWM's own
+// border -- inactive BGRA(43,43,43,128) -- the recipe's half-alpha gray. The
+// thread never touches the UI thread's bar buffer, so no GDI object is
+// shared: the worst interleaving is a redundant blit of the same bytes the
+// NC latch already chose.
+//
+// Each tick: fill the constant, GetDC(g_hwnd), BitBlt the 1 px strip,
+// ReleaseDC, GdiFlush. GetDC/BitBlt from another thread of the same process
+// is legal -- GDI serializes per-DC -- and the tick costs microseconds: no
+// GDI+ pass, no face render, no screen readback. A kick landing mid-run
+// restarts the train, so the LAST activation state still wins on rapid
+// toggles (the v7.2.14 rule), now without re-arming a timer.
+static DWORD WINAPI guiFadePresenter(LPVOID) {
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bi.bmiHeader.biHeight      = -1;          // top-down, like the bar DIB
+    HDC     dc   = nullptr;
+    HBITMAP bm   = nullptr;
+    void*   bits = nullptr;
+    int     rowW = 0, ticks = 0;
+    for (;;) {
+        const bool kicked =
+            WaitForSingleObject(g_fadeKick, ticks ? 20 : 250) == WAIT_OBJECT_0;
+        if (kicked) ticks = 20;               // every kick restarts the train
+        else if (ticks) --ticks;
+        if (!ticks) continue;                 // idle: the event owns the wait
+        if (g_fadeQuit.load(std::memory_order_acquire)) break;
+        const int nc = g_ncActive.load(std::memory_order_relaxed);
+        if (nc < 0) continue;                 // no activation state latched yet
+        HWND w = g_hwnd;
+        if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+        RECT cr;
+        if (!GetClientRect(w, &cr) || cr.right <= 0) continue;
+        if (cr.right > rowW) {                // (re)grow the private row DIB
+            if (bm) DeleteObject(bm);
+            if (dc) { DeleteDC(dc); dc = nullptr; }
+            bm = nullptr; bits = nullptr; rowW = 0;
+            HDC sdc = GetDC(w);
+            if (sdc) {
+                bi.bmiHeader.biWidth = cr.right;
+                bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (bm) {
+                    dc = CreateCompatibleDC(sdc);
+                    if (dc) SelectObject(dc, bm);
+                }
+                ReleaseDC(w, sdc);
+            }
+            if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
+            rowW = cr.right;
+        }
+        const unsigned px = (nc != 0) ? 0x00000000u   // the glass key: the DWM's own frame
+                                      : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
+        unsigned* row = (unsigned*)bits;
+        for (int x = 0; x < cr.right; ++x) row[x] = px;
+        HDC wdc = GetDC(w);
+        if (wdc) {
+            BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);
+            ReleaseDC(w, wdc);
+        }
+        GdiFlush();                           // the strip is presented before the next tick
+        --ticks;
+    }
+    if (bm) DeleteObject(bm);
+    if (dc) DeleteDC(dc);
+    return 0;
 }
 
 // ---- fonts / brushes -------------------------------------------------------
@@ -6985,6 +7109,16 @@ static bool guiCreateRealWindow() {
     RedrawWindow(g_hwnd, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
+    // v7.2.15: the fade presenter -- created once with the window; it idles
+    // on the kick event and re-presents the sheet row across every DWM
+    // activation fade (see guiFadePresenter). Joined at shutdown, after the
+    // message loop.
+    if (!g_fadeThread) {
+        g_fadeQuit.store(false, std::memory_order_release);
+        g_fadeKick  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_fadeThread = g_fadeKick ? CreateThread(nullptr, 0, guiFadePresenter,
+                                                 nullptr, 0, nullptr) : nullptr;
+    }
     // the whole boot log -- everything the engine said while tray-only --
     // lands in the pane in one flush, oldest first, nothing lost.
     guiFlushLogRing();
@@ -7337,9 +7471,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             guiPaintBar(w);                    // face + row 0 + GdiFlush
             g_forceActiveFace   = false;
             g_forceInactiveFace = false;
-            g_bakeTicks = 20;
-            SetTimer(w, 4, 20, nullptr);
         }
+        // v7.2.15: the fade-tracking train re-presents the row across the
+        // DWM's ~200 ms border fade (the presentation-time sheet blend,
+        // v7.1.30) -- now from the presenter THREAD, not a WM_TIMER: the
+        // timer's ticks starved behind queue traffic and froze the blend
+        // mid-fade (the intermittent deactivation delay). Kicking even when
+        // hidden is safe: the thread checks visibility on every tick.
+        guiFadeKick();
         break;
     case WM_NCPAINT:
         // v7.2.8 THE POST-FLIP NCPAINT. The field: "make it so the ncpaint
@@ -7393,12 +7532,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // runs AFTER the transaction has closed -- the queue view and the
         // NC latch agree, so the plain read paints the truth, no force.
         guiPaintBar(w);
-        // v7.2.14: (re-)arm the fade-tracking burst -- the sheet blend is
-        // baked at presentation time (v7.1.30), so the row is re-presented
-        // across the DWM's fade by the cheap 1 px ticks (WM_TIMER wp==4);
-        // the last activation state wins on rapid toggles.
-        g_bakeTicks = 20;
-        SetTimer(w, 4, 20, nullptr);
+        // v7.2.15: (re-)kick the fade presenter -- the sheet blend is baked
+        // at presentation time (v7.1.30), so the row is re-presented across
+        // the DWM's fade by the thread's cheap 1 px ticks; the last
+        // activation state wins on rapid toggles (every kick restarts the
+        // train). The v7.1.31 WM_TIMER burst is retired: its ticks starved
+        // behind queue traffic and froze the blend mid-fade.
+        guiFadeKick();
         // v7.2.8 THE FORCED FRAME PAINT (kept). The DWM can draw the
         // activation flip without ever asking us to repaint the frame --
         // win32k's own WM_NCPAINT is not guaranteed on the deactivation
@@ -7493,11 +7633,29 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // pixel, and a fill here would only hand DWM a blank intermediate
         // frame (the watermark flicker).
         return 1;
-    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORBTN: {
         // v6.6.7: DefWindowProc answers WM_CTLCOLORBTN with WHITE, and the
         // white pass under the corner AA was the ghost arcs. Answer DARK so
         // no pass can ever put white under the AA.
-        return (LRESULT)g_brBg;
+        // v7.2.15 THE ERASE MATCHES THE FACE. The BUTTON control erases its
+        // whole rect with THIS brush before it sends WM_DRAWITEM -- two
+        // screen writes, and the DWM can compose the first alone. The
+        // drawitem erase paints g_brPanel under the on-page faces and
+        // g_brBg under the bottom bar, but the answer here was ALWAYS
+        // g_brBg -- so every on-page toggle, pill and slot selector flashed
+        // the app background between its own pixels on each press, toggle
+        // and preset repaint (the "some buttons still flicker" report;
+        // the bottom-bar buttons sat on the answer's own color and could
+        // not flicker). The brush now mirrors WM_DRAWITEM's erase map per
+        // id, so the erase pass is pixel-identical to the face's own
+        // background and the intermediate frame ceases to exist. The
+        // v6.6.7 contract holds on both surfaces: both brushes are dark.
+        const int id = GetDlgCtrlID((HWND)lp);
+        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 4) ||
+                              id == IDC_START  || id == IDC_APPLY ||
+                              id == IDC_SAVE   || id == IDC_TICK  ||
+                              id == IDC_THEME);
+        return (LRESULT)(onPage ? g_brPanel : g_brBg); }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         const int id = GetDlgCtrlID((HWND)lp);
@@ -7885,43 +8043,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
-        // v7.2.14 THE FADE-TRACKING TICK (timer 4, armed at WM_NCACTIVATE
-        // and WM_ACTIVATE). The DWM bakes the extended-sheet row's blend
-        // at presentation time (v7.1.30) -- bytes written once at the flip
-        // compose can freeze mid-fade while the glass keeps changing
-        // underneath. So the row is RE-PRESENTED across the DWM's ~200 ms
-        // border fade, exactly the v7.1.31 train -- but CHEAP: the tick
-        // rewrites row 0 of the existing bar buffer and blits ONLY the
-        // 1 px strip (microseconds; the v7.2.12 cost rule -- no GDI+ pass,
-        // no face render per tick -- the face settled with the flip and
-        // hover paths re-render it themselves). Twenty 20 ms ticks span
-        // the fade with margin, then the timer kills itself. The row is
-        // the recipe's bytes in every frame -- half-alpha gray (inactive)
-        // or the glass key (active) -- read from the NC latch so a tick
-        // landing mid-transaction still writes the frame's own truth.
-        // Nothing is measured, nothing is cached, nothing is opaque.
-        if (wp == 4) {
-            if (g_glassSheet && g_barBits && g_barDc && g_hwnd
-                && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd)
-                && !IsIconic(g_hwnd)) {
-                const bool active = (g_ncActive >= 0)
-                                    ? (g_ncActive != 0)
-                                    : (GetActiveWindow() != nullptr);
-                RECT cr;
-                if (GetClientRect(g_hwnd, &cr) && cr.right > 0
-                    && guiBarBufEnsure(cr.right, kCapH)) {
-                    guiBarPatchSheetRow(cr.right, active);
-                    HDC wdc = GetDC(g_hwnd);
-                    if (wdc) {
-                        BitBlt(wdc, 0, 0, cr.right, 1, g_barDc, 0, 0, SRCCOPY);
-                        ReleaseDC(g_hwnd, wdc);
-                    }
-                    GdiFlush();           // the strip is presented before we return
-                }
-            }
-            if (g_bakeTicks == 0 || --g_bakeTicks == 0) KillTimer(w, 4);
-            return 0;
-        }
+        // v7.2.15: the wp == 4 fade-tracking tick is RETIRED -- the train is
+        // the presenter thread now (see guiFadePresenter), because WM_TIMER
+        // ticks starved behind queue traffic and froze the DWM's
+        // presentation-time sheet blend mid-fade. Timer 4 no longer exists.
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
         // re-tries every 2 s until the shell accepts it).
         if (wp == 3) {
@@ -8397,6 +8522,17 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         DispatchMessageA(&m);
     }
     KillTimer(g_hwnd, 1);
+    // v7.2.15: stop the fade presenter before the engine join -- signal,
+    // wake, join (bounded), dispose. The thread owns only its private row
+    // DIB and its event; nothing else is shared.
+    g_fadeQuit.store(true, std::memory_order_release);
+    guiFadeKick();
+    if (g_fadeThread) {
+        WaitForSingleObject(g_fadeThread, 2000);
+        CloseHandle(g_fadeThread);
+        g_fadeThread = nullptr;
+    }
+    if (g_fadeKick) { CloseHandle(g_fadeKick); g_fadeKick = nullptr; }
     // v7.1.20: join the engine ONCE here (the only blocking stop left -- the
     // UI is gone anyway). v7.1.26: the taskbar-list COM object is retired
     // with the AddTab machinery; nothing to release.
