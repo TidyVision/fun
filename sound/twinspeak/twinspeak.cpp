@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.12 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.13 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,48 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.13 THE HOLD TRACKS THE BACKDROP. Field: "Thanks, but I still
+//            get a white top border bar." The screenshot settles it: the
+//            window INACTIVE over a dark video (and half over a white
+//            explorer) shows the top border row as ONE uniform opaque
+//            RGB(170,170,170) line across BOTH backdrops -- while the
+//            DWM's own left strip blends dark over the same video. 170
+//            is exactly the settled composite over PURE white
+//            (half of gray85 + half of 255): the row was replaying the
+//            MEASURED CACHE -- the instant row's constant, captured at
+//            the tail of an earlier fade over a white backdrop. The
+//            instant row is opaque BY DESIGN (opaque never fades), but a
+//            constant is only right over the backdrop it was measured
+//            on: on the white test surface the stale replay blended in
+//            invisibly, over the dark video the same replay IS the white
+//            bar -- on the hook's first frame (the early present) and
+//            for the whole 400 ms hold after every unfocus. THE FIX: the
+//            hold color is no longer a memory, it is COMPUTED at the
+//            moment of deactivation from the backdrop actually behind
+//            the row (guiInstantRowForBackdrop): the settled recipe
+//            composite is (43 + 127*backdrop/255) per channel, and the
+//            backdrop is the visible desktop strip directly above the
+//            window's top edge -- one BitBlt into a persistent DIB, a
+//            sparse scan of the rows farthest from our own drop shadow,
+//            median by luma (the measure's own statistic). The held row
+//            then equals what the settled blend WOULD show over the
+//            current backdrop, so it never reads white over dark
+//            content and the handover to the recipe bytes at the tail
+//            is invisible. The measured cache (g_instantInactive)
+//            demotes to the fallback for a failed strip read; the hook's
+//            early present computes the color live too (its stale-cache
+//            front row was the first white frame of every click-away),
+//            so the instant row works from the FIRST deactivation of a
+//            session (no cache needed), and the 20 x 20 ms no-cache
+//            fade-tracking train retires -- the hold engages on every
+//            deactivation now, the train survives only when no color is
+//            readable at all. Belt: the hold carries a wall-clock stamp
+//            and any paint 600 ms past the latch releases it (a hold can
+//            never outlive the fade window again, whatever a timer
+//            path does), and the measure tick clears a lingering hold
+//            before reading the screen (the cache must measure the
+//            settled recipe row, not our own replay). Version steps to
+//            7.2.13.
 //    v7.2.12 THE HOOK THREAD GOES QUIET + THE TRAY AUDIT. Field: "while the
 //            window runs it makes my mouse lag -- look for any symptoms".
 //            The GUI thread answers the system-wide WH_MOUSE_LL hook (the
@@ -4619,7 +4661,29 @@ static unsigned g_bakeTicks = 0;
 // tail hands the row back to the recipe bytes and re-measures one tick
 // later, so the cache never goes stale on purpose.
 static COLORREF g_instantInactive = 0;    // the settled composite; 0 = not measured yet
-static bool     g_instantHold    = false; // row 0 = opaque cached color through the fade window
+static bool     g_instantHold    = false; // row 0 = opaque tracked color through the fade window
+// v7.2.13 THE TRACKED HOLD COLOR. The hold used to replay the CACHE --
+// the settled composite measured at the END of the previous fade, against
+// whatever backdrop the window wore THEN. The cache is a constant, and a
+// constant is only right over the backdrop it was measured on: parked on
+// the white OBS titlebar the replay was invisible, but with the window
+// sitting over a dark video (or ANY backdrop darker than the measured
+// one) every deactivation painted the stale light color across row 0 --
+// a WHITE top border bar for the whole hold window, on the very first
+// frame (the hook's early present) and through the 400 ms tail. The
+// field: "I still get a white top border bar." The hold color is now
+// COMPUTED AT THE MOMENT OF DEACTIVATION from the backdrop that is
+// actually behind the row (guiInstantRowForBackdrop -- the visible
+// desktop strip just above the top edge), and the cache demotes to the
+// FALLBACK for a failed read. The held color then equals what the
+// settled recipe WOULD composite over the current backdrop, so the
+// handover back to the recipe bytes at the tail is invisible and the
+// bar never reads white over dark content.
+static COLORREF g_instantHoldColor = 0;   // the tracked hold color; 0 = use the cache
+static unsigned long long g_instantHoldAtMs = 0; // v7.2.13: wall-clock stamp of the
+                                             // hold latch -- the cap in guiPaintBar
+                                             // releases the hold even if a timer
+                                             // tick were ever missed
 static bool     g_forceInstantRow = false; // v7.2.1: hook early-present -- one opaque row even while active
 static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
                                              // inactive face INSIDE the deactivation
@@ -4869,16 +4933,20 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // and refreshes the cache.
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
-    // v7.2.1: the opaque cached color, BGRA-packed -- shared by the hold
-    // branch and the hook's early present. Never pure black: the blend is
-    // 50% gray85, so >= RGB(21,21,21) -- the "black = glass" key can
-    // never trigger.
-    const unsigned c = (unsigned)g_instantInactive;
+    // v7.2.1: the opaque instant color, BGRA-packed -- shared by the hold
+    // branch and the hook's early present. v7.2.13: the color is the
+    // TRACKED hold color first (computed at the latch from the backdrop
+    // actually behind the row) and the measured cache second (the
+    // fallback for a failed strip read). Never pure black either way:
+    // the blend is 50% gray85, so >= RGB(21,21,21) -- the "black = glass"
+    // key can never trigger.
+    const unsigned c = (unsigned)(g_instantHoldColor ? g_instantHoldColor
+                                                     : g_instantInactive);
     const unsigned instantPx = 0xFF000000u | ((c >> 16) & 0xFFu)   // B -> byte 0
                                              | (c & 0xFF00u)       // G -> byte 1
                                              | ((c & 0xFFu) << 16);// R -> byte 2
     unsigned px;
-    if (g_forceInstantRow && g_instantInactive) {
+    if (g_forceInstantRow && c) {
         // v7.2.1 THE EARLY PRESENT (tsEarlyMouseHook): the click that will
         // deactivate us is seen BEFORE the activation transaction -- write
         // the settled inactive row while the window is still active, so it
@@ -4886,9 +4954,10 @@ static void guiBarPatchSheetRow(int cw, bool active) {
         px = instantPx;
     } else if (active) {
         px = 0x00000000u;                            // the recipe: bare glass = the DWM's active frame
-    } else if (g_instantHold && g_instantInactive) {
-        // v7.2.0 THE INSTANT ROW: opaque replay of the settled composite
-        // measured at the end of the previous burst.
+    } else if (g_instantHold && c) {
+        // v7.2.0 THE INSTANT ROW, v7.2.13 TRACKED: opaque replay of the
+        // color the settled composite would show over the CURRENT
+        // backdrop (the cache only when the live read failed).
         px = instantPx;
     } else {
         px = 0x802B2B2Bu;                            // the recipe: BGRA(43, 43, 43, 128)
@@ -5011,8 +5080,135 @@ static void guiMeasureInstantRow() {
     }
     g_instantInactive = v[nv / 2];
 }
+// v7.2.13 THE TRACKED HOLD COLOR -- the instant row computed from the
+// CURRENT backdrop, not from a memory of one. The hold (and the hook's
+// early present) used to replay g_instantInactive, the settled composite
+// measured at the tail of the PREVIOUS fade: correct only while the
+// backdrop behind the top row stayed the one it was measured on. The
+// field's own desktop broke that assumption -- the window parked over a
+// dark video (and half over a white explorer) reads the stale measured
+// color as a WHITE top border bar across the dark part, on the hook's
+// first frame and for the whole 400 ms hold after every unfocus. The
+// color the settled recipe WOULD produce over the CURRENT backdrop is
+// derivable without the DWM: the recipe composites half-alpha gray85
+// over the glass blur of whatever is behind the row, so over a backdrop
+// value B the settled row reads (43 + 127*B/255) per channel. B is not
+// guesswork either: the strip of desktop DIRECTLY ABOVE the window's top
+// edge is on screen, visible, and it is what the blur sees -- one BitBlt
+// of that strip into a persistent DIB, a sparse guarded scan and a
+// median (the same shape as guiMeasureInstantRow) yield it. No
+// WindowFromPoint guard is needed for ownership: whatever window shows
+// those pixels, its pixels ARE the backdrop the DWM would blur. The
+// samples come from the top half of the strip -- the rows farthest from
+// our own drop shadow, which darkens the desktop nearest the edge.
+// Returns 0 when nothing honest is readable (window iconic/hidden, strip
+// off-screen, readback failed) -- callers then fall back to the cache.
+static HDC     g_abDc    = nullptr;         // the above-backdrop strip surface
+static HBITMAP g_abBm    = nullptr, g_abBmOld = nullptr;
+static BYTE*   g_abBits  = nullptr;         // 32bpp top-down: 32 rows
+static int     g_abCap   = 0;               // allocated width
+#define TS_AB_ROWS 32                        // strip height (screen rows above the top edge)
+static void guiAboveSurfaceRelease() {
+    if (g_abBmOld) { SelectObject(g_abDc, g_abBmOld); g_abBmOld = nullptr; }
+    if (g_abBm)    { DeleteObject(g_abBm);            g_abBm    = nullptr; }
+    if (g_abDc)    { DeleteDC(g_abDc);               g_abDc    = nullptr; }
+    g_abBits = nullptr; g_abCap = 0;
+}
+static COLORREF guiInstantRowForBackdrop() {
+    if (!g_hwnd || !IsWindow(g_hwnd)) return 0;
+    if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return 0;
+    RECT wr;
+    if (!GetWindowRect(g_hwnd, &wr)) return 0;
+    const int width = wr.right - wr.left;
+    if (width < 48) return 0;
+    // the strip must sit fully on the desktop: rows [top-TS_AB_ROWS, top)
+    if (wr.top < TS_AB_ROWS) return 0;            // parked against the screen top
+    if (!g_abDc || width > g_abCap) {             // (re)build the strip DIB
+        guiAboveSurfaceRelease();
+        g_abDc = CreateCompatibleDC(nullptr);
+        if (g_abDc) {
+            BITMAPINFO bi;
+            memset(&bi, 0, sizeof(bi));
+            bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth       = width;
+            bi.bmiHeader.biHeight      = -TS_AB_ROWS;   // top-down
+            bi.bmiHeader.biPlanes      = 1;
+            bi.bmiHeader.biBitCount    = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            g_abBm = CreateDIBSection(g_abDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (g_abBm) {
+                g_abBmOld = (HBITMAP)SelectObject(g_abDc, g_abBm);
+                g_abBits  = (BYTE*)bits;
+                g_abCap   = width;
+            } else {
+                DeleteDC(g_abDc);
+                g_abDc = nullptr;
+            }
+        }
+        if (!g_abBits) { guiAboveSurfaceRelease(); return 0; }
+    }
+    HDC sdc = GetDC(nullptr);
+    if (!sdc) return 0;
+    const BOOL got = BitBlt(g_abDc, 0, 0, width, TS_AB_ROWS,
+                            sdc, wr.left, wr.top - TS_AB_ROWS, SRCCOPY);
+    ReleaseDC(nullptr, sdc);
+    if (!got) return 0;
+    GdiFlush();                                   // the strip is IN g_abBits before the scan
+    // sparse scan: every 24 px across, averaged over the four rows
+    // farthest from our shadow (strip rows 0..3). Median by luma -- the
+    // same statistic guiMeasureInstantRow uses on the composed row.
+    COLORREF v[64];
+    int nv = 0;
+    for (int x = 24; x <= width - 24 && nv < 64; x += 24) {
+        int r = 0, g = 0, b = 0;
+        for (int row = 0; row < 4; ++row) {
+            const BYTE* px = g_abBits + (size_t)row * width * 4   // row 0 = top-32
+                                        + (size_t)x * 4;          // BGRA, top-down
+            r += px[2]; g += px[1]; b += px[0];
+        }
+        v[nv++] = RGB(r / 4, g / 4, b / 4);
+    }
+    if (nv == 0) return 0;
+    for (int i = 1; i < nv; ++i) {                // insertion sort (nv <= 64)
+        const COLORREF c = v[i];
+        const int key = (int)((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF));
+        int j = i - 1;
+        while (j >= 0) {
+            const COLORREF d = v[j];
+            const int dl = (int)((d & 0xFF) + ((d >> 8) & 0xFF) + ((d >> 16) & 0xFF));
+            if (dl <= key) break;
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = c;
+    }
+    const COLORREF b = v[nv / 2];
+    // the settled recipe composite over this backdrop, OPAQUE:
+    // src(43) + dst*(1 - 128/255) per channel, rounded; floored at 26 so
+    // the "black = bare glass" key can never trigger (see the hold note).
+    const int r = 43 + (GetRValue(b) * 127 + 127) / 255;
+    const int g = 43 + (GetGValue(b) * 127 + 127) / 255;
+    const int bl = 43 + (GetBValue(b) * 127 + 127) / 255;
+    return RGB(r < 26 ? 26 : (r > 255 ? 255 : r),
+               g < 26 ? 26 : (g > 255 ? 255 : g),
+               bl < 26 ? 26 : (bl > 255 ? 255 : bl));
+}
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
+    // v7.2.13 THE HOLD CAP. The hold is a fade window, not a state: it is
+    // latched at WM_NCACTIVATE(FALSE)/WM_ACTIVATE(WA_INACTIVE) and released
+    // by the tail tick's handover. If any path ever left it latched with
+    // the tail dead, the row would freeze on the opaque instant color
+    // forever. The stamp makes that impossible: any paint that runs more
+    // than 600 ms after the latch (the tail's 400 ms + a full margin)
+    // releases the hold first and presents the recipe bytes -- the row
+    // can never stick past the fade window again.
+    if (g_instantHold && g_instantHoldAtMs
+        && GetTickCount64() - g_instantHoldAtMs > 600) {
+        g_instantHold = false;
+        g_instantHoldColor = 0;
+    }
     // v7.1.24: the hovered slot rides GWLP_USERDATA exactly like main.c;
     // the blit target is the CLIENT dc -- the window owns a real frame now,
     // so the bar is client pixels at (0,0), not window pixels.
@@ -5117,9 +5313,13 @@ static void guiPaintBar(HWND w) {
 // (the idle, pumping GUI thread -- the only state this handler acts in),
 // the handler runs no message dispatch and stays far under the hook
 // timeout, and everything bails instantly unless our window is the ACTIVE
-// window with a measured cache. Alt-Tab and programmatic deactivations
-// have no earlier signal a window can see: they keep the WM_ACTIVATE path
-// (one frame). If the hook never installed (policy, AV), nothing changes.
+// window and a tracked row color is readable. v7.2.13: the color is
+// computed HERE from the backdrop strip (guiInstantRowForBackdrop) -- the
+// stale measured cache no longer fronts the early present, which is what
+// put a WHITE row over a dark backdrop on the very first frame of every
+// click-away. Alt-Tab and programmatic deactivations have no earlier
+// signal a window can see: they keep the WM_ACTIVATE path (one frame).
+// If the hook never installed (policy, AV), nothing changes.
 static HRESULT (WINAPI* tsDwmFlushFn)() = nullptr;   // v7.2.2: resolved once,
 static bool      tsDwmFlushTried    = false;         // dwmapi is LoadLibrary'd
 static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
@@ -5131,12 +5331,19 @@ static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
             if (e && g_hwnd && IsWindow(g_hwnd)
                 && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)
                 && GetActiveWindow() == g_hwnd        // we hold activation: the click may take it
-                && g_instantInactive) {               // only with a measured cache
+                && g_glassSheet) {                    // v7.2.13: the row must be ours to patch
                 const HWND hit = WindowFromPoint(e->pt);
                 if (!hit || GetAncestor(hit, GA_ROOT) != g_hwnd) {
                     // A click outside our tree: present the settled inactive
                     // row NOW, while the bar face is still the active one (the
                     // face itself flips when WM_ACTIVATE arrives, as always).
+                    // v7.2.13: the tracked color is computed HERE, at click
+                    // time -- and only a click that can actually leave us
+                    // pays the strip read. No honest read: ride the
+                    // transaction exactly as v7.2.12 did.
+                    const COLORREF live = guiInstantRowForBackdrop();
+                    if (!live) return CallNextHookEx(nullptr, nCode, wp, lp);
+                    g_instantHoldColor = live;        // the patch below presents it
                     // v7.2.2: the three ordered steps -- see the block above.
                     if (!tsDwmFlushTried) {              // every other dwmapi
                         tsDwmFlushTried = true;          // import in this file
@@ -7537,23 +7744,38 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // it. DefWindowProc still runs -- the case falls to the common
         // tail; swallowing the message would freeze the frame state.
         if (!wp && IsWindowVisible(w) && !IsIconic(w)) {
-            g_instantHold = (g_instantInactive != 0);   // same latch rule as WM_ACTIVATE
+            // v7.2.13 THE TRACKED HOLD. The hold color is computed HERE --
+            // at the last instant the backdrop is still readable exactly as
+            // the DWM will fade it -- instead of replaying the previous
+            // fade's cache (which read as a WHITE bar over any darker
+            // backdrop: the field's "I still get a white top border bar").
+            // The cache remains the fallback for a failed strip read; with
+            // neither color available the hold stays off and the recipe
+            // bytes ride the fade exactly like a native frame's own
+            // strips (the pre-v7.2.0 behavior, still correct -- just not
+            // instant).
+            g_instantHoldColor = guiInstantRowForBackdrop();
+            g_instantHold = (g_instantHoldColor != 0) || (g_instantInactive != 0);
+            g_instantHoldAtMs = GetTickCount64();       // the cap's stamp
             g_forceInactiveFace = true;                 // the face must be the INACTIVE one
             guiPaintBar(w);                             // face + row 0 + GdiFlush
             g_forceInactiveFace = false;
-            // v7.2.12 THE BURST ONLY RENDERS WHEN IT MUST. With a measured
-            // cache the hold presents the SAME opaque row on every
-            // presentation -- twenty re-renders at 50 Hz for 400 ms were
-            // twenty identical pictures, and every one of them sat on the
-            // GUI thread that answers the system-wide WH_MOUSE_LL hook (the
-            // field: "while the window runs it makes my mouse lag"). The
-            // hold now spans the fade with ZERO re-renders: one tail tick
-            // at 400 ms (g_bakeTicks pre-set to 19) hands the row back to
-            // the recipe and schedules the measure, exactly as before.
-            // Without a cache (the first-run seeding path) the 20 x 20 ms
-            // fade tracking runs unchanged -- the only job it ever had.
-            g_bakeTicks = g_instantInactive ? 19 : 0;
-            SetTimer(w, 4, g_instantInactive ? 400 : 20, nullptr);
+            // v7.2.12 THE BURST ONLY RENDERS WHEN IT MUST. With the hold
+            // presenting the SAME tracked row on every presentation, the
+            // fade spans with ZERO re-renders: one tail tick at 400 ms
+            // (g_bakeTicks pre-set to 19) hands the row back to the
+            // recipe and schedules the measure. v7.2.13: the hold now
+            // engages on EVERY deactivation -- the tracked color needs no
+            // cache -- so the 20 x 20 ms no-cache fade-tracking train
+            // (v7.1.31) retires; when no color is available at all the
+            // train still runs, the only job it ever had.
+            if (g_instantHold) {
+                g_bakeTicks = 19;
+                SetTimer(w, 4, 400, nullptr);
+            } else {
+                g_bakeTicks = 0;
+                SetTimer(w, 4, 20, nullptr);
+            }
         } else if (wp && IsWindowVisible(w) && !IsIconic(w)) {
             // v7.2.9 THE SYMMETRIC ACTIVATION PRESENT. The deactivation
             // direction has had its pre-flip present since v7.2.3 (two
@@ -7662,19 +7884,27 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // one tick later guiMeasureInstantRow refreshes the cache. No
         // cache yet (first run): the hold stays off and v7.1.31's tracked
         // fade runs once to seed it.
-        if (LOWORD(wp) == WA_INACTIVE && g_instantInactive) g_instantHold = true;
-        else g_instantHold = false;
+        // v7.2.13: the deactivation latch computes the TRACKED hold color
+        // here too (WM_ACTIVATE can run without a preceding WM_NCACTIVATE
+        // present -- minimized/hidden deactivations) and stamps the cap.
+        if (LOWORD(wp) == WA_INACTIVE) {
+            g_instantHoldColor = guiInstantRowForBackdrop();
+            g_instantHold = (g_instantHoldColor != 0) || (g_instantInactive != 0);
+            g_instantHoldAtMs = GetTickCount64();
+        } else {
+            g_instantHold = false;
+            g_instantHoldColor = 0;
+        }
         g_measurePending = false;
         guiPaintBar(w);
         // v7.2.12 THE BURST ONLY RENDERS WHEN IT MUST (see WM_NCACTIVATE):
-        // a measured cache makes every fade-window presentation the SAME
-        // opaque row -- those pixels are already on screen from the blit
-        // above, so the hold spans the fade with zero re-renders and one
-        // tail tick at 400 ms. Without a cache the 20 x 20 ms fade
-        // tracking (v7.1.31, the first-run seeding path) runs unchanged.
-        if (LOWORD(wp) == WA_INACTIVE && !g_instantInactive) {
+        // the hold spans the fade with zero re-renders and one tail tick
+        // at 400 ms. v7.2.13: the hold engages on EVERY deactivation (the
+        // tracked color needs no cache), so the 20 x 20 ms no-cache fade
+        // tracking runs only when NO color is available at all.
+        if (LOWORD(wp) == WA_INACTIVE && !g_instantHold) {
             g_bakeTicks = 0;
-            SetTimer(w, 4, 20, nullptr);                // fade tracking (no cache yet)
+            SetTimer(w, 4, 20, nullptr);                // fade tracking (no color at all)
         } else {
             g_bakeTicks = 19;
             SetTimer(w, 4, 400, nullptr);               // one tail tick: recipe row + measure
@@ -8197,6 +8427,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 g_measurePending = false;
                 g_bakeTicks = 0;
                 KillTimer(w, 4);
+                // v7.2.13: the hold must be OFF before the measure -- the
+                // readback wants the SETTLED recipe row on screen, and a
+                // hold latched past the handover would feed the cache the
+                // opaque replay (measuring ourselves, not the blend).
+                if (g_instantHold) {
+                    g_instantHold = false;
+                    g_instantHoldColor = 0;
+                    guiPaintBar(w);
+                }
                 guiMeasureInstantRow();   // the settled composite is on screen now
                 // v7.2.3 THE MEASURE RETRY: the measurement is guarded --
                 // WindowFromPoint must return us at all three samples (a
