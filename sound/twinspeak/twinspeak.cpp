@@ -23,6 +23,34 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.11 THE FORCED REPLAY. Field, after v7.4.10: "Now it shows.
+//            Now have this same fix logic be applied to whenever you
+//            click on the tray icon and that's it." Plain start births
+//            the button -- the tray click does not. The second
+//            activation was already armed on every show-from-hidden
+//            (v7.4.10: tray click, tray menu, second-instance come-up),
+//            but the replay carried one guard the tray path cannot
+//            pass: tsReplayActivation ran only while the panel OWNS
+//            the foreground. At a plain start the process holds the
+//            launch grant, the panel owns the foreground, the guard
+//            passes, the replay runs. At a tray click the foreground
+//            belongs to the tray (Explorer) -- this process, running
+//            hidden since sign-in, holds no grant of its own, and
+//            every foreground call behind the restore (the activating
+//            show, SetForegroundWindow, even the v7.4.8 dance) can
+//            lose that race. 500 ms later the guard finds a
+//            non-foreground panel and exits: the replay never runs,
+//            the button stays unborn until the user's manual unfocus +
+//            refocus -- the exact symptom. THE FIX: tsReplayActivation
+//            takes a force flag, set by the show-from-hidden arm in
+//            guiRestoreWindow. Forced, a replay that finds the panel
+//            without the foreground does not stand down -- it TAKES
+//            the foreground with the v7.4.8 attach dance (the user
+//            clicked the icon to open this window: taking focus is
+//            the request, not a theft), then runs the blip unchanged;
+//            a twice-denied foreground stands down quietly. The
+//            plain-start arm stays unforced -- v7.4.10 byte for byte.
+//            Version steps to 7.4.11.
 //    v7.4.10 THE PLAIN PROCESS + THE SECOND ACTIVATION. Field, after
 //            v7.4.9: "Even then, it still does not show up on taskbar
 //            the moment the app starts without --tray." The window is
@@ -7646,6 +7674,12 @@ static int g_tbCycle = 0; // v7.4.10: ticks until the second activation replays
                           // (the unfocus + refocus replay -- see
                           // tsReplayActivation below; armed at every first
                           // show, spent in WM_TIMER)
+static bool g_tbForce = false; // v7.4.11: the armed replay TAKES the
+                               // foreground first (set by the
+                               // show-from-hidden arm -- the tray path,
+                               // where the foreground belongs to the tray
+                               // after the click and a guard-only replay
+                               // would never run; cleared when spent)
 
 static void tsAnnounceToTaskbar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -7738,10 +7772,40 @@ static void tsEnsureTaskbarButton(HWND w) {
 // The blip itself is one activation round trip inside our own process:
 // the bar repaints active -> inactive -> active through its buffered
 // paths and the fade presenter re-presents -- nothing else moves.
-static void tsReplayActivation(HWND panel) {
+// v7.4.11: the tray come-up arms the replay FORCED (g_tbForce). The click
+// granted the foreground to the tray, this process has no grant of its
+// own, and the restore's foreground calls can lose that race -- the
+// plain replay would exit at the guard every time and the button would
+// wait for a manual unfocus + refocus. Forced, the replay takes the
+// foreground with the attach dance first (the user asked for this
+// window), then runs the blip unchanged. The plain-start arm stays
+// unforced -- v7.4.10 as shipped.
+static void tsReplayActivation(HWND panel, bool force) {
     if (!panel || !IsWindow(panel) || !IsWindowVisible(panel)
         || IsIconic(panel) || g_hwnd != panel) return;
-    if (GetForegroundWindow() != panel) return;
+    if (GetForegroundWindow() != panel) {
+        if (!force) return;
+        // v7.4.11: the forced replay does not stand down here -- it TAKES
+        // the foreground first, with the v7.4.8 attach dance. The click on
+        // the tray icon granted the foreground to the tray (Explorer);
+        // this process, running hidden since sign-in, has no grant of its
+        // own, so the activating show, the plain SetForegroundWindow and
+        // even the audit's dance in guiRestoreWindow can all lose that
+        // race -- 500 ms later the panel is still not foreground, the
+        // plain replay exits at this guard and the button waits for the
+        // user's own unfocus + refocus. The user clicked the icon to OPEN
+        // this window: taking the foreground is the request, not a theft.
+        // Denied twice, stand down quietly (the next real refocus births
+        // the button as it always has).
+        const DWORD fgTid = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        const DWORD myTid = GetCurrentThreadId();
+        const BOOL attached = (fgTid && fgTid != myTid)
+                              ? AttachThreadInput(myTid, fgTid, TRUE) : FALSE;
+        SetForegroundWindow(panel);
+        SetFocus(panel);
+        if (attached) AttachThreadInput(myTid, fgTid, FALSE);
+        if (GetForegroundWindow() != panel) return;
+    }
     const HWND proxy = CreateWindowExW(WS_EX_TOOLWINDOW, L"static", L"",
                                        WS_POPUP, -32000, -32000, 1, 1,
                                        nullptr, nullptr,
@@ -7769,7 +7833,10 @@ static void guiRestoreWindow() {
     // show-from-hidden (tray click, tray menu, second-instance come-up).
     // A re-show on an already-visible window (the no-op focus refresh)
     // does not re-arm: the shell re-evaluated nothing.
-    if (wasHidden) g_tbCycle = 2;
+    // v7.4.11: the arm is FORCED -- the tray owns the foreground after
+    // the click and this process holds no grant; the plain replay would
+    // exit at its guard every time (see tsReplayActivation).
+    if (wasHidden) { g_tbCycle = 2; g_tbForce = true; }
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
@@ -7877,8 +7944,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.10 |  %s",  // v7.4.10 the plain process: the process AUMID retired too + the second
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // activation (the unfocus+refocus replay); v7.4.8's dance and APPWINDOW stay
+    snprintf(vbuf, sizeof(vbuf), "v7.4.11 |  %s",  // v7.4.11 the forced replay: the tray come-up takes the foreground
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // before the blip; v7.4.10's plain process + second activation stay
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8756,7 +8823,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // (tsReplayActivation above), armed two ticks (~500 ms) after the
         // first show, spent here once. Only fires while the panel owns
         // the foreground; the guard inside skips everything otherwise.
-        if (g_tbCycle > 0 && --g_tbCycle == 0) tsReplayActivation(w);
+        // v7.4.11: the forced arm (show-from-hidden) takes the foreground
+        // first instead of skipping -- see tsReplayActivation.
+        if (g_tbCycle > 0 && --g_tbCycle == 0) {
+            tsReplayActivation(w, g_tbForce);
+            g_tbForce = false;
+        }
         // v7.4.9: the taskbar nag -- the name-change re-announce budget set
         // by tsEnsureTaskbarButton, spent one per tick while the panel is
         // visible (covers the sign-in race: a taskbar that was still
@@ -9244,6 +9316,9 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         g_tbCycle = 2;                   // v7.4.10: arm the second activation
                                          // (the unfocus + refocus replay,
                                          // ~500 ms out -- see WM_TIMER)
+        g_tbForce = false;               // v7.4.11: plain start never forces
+                                         // -- the launch grant keeps the
+                                         // panel foreground (v7.4.10 path)
         // v7.1.26: no AddTab -- the native button arrives with the show.
         guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
         g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields

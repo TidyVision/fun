@@ -1,4 +1,13 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.10: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.11: version bump
+// (the forced replay: the tray-icon come-up -- tray click, tray menu,
+// second-instance come-up -- now runs the same second activation the plain
+// start runs, FORCED past its foreground guard: the click on the tray icon
+// grants the foreground to the tray (Explorer) and this process holds no
+// grant of its own, so the guard-only replay exited every time and the
+// button waited for a manual unfocus + refocus. Forced, the replay takes
+// the foreground with the v7.4.8 attach dance -- the user asked for this
+// window -- then runs the blip unchanged. Plain start stays byte for byte
+// v7.4.10: unforced arm, guard intact. v7.4.10: version bump
 // (the plain process + the second activation: the v7.1.23 process
 // AppUserModelID is RETIRED too -- the panel window has been vanilla since
 // v7.4.9 but the process still carried the AUMID, so every button was
@@ -149,12 +158,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.10.0"
+            VALUE "FileVersion",      "7.4.11.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.10.0"
+            VALUE "ProductVersion",   "7.4.11.0"
         END
     END
     BLOCK "VarFileInfo"
