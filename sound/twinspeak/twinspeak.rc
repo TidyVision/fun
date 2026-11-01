@@ -1,4 +1,15 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.9: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.10: version bump
+// (the plain process + the second activation: the v7.1.23 process
+// AppUserModelID is RETIRED too -- the panel window has been vanilla since
+// v7.4.9 but the process still carried the AUMID, so every button was
+// still born into the AUMID group's lifecycle instead of the plain window
+// path, with the windowless sign-in --tray twin as the group's claimant;
+// grouping, jumplist, balloons and the label all run on the default path
+// now. And tsReplayActivation replays the field machine's one proven
+// birth trigger -- the user's own unfocus + refocus pair -- ~500 ms after
+// every first show: a 1x1 off-screen toolwindow proxy takes the
+// foreground for 40 ms and hands it straight back, only while the panel
+// still owns the foreground. v7.4.9: version bump
 // (the vanilla window + the name-change channel: the per-window
 // System.AppUserModel.ID property (v7.1.25) is retired -- it never fixed
 // what it was added for and it routed the labeled taskbar's button birth
@@ -126,8 +137,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,4,9,0
-PRODUCTVERSION  7,4,9,0
+FILEVERSION     7,4,10,0
+PRODUCTVERSION  7,4,10,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -138,12 +149,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.9.0"
+            VALUE "FileVersion",      "7.4.10.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.9.0"
+            VALUE "ProductVersion",   "7.4.10.0"
         END
     END
     BLOCK "VarFileInfo"

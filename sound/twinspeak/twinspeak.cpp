@@ -23,6 +23,37 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.10 THE PLAIN PROCESS + THE SECOND ACTIVATION. Field, after
+//            v7.4.9: "Even then, it still does not show up on taskbar
+//            the moment the app starts without --tray." The window is
+//            vanilla since v7.4.9 -- but the PROCESS was not: the
+//            v7.1.23 process AppUserModelID stayed, so every panel is
+//            still born into the AUMID group's lifecycle instead of the
+//            plain window path, and the group's claimant is the
+//            windowless sign-in --tray twin joined late by the come-up
+//            panel -- the exact setup the labeled taskbar mishandles.
+//            (1) THE PLAIN PROCESS: SetCurrentProcessExplicitAppUser
+//            ModelID is RETIRED whole -- grouping (one window, nothing
+//            to group), the jumplist (exe default), balloon identity
+//            and the label (the window title, as v7.4.9 already rides)
+//            all run on the default path; the one-letter stub the claim
+//            once fought died with v7.1.26's Unicode conversion. Window
+//            AND process are vanilla; hiding happens only on --tray (no
+//            window is built there at all, v7.1.6). (2) THE SECOND
+//            ACTIVATION: the one birth trigger the field machine has
+//            never missed is the user's own unfocus + refocus -- a
+//            SECOND activation of the VISIBLE panel; no version ever
+//            replayed it (the fresh start shows-and-activates in one
+//            transaction and the v7.4.8 dance skips itself when the
+//            window IS foreground). tsReplayActivation now replays the
+//            pair ~500 ms after every first show (plain start AND every
+//            show-from-hidden come-up): a 1x1 off-screen toolwindow
+//            proxy takes the foreground for 40 ms and hands it straight
+//            back -- the exact pair the shell already answers there,
+//            minus the mouse. Runs only while the panel still owns the
+//            foreground: a user who already clicked away either gave
+//            the shell its re-evaluation or is elsewhere -- focus is
+//            never stolen. Version steps to 7.4.10.
 //    v7.4.9 THE VANILLA WINDOW + THE NAME-CHANGE CHANNEL. Field, after
 //            v7.4.8's audit: "I still don't see it. See what hides it from
 //            taskbar (initially from --tray) and fix it so it only hides
@@ -7611,6 +7642,10 @@ static bool guiCreateRealWindow() {
 // that never appeared. The flip is invisible: the trailing space renders
 // identically, and the bar paints its own title bytes anyway.
 static int g_tbNag = 0;   // v7.4.9: pending re-announces, one per 250 ms tick
+static int g_tbCycle = 0; // v7.4.10: ticks until the second activation replays
+                          // (the unfocus + refocus replay -- see
+                          // tsReplayActivation below; armed at every first
+                          // show, spent in WM_TIMER)
 
 static void tsAnnounceToTaskbar(HWND w) {
     if (!w || !IsWindow(w)) return;
@@ -7681,14 +7716,60 @@ static void tsEnsureTaskbarButton(HWND w) {
     g_tbNag = 12;
 }
 
+// ---- v7.4.10: THE SECOND ACTIVATION -----------------------------------------
+// The one birth trigger the field machine has NEVER missed is the user's
+// own unfocus + refocus cycle: the panel loses the foreground, the panel
+// regains it -- a SECOND activation of an ALREADY-VISIBLE window. Every
+// channel the audit exercised (show v7.4.7, foreground v7.4.8, style
+// v7.4.8, name-change v7.4.9) fires at or right after the FIRST
+// activation; this is the one re-evaluation that happens after, and it
+// is the one that always works there. No version ever replayed it: the
+// fresh start shows-and-activates in one transaction and tsEnsureTask
+// BarButton skips its dance when the window IS foreground, so after the
+// first activation nothing ever happens again. This replays the pair
+// programmatically: a 1x1 off-screen proxy takes the foreground for one
+// instant and hands it straight back. Proxy rules: WS_EX_TOOLWINDOW (no
+// taskbar entry, no Alt-Tab entry), 1x1 at -32000,-32000 (off every
+// monitor), the pre-registered "static" class (nothing to register).
+// The guard is the point: run ONLY while the panel still owns the
+// foreground. If the user already clicked away, either they came back
+// (their refocus was the real replay) or they are elsewhere (we never
+// steal focus -- their next refocus births the button as it always has).
+// The blip itself is one activation round trip inside our own process:
+// the bar repaints active -> inactive -> active through its buffered
+// paths and the fade presenter re-presents -- nothing else moves.
+static void tsReplayActivation(HWND panel) {
+    if (!panel || !IsWindow(panel) || !IsWindowVisible(panel)
+        || IsIconic(panel) || g_hwnd != panel) return;
+    if (GetForegroundWindow() != panel) return;
+    const HWND proxy = CreateWindowExW(WS_EX_TOOLWINDOW, L"static", L"",
+                                       WS_POPUP, -32000, -32000, 1, 1,
+                                       nullptr, nullptr,
+                                       GetModuleHandleA(nullptr), nullptr);
+    if (!proxy) return;
+    ShowWindow(proxy, SW_SHOWNOACTIVATE);   // visible so it can take focus;
+                                            // off-screen 1x1 toolwindow
+    SetForegroundWindow(proxy);             // the unfocus half
+    Sleep(40);                              // two DISTINCT foreground events
+    SetForegroundWindow(panel);             // the refocus half -- the ride
+    SetFocus(panel);
+    DestroyWindow(proxy);
+}
+
 static void guiRestoreWindow() {
     // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
     // tray menu, second instance); every later ask just shows it.
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
+    const bool wasHidden = !IsWindowVisible(g_hwnd);   // v7.4.10: show-from-hidden?
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
     tsEnsureTaskbarButton(g_hwnd);   // v7.4.8: the audit -- birth the button if the shell missed it
+    // v7.4.10: the second activation, armed (~500 ms out) for every
+    // show-from-hidden (tray click, tray menu, second-instance come-up).
+    // A re-show on an already-visible window (the no-op focus refresh)
+    // does not re-arm: the shell re-evaluated nothing.
+    if (wasHidden) g_tbCycle = 2;
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
@@ -7796,8 +7877,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.9  |  %s",  // v7.4.9 the vanilla window: per-window AUMID retired + the name-change
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // re-announce (immediate + 3 s nag); v7.4.8's dance and APPWINDOW stay
+    snprintf(vbuf, sizeof(vbuf), "v7.4.10 |  %s",  // v7.4.10 the plain process: the process AUMID retired too + the second
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // activation (the unfocus+refocus replay); v7.4.8's dance and APPWINDOW stay
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8671,6 +8752,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
+        // v7.4.10: the second activation -- the unfocus + refocus replay
+        // (tsReplayActivation above), armed two ticks (~500 ms) after the
+        // first show, spent here once. Only fires while the panel owns
+        // the foreground; the guard inside skips everything otherwise.
+        if (g_tbCycle > 0 && --g_tbCycle == 0) tsReplayActivation(w);
         // v7.4.9: the taskbar nag -- the name-change re-announce budget set
         // by tsEnsureTaskbarButton, spent one per tick while the panel is
         // visible (covers the sign-in race: a taskbar that was still
@@ -8987,34 +9073,24 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         CloseHandle(mutex);
         return 1;
     }
-    // v7.1.23 THE TASKBAR LABEL: the window had no AppUserModelID, so
-    // Win11's labeled taskbar ran the generic-window path and collapsed
-    // the button to a one-letter stub ("T") while AUMID-bearing apps kept
-    // full labels. Claim the identity BEFORE any window exists -- the
-    // taskbar grouping, the jumplist and the balloon notifications all
-    // hang off it. (shell32 export, Win7+; resolved dynamically so the
-    // header surface stays untouched.)
-    // v7.1.25 STILL ONE LETTER ON THE FIELD even with this call verbatim
-    // in the binary -- so v7.1.25 added the claim in a SECOND place, the
-    // per-window property on the panel (tsSetWindowAumid). That second
-    // place never fixed what it was added for (the stub died with
-    // v7.1.26's Unicode conversion, not with the property) and on the
-    // labeled taskbar it routed the button out of the default window
-    // path -- v7.4.9 retires it; the panel is a vanilla window again and
-    // this process-wide claim (grouping, jumplist, balloons, label) is
-    // the only AUMID left.
-    {
-        typedef HRESULT (WINAPI *TS_SCAPID)(PCWSTR);
-        HMODULE sh = GetModuleHandleA("shell32.dll");
-        if (!sh) sh = LoadLibraryA("shell32.dll");
-        const TS_SCAPID setAppId = (TS_SCAPID)(void*)GetProcAddress(
-            sh ? sh : GetModuleHandleA(nullptr),
-            "SetCurrentProcessExplicitAppUserModelID");
-        const HRESULT aumidHr =
-            setAppId ? setAppId(L"TidyVision.TwinSpeak") : (HRESULT)0x80004005L;
-        tlog("[twinspeak] gui           : process AppUserModelID TidyVision.TwinSpeak -> 0x%08lX%s\n",
-             (unsigned long)aumidHr, SUCCEEDED(aumidHr) ? "" : " (FAILED)");
-    }
+    // v7.1.23 was: THE TASKBAR LABEL -- the process AppUserModelID claim
+    // ("the window had no AUMID, so Win11's labeled taskbar collapsed the
+    // button to a one-letter stub"). RETIRED v7.4.10, the plain process.
+    // v7.4.9 retired the per-window half of this and called the panel a
+    // vanilla window -- but kept this process-wide claim, so every panel
+    // window was STILL born into the AUMID group's lifecycle instead of
+    // the plain window path, with the windowless sign-in --tray twin as
+    // the group's claimant and the come-up panel joining late. That
+    // group is the exact thing the field machine fails to birth a button
+    // in. Every job the claim still held runs without it: grouping (one
+    // window -- nothing to group), the jumplist (the exe default), the
+    // balloon identity (the tray icon's own) and the label (the window
+    // title, "TidyVision TwinSpeak", as v7.4.9 already rides). And the
+    // claim's original target -- the one-letter stub -- died with
+    // v7.1.26's end-to-end Unicode conversion, v7.4.9's own finding.
+    // The process is as vanilla as the window now: no AUMID anywhere,
+    // no group anywhere -- and "hidden from the taskbar" happens only
+    // on --tray, where v7.1.6 builds no window at all.
     if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());   // show defaults if absent
     guiInitDpi();          // v7.1.20: FIRST geometry act -- scale every constant + font
     guiCalcFrameInsets();  // v7.1.24: SECOND geometry act -- the frame insets
@@ -9165,6 +9241,9 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // channel that depends on neither the show nor the foreground
         // event (see the helper above for the full mechanism).
         tsEnsureTaskbarButton(g_hwnd);
+        g_tbCycle = 2;                   // v7.4.10: arm the second activation
+                                         // (the unfocus + refocus replay,
+                                         // ~500 ms out -- see WM_TIMER)
         // v7.1.26: no AddTab -- the native button arrives with the show.
         guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
         g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields
