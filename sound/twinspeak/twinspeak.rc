@@ -1,4 +1,12 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.5: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.6: version bump
+// (the shadow scrub: the screenshot's luminance scan shows the ghost as
+// stacked shadow bands -- one stranded per hide/show cycle, and the
+// earlier move fix died because both SetWindowPos calls shared one
+// dispatch so DWM never committed a frame at the offset. WM_CLOSE now
+// sets DWMWA_NCRENDERING_POLICY DISABLED before the hide, the show sets
+// ENABLED, and guiRestoreWindow scrubs with two pinned composes -- two
+// pixels diagonally, DwmFlush, back, DwmFlush. The v7.4.5 sheet
+// re-commit is retired as a measured no-op. v7.4.5: version bump
 // (the sheet re-commit: the v7.4.4 frame-change nudge recomputes the
 // win32 side of the frame but DWM's own shadow projection can still
 // resurrect stale -- the right/bottom tray-reopen ghost; guiRestoreWindow
@@ -93,8 +101,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,4,5,0
-PRODUCTVERSION  7,4,5,0
+FILEVERSION     7,4,6,0
+PRODUCTVERSION  7,4,6,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -105,12 +113,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.5.0"
+            VALUE "FileVersion",      "7.4.6.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.5.0"
+            VALUE "ProductVersion",   "7.4.6.0"
         END
     END
     BLOCK "VarFileInfo"
