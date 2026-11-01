@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,38 +23,6 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.3.3 THE SHADOW FOLLOWS THE FRAME. Field: "when I open the window
-//            again after being minimized to the system tray, the right and
-//            bottom borders' drop shadow stretch past the window size
-//            itself. But why is that?" WHY: the drop shadow is the DWM's
-//            -- it composites it OUTSIDE the window rect, sized from its
-//            cached frame model of the window (the model the WM_NCCALCSIZE
-//            insets define -- the invisible left/right/bottom strips the
-//            DWM border + shadow own). Hide-to-tray drops the window out
-//            of composition; the reopen -- SW_SHOW, or SW_RESTORE off the
-//            iconic state -- rebuilds it, and the rebuild rides the
-//            transition's frame state instead of re-asking WM_NCCALCSIZE:
-//            no frame-change event fires on a plain show. The only
-//            SWP_FRAMECHANGED the window ever sends is the WM_CREATE
-//            nudge (main.c's "inform the application of the frame
-//            change"), which ran once, at creation -- so the rebuilt
-//            model reads "full standard frame" and the rebuilt shadow
-//            carries one standard frame margin too much, right and
-//            bottom, exactly where the shadow's bulk lives: it stretches
-//            past the window. THE FIX: the WM_CREATE nudge, again, after
-//            every show that re-enters composition -- guiReframeForDwm(),
-//            one SetWindowPos(SWP_FRAMECHANGED | NOMOVE | NOSIZE |
-//            NOZORDER | NOACTIVATE) that makes DWM re-run WM_NCCALCSIZE
-//            against the visible state and rebuild the shadow around the
-//            real rect. Called from guiRestoreWindow right after
-//            ShowWindow (before SetForegroundWindow -- the activation
-//            flip composites with the corrected model), and from WM_SIZE
-//            on SIZE_RESTORED (the taskbar-button restore rides
-//            SC_RESTORE, not guiRestoreWindow -- same staleness, same
-//            mechanism; the first-show WM_SIZE reframe is a no-op, the
-//            model is already correct at creation). No pixels move, no
-//            activation change, no repaint beyond the frame DWM was
-//            wrong about. Version steps to 7.3.3.
 //    v7.3.2 THE HOLD THAT DOES NOT EXPIRE. Field: "I just see a
 //            transparency issue on the top border itself ... I think I
 //            might have experienced that 240ms timer that redrew the
@@ -7362,23 +7330,6 @@ static void guiCaptureWindowPos(HWND w) {
     g_guiWinX = wr.left;    // full int: virtual-screen coords can be negative
     g_guiWinY = wr.top;
 }
-// v7.3.3 THE SHADOW FOLLOWS THE FRAME. The drop shadow on the right and
-// bottom is the DWM's, composited OUTSIDE the window rect from ITS cached
-// frame model of this window -- the model the WM_NCCALCSIZE insets define
-// (the invisible left/right/bottom strips). A show that re-enters
-// composition after hide/minimize rebuilds that model from the TRANSITION
-// (full standard frame) instead of re-asking WM_NCCALCSIZE, so the rebuilt
-// shadow carries one standard frame margin too much. This re-fires the
-// WM_CREATE nudge: DWM re-runs WM_NCCALCSIZE against the visible state and
-// rebuilds the shadow around the real rect. No pixels move (NOMOVE |
-// NOSIZE); NOACTIVATE keeps it out of the activation ordering that
-// follows the show; NOZORDER keeps it invisible to the Z stack.
-static void guiReframeForDwm(HWND w) {
-    if (!w || !IsWindow(w)) return;
-    SetWindowPos(w, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-}
 // ---- v7.1.6 TRAY-FIRST: the deferred control window -------------------------
 // A --tray (startup) launch builds NOTHING but the invisible tray owner; the
 // real panel is constructed HERE, on demand: the first tray double-click,
@@ -7611,11 +7562,6 @@ static void guiRestoreWindow() {
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
-    // v7.3.3: the show re-enters composition without a frame-change event
-    // -- DWM rebuilt its frame model from the hidden/iconic transition and
-    // the rebuilt shadow runs one frame margin past the window (right and
-    // bottom). Re-ask the frame BEFORE the activation flip composites.
-    guiReframeForDwm(g_hwnd);
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
@@ -8078,18 +8024,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             RedrawWindow(w, nullptr, nullptr,
                          RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
-        break;
-    case WM_SIZE:
-        // v7.3.3 THE SHADOW FOLLOWS THE FRAME, second door: the
-        // taskbar-button restore (SC_RESTORE) re-enters visible composition
-        // WITHOUT guiRestoreWindow -- the same frame-model staleness as the
-        // tray reopen, by the same mechanism. One reframe after the flip
-        // lands settles the DWM shadow back onto the real rect.
-        // SIZE_RESTORED is the only resize this window ever sees (the size
-        // lock pins every other pass); the first-show WM_SIZE rides this
-        // branch too -- a no-op reframe there, the model is already correct
-        // from the WM_CREATE nudge.
-        if (wp == SIZE_RESTORED) guiReframeForDwm(w);
         break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
