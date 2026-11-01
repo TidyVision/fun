@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,19 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.2 THE INACTIVE ROW, HALF-ALPHA BLACK. Field, after living with
+//            v7.4.1: "Now I see something clever. This means the #696969
+//            needs to be #000000 for the inactive window top bar." The
+//            observation closes the loop: the DWM's own inactive border
+//            is not a gray painted ON TOP of the glass -- it is the
+//            glass itself DIMMED 50%, which is half-alpha BLACK and
+//            nothing else. A gray source byte double-dims (the gray
+//            rides 50% on top of an already-dimmed glass). One byte
+//            moves: kSheetRowInactive 0x80696969 -> 0x80000000
+//            (BGRA(0,0,0,0x80)); the guiRenderBar brush moves with it
+//            (Gdiplus::Color(128, 0, 0, 0)). Active stays the glass key
+//            BGRA(0,0,0,0) -- the focused window is never touched.
+//            Version steps to 7.4.2.
 //    v7.4.1 THE INACTIVE ROW, PINNED. Field: "Now the opposite happens on
 //            unfocus. Why is this? Btw, the focused window remains
 //            accurate. I just want you to revert those changes." Then the
@@ -4851,7 +4864,7 @@ static bool g_glassSheet = false;
 // tracking (see guiHoldPxForBackdrop, after the sheet-row essay): computed
 // live at WM_NCACTIVATE(FALSE) from the desktop strip above the window.
 // v7.4.1: the tracking is RETIRED whole -- this train re-presents the ONE
-// constant inactive row, half-alpha #696969 (see the sheet-row essay).
+// constant inactive row, half-alpha black (v7.4.2; see the sheet-row essay).
 // v7.3.2: the 240 ms wall-clock stamp and its handover present are
 // RETIRED (the field caught the handover as "a transparency issue on the
 // top border itself"): the hold is a LATCH that lasts the whole inactive
@@ -4994,7 +5007,7 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
         rowCol = active ? Gdiplus::Color(255, 0, 0, 0)       // the DWM frame
-                        : Gdiplus::Color(128, 0x69, 0x69, 0x69); // RGBA(0x69, 0.5) -- v7.4.1: kSheetRowInactive's bytes
+                        : Gdiplus::Color(128, 0, 0, 0);          // RGBA(0, 0.5) -- v7.4.2: kSheetRowInactive's bytes
     } else {
         const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
         const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
@@ -5113,10 +5126,11 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 //   active    BGRA(0,0,0,0)      alpha 0 = bare glass: the sheet shows the
 //                                DWM's OWN border (accent or the default
 //                                gray), fading natively with the frame;
-//   inactive  BGRA(0x69,0x69,0x69,0x80) half-alpha #696969 -- v7.4.1: the
-//                                classic inactive border the DWM itself
-//                                rides, composited 50/50 with the glass
-//                                blur over whatever is behind.
+//   inactive  BGRA(0,0,0,0x80)   half-alpha black -- v7.4.2: the glass
+//                                itself dimmed 50%, the classic inactive
+//                                border the DWM itself rides, composited
+//                                50/50 with the glass blur over whatever
+//                                is behind.
 // The opaque overlays of v7.2.0..v7.2.13 (the measured cache, the tracked
 // hold, the hook's early present) are RETIRED: an opaque constant on the
 // sheet was the white bar over dark backdrops AND the ~400 ms non-vanilla
@@ -5157,7 +5171,7 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // NOTHING ELSE of the retired machine returns: no measured cache, no
 // seeder, no mouse hook, no tail timer.
 //
-// ---- v7.4.1: THE INACTIVE ROW, PINNED ---------------------------------------
+// ---- v7.4.1 + v7.4.2: THE INACTIVE ROW, PINNED ------------------------------
 // The v7.3.0/v7.3.2 tracked hold above is RETIRED whole, together with
 // v7.4.0's alpha-0-both-states row. Why: the inactive sheet material is
 // the DWM's own business. v7.4.0 trusted the DWM to paint its inactive
@@ -5169,18 +5183,23 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // spec cuts through both: "have the inactive top border be a
 // half-transparent #696969 upon the window being unfocused, since
 // that's what's apparently being done." That is exactly what the DWM
-// does for the real frame -- the classic inactive border IS half-alpha
-// DimGray composited over the glass -- so the row is PINNED to those
-// bytes and the DWM's own compose blends it exactly like the strips:
+// does for the real frame -- the classic inactive border is the glass
+// composited 50/50 with a dark source -- so the row was PINNED to
+// those bytes and the DWM's own compose blends it exactly like the
+// strips. v7.4.2 closes the loop, the field's own composite math:
+// "Now I see something clever. This means the #696969 needs to be
+// #000000 for the inactive window top bar." Right -- a gray source
+// byte dims the glass AND tints it; the DWM's own inactive border is
+// the glass DIMMED 50%, which is half-alpha BLACK and nothing else:
 //
-//   active    BGRA(0,0,0,0)             the glass key: the DWM's OWN border
-//                                       paints through it -- the proven
-//                                       focused look, untouched since
-//                                       v7.1.27 ("the focused window
-//                                       remains accurate")
-//   inactive  BGRA(0x69,0x69,0x69,0x80) half-alpha #696969: the DWM's own
-//                                       inactive-border recipe, composited
-//                                       by the same DWM over the same glass
+//   active    BGRA(0,0,0,0)      the glass key: the DWM's OWN border
+//                                paints through it -- the proven
+//                                focused look, untouched since
+//                                v7.1.27 ("the focused window
+//                                remains accurate")
+//   inactive  BGRA(0,0,0,0x80)   half-alpha black: the glass dimmed
+//                                50%, composited by the same DWM over
+//                                the same glass as the strips
 //
 // guiHoldPxForBackdrop (the screen read, the strip DIB, the luma median,
 // the 43 + 127*B/255 math) and the g_holdLive/g_holdPx latch pair are
@@ -5192,12 +5211,13 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // GUI writes before the thread's reads.
 typedef HRESULT (WINAPI *TS_DWMFLUSH)(void);
 static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRealWindow (the house trick)
-// v7.4.1 THE TWO ROWS. BGRA little-endian u32: the high byte is the alpha.
-// The inactive bytes are the field's spec -- half-alpha #696969, the classic
-// inactive border the DWM's own frame rides; the active bytes are the glass
-// key the active window has carried since v7.1.27. No latch, no measurement.
+// v7.4.2 THE TWO ROWS. BGRA little-endian u32: the high byte is the alpha.
+// The inactive bytes are the field's spec -- half-alpha #000000, the glass
+// itself dimmed 50% (v7.4.1 rode #696969; the field's composite observation
+// moved it to black); the active bytes are the glass key the active window
+// has carried since v7.1.27. No latch, no measurement.
 static const unsigned kSheetRowActive   = 0x00000000u; // the glass key: the DWM's own frame
-static const unsigned kSheetRowInactive = 0x80696969u; // half-alpha #696969: the classic inactive border
+static const unsigned kSheetRowInactive = 0x80000000u; // half-alpha black: the glass dimmed 50%
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
     // v7.4.1: two constants, no latch, no measurement (see the essay above).
@@ -5318,8 +5338,8 @@ static void guiPaintBar(HWND w) {
 // The surface is a PRIVATE 1 px top-down 32bpp DIB section. That is enough
 // because the sheet row is ONE uniform constant in both states
 // (guiBarPatchSheetRow): active BGRA(0,0,0,0) -- the glass key, the DWM's own
-// border -- inactive BGRA(0x69,0x69,0x69,0x80) -- half-alpha #696969 (v7.4.1:
-// the classic inactive border the DWM itself rides). The
+// border -- inactive BGRA(0,0,0,0x80) -- half-alpha black (v7.4.2: the
+// glass dimmed 50%, the classic inactive border the DWM itself rides). The
 // thread never touches the UI thread's bar buffer, so no GDI object is
 // shared: the worst interleaving is a redundant blit of the same bytes the
 // NC latch already chose.
@@ -5384,7 +5404,7 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         }
         // v7.4.1: two constants, no hold atomics (see the sheet-row essay).
         const unsigned px = (nc != 0) ? kSheetRowActive    // the glass key: the DWM's own frame
-                                      : kSheetRowInactive; // half-alpha #696969
+                                      : kSheetRowInactive; // half-alpha black
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
@@ -7547,7 +7567,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.1  |  %s",  // v7.4.1 the inactive row, pinned: half-alpha #696969 (v7.3.2 the latch)
+    snprintf(vbuf, sizeof(vbuf), "v7.4.2  |  %s",  // v7.4.2 the inactive row: half-alpha black (v7.4.1 the pin, v7.3.2 the latch)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7761,19 +7781,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         //       as the belt it always was.
         //   (2) THE FADE ITSELF. The half-alpha row blended against the
         //       sheet's ANIMATING visuals shows transitional grays for
-        //       the ~200 ms fade -- and v7.4.1 makes them the FRAME'S OWN
+        //       the ~200 ms fade -- and v7.4.2 makes them the FRAME'S OWN
         //       grays: on DEACTIVATION the row is the constant half-alpha
-        //       #696969, the same recipe bytes the DWM's own inactive
-        //       border rides, so the compose blends it exactly like the
-        //       left/right/bottom strips and the fade tracks the frame's
-        //       own. The v7.3.0 tracked OPAQUE row (guiHoldPxForBackdrop,
-        //       the backdrop measurement) and the v7.3.2 g_holdLive latch
-        //       are RETIRED whole -- no measurement, no stamp, no
-        //       handover, nothing to sample stale; the v7.4.0
-        //       alpha-0-both-states row is retired with them (over a
-        //       (252,252,252) backdrop the DWM's inactive sheet material
-        //       landed BLACK -- the field's tape; Discord's custom-frame
-        //       build carries the same hole).
+        //       BLACK (v7.4.1 rode #696969; the field's composite
+        //       observation -- "the #696969 needs to be #000000" -- moved
+        //       it), the glass dimmed 50% by the same compose that dims
+        //       the left/right/bottom strips, so the fade tracks the
+        //       frame's own. The v7.3.0 tracked OPAQUE row
+        //       (guiHoldPxForBackdrop, the backdrop measurement) and the
+        //       v7.3.2 g_holdLive latch are RETIRED whole -- no
+        //       measurement, no stamp, no handover, nothing to sample
+        //       stale; the v7.4.0 alpha-0-both-states row is retired with
+        //       them (over a (252,252,252) backdrop the DWM's inactive
+        //       sheet material landed BLACK -- the field's tape;
+        //       Discord's custom-frame build carries the same hole).
         // On activation the glass key goes down (alpha 0 black -- the DWM
         // paints its own border through it).
         if (IsWindowVisible(w) && !IsIconic(w)) {
