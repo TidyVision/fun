@@ -23,6 +23,50 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.10 THE EVER-SEEDED CACHE. The field: "My only issue is that
+//            the window titlebar's top border is flashing whenever I
+//            deactivate the window... the window is redrawn as the
+//            input has never been gotten yet until the second frame."
+//            That is the NO-CACHE deactivation, still, on a machine
+//            where v7.2.9's median scan never even gets to run: every
+//            instant machine on the row (the v7.2.1 hook early
+//            present, the v7.2.0 opaque hold at WM_NCACTIVATE and
+//            WM_ACTIVATE) gates on g_instantInactive, and the cache's
+//            ONLY writer was the burst-tail measure -- twenty 20 ms
+//            ticks that must run UNINTERRUPTED while the window STAYS
+//            inactive, plus one more tick. The field's own test loop
+//            defeats it: click away, click back inside half a second
+//            -- WM_ACTIVATE resets g_measurePending, the burst
+//            re-arms, the measure tick lands while ACTIVE
+//            (guiMeasureInstantRow bails), the retry wants the window
+//            to STILL be inactive, the timer dies -- and the cache
+//            stays empty for the whole session. Every deactivation
+//            then rides the DWM's transition: row 0 is the recipe's
+//            HALF-ALPHA bytes, alpha-carrying pixels on the extended
+//            sheet are owned by the glass blend while the activation
+//            transition runs, and the composes that carry the flip
+//            show the PRE-INPUT (active) blend until the settled gray
+//            lands -- the flash, every time. The fix is a SEEDER of
+//            its own: timer 5 at 250 ms, armed the moment the sheet
+//            extends, ALIVE while g_instantInactive is empty and
+//            owned by NO other path -- WM_ACTIVATE cannot reset it,
+//            the burst cannot kill it. Each tick: hidden/iconic =
+//            nothing; within 450 ms of the last activation change =
+//            nothing (the fade owns the row there; a mid-fade sample
+//            would cache the bright glass); otherwise
+//            guiMeasureInstantRow runs -- any quiet inactive stretch
+//            (the watched deactivation itself, the gap of a quick
+//            toggle, the first idle seconds after launch) seeds the
+//            cache, and the first success kills the timer FOREVER
+//            (the burst tail owns the refresh from there; the cache
+//            is never cleared, so the seeder's job is once per
+//            session). From the first seeded moment every
+//            deactivation is the v7.2.3 ordering with the v7.2.0
+//            opaque row: the flip compose reads OUR bytes -- no
+//            glass, no fade, no second frame. The one deactivation
+//            the seeder cannot help is the first-ever one (nothing
+//            settled has ever existed to measure). Version steps to
+//            7.2.10.
 //    v7.2.9 THE ONE-FRAME ROW, TRACED AND KILLED. The field: "I still
 //            see the top bar thing being delayed by one frame. Trace
 //            the exact sequence for deactivation and fix it once you
@@ -4536,6 +4580,14 @@ static int      g_ncActive = -1;             // v7.2.9: the NC-latched activatio
                                              // runs after the transaction closes
 static HHOOK    g_mouseHook      = nullptr; // v7.2.1: the early-present mouse hook (see guiMain)
 static bool     g_measurePending = false; // one tick after the recipe handover, refresh the cache
+static unsigned long long g_lastActChgMs = 0; // v7.2.10: GetTickCount64() of the last
+                                             // activation change (stamped at WM_NCACTIVATE
+                                             // -- both directions -- and WM_ACTIVATE): the
+                                             // seeder's settle gate. The DWM's glass fade
+                                             // owns row 0 for ~200 ms after a change, so a
+                                             // sample taken sooner would cache the mid-fade
+                                             // bright glass and one wrong seed sticks until
+                                             // the next successful measure.
 // renders the whole bar into dc (memory buffer or screen -- identical code)
 // v7.1.24: main.c's button geometry on the theme face. MINIMIZE + CLOSE
 // (no maximize -- the size lock refuses it), hover faces driven by the
@@ -6902,6 +6954,18 @@ static bool guiCreateRealWindow() {
                 const TS_MARGINS sheet = { 0, 0, 1, 0 };
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
             }
+            // v7.2.10 THE EVER-SEEDED CACHE, arming: the seeder (timer 5,
+            // 250 ms) starts the moment the sheet exists and lives until the
+            // first successful measure -- see WM_TIMER (wp == 5). Without it
+            // the cache seeds ONLY at the tail of a full, UNINTERRUPTED
+            // deactivation burst: WM_ACTIVATE resets g_measurePending, so a
+            // quick click-away-click-back -- the exact loop the deactivation
+            // flash gets tested with -- cancels the pending measure, lands
+            // the retry's bail while ACTIVE, and leaves the cache empty for
+            // the whole session; every deactivation then rides the DWM's
+            // transition and the top border shows the PRE-INPUT blend until
+            // the second frame. The seeder is owned by no other path.
+            if (g_glassSheet) SetTimer(g_hwnd, 5, 250, nullptr);
             // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
             // Without it the DWM paints the extended sheet WHITE in light
             // mode (the documented light-mode border bug); with it the
@@ -7082,8 +7146,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.9  |  %s",   // v7.2.9 the one-frame row traced and killed (v7.2.8 post-flip NCPAINT)
-             tsMidTrunc(g_guiIniPath, (size_t)S(90)).c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.2.10  |  %s",  // v7.2.10 the ever-seeded cache (v7.2.9 the one-frame row traced and killed)
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -7256,6 +7320,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // transaction closes. WM_NCPAINT uses this latch to refuse to
         // repaint a stale face mid-transaction.
         g_ncActive = (wp ? 1 : 0);
+        g_lastActChgMs = GetTickCount64();   // v7.2.10: the seeder's settle gate starts here --
+                                             // BOTH directions stamp, the fade owns row 0
+                                             // after either one
         // v7.2.3 THE NC-FLIP PRESENT. The video's frames, decoded: on
         // deactivation the DWM re-bakes the extended-sheet row at the
         // compose that carries the activation flip, and that compose is
@@ -7361,6 +7428,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // it on every activation change (DefWindowProc still runs). The
         // example invalidates the bar rect here; the buffered blit is the
         // same pixels without the invalidation round-trip.
+        g_lastActChgMs = GetTickCount64();   // v7.2.10: the seeder's settle gate starts here
         // v7.1.30 THE SETTLE BAKE, v7.1.31 THE SETTLE BURST: this blit
         // lands BEFORE the DWM's ~200 ms activation fade has run, and the
         // DWM evaluates the extended-sheet blend when the window presents
@@ -7929,6 +7997,53 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 guiPaintBar(w);           // present the recipe row against settled glass
                 g_measurePending = true;  // measure it on the next tick
             }
+            return 0;
+        }
+        // v7.2.10 THE EVER-SEEDED CACHE, the seeder tick. Timer 5 at 250 ms,
+        // armed once the glass sheet exists (guiCreateRealWindow), dead the
+        // moment the cache seeds: the ONLY owner of the INITIAL
+        // g_instantInactive seed that no other path can reset. Before this
+        // timer the cache's only writer was the burst-tail measure, and it
+        // needs twenty UNINTERRUPTED 20 ms ticks PLUS one more, all while
+        // the window STAYS inactive -- WM_ACTIVATE resets g_measurePending
+        // and re-arms the 20 ms burst, so a quick click-away-click-back (the
+        // exact loop the deactivation flash gets tested with) cancels the
+        // pending measure, lands the retry's bail while ACTIVE, and leaves
+        // the cache empty for the whole session. With the cache empty the
+        // two instant machines (the hook's early present, the opaque hold at
+        // WM_NCACTIVATE/WM_ACTIVATE) never engage, every deactivation rides
+        // the DWM's transition -- row 0 is the recipe's half-alpha bytes and
+        // alpha-carrying pixels on the extended sheet are owned by the glass
+        // blend while the activation transition runs -- and the composes
+        // that carry the flip show the PRE-INPUT (active) blend until the
+        // settled gray lands: the top border flashes, every time. This tick
+        // has exactly three jobs:
+        //   1. hidden/iconic = nothing (nothing honest to read);
+        //   2. within 450 ms of the last activation change = nothing -- the
+        //      fade owns the row there and a mid-fade sample would cache the
+        //      bright glass; one wrong seed sticks until the next successful
+        //      measure, so the seeder never races it (450 ms > the ~200 ms
+        //      fade AND > the burst's 20 x 20 ms run, so every sample this
+        //      timer takes is a settled one);
+        //   3. otherwise guiMeasureInstantRow runs -- its own guards filter
+        //      the active window and the covered points; any quiet inactive
+        //      stretch (the watched deactivation itself, the gap of a quick
+        //      toggle, the first idle seconds after launch) seeds the cache.
+        // The first success kills the timer FOREVER: the burst tail owns the
+        // refresh from there and the cache is never cleared, so the seeder's
+        // job is once per session. While unseeded it stays armed -- a
+        // covered top row costs nothing but time; the first tick with a
+        // visible sliver wins. The one deactivation the seeder cannot help
+        // is the first-ever one: nothing settled has ever existed to
+        // measure, so that row rides the fade exactly like a native
+        // frame's own strips, and every watched deactivation after it is
+        // the opaque instant row.
+        if (wp == 5) {
+            if (!g_glassSheet || g_instantInactive) { KillTimer(w, 5); return 0; }
+            if (!IsWindowVisible(w) || IsIconic(w)) return 0;
+            if (GetTickCount64() - g_lastActChgMs < 450) return 0;   // mid-fade: never sample
+            guiMeasureInstantRow();
+            if (g_instantInactive) KillTimer(w, 5);
             return 0;
         }
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
