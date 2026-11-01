@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,23 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.7 THE BUTTON RIDE. Field: "The 'TidyVision TwinSpeak' will not
+//            show up anywhere on the taskbar until I unfocus and refocus
+//            the window" -- a plain launch opened the panel but the
+//            taskbar button stayed unborn until an activation change.
+//            The first show was SW_SHOWNA (v6.6.5's no-activate,
+//            no-flash show) with SetForegroundWindow bolted on behind
+//            it (v7.1.20) -- two separate shell transactions. The
+//            taskbar button is born in the SHOW transaction, and a
+//            no-activate show is the exact case v7.1.7 had to patch
+//            with ITaskbarList::AddTab ("a button that lagged behind a
+//            no-activate show"; retired v7.1.26 -- Win11 files AddTab
+//            items as TABS and renders them as one-letter stubs). The
+//            fix is the natural order: ShowWindow(SW_SHOW) -- show AND
+//            activate in ONE transaction, the show the button birth
+//            actually rides; the pre-render keeps the finished first
+//            frame and the foreground calls stay as a belt. Both show
+//            paths now activate (guiRestoreWindow always did).
 //    v7.4.6 THE LEGACY SHADOW, RETIRED. Field: "When I click on the tray
 //            icon to open the app's window again, I see this ghost shadow
 //            that extends to the bottom right." The two DWM-side rebuilds
@@ -7682,8 +7699,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.6  |  %s",  // v7.4.6 the legacy shadow retired: CS_DROPSHADOW is gone (the tray-reopen
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // ghost was win32k's SysShadow sprite); the tray icon rides plain starts too
+    snprintf(vbuf, sizeof(vbuf), "v7.4.7  |  %s",  // v7.4.7 the button ride: the first show activates (SW_SHOW) so the taskbar
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // button is born with it; v7.4.6 retired CS_DROPSHADOW (the tray-reopen ghost)
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8979,7 +8996,28 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // the v6.6.5 white-flash trick -- so SW_SHOWNA lands one finished
         // frame, no activate/erase cycle).
         if (!guiCreateRealWindow()) { if (mutex) CloseHandle(mutex); return 1; }
-        ShowWindow(g_hwnd, SW_SHOWNA);   // v6.6.5: NA -- no activate repaint
+        // v7.4.7 THE BUTTON RIDE: the first show carries the activation.
+        // v6.6.5 showed SW_SHOWNA (no-activate: one pre-rendered frame, no
+        // activate/erase cycle) and v7.1.20 bolted SetForegroundWindow on
+        // behind it for the keyboard -- two separate shell transactions.
+        // The taskbar button is born in the SHOW transaction, and a
+        // no-activate show is the exact case v7.1.7 had to patch with
+        // ITaskbarList::AddTab ("a button that lagged behind a no-activate
+        // show"; retired v7.1.26 -- Win11 files AddTab items as TABS and
+        // renders them as one-letter stubs). On the field machine the
+        // separate foreground call does not birth the button at all: the
+        // window opens, "TidyVision TwinSpeak" is nowhere on the taskbar,
+        // and only an unfocus + refocus cycle (a real activation change)
+        // makes it appear. The fix is the order every normal app uses:
+        // ShowWindow(SW_SHOW) -- show AND activate in ONE transaction, the
+        // show the button birth actually rides. The v6.6.5 pre-render
+        // already made activation safe (v7.1.20's own finding), so the
+        // white-flash trick keeps its finished first frame and the
+        // activation comes home inside the same transaction. The two
+        // foreground calls stay as a belt for launch contexts that
+        // suppress ShowWindow activation; on an already-active window
+        // they are no-ops.
+        ShowWindow(g_hwnd, SW_SHOW);   // v7.4.7: activating show -- the taskbar button rides it
         // v7.1.20 THE FOCUS FIX: SW_SHOWNA alone left the first-open window
         // UNFOCUSED -- keyboard dead until the first click (the tray path
         // always foregrounded; the double-click path never did). The v6.6.5

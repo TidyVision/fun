@@ -1,4 +1,10 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.6: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.7: version bump
+// (the button ride: a plain launch showed the panel with SW_SHOWNA -- a
+// no-activate show -- and the taskbar button stayed unborn until an
+// activation change (the field: "'TidyVision TwinSpeak' will not show up
+// anywhere on the taskbar until I unfocus and refocus the window"). The
+// first show is ShowWindow(SW_SHOW) now: show AND activate in one shell
+// transaction, the transaction the button birth rides. v7.4.6: version bump
 // (the legacy shadow, retired: the class carried CS_DROPSHADOW next to the
 // DWM shadow -- win32k's legacy shadow is a separate "SysShadow" sprite
 // drawn OFFSET DOWN-RIGHT of the owner window, and its show/hide lifecycle
@@ -104,8 +110,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,4,6,0
-PRODUCTVERSION  7,4,6,0
+FILEVERSION     7,4,7,0
+PRODUCTVERSION  7,4,7,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -116,12 +122,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.6.0"
+            VALUE "FileVersion",      "7.4.7.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.6.0"
+            VALUE "ProductVersion",   "7.4.7.0"
         END
     END
     BLOCK "VarFileInfo"
