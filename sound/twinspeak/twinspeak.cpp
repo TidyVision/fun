@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,19 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.8 THE ROW REVERTED, THE SIZE EVENT STAYS. Field: "This just
+//            makes the top border always black. Please revert that top
+//            border change." The v7.3.7 opaque constant row is
+//            withdrawn in full: all three row-0 writers return to the
+//            exact v7.3.2-recipe behavior -- the alpha-0 glass key when
+//            active (the REAL DWM sheet shows; the blend over a white
+//            backdrop is what real glass IS, and the field prefers the
+//            real border over a constant imitation), the backdrop-
+//            tracked hold / half-alpha recipe when inactive. The other
+//            half of v7.3.7 -- the reopen's REAL one-pixel size event,
+//            gated through the size lock, after the identity
+//            re-assertion -- is NOT touched and stays. Version steps
+//            to 7.3.8.
 //    v7.3.7 THE SIZE EVENT + THE ROW THAT BLENDS WITH NOTHING. Field:
 //            "I still get the bug. Also ... the window border's top bar
 //            is blending its color wrong when being layered on complete
@@ -5344,26 +5357,29 @@ static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vani
     const int cb = 43 + (((int)med & 0xFF) * 127 + 127) / 255;
     return 0xFF000000u | ((unsigned)cr << 16) | ((unsigned)cg << 8) | (unsigned)cb; // BGRA, opaque
 }
-static void guiBarPatchSheetRow(int cw, bool /*active -- v7.3.7: the row is constant*/) {
+// v7.3.8 THE REVERT. The field: "This just makes the top border always
+// black." The v7.3.7 opaque constant is withdrawn in full -- the row
+// returns to the exact v7.3.2-recipe behavior: the glass key when
+// active (the REAL sheet shows -- the field prefers the real border,
+// and the blend over a white backdrop is what real glass IS), the
+// backdrop-tracked hold / half-alpha recipe when inactive. The size
+// event (the other half of v7.3.7) is NOT touched.
+static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
-    // v7.3.7 THE ROW BLENDS WITH NOTHING. Every former state depended on
-    // the backdrop: ACTIVE row 0 was the glass key (alpha 0 -- the REAL
-    // sheet showed, and the sheet is GLASS: it always blends with what is
-    // behind the window, so over complete white the border washed out --
-    // the field's new tape), and the inactive rows simulated that blend
-    // over the measured backdrop (the v7.3.0 hold) or rode the half-alpha
-    // recipe. The three DWM strips never blend -- they are window pixels
-    // -- so on light backdrops the top border visibly mismatched them.
-    // The row is now the OPAQUE recipe constant in EVERY state:
-    // BGRA(43,43,43,255). Over the dark backdrops the field has always
-    // run this is byte-for-byte the look the glass produced (the recipe
-    // was measured there); over white it stays the dark border, uniform
-    // with the strips. The hold/latch machinery keeps running untouched
-    // (nothing reads it for the row anymore) and the fade presenter
-    // lands the same constant -- a state flip can no longer change the
-    // border at all, which retires the whole fade-visibility problem by
-    // construction.
-    const unsigned px = 0xFF2B2B2Bu;            // BGRA(43, 43, 43) -- opaque, constant
+    unsigned px;
+    if (active) {
+        px = 0x00000000u;                       // the glass key: the DWM's own frame
+    } else {
+        // v7.3.0: while the deactivation hold is stamped, EVERY painter
+        // lands the tracked OPAQUE row (the Chrome contract -- an opaque
+        // pixel on the sheet displays as-is, no glass blend to re-bake).
+        // v7.3.2: the hold is the latch (g_holdLive), not a clock -- it
+        // lasts the whole inactive period; the recipe's half-alpha row
+        // rides only a failed backdrop measurement (no stamp).
+        px = g_holdLive.load(std::memory_order_relaxed)
+           ? g_holdPx.load(std::memory_order_relaxed)
+           : 0x802B2B2Bu;                       // the recipe: BGRA(43, 43, 43, 128)
+    }
     unsigned* row = (unsigned*)g_barBits;       // top-down: row 0 first
     for (int x = 0; x < cw; ++x) row[x] = px;
 }
@@ -5384,12 +5400,16 @@ static void guiBarPatchSheetRow(int cw, bool /*active -- v7.3.7: the row is cons
 // the face follows in the same handler with the full paint. The race
 // window collapses from a multi-ms render to the blit itself. Buffer
 // missing (the first frames): skip -- the full paint covers it.
-static void guiCommitSheetRowFast(HWND w, bool /*active -- v7.3.7: the row is constant*/) {
+static void guiCommitSheetRowFast(HWND w, bool active) {
     if (!g_glassSheet) return;
-    // v7.3.7: the row blends with nothing -- the opaque constant in every
-    // state (see guiBarPatchSheetRow). The flip-carrying compose can now
-    // sample either direction's row: they are the same bytes.
-    const unsigned px = 0xFF2B2B2Bu;          // BGRA(43, 43, 43) -- opaque, constant
+    unsigned px;
+    if (active) {
+        px = 0x00000000u;                     // the glass key: the DWM's own frame (v7.3.8 revert)
+    } else {
+        px = g_holdLive.load(std::memory_order_relaxed)  // v7.3.2: the latch, not a clock
+           ? g_holdPx.load(std::memory_order_relaxed)
+           : 0x802B2B2Bu;                     // the recipe row: a failed measurement only
+    }
     RECT cr;
     if (!GetClientRect(w, &cr) || cr.right <= 0) return;
     if (!guiBarBufEnsure(cr.right, kCapH)) return;
@@ -5555,12 +5575,20 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         unsigned px;
         if (nc != 0) {
             g_holdLive.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
+            px = 0x00000000u;                     // the glass key: the DWM's own frame (v7.3.8 revert)
+        } else {
+            // v7.3.0: inside the hold window re-present the tracked OPAQUE
+            // color. v7.3.2: the hold is the latch, not a clock -- while
+            // it is set every tick lands the SAME opaque row and the row
+            // never hands back mid-inactivity; the HANDOVER present (the
+            // first tick past a 240 ms stamp re-landing the recipe's
+            // half-alpha row -- the transparency snap the field caught)
+            // is retired with the stamp. The recipe row rides only a
+            // failed measurement (no stamp -- see WM_NCACTIVATE).
+            px = g_holdLive.load(std::memory_order_relaxed)
+               ? g_holdPx.load(std::memory_order_relaxed)
+               : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
         }
-        // v7.3.7: the row blends with nothing -- the same opaque constant
-        // in both states (see guiBarPatchSheetRow). The train keeps
-        // running as the belt it is; every tick lands identical bytes, so
-        // a compose mid-fade samples the border the window settles on.
-        px = 0xFF2B2B2Bu;  // BGRA(43, 43, 43) -- opaque, constant
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
@@ -7816,7 +7844,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.3.7  |  %s",  // v7.3.7: the size-event reopen (identity first, the resize last) + the opaque border row
+    snprintf(vbuf, sizeof(vbuf), "v7.3.8  |  %s",  // v7.3.8: the row reverts to the glass key / hold recipe; the size-event reopen stays
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
