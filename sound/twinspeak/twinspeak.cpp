@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,20 +23,6 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.4.5 THE SHEET RE-COMMIT. Field, after v7.4.4: "At least only the
-//            right and bottom ghost shadow appears now, but I want to get
-//            rid of it. I would do option 2." The v7.4.4 frame-change
-//            nudge recomputes the win32 side; DWM's own shadow projection
-//            can still resurrect stale (the right/bottom ghost). The
-//            sheet is the DWM-side half of the frame commitment, so
-//            guiRestoreWindow re-commits it after the nudge, RAD-style
-//            (the v7.3.1 WM_DWMCOMPOSITIONCHANGED move) -- twice, because
-//            a re-extend of unchanged margins can be filtered: first
-//            {0,0,0,0} to drop the stale frame visualization, then the
-//            real {0,0,1,0} so frame + shadow rebuild against the live
-//            rect. Settled state = the exact v7.1.27 sheet; the bar's
-//            bytes and both recipe rows are untouched. Version steps to
-//            7.4.5.
 //    v7.4.4 THE SHADOW REBUILD. Field, on the tray-reopen screenshot: "I
 //            forgot to mention this again, but this is what happens when I
 //            close the window and then click on the tray icon to reopen said
@@ -7568,34 +7554,6 @@ static void guiRestoreWindow() {
       SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
       SWP_NOACTIVATE
     );
-    // v7.4.5 THE SHEET RE-COMMIT (option 2). The field, after v7.4.4: "At
-    // least only the right and bottom ghost shadow appears now, but I want
-    // to get rid of it." The nudge recomputes the win32 side of the frame;
-    // the DWM side can still resurrect the visual retired at SW_HIDE --
-    // the right/bottom ghost is DWM's stale shadow projection outliving
-    // the frame change. The sheet is the DWM-side half of the frame
-    // commitment (v7.1.27), and WM_DWMCOMPOSITIONCHANGED has re-committed
-    // it since v7.3.1 (the RAD adoption) whenever DWM's frame state goes
-    // stale -- a tray hide/show is exactly such a staleness. Two commits,
-    // not one: a re-extend of UNCHANGED margins can be filtered as a
-    // no-op, so first {0,0,0,0} (a real change -- the stale frame
-    // visualization is dropped) and then {0,0,1,0} (a real change --
-    // frame + shadow are rebuilt against the live rect). Both land inside
-    // this one dispatch; the settled state is the exact v7.1.27 sheet.
-    // The bar's bytes never move -- worst case one compose lands between
-    // the commits and row 0 renders one frame as its plain painted pixel
-    // (the recipe's dark gray or black, never white).
-    typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
-    typedef struct { int cxLeftWidth, cxRightWidth,
-                     cyTopHeight, cyBottomHeight; } TS_MARGINS;
-    const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
-        LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
-    if (dwmExtend) {
-        const TS_MARGINS off   = { 0, 0, 0, 0 };
-        const TS_MARGINS sheet = { 0, 0, 1, 0 };
-        dwmExtend(g_hwnd, &off);
-        g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
-    }
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
 
@@ -7654,7 +7612,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.5  |  %s",  // v7.4.5 the sheet re-commit: 0 -> {0,0,1,0} after the v7.4.4 frame nudge, every restore
+    snprintf(vbuf, sizeof(vbuf), "v7.4.4  |  %s",  // v7.4.4 the shadow rebuild: SWP_FRAMECHANGED on every restore (v7.4.3 the inactive row)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
