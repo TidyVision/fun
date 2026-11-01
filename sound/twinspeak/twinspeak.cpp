@@ -7351,7 +7351,7 @@ static bool guiCreateRealWindow() {
             // the whole session; every deactivation then rides the DWM's
             // transition and the top border shows the PRE-INPUT blend until
             // the second frame. The seeder is owned by no other path.
-            if (g_glassSheet) SetTimer(g_hwnd, 5, 250, nullptr);
+            if (g_glassSheet) SetTimer(g_hwnd, 5, 1, nullptr);
             // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
             // Without it the DWM paints the extended sheet WHITE in light
             // mode (the documented light-mode border bug); with it the
