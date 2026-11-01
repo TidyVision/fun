@@ -1,10 +1,13 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.6: version bump
-// (the frame the rebuild was owed: the tray reopen's ShowWindow is now
-// followed by SWP_FRAMECHANGED -- the one event that re-derives the DWM
-// node's shadow anchor and the pointer's edge bands, both one standard
-// frame off after a hide/show -- and THEN the v7.3.5 attribute
-// re-assertion runs, so the re-derived glass sheet reads the immersive
-// dark tint and the top border cannot whiten like v7.3.3).
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.7: version bump
+// (the size event + the row that blends with nothing: the tray reopen
+// ends with one REAL pixel of height added and taken back -- the size
+// event is the one shadow re-anchor path never tried; the move was
+// coalesced, the attributes are not what the shadow reads, and the
+// frame change is field-falsified -- and the identity re-assertion runs
+// BEFORE the resize so the rebuilt geometry reads the square corner and
+// the dark tint. The border row 0 is now the OPAQUE constant
+// BGRA(43,43,43,255) in every state -- the glass key is retired, so the
+// top border can no longer wash out over a white backdrop).
 // v7.3.4: version bump
 // (the hold that does not expire: the deactivation hold is a LATCH --
 // g_holdLive -- spanning the whole inactive period; the 240 ms
@@ -72,8 +75,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,3,6,0
-PRODUCTVERSION  7,3,6,0
+FILEVERSION     7,3,7,0
+PRODUCTVERSION  7,3,7,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -84,12 +87,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.3.6.0"
+            VALUE "FileVersion",      "7.3.7.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.3.6.0"
+            VALUE "ProductVersion",   "7.3.7.0"
         END
     END
     BLOCK "VarFileInfo"
