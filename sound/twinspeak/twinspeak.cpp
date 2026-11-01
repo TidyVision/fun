@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,27 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.4 THE SHADOW RE-ANCHORS. Field: "when opening the window from
+//            clicking the system tray icon, the drop shadow gets screwed
+//            up and it doesn't get attached to the rectangle window
+//            position anymore. This issue only happens when opening the
+//            app from clicking on the tray icon." v7.3.3 (the
+//            SWP_FRAMECHANGED reframe at every re-entry) is WITHDRAWN:
+//            it re-anchored the shadow, but the frame-change event made
+//            the DWM re-derive the glass sheet WITHOUT the immersive
+//            dark-mode tint -- the v7.1.27 white top border, back. The
+//            base is the field's v7.3.2 zip, byte-for-byte, and the fix
+//            is the smallest lever that re-anchors a shadow WITHOUT any
+//            frame event: after the ShowWindow in guiRestoreWindow the
+//            window moves one pixel right and back, inside this one
+//            handler turn. The rect change is the one input DWM
+//            re-derives a shadow's anchor from; the sheet, the NC
+//            strips, the corner preference and WM_NCCALCSIZE are never
+//            touched, so nothing can re-white the border. A compose
+//            sampling between the two back-to-back calls would show a
+//            one-frame 1 px offset; the calls are microseconds apart --
+//            the same wager the row-first commit already wins every
+//            activation. Version steps to 7.3.4.
 //    v7.3.2 THE HOLD THAT DOES NOT EXPIRE. Field: "I just see a
 //            transparency issue on the top border itself ... I think I
 //            might have experienced that 240ms timer that redrew the
@@ -7562,6 +7583,22 @@ static void guiRestoreWindow() {
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
+    // v7.3.4 THE SHADOW RE-ANCHORS. The tray reopen re-enters DWM
+    // composition, and the rebuilt node anchors its drop shadow to the
+    // rect it cached across the hide -- the shadow reads detached from
+    // the window (only on this path). A frame-change nudge fixes the
+    // shadow but re-derives the glass sheet without the dark-mode tint
+    // (the white top border -- v7.3.3 was withdrawn for exactly that),
+    // so the re-anchor fires NO frame event: one pixel right and back,
+    // back-to-back on this thread. The rect change is the one input DWM
+    // re-derives a shadow anchor from; the sheet and the frame geometry
+    // are untouched.
+    {   RECT ra; if (GetWindowRect(g_hwnd, &ra)) {
+            SetWindowPos(g_hwnd, nullptr, ra.left + 1, ra.top, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(g_hwnd, nullptr, ra.left, ra.top, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } }
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
