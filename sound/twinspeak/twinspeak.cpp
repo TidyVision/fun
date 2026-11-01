@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.12 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,36 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.12 THE HOOK THREAD GOES QUIET + THE TRAY AUDIT. Field: "while the
+//            window runs it makes my mouse lag -- look for any symptoms".
+//            The GUI thread answers the system-wide WH_MOUSE_LL hook (the
+//            zero-frame row delivery), so every mouse event on the desktop
+//            queues behind whatever that thread is doing, and four things
+//            kept it busy: (1) the settle burst re-rendered the whole bar
+//            twenty times at 50 Hz after EVERY activation change even when
+//            the measured cache made all twenty renders identical pixels --
+//            with a cache the hold now spans the fade with ZERO re-renders
+//            and one tail tick at 400 ms (the 20 x 20 ms train survives only
+//            for the no-cache first-run fade tracking); (2) the measure-retry
+//            tail re-rendered the bar on every 250 ms retry tick forever --
+//            the retry is a bare re-measure now; (3) guiMeasureInstantRow
+//            did up to 36 synchronous GetPixel screen readbacks per scan --
+//            ONE BitBlt into a persistent 1-row DIB + an in-memory scan
+//            replaces them, same pixels, same guards; (4) g_lastHealth was
+//            a plain std::string written by the engine thread and read by
+//            the GUI thread with no lock -- it rides g_logCS now. TRAY:
+//            the close-hint balloon was dead code (trayAdd early-returns
+//            while the icon is already in the tray -- it shows on WM_CLOSE
+//            now, still capped at three per session); a delayed sign-in add
+//            left the generic tooltip while the engine ran (the tip re-syncs
+//            the moment the icon lands); the tray icon loaded the 32 px
+//            shell icon and the tray down-scaled it (small icon size now);
+//            explorer restarts deleted + re-added the icon TWICE (both
+//            windows answered TaskbarCreated -- the owner window answers
+//            once now, and re-adds keep the original owner); a failed add
+//            could orphan the 2 s retry timer on the surrogate; a tray-menu
+//            Start with unset devices died silently (balloon now). Version
+//            steps to 7.2.12.
 //    v7.2.11 THE LATCH ANSWERS FOR EVERY PATH. The field's second tape
 //            (60 fps, the top border parked on the white titlebar of OBS):
 //            on EVERY unfocus the deactivation plays one correct inactive
@@ -4298,6 +4328,7 @@ static void guiRepaintSlots(HWND w);
 static void trayAdd(bool hint);
 static void trayRemove();
 static void trayUpdateTip(bool running);   // v7.1.20: the tip tracks the engine
+static void trayBalloon(const char* text); // v7.2.12: fwd -- the tray path's voice (start refusals)
 static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on demand
 // v6.6.1 tray context-menu commands
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
@@ -4889,6 +4920,27 @@ static void guiBarPatchSheetRow(int cw, bool active) {
 // MEDIAN -- any single visible point seeds the cache, a stray
 // reflection or a lossy edge cannot move the middle, and a partially
 // covered row still measures through whatever sliver is showing.
+// v7.2.12 ONE READBACK, NOT THIRTY-SIX. The scan used GetPixel on the screen
+// DC once per guarded candidate -- up to 36 synchronous display readbacks per
+// measure, and the measure runs from three places: the seeder (timer 5, every
+// 250 ms while the cache sits unseeded), the burst tail, and the soft retry.
+// Every one of those runs on the GUI thread that also answers the system-wide
+// WH_MOUSE_LL hook, so each readback stalled input delivery for its whole
+// duration -- the field felt exactly that ("while the window runs it makes my
+// mouse lag"). The whole row now comes off the screen in ONE BitBlt into a
+// persistent 1-row 32bpp DIB and the guarded points read from memory: the
+// same composed pixels, the same WindowFromPoint guards, one readback instead
+// of thirty-six.
+static HDC     g_rowDc   = nullptr;                    // the measure's memory surface
+static HBITMAP g_rowBm   = nullptr, g_rowBmOld = nullptr;
+static BYTE*   g_rowBits = nullptr;                    // 32bpp top-down: one row
+static int     g_rowCap  = 0;                          // allocated width
+static void guiRowSurfaceRelease() {
+    if (g_rowBmOld) { SelectObject(g_rowDc, g_rowBmOld); g_rowBmOld = nullptr; }
+    if (g_rowBm)    { DeleteObject(g_rowBm);             g_rowBm    = nullptr; }
+    if (g_rowDc)    { DeleteDC(g_rowDc);                 g_rowDc    = nullptr; }
+    g_rowBits = nullptr; g_rowCap = 0;
+}
 static void guiMeasureInstantRow() {
     if (!g_glassSheet || !g_hwnd || !IsWindow(g_hwnd)) return;
     if (GetActiveWindow() != nullptr) return;         // meaningful while inactive only
@@ -4897,8 +4949,37 @@ static void guiMeasureInstantRow() {
     if (!GetWindowRect(g_hwnd, &wr)) return;
     const int width = wr.right - wr.left;
     if (width < 48) return;
+    if (!g_rowDc || width > g_rowCap) {               // (re)build the 1-row DIB
+        guiRowSurfaceRelease();
+        g_rowDc = CreateCompatibleDC(nullptr);
+        if (g_rowDc) {
+            BITMAPINFO bi;
+            memset(&bi, 0, sizeof(bi));
+            bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth       = width;
+            bi.bmiHeader.biHeight      = -1;          // top-down
+            bi.bmiHeader.biPlanes      = 1;
+            bi.bmiHeader.biBitCount    = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            g_rowBm = CreateDIBSection(g_rowDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (g_rowBm) {
+                g_rowBmOld = (HBITMAP)SelectObject(g_rowDc, g_rowBm);
+                g_rowBits  = (BYTE*)bits;
+                g_rowCap   = width;
+            } else {
+                DeleteDC(g_rowDc);
+                g_rowDc = nullptr;
+            }
+        }
+        if (!g_rowBits) { guiRowSurfaceRelease(); return; }
+    }
     HDC sdc = GetDC(nullptr);
     if (!sdc) return;
+    const BOOL got = BitBlt(g_rowDc, 0, 0, width, 1, sdc, wr.left, wr.top, SRCCOPY);
+    ReleaseDC(nullptr, sdc);
+    if (!got) return;
+    GdiFlush();                                       // the blit is IN g_rowBits before the scan reads it
     // v7.2.9: the scan -- every 24 px across the row, guarded points only.
     // 24 px steps give ~36 candidates on the 880 px client: fine enough to
     // find any visible sliver, coarse enough to stay off glyph kerning.
@@ -4907,11 +4988,9 @@ static void guiMeasureInstantRow() {
     for (int x = 24; x <= width - 24 && nv < 64; x += 24) {
         const POINT p = { wr.left + x, wr.top };
         if (WindowFromPoint(p) != g_hwnd) continue;  // covered: never cache another window's pixels
-        const COLORREF c = GetPixel(sdc, p.x, p.y);
-        if (c == CLR_INVALID) continue;
-        v[nv++] = c;
+        const BYTE* px = g_rowBits + (size_t)x * 4;  // BGRA, top-down
+        v[nv++] = RGB(px[2], px[1], px[0]);
     }
-    ReleaseDC(nullptr, sdc);
     if (nv == 0) return;                              // fully covered: nothing honest to read
     // v7.2.9: the MEDIAN by luma -- the blend varies along the row with
     // the backdrop; the middle sample is the row's honest average. (The
@@ -5088,10 +5167,14 @@ static LRESULT CALLBACK tsEarlyMouseHook(int nCode, WPARAM wp, LPARAM lp) {
                     }
                     GdiFlush();                          // 3. bytes in the surface
                     // Self-heal: if this click never deactivates us (menus
-                    // and other non-activating surfaces), the burst's first
-                    // tick re-presents the truth within 20 ms; if it does
-                    // deactivate, WM_ACTIVATE re-arms the burst itself.
-                    g_bakeTicks = 0;
+                    // and other non-activating surfaces), the tail tick
+                    // re-presents the ACTIVE truth within 20 ms and the
+                    // measure branch kills the timer; if it does
+                    // deactivate, WM_NCACTIVATE/WM_ACTIVATE re-arm the
+                    // tail themselves. v7.2.12: two cheap ticks, not a
+                    // twenty-render burst -- this thread answers every
+                    // mouse event on the system.
+                    g_bakeTicks = 19;
                     SetTimer(g_hwnd, 4, 20, nullptr);
                 }
             }
@@ -5903,7 +5986,14 @@ static void guiLogSink(const char* s) {
     if (line.compare(0, 5, "out1 ") == 0) {          // the live health line:
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
             line.pop_back();
+        // v7.2.12: g_lastHealth is written HERE (an engine thread) and read
+        // by the 250 ms tick (the GUI thread) -- a plain std::string handed
+        // across threads without the lock is a torn-read / heap-corruption
+        // crash waiting for one unlucky interleaving. It rides g_logCS like
+        // the log ring one block below always has.
+        EnterCriticalSection(&g_logCS);
         g_lastHealth = line;                          // status bar, not the pane
+        LeaveCriticalSection(&g_logCS);
         g_logDirty.store(true);
         return;
     }
@@ -5990,6 +6080,13 @@ static void guiStartEngine(HWND w) {
     cfgSanitize();
     if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty() || g_cfg.outputDevice2.empty()) {
         guiSetStatus(g_hwnd, "set input_device / output_device1 / output_device2 first");
+        // v7.2.12: tray-only start (no panel yet) has no status line -- the
+        // refusal used to vanish into a hidden STATIC and "Start engine"
+        // from the tray menu looked like a silent dead click. The balloon
+        // is the tray path's only voice.
+        if (g_trayVisible && (!g_hwnd || g_hwnd == g_trayWnd))
+            trayBalloon("Cannot start: set input_device / output_device1 /\n"
+                        "output_device2 in twinspeak.ini first.");
         return;
     }
     if (!guiSaveIni())
@@ -6813,14 +6910,28 @@ static void trayRemove() {
 }
 static void trayAdd(bool hint) {
     if (!g_hwnd || g_trayVisible) return;
+    // v7.2.12: a re-add (explorer restart) keeps the ORIGINAL owner window.
+    // The old code re-pointed the icon at the current g_hwnd every time, so
+    // a TaskbarCreated re-add after the panel was built silently moved the
+    // callback from the tray surrogate to the panel -- harmless while both
+    // live, but it breaks the owner-only TaskbarCreated guard below and it
+    // is a surprise nobody asked for. First add: the current window.
+    const HWND owner = g_nid.hWnd ? g_nid.hWnd : g_hwnd;
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize           = sizeof(g_nid);
-    g_nid.hWnd             = g_hwnd;
+    g_nid.hWnd             = owner;
     g_nid.uID              = 1;
     g_nid.uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP + 3;
+    // v7.2.12: the tray wants the SMALL icon. LR_DEFAULTSIZE loaded the
+    // 32 px shell icon and the notification area down-scaled it to the
+    // tray's small size on every draw -- the soft-looking icon next to
+    // every other tray icon. SM_CXSMICON/SM_CYSMICON is the size the tray
+    // actually renders (16 px @ 96 dpi, DPI-scaled), the same pair the
+    // window class loads for hIconSm.
     g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1),
-                                    IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+                                    IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), LR_SHARED);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     lstrcpynA(g_nid.szTip, "TidyVision TwinSpeak", (int)sizeof(g_nid.szTip));
     g_trayVisible = Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE;
@@ -6831,7 +6942,16 @@ static void trayAdd(bool hint) {
         SetTimer(g_hwnd, 3, 2000, nullptr);
         return;
     }
-    KillTimer(g_hwnd, 3);
+    // v7.2.12: kill the retry wherever it was armed -- the failed add may
+    // have armed timer 3 on the SURROGATE while this success runs after the
+    // panel took g_hwnd over (an orphan 2 s no-op timer otherwise).
+    KillTimer(owner, 3);
+    if (g_hwnd != owner) KillTimer(g_hwnd, 3);
+    // v7.2.12: the tip must match the engine the moment the icon lands. A
+    // sign-in add that needed the retry timer landed AFTER guiStartEngine's
+    // trayUpdateTip -- which was swallowed (the icon did not exist yet) --
+    // and the tip then stayed the generic one for the whole session.
+    trayUpdateTip(g_engState.load() != 0);
     if (hint && g_closeHints < 3) {   // v7.1.20: explain the first 3 closes, not once ever
         ++g_closeHints;
         g_nid.uFlags       = NIF_INFO;
@@ -7205,7 +7325,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.11  |  %s",  // v7.2.11 the latch answers for every path (v7.2.10 the ever-seeded cache)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.12  |  %s",  // v7.2.12 the hook thread goes quiet + the tray audit (v7.2.11 the latch)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7252,8 +7372,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     // the invisible tray window (no control window exists yet), and explorer
     // lost every icon anyway -- a fresh NIM_ADD is the only thing that works.
     if (g_taskbarCreated && msg == g_taskbarCreated) {
-        trayRemove();
-        trayAdd(false);
+        // v7.2.12: the OWNER window re-adds, once. The broadcast reaches
+        // every top-level window of the class (the tray surrogate AND the
+        // panel both carry the UIPI allowance), and two windows answering
+        // it deleted + re-added the icon twice per explorer restart -- a
+        // needless remove/add flicker racing the retry timer. g_nid.hWnd
+        // names the one true owner (preserved across re-adds now); a
+        // window that never added an icon (plain launch, no tray yet)
+        // correctly skips: g_nid.hWnd is still null.
+        if (w == g_nid.hWnd) {
+            trayRemove();
+            trayAdd(false);
+        }
         return 0;
     }
     switch (msg) {
@@ -7411,8 +7541,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_forceInactiveFace = true;                 // the face must be the INACTIVE one
             guiPaintBar(w);                             // face + row 0 + GdiFlush
             g_forceInactiveFace = false;
-            g_bakeTicks = 0;
-            SetTimer(w, 4, 20, nullptr);                // the burst still tracks the fade
+            // v7.2.12 THE BURST ONLY RENDERS WHEN IT MUST. With a measured
+            // cache the hold presents the SAME opaque row on every
+            // presentation -- twenty re-renders at 50 Hz for 400 ms were
+            // twenty identical pictures, and every one of them sat on the
+            // GUI thread that answers the system-wide WH_MOUSE_LL hook (the
+            // field: "while the window runs it makes my mouse lag"). The
+            // hold now spans the fade with ZERO re-renders: one tail tick
+            // at 400 ms (g_bakeTicks pre-set to 19) hands the row back to
+            // the recipe and schedules the measure, exactly as before.
+            // Without a cache (the first-run seeding path) the 20 x 20 ms
+            // fade tracking runs unchanged -- the only job it ever had.
+            g_bakeTicks = g_instantInactive ? 19 : 0;
+            SetTimer(w, 4, g_instantInactive ? 400 : 20, nullptr);
         } else if (wp && IsWindowVisible(w) && !IsIconic(w)) {
             // v7.2.9 THE SYMMETRIC ACTIVATION PRESENT. The deactivation
             // direction has had its pre-flip present since v7.2.3 (two
@@ -7438,8 +7579,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_forceActiveFace = true;                   // the face must be the ACTIVE one
             guiPaintBar(w);                             // face + row 0 (black) + GdiFlush
             g_forceActiveFace = false;
-            g_bakeTicks = 0;
-            SetTimer(w, 4, 20, nullptr);                // the burst tracks this fade too
+            // v7.2.12: row 0 is the glass key here -- the DWM's own fade
+            // draws the border through it, and re-presenting the identical
+            // active bar twenty times changed nothing on screen. One tail
+            // tick lands the post-fade measure; no 50 Hz render train.
+            g_bakeTicks = 19;
+            SetTimer(w, 4, 400, nullptr);
         }
         break;
     case WM_NCPAINT:
@@ -7521,8 +7666,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         else g_instantHold = false;
         g_measurePending = false;
         guiPaintBar(w);
-        g_bakeTicks = 0;
-        SetTimer(w, 4, 20, nullptr);
+        // v7.2.12 THE BURST ONLY RENDERS WHEN IT MUST (see WM_NCACTIVATE):
+        // a measured cache makes every fade-window presentation the SAME
+        // opaque row -- those pixels are already on screen from the blit
+        // above, so the hold spans the fade with zero re-renders and one
+        // tail tick at 400 ms. Without a cache the 20 x 20 ms fade
+        // tracking (v7.1.31, the first-run seeding path) runs unchanged.
+        if (LOWORD(wp) == WA_INACTIVE && !g_instantInactive) {
+            g_bakeTicks = 0;
+            SetTimer(w, 4, 20, nullptr);                // fade tracking (no cache yet)
+        } else {
+            g_bakeTicks = 19;
+            SetTimer(w, 4, 400, nullptr);               // one tail tick: recipe row + measure
+        }
         // v7.2.8 THE FORCED FRAME PAINT. The DWM can draw the activation
         // flip without ever asking us to repaint the frame -- win32k's own
         // WM_NCPAINT is not guaranteed on the deactivation path -- and the
@@ -8030,7 +8186,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // off the screen and the cache refreshed. Kills itself after the
         // measurement.
         if (wp == 4) {
-            guiPaintBar(w);
+            // v7.2.12: the measure-retry tick is a BARE re-measure. It used
+            // to re-render the whole bar first -- a full GDI+ pass every
+            // 250 ms for as long as the measure kept failing (inactive,
+            // unseeded, top row covered -- e.g. parked under another
+            // window), all on the GUI thread that answers the system-wide
+            // mouse hook. The face is already the settled one; only the
+            // cache is due.
             if (g_measurePending) {
                 g_measurePending = false;
                 g_bakeTicks = 0;
@@ -8054,11 +8216,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_measurePending = true;
                     SetTimer(w, 4, 250, nullptr);
                 }
-            } else if (++g_bakeTicks >= 20) {
-                g_instantHold = false;    // fade window over: hand the row back
-                g_bakeTicks = 0;
-                guiPaintBar(w);           // present the recipe row against settled glass
-                g_measurePending = true;  // measure it on the next tick
+            } else {
+                guiPaintBar(w);           // v7.2.12: the 20 x 20 ms render train runs
+                                          // for the no-cache fade tracking ONLY
+                if (++g_bakeTicks >= 20) {
+                    g_instantHold = false;    // fade window over: hand the row back
+                    g_bakeTicks = 0;
+                    guiPaintBar(w);           // present the recipe row against settled glass
+                    g_measurePending = true;  // measure it on the next tick
+                }
             }
             return 0;
         }
@@ -8172,7 +8338,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             snprintf(eb, sizeof(eb), " (exit code %d)", g_engRC.load());
             s += eb;
         }
-        if (!g_lastHealth.empty()) { s += "   |   "; s += g_lastHealth; }
+        // v7.2.12: read the health line under the same lock the engine
+        // thread writes it with (guiLogSink) -- no torn std::string reads.
+        EnterCriticalSection(&g_logCS);
+        const std::string health = g_lastHealth;
+        LeaveCriticalSection(&g_logCS);
+        if (!health.empty()) { s += "   |   "; s += health; }
         // v7.0.7: WM_SETTEXT repaints a STATIC even when the text is
         // identical -- 4 idle repaints a second for nothing. Set only on
         // change; the task-manager CPU line stays at the engine's floor.
@@ -8279,6 +8450,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(w, 1);
         // v7.1.26: no DeleteTab -- hiding a window removes its native
         // taskbar button by itself.
+        // v7.2.12: the "still running" hint used to ride trayAdd(true) --
+        // but trayAdd early-returns while the icon is ALREADY in the tray,
+        // i.e. ALWAYS in the normal close-to-tray flow, so the first-three-
+        // closes balloon never fired even once (dead code since v7.1.20).
+        // It shows here now, directly, still capped at three per session;
+        // trayAdd(true) stays for the rare icon-was-missing re-add case.
+        if (g_trayVisible && g_closeHints < 3) {
+            ++g_closeHints;
+            trayBalloon("Still running -- the engine stays up.\n"
+                        "Click this icon to reopen the window; "
+                        "right-click for Start/Stop and Exit.");
+        }
         trayAdd(true);
         ShowWindow(w, SW_HIDE);
         return 0;
