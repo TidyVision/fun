@@ -1,4 +1,7 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.2: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.3: version bump
+// (the inactive row, the field's gray: kSheetRowInactive 0x80000000 ->
+// 0x802B2B2B -- BGRA(43,43,43,0x80), half-alpha RGB(43,43,43), the
+// recipe's own source gray, now one pinned constant. v7.4.2: version bump
 // (the inactive row, half-alpha black: kSheetRowInactive 0x80696969 ->
 // 0x80000000 -- BGRA(0,0,0,0x80), the glass itself dimmed 50%, which is
 // what the DWM's own inactive border is; a gray source byte dims AND
@@ -77,8 +80,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,4,2,0
-PRODUCTVERSION  7,4,2,0
+FILEVERSION     7,4,3,0
+PRODUCTVERSION  7,4,3,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -89,12 +92,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.2.0"
+            VALUE "FileVersion",      "7.4.3.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.2.0"
+            VALUE "ProductVersion",   "7.4.3.0"
         END
     END
     BLOCK "VarFileInfo"

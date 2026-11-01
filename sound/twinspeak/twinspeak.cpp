@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,17 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.3 THE INACTIVE ROW, THE FIELD'S GRAY. Field: "Now, I just need
+//            the top bar's inactive glass key color to be 43, 43, 43 and
+//            that's just it." One color moves: kSheetRowInactive
+//            0x80000000 -> 0x802B2B2B -- BGRA(43,43,43,0x80), half-alpha
+//            RGB(43,43,43), the recipe's own source gray (the vanilla
+//            inactive-border byte v7.3.2 already carried, now one pinned
+//            constant with nothing measured behind it); the guiRenderBar
+//            brush moves with it (Gdiplus::Color(128, 43, 43, 43)).
+//            Nothing else: the alpha stays the half, active stays the
+//            glass key BGRA(0,0,0,0), the pin stays a pin. Version steps
+//            to 7.4.3.
 //    v7.4.2 THE INACTIVE ROW, HALF-ALPHA BLACK. Field, after living with
 //            v7.4.1: "Now I see something clever. This means the #696969
 //            needs to be #000000 for the inactive window top bar." The
@@ -4864,7 +4875,8 @@ static bool g_glassSheet = false;
 // tracking (see guiHoldPxForBackdrop, after the sheet-row essay): computed
 // live at WM_NCACTIVATE(FALSE) from the desktop strip above the window.
 // v7.4.1: the tracking is RETIRED whole -- this train re-presents the ONE
-// constant inactive row, half-alpha black (v7.4.2; see the sheet-row essay).
+// constant inactive row (v7.4.2; the byte is half-alpha RGB(43,43,43)
+// since v7.4.3 -- see the sheet-row essay).
 // v7.3.2: the 240 ms wall-clock stamp and its handover present are
 // RETIRED (the field caught the handover as "a transparency issue on the
 // top border itself"): the hold is a LATCH that lasts the whole inactive
@@ -5007,7 +5019,7 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
         rowCol = active ? Gdiplus::Color(255, 0, 0, 0)       // the DWM frame
-                        : Gdiplus::Color(128, 0, 0, 0);          // RGBA(0, 0.5) -- v7.4.2: kSheetRowInactive's bytes
+                        : Gdiplus::Color(128, 43, 43, 43);   // RGBA(43, 0.5) -- v7.4.3: kSheetRowInactive's bytes
     } else {
         const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
         const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
@@ -5126,11 +5138,10 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 //   active    BGRA(0,0,0,0)      alpha 0 = bare glass: the sheet shows the
 //                                DWM's OWN border (accent or the default
 //                                gray), fading natively with the frame;
-//   inactive  BGRA(0,0,0,0x80)   half-alpha black -- v7.4.2: the glass
-//                                itself dimmed 50%, the classic inactive
-//                                border the DWM itself rides, composited
-//                                50/50 with the glass blur over whatever
-//                                is behind.
+//   inactive  BGRA(43,43,43,0x80) half-alpha RGB(43,43,43) -- v7.4.3:
+//                                the field's gray, the recipe's own source
+//                                byte, composited 50/50 with the glass
+//                                blur over whatever is behind.
 // The opaque overlays of v7.2.0..v7.2.13 (the measured cache, the tracked
 // hold, the hook's early present) are RETIRED: an opaque constant on the
 // sheet was the white bar over dark backdrops AND the ~400 ms non-vanilla
@@ -5171,7 +5182,7 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // NOTHING ELSE of the retired machine returns: no measured cache, no
 // seeder, no mouse hook, no tail timer.
 //
-// ---- v7.4.1 + v7.4.2: THE INACTIVE ROW, PINNED ------------------------------
+// ---- v7.4.1..v7.4.3: THE INACTIVE ROW, PINNED -------------------------------
 // The v7.3.0/v7.3.2 tracked hold above is RETIRED whole, together with
 // v7.4.0's alpha-0-both-states row. Why: the inactive sheet material is
 // the DWM's own business. v7.4.0 trusted the DWM to paint its inactive
@@ -5186,20 +5197,21 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // does for the real frame -- the classic inactive border is the glass
 // composited 50/50 with a dark source -- so the row was PINNED to
 // those bytes and the DWM's own compose blends it exactly like the
-// strips. v7.4.2 closes the loop, the field's own composite math:
-// "Now I see something clever. This means the #696969 needs to be
-// #000000 for the inactive window top bar." Right -- a gray source
-// byte dims the glass AND tints it; the DWM's own inactive border is
-// the glass DIMMED 50%, which is half-alpha BLACK and nothing else:
+// strips. v7.4.2 closed that loop with half-alpha black, and v7.4.3
+// lands the final byte, the field's own: "Now, I just need the top
+// bar's inactive glass key color to be 43, 43, 43 and that's just it."
+// RGB(43,43,43) IS the recipe's own source gray -- the vanilla
+// inactive-border byte v7.3.2 carried all along, now one pinned
+// constant with nothing measured behind it:
 //
 //   active    BGRA(0,0,0,0)      the glass key: the DWM's OWN border
 //                                paints through it -- the proven
 //                                focused look, untouched since
 //                                v7.1.27 ("the focused window
 //                                remains accurate")
-//   inactive  BGRA(0,0,0,0x80)   half-alpha black: the glass dimmed
-//                                50%, composited by the same DWM over
-//                                the same glass as the strips
+//   inactive  BGRA(43,43,43,0x80) half-alpha RGB(43,43,43): the
+//                                field's gray, composited by the same
+//                                DWM over the same glass as the strips
 //
 // guiHoldPxForBackdrop (the screen read, the strip DIB, the luma median,
 // the 43 + 127*B/255 math) and the g_holdLive/g_holdPx latch pair are
@@ -5211,13 +5223,14 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // GUI writes before the thread's reads.
 typedef HRESULT (WINAPI *TS_DWMFLUSH)(void);
 static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRealWindow (the house trick)
-// v7.4.2 THE TWO ROWS. BGRA little-endian u32: the high byte is the alpha.
-// The inactive bytes are the field's spec -- half-alpha #000000, the glass
-// itself dimmed 50% (v7.4.1 rode #696969; the field's composite observation
-// moved it to black); the active bytes are the glass key the active window
-// has carried since v7.1.27. No latch, no measurement.
+// v7.4.3 THE TWO ROWS. BGRA little-endian u32: the high byte is the alpha.
+// The inactive bytes are the field's spec -- half-alpha RGB(43,43,43), the
+// recipe's own source gray (v7.4.1 rode #696969, v7.4.2 half-alpha black;
+// the field pinned 43,43,43 -- "and that's just it"); the active bytes are
+// the glass key the active window has carried since v7.1.27. No latch,
+// no measurement.
 static const unsigned kSheetRowActive   = 0x00000000u; // the glass key: the DWM's own frame
-static const unsigned kSheetRowInactive = 0x80000000u; // half-alpha black: the glass dimmed 50%
+static const unsigned kSheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
     // v7.4.1: two constants, no latch, no measurement (see the essay above).
@@ -5338,8 +5351,8 @@ static void guiPaintBar(HWND w) {
 // The surface is a PRIVATE 1 px top-down 32bpp DIB section. That is enough
 // because the sheet row is ONE uniform constant in both states
 // (guiBarPatchSheetRow): active BGRA(0,0,0,0) -- the glass key, the DWM's own
-// border -- inactive BGRA(0,0,0,0x80) -- half-alpha black (v7.4.2: the
-// glass dimmed 50%, the classic inactive border the DWM itself rides). The
+// border -- inactive BGRA(43,43,43,0x80) -- half-alpha RGB(43,43,43)
+// (v7.4.3: the field's gray, the recipe's own source byte). The
 // thread never touches the UI thread's bar buffer, so no GDI object is
 // shared: the worst interleaving is a redundant blit of the same bytes the
 // NC latch already chose.
@@ -5404,7 +5417,7 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         }
         // v7.4.1: two constants, no hold atomics (see the sheet-row essay).
         const unsigned px = (nc != 0) ? kSheetRowActive    // the glass key: the DWM's own frame
-                                      : kSheetRowInactive; // half-alpha black
+                                      : kSheetRowInactive; // half-alpha RGB(43,43,43)
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
@@ -7567,7 +7580,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.2  |  %s",  // v7.4.2 the inactive row: half-alpha black (v7.4.1 the pin, v7.3.2 the latch)
+    snprintf(vbuf, sizeof(vbuf), "v7.4.3  |  %s",  // v7.4.3 the inactive row: half-alpha RGB(43,43,43) (v7.4.2 the black, v7.4.1 the pin)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7781,12 +7794,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         //       as the belt it always was.
         //   (2) THE FADE ITSELF. The half-alpha row blended against the
         //       sheet's ANIMATING visuals shows transitional grays for
-        //       the ~200 ms fade -- and v7.4.2 makes them the FRAME'S OWN
-        //       grays: on DEACTIVATION the row is the constant half-alpha
-        //       BLACK (v7.4.1 rode #696969; the field's composite
-        //       observation -- "the #696969 needs to be #000000" -- moved
-        //       it), the glass dimmed 50% by the same compose that dims
-        //       the left/right/bottom strips, so the fade tracks the
+        //       the ~200 ms fade -- and they are the FRAME'S OWN grays:
+        //       on DEACTIVATION the row is the constant half-alpha
+        //       RGB(43,43,43) (v7.4.3, the field's byte; v7.4.1 rode
+        //       #696969 and v7.4.2 half-alpha black before it),
+        //       composited by the same compose that blends the
+        //       left/right/bottom strips, so the fade tracks the
         //       frame's own. The v7.3.0 tracked OPAQUE row
         //       (guiHoldPxForBackdrop, the backdrop measurement) and the
         //       v7.3.2 g_holdLive latch are RETIRED whole -- no
