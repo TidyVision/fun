@@ -1,4 +1,10 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.0: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.1: version bump
+// (the row-first commit, the RAD
+// contract: WM_NCACTIVATE lands the 1 px border row alone FIRST --
+// guiCommitSheetRowFast -- before the full GDI+ face render, and answers
+// the flip with DefWindowProcW's documented lParam -1, the RAD
+// debugger's "without this result, stuff flickers").
+// v7.3.0: version bump
 // (the Chrome contract, tracked: on deactivation row 0 is OPAQUE at the
 // settled recipe composite over the CURRENT backdrop -- computed live from
 // the desktop strip above the window, v7.2.13's estimator -- stamped 240 ms
@@ -64,12 +70,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.3.0.0"
+            VALUE "FileVersion",      "7.3.1.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.3.0.0"
+            VALUE "ProductVersion",   "7.3.1.0"
         END
     END
     BLOCK "VarFileInfo"

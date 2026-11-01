@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,46 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.1 THE ROW-FIRST COMMIT, THE RAD CONTRACT. Field: "I still
+//            sometimes get the one-frame delay of the window border ... I
+//            want the accurate window borders from window activation to
+//            render every time here. I'm not joking." The residual frame
+//            was the one window v7.3.0's DwmFlush() cannot close: the
+//            flush retires the compose IN FLIGHT, but the NEXT compose --
+//            the one that carries the flip -- starts on the DWM's own
+//            cadence, and v7.3.0's commit was the FULL bar paint, a multi-
+//            millisecond GDI+ pass (gradients, glyphs, one blit) that
+//            lands its row bytes LAST. A flip compose starting inside
+//            that window sampled the PRE-flip row -- the active glass key
+//            on deactivation, the held opaque row on activation -- and
+//            the border read one frame late, "sometimes", wherever the
+//            click landed in the compose cadence. Two adoptions from the
+//            RAD debugger's win32_window_manager.c (the same main.c
+//            geometry, field-proven) close it. (1) THE ROW-FIRST COMMIT:
+//            after the latch, the flush and the hold stamp, row 0 reaches
+//            the redirection surface ALONE -- one uniform-constant row
+//            write into the bar DIB, one 1 px blit, GdiFlush(),
+//            microseconds (guiCommitSheetRowFast) -- and the face follows
+//            in the same handler with the full paint; the race window
+//            collapses from milliseconds to the blit itself. (2) THE
+//            lParam -1 ANSWER: WM_NCACTIVATE now returns
+//            DefWindowProcW(w, msg, wp, -1) -- the documented convention
+//            ("does not repaint the nonclient area to reflect the state
+//            change"; RAD: "without this result, stuff flickers") -- so
+//            the legacy NC repaint machinery (the themed-frame blit, the
+//            mid-transaction WM_NCPAINT it schedules) never runs for the
+//            flip; the DWM's own left/right/bottom strips are composited
+//            by the DWM regardless, the flip still completes, and the
+//            v7.2.8/v7.2.9 WM_NCPAINT dance stays for the message's OTHER
+//            sources. Plus two guards the race analysis exposed: the fade
+//            presenter thread now STANDS DOWN while the GUI commit is in
+//            flight (g_guiRowCommit) -- a tick could read the NEW latch
+//            with the OLD hold state between the two writes and re-land
+//            the recipe row over the flip -- and WM_DWMCOMPOSITIONCHANGED
+//            re-commits the sheet + dark mode + a bar repaint, so a
+//            composition restart (driver reset, RDP) can no longer leave
+//            row 0 riding a dead extend (RAD re-extends for the same
+//            reason). Version steps to 7.3.1.
 //    v7.3.0 THE CHROME CONTRACT, TRACKED. Field: "sometimes for a split
 //            second the window borders stop being accurate until the next
 //            frame. Really, the {0,0,1,0} should be drawn constantly.
@@ -4775,6 +4815,16 @@ static std::atomic<bool> g_fadeQuit{false};
 static void guiFadeKick() {            // non-blocking; safe from any message
     if (g_fadeKick) SetEvent(g_fadeKick);
 }
+// v7.3.1: TRUE while the GUI thread is inside the WM_NCACTIVATE row commit
+// -- the fade presenter stands down for the duration. Without it a
+// presenter tick racing the handler reads the NEW latch (flipped at
+// handler entry) with the OLD hold state (the stamp lands after the
+// backdrop measure) and re-lands the recipe's half-alpha row right into
+// the commit window -- the exact transitional frame the hold exists to
+// prevent. The v7.3.0 note claimed the worst interleaving was "a
+// redundant blit of the same bytes the NC latch already chose"; between
+// the latch flip and the hold stamp that was not true.
+static std::atomic<bool> g_guiRowCommit{false};
 static bool     g_forceInactiveFace = false; // v7.2.3: WM_NCACTIVATE(FALSE) paints the
                                              // inactive face INSIDE the deactivation
                                              // transaction (GetActiveWindow still
@@ -5167,6 +5217,46 @@ static void guiBarPatchSheetRow(int cw, bool active) {
     unsigned* row = (unsigned*)g_barBits;       // top-down: row 0 first
     for (int x = 0; x < cw; ++x) row[x] = px;
 }
+// v7.3.1 THE ROW-FIRST COMMIT (the RAD debugger's shape of mind, adopted).
+// The full-bar paint in guiPaintBar is a GDI+ render -- gradient, glyphs,
+// one blit -- and lands its row bytes MILLIS after DwmFlush() returns.
+// The flip-carrying compose is not the one DwmFlush retires (that one is
+// gone); it is the NEXT compose, and it starts on the DWM's own cadence:
+// a compose beginning inside the paint window samples the PRE-flip row --
+// the active glass key on deactivation, the held opaque row on
+// activation -- and the border reads one frame late, "sometimes",
+// wherever the click lands in the compose cadence. RAD never risks this:
+// its border row is painted by the same synchronous update() pass that
+// answers every message, and its frame region is never repainted by the
+// system (the lParam -1 answer, adopted in WM_NCACTIVATE below). So the
+// row goes FIRST: the same state rule as guiBarPatchSheetRow, one row
+// write into the bar DIB, ONE 1 px blit, GdiFlush -- microseconds -- and
+// the face follows in the same handler with the full paint. The race
+// window collapses from a multi-ms render to the blit itself. Buffer
+// missing (the first frames): skip -- the full paint covers it.
+static void guiCommitSheetRowFast(HWND w, bool active) {
+    if (!g_glassSheet) return;
+    unsigned px;
+    if (active) {
+        px = 0x00000000u;                     // the glass key: the DWM's own frame
+    } else {
+        const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
+        px = (until && GetTickCount64() < until)
+           ? g_holdPx.load(std::memory_order_relaxed)
+           : 0x802B2B2Bu;                     // the recipe: BGRA(43, 43, 43, 128)
+    }
+    RECT cr;
+    if (!GetClientRect(w, &cr) || cr.right <= 0) return;
+    if (!guiBarBufEnsure(cr.right, kCapH)) return;
+    unsigned* row = (unsigned*)g_barBits;     // top-down: row 0 first
+    for (int x = 0; x < cr.right; ++x) row[x] = px;
+    HDC wdc = GetDC(w);
+    if (wdc) {
+        BitBlt(wdc, 0, 0, cr.right, 1, g_barDc, 0, 0, SRCCOPY);
+        ReleaseDC(w, wdc);
+    }
+    GdiFlush();                               // the row is in the redirection surface
+}
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
     // v7.1.24: the hovered slot rides GWLP_USERDATA exactly like main.c;
@@ -5287,6 +5377,9 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         else if (ticks) --ticks;
         if (!ticks) continue;                 // idle: the event owns the wait
         if (g_fadeQuit.load(std::memory_order_acquire)) break;
+        if (g_guiRowCommit.load(std::memory_order_acquire)) {
+            --ticks; continue;                // v7.3.1: the GUI commit owns the
+        }                                     // row this tick (see g_guiRowCommit)
         const int nc = g_ncActive.load(std::memory_order_relaxed);
         if (nc < 0) continue;                 // no activation state latched yet
         HWND w = g_hwnd;
@@ -7674,8 +7767,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // queue's view) only catches up when WM_ACTIVATE runs after the
         // transaction closes. WM_NCPAINT and the fade tick read this
         // latch mid-transaction.
+        // v7.3.1: the presenter stands down BEFORE the latch flips -- a
+        // tick racing the handler would otherwise read the NEW latch with
+        // the OLD hold state (the stamp lands after the backdrop measure)
+        // and re-land the recipe row right into the commit window. Cleared
+        // after the full paint's GdiFlush below.
+        g_guiRowCommit.store(true, std::memory_order_release);
         g_ncActive = (wp ? 1 : 0);
-        // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED.
+        // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED,
+        // v7.3.1 ROW-FIRST + THE lParam -1 ANSWER.
         // The bar -- the face AND row 0 -- is painted in the state wParam
         // carries and GdiFlush()ed (guiPaintBar ends with it) BEFORE
         // DefWindowProc below tells the frame to flip; win32k cannot
@@ -7690,7 +7790,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         //       after it, every compose that can carry the flip starts
         //       after our write and MUST sample it (the proven v7.2.2
         //       ordering, retired with the mouse hook in v7.2.14, back
-        //       as a belt for BOTH directions).
+        //       as a belt for BOTH directions). v7.3.1 CORRECTION: the
+        //       flush retires the compose IN FLIGHT, but the NEXT compose
+        //       -- the flip carrier -- starts on the DWM's own cadence
+        //       and can begin inside our commit window; the row-first
+        //       commit below is what closes that window. The flush stays
+        //       as the belt it always was.
         //   (2) THE FADE ITSELF. The recipe's half-alpha row blended
         //       against the sheet's ANIMATING visuals shows transitional
         //       colors for the ~200 ms fade. On DEACTIVATION the row is
@@ -7724,6 +7829,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     g_holdUntil.store(0, std::memory_order_relaxed); // vanilla ride
                 }
             }
+            // v7.3.1 THE ROW-FIRST COMMIT: the 1 px border row reaches the
+            // redirection surface BEFORE the multi-millisecond GDI+ face
+            // render starts -- a flip-carrying compose can no longer sample
+            // the pre-flip row (see guiCommitSheetRowFast).
+            guiCommitSheetRowFast(w, (wp != 0));
             g_forceActiveFace   = (wp != 0);   // the face must match the flip
             g_forceInactiveFace = (wp == 0);
             guiPaintBar(w);                    // face + row 0 + GdiFlush
@@ -7736,7 +7846,66 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // timer's ticks starved behind queue traffic and froze the blend
         // mid-fade (the intermittent deactivation delay). Kicking even when
         // hidden is safe: the thread checks visibility on every tick.
+        // v7.3.1: the commit is landed and flushed -- the presenter may
+        // resume; the gate clears BEFORE the kick so the train's first
+        // tick is not burned by the still-set gate.
+        g_guiRowCommit.store(false, std::memory_order_release);
         guiFadeKick();
+        // v7.3.1 THE RAD ANSWER: lParam -1. "When this parameter is -1,
+        // DefWindowProc does not repaint the nonclient area to reflect the
+        // state change" (the documented convention -- the WPF custom-chrome
+        // recipe; the RAD debugger's win32_window_manager answers the same
+        // way and its comment is the field report: "without this result,
+        // stuff flickers"). The legacy NC repaint machinery -- the
+        // themed-frame blit, the WM_NCPAINT it schedules mid-transaction --
+        // is the last system-side machine that could hand the flip compose
+        // stale edge bytes; it does not run for the flip anymore. The DWM's
+        // own border strips (left/right/bottom) are composited by the DWM
+        // regardless, the state flip itself still completes, and the bar is
+        // already painted and flushed above. (The v7.1.18 objection to -1
+        // died with the old geometry: that window carried WS_CAPTION and
+        // had no NC strip, so the themed painter had a caption TO paint;
+        // this window has no WS_CAPTION and real strips -- there is nothing
+        // left for the legacy machinery to strike into.) The mid-transaction
+        // WM_NCPAINT dance (v7.2.8/v7.2.9) stays for this message's OTHER
+        // sources -- SetWindowPos, the frame-change nudges -- which still
+        // arrive.
+        return DefWindowProcW(w, msg, wp, (LPARAM)-1);
+    case WM_DWMCOMPOSITIONCHANGED:
+        // v7.3.1 (RAD adoption): composition can restart under the window
+        // (driver reset, an RDP session) -- the {0,0,1,0} sheet is a
+        // geometry commitment to a DWM that no longer exists, and row 0
+        // would ride the dead extend forever (RAD re-extends on this
+        // message for the same reason). Re-commit the sheet + the
+        // immersive dark mode attribute (the v7.1.27 pair), refresh the
+        // sheet flag, repaint the bar and re-kick the train, so the first
+        // compose after the restart shows a live border again. (dwmapi.h
+        // is not included -- the house spelled-out typedefs, same as
+        // guiCreateRealWindow.)
+        if (IsWindowVisible(w) && !IsIconic(w)) {
+            typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
+            typedef struct { int cxLeftWidth, cxRightWidth,
+                             cyTopHeight, cyBottomHeight; } TS_MARGINS;
+            const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
+                LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+            if (dwmExtend) {
+                const TS_MARGINS sheet = { 0, 0, 1, 0 };
+                g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+            }
+            typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+            const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+                LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+            if (dwmSet) {
+                const int darkOn = 1;
+                if (FAILED(dwmSet(g_hwnd,
+                                  20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                                  &darkOn, sizeof(darkOn)))) {
+                    dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
+                }
+            }
+            guiPaintBar(w);
+            guiFadeKick();
+        }
         break;
     case WM_NCPAINT:
         // v7.2.8 THE POST-FLIP NCPAINT. The field: "make it so the ncpaint
