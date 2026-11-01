@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.15 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,51 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.0 THE CHROME CONTRACT, TRACKED. Field: "sometimes for a split
+//            second the window borders stop being accurate until the next
+//            frame. Really, the {0,0,1,0} should be drawn constantly.
+//            Google chrome doesn't have this issue." Two truths became
+//            code. (1) The sheet row is never "drawn constantly": the
+//            {0,0,1,0} extend is a ONE-TIME GEOMETRY COMMITMENT, and the
+//            row's final look is a DWM-side blend of OUR last-written
+//            bytes with the sheet's ANIMATING activation visuals, re-baked
+//            only when the window presents or the fade ticks -- between
+//            re-bakes the row is the LAST BAKE. Two windows of
+//            inaccuracy remained in v7.2.15: a compose already in flight
+//            at the click can carry the flip off a surface snapshot taken
+//            before our bytes existed (the "sometimes, until the next
+//            frame" frame), and the ~200 ms fade itself blends the
+//            half-alpha row against animating visuals (the "split
+//            second"). The first is closed by REINSTATING v7.2.2's
+//            DwmFlush() inside WM_NCACTIVATE -- it retired with the mouse
+//            hook in v7.2.14 -- before the pre-flip present, both
+//            directions. The second is closed by adopting the CHROME
+//            CONTRACT for the deactivation: Chromium repaints its frame
+//            synchronously inside WM_NCACTIVATE, returns TRUE without
+//            DefWindowProc, and delivers its inactive border as a SOLID
+//            theme color in its own atomically-presented surface -- no
+//            alpha-carrying row, no glass blend to re-bake, nothing to
+//            fade or sample stale. So on WM_NCACTIVATE(FALSE) row 0 is
+//            now OPAQUE at the settled recipe composite over the CURRENT
+//            backdrop, computed live (guiHoldPxForBackdrop: one BitBlt of
+//            the desktop strip above the window's top edge into a
+//            persistent DIB, sparse scan of the rows farthest from our
+//            own drop shadow, median by luma -- v7.2.13's estimator
+//            verbatim, whose look the field approved; the MACHINE around
+//            it is what v7.2.14 retired, and none of it returns: no
+//            measured cache, no seeder, no mouse hook, no tail timer).
+//            The hold is a wall-clock stamp (240 ms, ~the DWM's 200 ms
+//            border fade + one compose): guiBarPatchSheetRow honors it on
+//            EVERY painter, the fade presenter's own train hands it back
+//            (the first tick past the stamp presents the recipe's
+//            half-alpha row and retires the stamp -- no tail timer, the
+//            train IS the handover), and the clock check makes it
+//            self-expiring, so a hold can never outlive the fade window.
+//            Over an unchanged backdrop the handover is invisible (the
+//            held color IS the recipe's settled composite there); over a
+//            changed one it is a one-snap re-convergence. Measurement
+//            failure (window top at a monitor edge) rides the vanilla
+//            recipe row exactly as v7.2.14 did. Version steps to 7.3.0.
 //    v7.2.15 THE QUEUE-PROOF FADE, THE QUIET BUTTONS. Field: "now I
 //            sometimes get a deactivate redraw delay" + "some buttons
 //            still flicker". The delay WAS the fade-tracking burst's
@@ -4717,6 +4762,13 @@ static bool g_glassSheet = false;
 // waits on the kick event below; WM_NCACTIVATE and WM_ACTIVATE SetEvent
 // it after their synchronous presents, and it re-presents the 1 px row
 // twenty times ~20 ms apart (see guiFadePresenter, after guiPaintBar).
+// v7.3.0: A TAMED opaque row returns -- the Chrome contract with backdrop
+// tracking (see guiHoldPxForBackdrop, after the sheet-row essay): computed
+// live at WM_NCACTIVATE(FALSE) from the desktop strip above the window,
+// held OPAQUE 240 ms by a wall-clock stamp, handed back to the recipe
+// bytes INSIDE this train (the first tick past the stamp). None of the
+// v7.2.14-retired machinery returns: no measured cache, no seeder, no
+// mouse hook, no 400 ms tail timer.
 static HANDLE g_fadeKick  = nullptr;   // auto-reset: one SetEvent = one burst
 static HANDLE g_fadeThread = nullptr;  // created with the window, joined at exit
 static std::atomic<bool> g_fadeQuit{false};
@@ -4968,10 +5020,150 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // hold, the hook's early present) are RETIRED: an opaque constant on the
 // sheet was the white bar over dark backdrops AND the ~400 ms non-vanilla
 // hold -- the native fade needs no cover (see WM_NCACTIVATE).
+// ---- v7.3.0: THE CHROME CONTRACT, TRACKED -----------------------------------
+// What Chromium does (ui/views/win/hwnd_message_handler.cc): OnNCActivate
+// for a custom-drawn frame repaints the window and children SYNCHRONOUSLY
+// (RedrawWindow RDW_UPDATENOW), schedules the frame paint, and returns TRUE
+// WITHOUT DefWindowProc -- the system's NC flip machinery never runs for
+// it -- and the frame color is a SOLID theme constant
+// (kColorFrameActive/kColorFrameInactive) painted into its own
+// double-buffered compositor surface. One atomic commit flips caption,
+// title and border together; the DWM has no alpha-carrying sheet row to
+// re-bake and nothing to fade (an opaque pixel on the sheet displays
+// as-is -- the v7.2.0 finding). Chrome is not more impressive: it opted
+// OUT of the glass-blend border entirely, and its inactive border color
+// never follows the backdrop.
+//
+// This file adopts that contract for the deactivation only, and builds
+// back the one thing Chrome gave up: THE BORDER FOLLOWS THE BACKDROP.
+// The settled recipe composite over a backdrop B is 43 + 127*B/255 per
+// channel (the premultiplied BGRA(43,43,43,128) row src-over'd onto the
+// glass; over pure white that is 170, the #AAAAAA the v7.1.29 screenshot
+// measured on the DWM's own edges), so the opaque stand-in for the fade
+// window is COMPUTED at the moment of deactivation from the desktop strip
+// actually above the window -- v7.2.13's estimator VERBATIM (the field
+// approved the look; v7.2.14 retired the machine around it, not the
+// math): one BitBlt into a persistent DIB, a sparse scan of the rows
+// farthest from our own drop shadow, median by luma. The held row then
+// equals what the settled blend WOULD show over the current backdrop, so
+// the handover to the recipe bytes at the end of the fade is invisible
+// over an unchanged backdrop and a one-snap re-convergence over a changed
+// one. NOTHING ELSE of the retired machine returns: no measured cache, no
+// seeder, no mouse hook, no tail timer -- the hold is a wall-clock stamp
+// (240 ms, ~the DWM's 200 ms border fade + one compose) that the fade
+// presenter's own train hands back (see guiFadePresenter), and every
+// writer checks the clock (see guiBarPatchSheetRow), so a hold can never
+// outlive the fade window.
+//
+// Threading: the measurement runs on the GUI thread only (inside
+// WM_NCACTIVATE); the strip DIB below is owned by it. The presenter
+// thread never measures -- it reads the two atomics. The kick's SetEvent
+// orders the GUI writes before the thread's reads.
+typedef HRESULT (WINAPI *TS_DWMFLUSH)(void);
+static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRealWindow (the house trick)
+static std::atomic<unsigned long long> g_holdUntil{0}; // stamp expiry (GetTickCount64 ms); 0 = no hold
+static std::atomic<unsigned> g_holdPx{0};              // the held OPAQUE row pixel (BGRA, alpha 255)
+static const unsigned long long kHoldMs = 240;
+static unsigned g_holdScan[4 * 512];   // the sparse-scan scratch (guiHoldPxForBackdrop is the only writer)
+static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vanilla recipe row
+    HWND w = g_hwnd;
+    if (!w || !g_glassSheet || !IsWindow(w)) return 0;
+    RECT wr;
+    if (!GetWindowRect(w, &wr)) return 0;
+    MONITORINFO mi; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
+    // the strip: rows 14..34 px ABOVE the window's top edge -- far enough
+    // to clear most of our own drop shadow's darkest band, close enough
+    // to track the blur neighborhood the DWM samples at row 0.
+    const int stripTop = wr.top - 34, stripBottom = wr.top - 14;
+    if (stripTop < mi.rcMonitor.top || stripBottom <= stripTop) return 0; // docked at a monitor top
+    const int x0 = (wr.left + 16 > mi.rcMonitor.left) ? wr.left + 16 : mi.rcMonitor.left;
+    const int x1 = (wr.right - 16 < mi.rcMonitor.right) ? wr.right - 16 : mi.rcMonitor.right;
+    if (x1 - x0 < 32) return 0;
+    const int sw = x1 - x0, sh = stripBottom - stripTop;
+    // persistent strip DIB, grown on demand (single-threaded owner: no lock).
+    static HDC     s_dibDc = nullptr;
+    static HBITMAP s_bm    = nullptr;
+    static void*   s_bits  = nullptr;
+    static int     s_w = 0, s_h = 0;
+    if (!s_dibDc) {
+        HDC sdc = GetDC(nullptr);
+        if (!sdc) return 0;
+        s_dibDc = CreateCompatibleDC(sdc);
+        ReleaseDC(nullptr, sdc);
+        if (!s_dibDc) return 0;
+    }
+    if (sw > s_w || sh > s_h) {
+        if (s_bm) { DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr; s_w = s_h = 0; }
+        BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bi.bmiHeader.biWidth       = sw;
+        bi.bmiHeader.biHeight      = -sh;             // top-down
+        HDC sdc = GetDC(nullptr);
+        s_bm = sdc ? CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &s_bits, nullptr, 0) : nullptr;
+        if (sdc) ReleaseDC(nullptr, sdc);
+        if (!s_bm || !s_bits) return 0;
+        if (!SelectObject(s_dibDc, s_bm)) { DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr; return 0; }
+        s_w = sw; s_h = sh;
+    }
+    HDC sdc = GetDC(nullptr);
+    if (!sdc) return 0;
+    const BOOL ok = BitBlt(s_dibDc, 0, 0, sw, sh, sdc, x0, stripTop, SRCCOPY);
+    ReleaseDC(nullptr, sdc);
+    if (!ok) return 0;
+    // sparse scan: every 8th px on four rows spread across the strip;
+    // MEDIAN BY LUMA (the v7.2.13 statistic -- one hot pixel, a cursor or
+    // a notification corner, cannot steer the color).
+    const int cap = (int)(sizeof(g_holdScan) / sizeof(g_holdScan[0]));
+    unsigned luma[sizeof(g_holdScan) / sizeof(g_holdScan[0])];
+    int n = 0;
+    const int rows[4] = { 0, sh / 3, (2 * sh) / 3, sh - 1 };
+    for (int ri = 0; ri < 4; ++ri) {
+        const unsigned* row = (const unsigned*)((const unsigned char*)s_bits
+                              + (size_t)rows[ri] * (size_t)(s_w * 4));
+        for (int x = 4; x < sw && n < cap; x += 8) g_holdScan[n++] = row[x];
+    }
+    if (n < 8) return 0;
+    for (int i = 0; i < n; ++i) {
+        const unsigned p = g_holdScan[i];
+        luma[i] = (unsigned)((((int)(p >> 16) & 0xFF) * 77 +  // Rec.601-ish, the
+                              ((int)(p >> 8) & 0xFF) * 150 +  // house weights
+                              ((int)p & 0xFF) * 29) >> 8);    // (guiRenderBar)
+    }
+    // insertion sort of <= ~500 pairs, once per deactivation -- nothing.
+    for (int i = 1; i < n; ++i) {
+        const unsigned lv = luma[i], sv = g_holdScan[i];
+        int j = i - 1;
+        while (j >= 0 && luma[j] > lv) { luma[j + 1] = luma[j]; g_holdScan[j + 1] = g_holdScan[j]; --j; }
+        luma[j + 1] = lv; g_holdScan[j + 1] = sv;
+    }
+    const unsigned med = g_holdScan[n / 2];
+    // the settled recipe composite over THIS backdrop: 43 + 127*B/255.
+    const int cr = 43 + (((int)(med >> 16) & 0xFF) * 127 + 127) / 255;
+    const int cg = 43 + (((int)(med >> 8) & 0xFF) * 127 + 127) / 255;
+    const int cb = 43 + (((int)med & 0xFF) * 127 + 127) / 255;
+    return 0xFF000000u | ((unsigned)cr << 16) | ((unsigned)cg << 8) | (unsigned)cb; // BGRA, opaque
+}
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
-    const unsigned px = active ? 0x00000000u    // the glass key: the DWM's own frame
-                               : 0x802B2B2Bu;   // the recipe: BGRA(43, 43, 43, 128)
+    unsigned px;
+    if (active) {
+        px = 0x00000000u;                       // the glass key: the DWM's own frame
+    } else {
+        // v7.3.0: while the deactivation hold is stamped, EVERY painter
+        // lands the tracked OPAQUE row (the Chrome contract -- an opaque
+        // pixel on the sheet displays as-is, no glass blend to re-bake);
+        // past the stamp the recipe's half-alpha row returns. The clock
+        // check makes the hold self-expiring for every writer, so it can
+        // never outlive the fade window (the v7.2.14 belt, kept).
+        const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
+        px = (until && GetTickCount64() < until)
+           ? g_holdPx.load(std::memory_order_relaxed)
+           : 0x802B2B2Bu;                       // the recipe: BGRA(43, 43, 43, 128)
+    }
     unsigned* row = (unsigned*)g_barBits;       // top-down: row 0 first
     for (int x = 0; x < cw; ++x) row[x] = px;
 }
@@ -5061,6 +5253,15 @@ static void guiPaintBar(HWND w) {
 // shared: the worst interleaving is a redundant blit of the same bytes the
 // NC latch already chose.
 //
+// v7.3.0: the inactive constant has TWO forms over time now -- the tracked
+// OPAQUE color while the deactivation hold is stamped, the recipe's
+// half-alpha row once it expires (the handover present). The thread never
+// measures and holds no state beyond its DIB: it reads the hold atomics
+// (g_holdUntil/g_holdPx, written by WM_NCACTIVATE on the GUI thread; the
+// kick's SetEvent orders the writes before these reads) and mirrors what
+// guiBarPatchSheetRow would write -- the worst interleaving stays a
+// redundant blit of the same bytes.
+//
 // Each tick: fill the constant, GetDC(g_hwnd), BitBlt the 1 px strip,
 // ReleaseDC, GdiFlush. GetDC/BitBlt from another thread of the same process
 // is legal -- GDI serializes per-DC -- and the tick costs microseconds: no
@@ -5109,8 +5310,25 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
             if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
             rowW = cr.right;
         }
-        const unsigned px = (nc != 0) ? 0x00000000u   // the glass key: the DWM's own frame
-                                      : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
+        unsigned px;
+        if (nc != 0) {
+            g_holdUntil.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
+            px = 0x00000000u;                     // the glass key: the DWM's own frame
+        } else {
+            // v7.3.0: inside the hold window re-present the tracked OPAQUE
+            // color; the first tick PAST the stamp lands the HANDOVER --
+            // the recipe's half-alpha row -- and retires the stamp. No
+            // tail timer: the train IS the handover (the v7.2.14 400 ms
+            // tail objection stays retired). The stamp self-expires for
+            // every other writer too (see guiBarPatchSheetRow), so a hold
+            // can never outlive the fade window.
+            const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
+            const unsigned long long now   = GetTickCount64();
+            px = (until && now < until) ? g_holdPx.load(std::memory_order_relaxed)
+                                        : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
+            if (until && now >= until)
+                g_holdUntil.store(0, std::memory_order_relaxed);
+        }
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
@@ -7088,6 +7306,13 @@ static bool guiCreateRealWindow() {
                               &darkOn, sizeof(darkOn)))) {
                 dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
             }
+            // v7.3.0: DwmFlush blocks until the compose in flight has
+            // retired; WM_NCACTIVATE calls it before the pre-flip present
+            // so every compose that can carry the activation flip starts
+            // after our write and must sample it (the v7.2.2 ordering,
+            // back as a belt for both directions).
+            g_dwmFlush = (TS_DWMFLUSH)GetProcAddress(LoadLibraryA("dwmapi.dll"),
+                                                     "DwmFlush");
         }
     }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
@@ -7450,22 +7675,55 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // transaction closes. WM_NCPAINT and the fade tick read this
         // latch mid-transaction.
         g_ncActive = (wp ? 1 : 0);
-        // v7.2.3 THE NC-FLIP PRESENT, v7.2.14 THE WHOLE STORY. The bar --
-        // the face AND row 0 -- is painted in the state wParam carries
-        // and GdiFlush()ed (guiPaintBar ends with it) BEFORE DefWindowProc
-        // below tells the frame to flip; win32k cannot resume the
-        // transaction until this WndProc returns, so the flip compose
-        // reads OUR bytes by ordering: no stale face, no pre-input row.
-        // On deactivation row 0 carries the recipe's half-alpha gray
-        // (BGRA 43,43,43,128); on activation the glass key (alpha 0
-        // black -- the DWM paints its own border through it). Nothing
-        // OPAQUE is laid over the row any more: the recipe bytes ride
-        // the DWM's own ~200 ms border fade exactly like a native
-        // frame's own strips -- the fade IS the vanilla Windows 10
-        // deactivation. The fade-tracking burst below keeps the
-        // presentation-time sheet blend from freezing mid-fade
-        // (v7.1.30's bake-stick), both directions.
+        // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED.
+        // The bar -- the face AND row 0 -- is painted in the state wParam
+        // carries and GdiFlush()ed (guiPaintBar ends with it) BEFORE
+        // DefWindowProc below tells the frame to flip; win32k cannot
+        // resume the transaction until this WndProc returns, so the flip
+        // compose reads OUR bytes by ordering. v7.3.0 closes the two
+        // windows of inaccuracy the field could still catch:
+        //   (1) THE COMPOSE IN FLIGHT. Ordering vs. the transaction
+        //       resume is not ordering vs. a compose that was already
+        //       running when the click landed: it can carry the flip off
+        //       a surface snapshot taken before our bytes existed. So
+        //       before the present, DwmFlush() waits that compose out --
+        //       after it, every compose that can carry the flip starts
+        //       after our write and MUST sample it (the proven v7.2.2
+        //       ordering, retired with the mouse hook in v7.2.14, back
+        //       as a belt for BOTH directions).
+        //   (2) THE FADE ITSELF. The recipe's half-alpha row blended
+        //       against the sheet's ANIMATING visuals shows transitional
+        //       colors for the ~200 ms fade. On DEACTIVATION the row is
+        //       now the Chrome contract instead: OPAQUE, computed live
+        //       from the backdrop actually above the window
+        //       (guiHoldPxForBackdrop -- the settled recipe composite
+        //       43 + 127*backdrop/255 per channel), stamped for 240 ms,
+        //       and handed back to the recipe bytes by the fade
+        //       presenter's own train once the stamp expires -- over an
+        //       unchanged backdrop the swap is invisible (the held color
+        //       IS the recipe's settled composite there). Opaque on the
+        //       sheet displays AS-IS (the v7.2.0 finding): no glass blend
+        //       to re-bake, nothing to fade, nothing to sample stale --
+        //       Chrome-instant, with the backdrop tracking Chrome never
+        //       had. Measurement failure (window top at a monitor edge)
+        //       rides the vanilla recipe row exactly as v7.2.14 did.
+        // On activation the glass key goes down (alpha 0 black -- the DWM
+        // paints its own border through it) and any hold is retired.
         if (IsWindowVisible(w) && !IsIconic(w)) {
+            if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight (v7.3.0, both directions)
+            if (wp) {
+                g_holdUntil.store(0, std::memory_order_relaxed); // activation retires any hold
+            } else {
+                // v7.3.0: the tracked opaque hold, from the live backdrop.
+                const unsigned holdPx = guiHoldPxForBackdrop();
+                if (holdPx) {
+                    g_holdPx.store(holdPx, std::memory_order_relaxed);
+                    g_holdUntil.store(GetTickCount64() + kHoldMs,
+                                      std::memory_order_relaxed);
+                } else {
+                    g_holdUntil.store(0, std::memory_order_relaxed); // vanilla ride
+                }
+            }
             g_forceActiveFace   = (wp != 0);   // the face must match the flip
             g_forceInactiveFace = (wp == 0);
             guiPaintBar(w);                    // face + row 0 + GdiFlush

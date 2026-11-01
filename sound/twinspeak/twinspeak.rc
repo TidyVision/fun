@@ -1,8 +1,10 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.15: version bump
-// (the hold tracks the backdrop: the instant row's color is computed at
-// the moment of deactivation from the desktop strip above the top edge --
-// the stale measured cache read as a WHITE top border bar over any darker
-// backdrop, on the hook's first frame and through the 400 ms hold).
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.0: version bump
+// (the Chrome contract, tracked: on deactivation row 0 is OPAQUE at the
+// settled recipe composite over the CURRENT backdrop -- computed live from
+// the desktop strip above the window, v7.2.13's estimator -- stamped 240 ms
+// and handed back to the recipe's half-alpha row by the fade presenter's
+// own train; DwmFlush() is back before the pre-flip present so a compose
+// in flight can never carry the flip off a stale snapshot).
 // v7.2.12: version bump
 // (the hook thread goes quiet + the tray audit: the settle burst renders
 // only when it must -- with a measured cache one tail tick replaces the
@@ -50,8 +52,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,2,15,0
-PRODUCTVERSION  7,2,15,0
+FILEVERSION     7,3,0,0
+PRODUCTVERSION  7,3,0,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -62,12 +64,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.2.15.0"
+            VALUE "FileVersion",      "7.3.0.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.2.15.0"
+            VALUE "ProductVersion",   "7.3.0.0"
         END
     END
     BLOCK "VarFileInfo"
