@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,34 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.6 THE LEGACY SHADOW, RETIRED. Field: "When I click on the tray
+//            icon to open the app's window again, I see this ghost shadow
+//            that extends to the bottom right." The two DWM-side rebuilds
+//            (v7.4.4's frame nudge, v7.4.5's sheet re-commit) shrank the
+//            ghost but could not kill it -- because it was never DWM's
+//            projection. The class carried CS_DROPSHADOW next to the DWM
+//            shadow: win32k's legacy shadow is a separate "SysShadow"
+//            sprite drawn OFFSET DOWN-RIGHT of the owner window (that is
+//            its whole geometry -- exactly the ghost's shape), and its
+//            show/hide lifecycle around a hide-to-tray + reopen cycle is
+//            where it goes stale. The v7.4.4 nudge recomputes the win32
+//            side and re-anchored the sprite (the ghost shrank to
+//            right/bottom); the v7.4.5 sheet re-commit lives entirely on
+//            the DWM side and cannot touch it. CS_DROPSHADOW is gone from
+//            the class style: no SysShadow window can exist for this
+//            window, so no ghost can. The Windows-default drop shadow the
+//            field asked for in v7.1.23 is untouched -- it comes from
+//            WS_THICKFRAME + the default border color + the glass sheet
+//            (v7.1.23/v7.1.27) under DWM composition, none of which move;
+//            only a composition-off machine loses the legacy soft edge
+//            (the field machine runs composition -- the sheet, the border
+//            color and the DWM shadow all read live there). Also in
+//            v7.4.6: a plain (no --tray) launch adds the tray icon at
+//            startup -- until now the icon rode the first close-to-tray
+//            (trayAdd lived in WM_CLOSE), so a fresh launch had no tray
+//            presence at all; every start path owns the icon from the
+//            first moment now (hint=false: no balloon -- the window IS
+//            open). Version steps to 7.4.6.
 //    v7.4.5 THE SHEET RE-COMMIT. Field, after v7.4.4: "At least only the
 //            right and bottom ghost shadow appears now, but I want to get
 //            rid of it. I would do option 2." The v7.4.4 frame-change
@@ -7654,8 +7682,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.5  |  %s",  // v7.4.5 the sheet re-commit: 0 -> {0,0,1,0} after the v7.4.4 frame nudge, every restore
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
+    snprintf(vbuf, sizeof(vbuf), "v7.4.6  |  %s",  // v7.4.6 the legacy shadow retired: CS_DROPSHADOW is gone (the tray-reopen
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // ghost was win32k's SysShadow sprite); the tray icon rides plain starts too
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8867,16 +8895,24 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     }
     g_taskbarCreated = RegisterWindowMessageA("TaskbarCreated");   // v6.6.1
     // v7.1.20: WNDCLASSEXW (a true small icon -- hIconSm -- for the taskbar /
-    // Alt-Tab instead of a scaled 32 px). v7.1.23: CS_DROPSHADOW is BACK --
-    // the user asked for the Windows default drop shadow. Under DWM
-    // composition the class style is dormant (the DWM shadow from
-    // WS_THICKFRAME is THE shadow); when the composition effects are off
-    // (the customized-visual-style machine) it draws the legacy soft shadow
-    // again, and with the corners pinned SQUARE there is no rounded notch
-    // for it to fill -- the reason v7.1.20 retired it is gone.
+    // Alt-Tab instead of a scaled 32 px). v7.1.23 had CS_DROPSHADOW ride
+    // along as a composition-off fallback shadow. v7.4.6 RETIRES it for
+    // good: the legacy shadow is win32k's own "SysShadow" sprite, drawn
+    // OFFSET DOWN-RIGHT of the owner window, and its show/hide lifecycle is
+    // exactly what the tray-reopen ghost was -- a hide-to-tray + reopen
+    // cycle left the sprite stale at the window's bounds (the v7.4.4 frame
+    // nudge re-anchored it, the v7.4.5 sheet re-commit could not touch it:
+    // neither one owns the sprite). No CS_DROPSHADOW -> no SysShadow window
+    // can exist -> no ghost can. The Windows-default drop shadow the field
+    // asked for is untouched: it comes from WS_THICKFRAME + the default
+    // border color + the glass sheet (v7.1.23/v7.1.27) under DWM
+    // composition -- which is where the field machine lives (the sheet,
+    // the border color and the DWM shadow all read live there). A
+    // composition-off machine loses only the legacy soft edge; that is the
+    // trade that takes the ghost's head.
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = guiWndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.hIcon = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
@@ -8953,6 +8989,16 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // v7.1.26: no AddTab -- the native button arrives with the show.
         guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
         g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields
+        // v7.4.6: the tray icon lands at plain start too. Until now it was
+        // added only on the first close-to-tray (trayAdd rode WM_CLOSE), so
+        // a fresh launch had no tray presence at all -- the app the field
+        // sees in the taskbar corner should be there from the first second,
+        // exactly like a --tray start (v7.1.6). hint=false: no balloon --
+        // the window IS open, "still running" would read wrong. Clicking
+        // the icon while the window is visible just re-runs
+        // guiRestoreWindow: ShowWindow(SW_SHOW) on a visible window is a
+        // no-op and the foreground call keeps it focused.
+        trayAdd(false);
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
