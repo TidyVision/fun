@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,32 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.5 THE REOPEN RECIPE. Field: "Again, I still get this bug. But
+//            at least the white top bar is gone, cuz that's how I want
+//            it." So v7.3.4's one-pixel move-and-return re-anchored
+//            nothing -- and that failure is the diagnosis: the rect was
+//            never the stale input, the ATTRIBUTES were. The tray reopen
+//            re-enters DWM composition, and the rebuilt node comes up
+//            with DEFAULTS for the window's DWM identity -- the corner
+//            preference (a ROUNDED shadow on the square window bulges
+//            past the right/bottom edges: exactly the field tape), the
+//            NC rendering policy, the immersive dark mode, the glass
+//            sheet extend. DWM coalesces a back-to-back +1/-1 move pair
+//            into no change; a frame change (v7.3.3) re-derives the
+//            sheet white. So the identity is re-ASSERTED after the
+//            reopen's ShowWindow, attribute by attribute, no frame
+//            event -- the same recipe the WM_DWMCOMPOSITIONCHANGED
+//            handler runs when the DWM rebuilds itself under the
+//            window, plus the corner attribute that path never needed:
+//            33 = DWMWCP_DONOTROUND (the shadow hugs the square rect
+//            again), 2 = DWMNCRP_ENABLED, 20/19 = dark mode on (the
+//            sheet can never ride the light-mode white), the {0,0,1,0}
+//            extend re-committed -- then one bar paint + a presenter
+//            kick, so the first compose of the reopened window samples
+//            OUR bytes over the re-asserted identity. Also fixed here:
+//            the frame's version line still read v7.2.12 -- never bumped
+//            through v7.3.x, which is why the field's tape showed an old
+//            number. Version steps to 7.3.5.
 //    v7.3.4 THE SHADOW RE-ANCHORS. Field: "when opening the window from
 //            clicking the system tray icon, the drop shadow gets screwed
 //            up and it doesn't get attached to the rectangle window
@@ -7583,22 +7609,45 @@ static void guiRestoreWindow() {
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
-    // v7.3.4 THE SHADOW RE-ANCHORS. The tray reopen re-enters DWM
-    // composition, and the rebuilt node anchors its drop shadow to the
-    // rect it cached across the hide -- the shadow reads detached from
-    // the window (only on this path). A frame-change nudge fixes the
-    // shadow but re-derives the glass sheet without the dark-mode tint
-    // (the white top border -- v7.3.3 was withdrawn for exactly that),
-    // so the re-anchor fires NO frame event: one pixel right and back,
-    // back-to-back on this thread. The rect change is the one input DWM
-    // re-derives a shadow anchor from; the sheet and the frame geometry
-    // are untouched.
-    {   RECT ra; if (GetWindowRect(g_hwnd, &ra)) {
-            SetWindowPos(g_hwnd, nullptr, ra.left + 1, ra.top, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            SetWindowPos(g_hwnd, nullptr, ra.left, ra.top, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        } }
+    // v7.3.5 THE REOPEN RECIPE. The tray reopen re-enters DWM composition
+    // and the rebuilt node comes up with DEFAULTS for the window's DWM
+    // identity -- corner preference (rounded: the shadow bulges past the
+    // square right/bottom edges, the field tape), NC rendering, dark
+    // mode, the sheet. v7.3.4's +1/-1 move pair fixed nothing (DWM
+    // coalesces it; the rect was never the stale input) and a frame
+    // change (v7.3.3) re-whitens the sheet -- so the identity is
+    // re-ASSERTED here, attribute by attribute, no frame event: the
+    // WM_DWMCOMPOSITIONCHANGED recipe plus the corner attribute.
+    {
+        typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
+        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+        typedef struct { int cxLeftWidth, cxRightWidth,
+                         cyTopHeight, cyBottomHeight; } TS_MARGINS;
+        const HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        const TS_DWMSA dwmSet = dwm ? (TS_DWMSA)GetProcAddress(
+            dwm, "DwmSetWindowAttribute") : nullptr;
+        const TS_DWMEA dwmExtend = dwm ? (TS_DWMEA)GetProcAddress(
+            dwm, "DwmExtendFrameIntoClientArea") : nullptr;
+        if (dwmSet) {
+            const int corner = 1;   // DWMWCP_DONOTROUND -- stays square
+            dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                   &corner, sizeof(corner));
+            const int ncrp = 2;     // DWMNCRP_ENABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
+                   &ncrp, sizeof(ncrp));
+            const int darkOn = 1;
+            if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                              &darkOn, sizeof(darkOn)))) {
+                dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
+            }
+        }
+        if (dwmExtend) {
+            const TS_MARGINS sheet = { 0, 0, 1, 0 };
+            g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+        }
+    }
+    guiPaintBar(g_hwnd);               // face + row 0 over the re-asserted identity
+    guiFadeKick();
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
@@ -7661,7 +7710,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.12  |  %s",  // v7.2.12 the hook thread goes quiet + the tray audit (v7.2.11 the latch)
+    snprintf(vbuf, sizeof(vbuf), "v7.3.5  |  %s",  // v7.3.5: the line still read v7.2.12 -- never bumped through v7.3.x (the tape showed the old number)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);

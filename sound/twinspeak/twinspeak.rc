@@ -1,10 +1,11 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.4: version bump
-// (the shadow re-anchors: after the tray reopen's ShowWindow,
-// guiRestoreWindow moves the window one pixel right and back -- no frame
-// event -- so DWM re-anchors the drop shadow to the real rect; the
-// v7.3.3 SWP_FRAMECHANGED reframe is withdrawn, it re-derived the sheet
-// without the dark-mode tint and re-whitened the top border).
-// v7.3.2: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.5: version bump
+// (the reopen recipe: after the tray reopen's ShowWindow the window's
+// DWM identity is re-asserted attribute by attribute -- square corner,
+// NC rendering, dark mode, the {0,0,1,0} sheet -- no frame event, so
+// the rebuilt node's shadow hugs the square rect again; v7.3.4's
+// move-and-return is retired, DWM coalesced it. The frame's version
+// line also stops reading v7.2.12 -- never bumped through v7.3.x).
+// v7.3.4: version bump
 // (the hold that does not expire: the deactivation hold is a LATCH --
 // g_holdLive -- spanning the whole inactive period; the 240 ms
 // wall-clock stamp, the clock checks in all three row writers and the
@@ -71,8 +72,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,3,4,0
-PRODUCTVERSION  7,3,4,0
+FILEVERSION     7,3,5,0
+PRODUCTVERSION  7,3,5,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -83,12 +84,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.3.4.0"
+            VALUE "FileVersion",      "7.3.5.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.3.4.0"
+            VALUE "ProductVersion",   "7.3.5.0"
         END
     END
     BLOCK "VarFileInfo"
