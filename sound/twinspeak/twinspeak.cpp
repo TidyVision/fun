@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,35 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.6 THE FRAME THE REBUILD WAS OWED. Field: "I still get the same
+//            issue ... when I open the system tray, my mouse also treats
+//            the window like it's going to resize but it's made not to
+//            resize." The second face is the diagnosis. The resize intent
+//            and the detached shadow are THE SAME stale geometry: the
+//            plain SW_SHOW after a SW_HIDE rebuilds the window's DWM node
+//            WITHOUT the frame-geometry notification -- the shadow
+//            re-anchors one standard frame off on right/bottom (the
+//            field tape) and the pointer's edge bands ride the phantom
+//            with it. v7.3.4 moved the rect (coalesced to no change);
+//            v7.3.5 re-asserted the attributes -- the sheet never needed
+//            it (it survives the node rebuild, which is why the top
+//            border stayed dark) and the shadow reads geometry, not
+//            attributes. The one event that re-derives BOTH is the frame
+//            change -- v7.3.3 proved it and died on ONE mistake: the
+//            re-derived sheet came up WITHOUT the immersive dark tint
+//            and nothing ever invalidated it again. So v7.3.6 runs the
+//            frame change FIRST and the v7.3.5 re-assertion AFTER it, in
+//            this one handler turn: every DwmSetWindowAttribute is
+//            itself an invalidation, so the sheet rebuild is forced a
+//            second time, now reading dark-on; the {0,0,1,0} extend
+//            re-commits after the tint; DwmFlush waits out the compose
+//            in flight; guiPaintBar (the WM_NCPAINT the frame change
+//            pumps lands there) re-lands row 0 black over the rebuilt
+//            sheet. The white top border cannot ride the frame change
+//            anymore: the tint lands after the rebuild that dropped it,
+//            every reopen. The rect is never touched (NOMOVE + NOSIZE --
+//            no resize-lock pass, no move to coalesce). Version steps
+//            to 7.3.6.
 //    v7.3.5 THE REOPEN RECIPE. Field: "Again, I still get this bug. But
 //            at least the white top bar is gone, cuz that's how I want
 //            it." So v7.3.4's one-pixel move-and-return re-anchored
@@ -7609,15 +7638,32 @@ static void guiRestoreWindow() {
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
-    // v7.3.5 THE REOPEN RECIPE. The tray reopen re-enters DWM composition
-    // and the rebuilt node comes up with DEFAULTS for the window's DWM
-    // identity -- corner preference (rounded: the shadow bulges past the
-    // square right/bottom edges, the field tape), NC rendering, dark
-    // mode, the sheet. v7.3.4's +1/-1 move pair fixed nothing (DWM
-    // coalesces it; the rect was never the stale input) and a frame
-    // change (v7.3.3) re-whitens the sheet -- so the identity is
-    // re-ASSERTED here, attribute by attribute, no frame event: the
-    // WM_DWMCOMPOSITIONCHANGED recipe plus the corner attribute.
+    // v7.3.6 THE FRAME THE REBUILD WAS OWED. The plain SW_SHOW after a
+    // SW_HIDE rebuilds the window's DWM node without the frame-geometry
+    // notification: the shadow re-anchors one standard frame off on
+    // right/bottom (the field tape) and the pointer's edge bands ride
+    // the same phantom ("my mouse also treats the window like it's
+    // going to resize"). v7.3.3 proved the frame change re-derives both
+    // and died on one mistake -- the re-derived sheet came up WITHOUT
+    // the dark tint and nothing invalidated it again. So the frame
+    // change runs HERE, first; the v7.3.5 re-assertion below runs AFTER
+    // it, in this same handler turn, and each of those attribute writes
+    // is itself an invalidation -- the sheet is rebuilt a second time
+    // reading dark-on. The rect is never touched (NOMOVE + NOSIZE: no
+    // resize-lock pass, no move for DWM to coalesce -- v7.3.4's lever,
+    // retired).
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    // v7.3.5 THE REOPEN RECIPE (v7.3.6: runs AFTER the frame change).
+    // The tray reopen re-enters DWM composition and the rebuilt node
+    // comes up with DEFAULTS for the window's DWM identity -- corner
+    // preference, NC rendering, dark mode, the sheet. The identity is
+    // re-ASSERTED attribute by attribute: the WM_DWMCOMPOSITIONCHANGED
+    // recipe plus the corner attribute. Re-sent after the frame change,
+    // these writes are also the invalidations that make the sheet's
+    // rebuild read the dark tint (v7.3.3's white top border cannot
+    // return: nothing is left un-invalidated).
     {
         typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
         typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
@@ -7646,6 +7692,7 @@ static void guiRestoreWindow() {
             g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
         }
     }
+    if (g_dwmFlush) g_dwmFlush();  // v7.3.6: wait out the compose in flight -- the first compose of the reopened window starts after every write above (the v7.3.0 belt)
     guiPaintBar(g_hwnd);               // face + row 0 over the re-asserted identity
     guiFadeKick();
     SetForegroundWindow(g_hwnd);
@@ -7710,7 +7757,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.3.5  |  %s",  // v7.3.5: the line still read v7.2.12 -- never bumped through v7.3.x (the tape showed the old number)
+    snprintf(vbuf, sizeof(vbuf), "v7.3.6  |  %s",  // v7.3.6: the frame-change + re-assertion reopen (the shadow re-anchors, the sheet reads dark)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
