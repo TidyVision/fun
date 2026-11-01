@@ -1,4 +1,16 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.4.11: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.0: version bump
+// (the one-file window: customWindow.h arrives -- the whole Windows chrome
+// (WM_NCCALCSIZE insets, WM_NCHITTEST, the caption button stack, the hover,
+// the sysmenu, the face/title/icon/button painting, the built-in fallback
+// tray, putWindowinTray) moves behind an eleven-function API:
+// enableCustomWin, changeWinTitlebarColor, changeWinTextColor,
+// changeWinTextUnfocusedColor, changeWinTextFont, enableWinIcon,
+// setWinTitlebarButtonLayout, setCanWinResize, changeWinMinimizeHoverColor,
+// changeWinMaximizeHoverColor, putWindowinTray -- Windows-real with no-op
+// stubs for every other target. twinspeak stays consumer #1, byte-identical:
+// applyTheme re-seeds the chrome from the live theme, guiRenderBar keeps the
+// sheet row + edge sandwich, guiWndProc forwards through cwWndProc first.
+// v7.4.11: version bump
 // (the forced replay: the tray-icon come-up -- tray click, tray menu,
 // second-instance come-up -- now runs the same second activation the plain
 // start runs, FORCED past its foreground guard: the click on the tray icon
@@ -158,12 +170,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.4.11.0"
+            VALUE "FileVersion",      "7.5.0.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.4.11.0"
+            VALUE "ProductVersion",   "7.5.0.0"
         END
     END
     BLOCK "VarFileInfo"

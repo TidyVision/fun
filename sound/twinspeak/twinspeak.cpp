@@ -23,6 +23,35 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.0 THE ONE-FILE WINDOW. customWindow.h: every piece of Windows
+//            window chrome that is not the audio engine moves out of this
+//            file into a one-file API -- WM_NCCALCSIZE's frame insets,
+//            WM_NCHITTEST, the caption buttons (now a configurable stack:
+//            minimize + maximize + close, close always kept), the hover
+//            state (GWLP_USERDATA retired -- the header owns it), the
+//            caption right-click system menu, WM_SETCURSOR, the button
+//            glyph/hover painting, the title text (now the WINDOW TITLE
+//            through GetWindowText -- kCapTitle retired), the bar face
+//            fill, the window-class icon (new, optional, off by default:
+//            the same icon the taskbar shows), the built-in fallback tray
+//            icon, and putWindowinTray(true/false) which delegates to
+//            twinspeak's own hide-to-tray / guiRestoreWindow paths. The
+//            API: enableCustomWin, changeWinTitlebarColor,
+//            changeWinTextColor, changeWinTextUnfocusedColor,
+//            changeWinTextFont (a family name or a C:/Windows/Fonts file),
+//            enableWinIcon, setWinTitlebarButtonLayout, setCanWinResize,
+//            changeWinMinimizeHoverColor, changeWinMaximizeHoverColor,
+//            putWindowinTray -- each Windows-real, with a no-op stub for
+//            every other target. twinspeak stays consumer #1: applyTheme
+//            re-seeds every chrome color from the live theme (byte-identical
+//            bytes -- the active/inactive face lift, the dark-theme title
+//            gradient, the light-theme solid, the panel-gray hover),
+//            guiRenderBar becomes background(row0/edge sandwich), the
+//            NC cases leave guiWndProc for cwWndProc, WM_CLOSE's body
+//            becomes guiHideToTray (shared with putWindowinTray). No new
+//            behavior on the field machine -- every pixel and every
+//            gesture v7.4.11 produced, now through the API. Version
+//            steps to 7.5.0.
 //    v7.4.11 THE FORCED REPLAY. Field, after v7.4.10: "Now it shows.
 //            Now have this same fix logic be applied to whenever you
 //            click on the tray icon and that's it." Plain start births
@@ -1352,6 +1381,10 @@
 #include <ks.h>
 #include <ksmedia.h>
 #include <setupapi.h>
+#include "customWindow.h"    // v7.5.0: the one-file window-chrome API (the NC
+                             // machinery, the caption buttons, the tray gesture;
+                             // twinspeak is consumer #1 -- see guiRenderBar and
+                             // guiWndProc for the seams)
 
 #ifndef FILE_DEVICE_KS
 #define FILE_DEVICE_KS 0x0000002f
@@ -4664,8 +4697,9 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr,
-                 g_fTitle = nullptr;   // v7.1.0: the bar's "TwinSpeak" title
+                 g_fSml = nullptr, g_fMono = nullptr;   // (g_fTitle retired v7.5.0:
+                                    // the title font is customWindow.h's, seeded
+                                    // in guiMakeGdi below)
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -4761,6 +4795,10 @@ static void guiRepaint(HWND w, int id);
 static void guiRepaintSlots(HWND w);
 static void trayAdd(bool hint);
 static void trayRemove();
+static void guiRestoreWindow();      // v7.5.0: fwd -- putWindowinTray(false) rides it
+static void guiHideToTray(HWND w);   // v7.5.0: fwd -- putWindowinTray(true) rides it
+static void cwTrayShowHost(HWND w);  // v7.5.0: adapter -- guiRestoreWindow() in the
+                                     // header's void(*)(HWND) show signature
 static void trayUpdateTip(bool running);   // v7.1.20: the tip tracks the engine
 static void trayBalloon(const char* text); // v7.2.12: fwd -- the tray path's voice (start refusals)
 static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on demand
@@ -4833,6 +4871,7 @@ static void guiInitDpi() {
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
     KSTRIP_FACE_Y = S(6);
+    cwSetBarHeight(kCapH);   // v7.5.0: the header's caption geometry = ours (real px)
 }
 
 // v7.1.24 THE WINDOW IS THE Win32 CUSTOM TITLE BAR EXAMPLE (main.c): the
@@ -4865,30 +4904,21 @@ static void guiInitDpi() {
 // off it (the example measures its caption from the theme; that function
 // is deliberately NOT adopted). The example's HTMAXBUTTON/SnapLayout hook
 // has no maximize button to serve and is not adopted either.
-static const DWORD kGuiFrame
-    = WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX;
+static const DWORD kGuiFrame = cwFrameStyle();   // v7.5.0: the recipe lives in
+                             // customWindow.h now (WS_THICKFRAME | WS_SYSMENU |
+                             // WS_MAXIMIZEBOX | WS_MINIMIZEBOX, unchanged)
 
-// main.c: signed cursor extraction (multi-monitor coordinates can be
-// negative; windowsx.h defines these but we don't want the whole header).
-#ifndef GET_X_PARAM
-#define GET_X_PARAM(lp) ((int)(short)LOWORD(lp))
-#endif
-#ifndef GET_Y_PARAM
-#define GET_Y_PARAM(lp) ((int)(short)HIWORD(lp))
-#endif
-
-// main.c verbatim: the maximized state (WM_NCCALCSIZE's top inset,
-// WM_NCHITTEST's top-band guard, the sysmenu item states).
-static bool
-win32_window_is_maximized(HWND handle) {
-    WINDOWPLACEMENT placement = {0};
-    placement.length = sizeof(WINDOWPLACEMENT);
-    if (GetWindowPlacement(handle, &placement)) {
-        return placement.showCmd == SW_SHOWMAXIMIZED;
-    }
-    return false;
-}
-
+// v7.5.0 THE CHROME MOVED. The sample's helpers -- GET_X/Y_PARAM,
+// win32_window_is_maximized, WIN32_FAKE_SHADOW_HEIGHT, the hover enum, the
+// button rects, set_menu_item_state, the kCapTitle brand string -- live in
+// customWindow.h now (generalized: the button stack is minimize + maximize
+// + close with close always kept, the title text is the WINDOW TITLE via
+// GetWindowText, every color/font/icon choice is the eleven-function API).
+// twinspeak keeps only what is still its own: the frame-inset calculator
+// below (the creation size, the WINDOWPOS pin and WM_GETMINMAXINFO hang
+// off it), and the bar's border recipe -- the sheet row and the 1px bottom
+// edge -- which is painted AROUND the header's chrome in guiRenderBar.
+//
 // v7.1.24: the frame insets WM_NCCALCSIZE removes on left/right (X) and
 // bottom (Y) -- computed once after guiInitDpi and reused by the creation
 // size, the WM_WINDOWPOSCHANGING pin and WM_GETMINMAXINFO, so the designed
@@ -4904,48 +4934,6 @@ static void guiCalcFrameInsets() {
     g_frmInsY = frameY + pad;
 }
 
-// v7.1.24 (main.c): the caption buttons; the 1px row the example paints
-// its fake shadow into. v7.1.27: that row is the window's REAL top border
-// now -- the DWM glass sheet shows through pure black while active (see
-// guiCreateRealWindow + guiRenderBar), and the vanilla inactive gray is
-// composited while inactive. Keep at 1: row 0 must exist to carry the
-// border, and the face gradient (offset 1px down) leans on it.
-#define WIN32_FAKE_SHADOW_HEIGHT 1
-enum {
-    CustomTitleBarHoveredButton_None = 0,
-    CustomTitleBarHoveredButton_Minimize,
-    CustomTitleBarHoveredButton_Close,
-};
-struct CustomTitleBarButtonRects {
-    RECT close;
-    RECT minimize;
-};
-// main.c's win32_get_title_bar_button_rects over the kCapH bar in CLIENT
-// coordinates ("Sadly SM_CXSIZE does not result in the right size buttons
-// for Win10" -- the example scales 47 px per button; so do we, via S()).
-static CustomTitleBarButtonRects
-win32_get_title_bar_button_rects(HWND handle, const RECT* title_bar_rect) {
-    (void)handle;
-    CustomTitleBarButtonRects button_rects;
-    const int button_width = S(47);
-    button_rects.close = *title_bar_rect;
-    button_rects.close.top += WIN32_FAKE_SHADOW_HEIGHT;
-    button_rects.close.left = button_rects.close.right - button_width;
-    button_rects.minimize = button_rects.close;
-    button_rects.minimize.left  -= button_width;
-    button_rects.minimize.right -= button_width;
-    return button_rects;
-}
-// main.c verbatim: the system-menu item states the size lock honors.
-static void
-set_menu_item_state(HMENU menu, MENUITEMINFO* menuItemInfo, UINT item,
-                    bool enabled) {
-    menuItemInfo->fState = enabled ? MF_ENABLED : MF_DISABLED;
-    SetMenuItemInfo(menu, item, false, menuItemInfo);
-}
-
-static const wchar_t* kCapTitle = L"TidyVision TwinSpeak";   // v7.2.1: the bar's brand text
-                                              // (v7.2.0: L"Twinspeak Control Panel")
 // Paints the bar from a persistent memory buffer -- usable from any context
 // (theme click, WM_NCPAINT, hover), never needs an invalidate.
 // v7.1.3 THE WHOLE BAR IS GDI+: v7.0.9 built the bar from GDI FillRects and
@@ -5123,7 +5111,7 @@ static std::atomic<int> g_ncActive{-1};      // v7.2.9: the NC-latched activatio
 // (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
 // active vs. inactive like every native caption does.
 static Gdiplus::Color GCol(COLORREF c, BYTE a = 255);   // fwd (defined below)
-static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
+static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     Gdiplus::Graphics g(dc);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     // v7.1.28 THE ALPHA CHANNEL IS THE DELIVERY. The DWM blends the sheet
@@ -5152,13 +5140,11 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // brush rides along (same height, one row down), so
     // the face still melts to cBg exactly at the bottom edge. The bottom
     // overscan row past the edge line stays covered.
+    // v7.5.0: the FACE is customWindow.h's now (changeWinTitlebarColor's
+    // state, re-seeded from the theme in applyTheme). Same fill + brush
+    // rects as v7.4.11's render, so the seeded state lands the exact bytes.
+    cwPaintBarBackground(g, ww, active);
     const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), active ? 0.07 : 0.03);
-    Gdiplus::LinearGradientBrush face(
-        Gdiplus::Rect(0, 1, ww + 1, kCapH),
-        Gdiplus::Color(255, GetRValue(bgTop), GetGValue(bgTop), GetBValue(bgTop)),
-        Gdiplus::Color(255, GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg)),
-        Gdiplus::LinearGradientModeVertical);
-    g.FillRectangle(&face, -1, 1, ww + 2, kCapH);
     // 1px bottom edge: chrome, not dead space (same cPanel2 as v7.0.9).
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
@@ -5215,73 +5201,11 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     }
     Gdiplus::SolidBrush rowBrush(rowCol);
     g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
-    // v7.1.24 main.c: the caption buttons -- hover face + glyphs. The fills
-    // stay integer-exact; shape smoothing turns ON for the X's diagonals
-    // ONLY (the two strokes need AA, the fills above do not).
-    const RECT bar = { 0, 0, ww, kCapH };
-    const CustomTitleBarButtonRects br =
-        win32_get_title_bar_button_rects(nullptr, &bar);
-    const COLORREF item = active ? guic::cText : guic::cDim;  // main.c's item color
-    const int buttonW   = br.close.right - br.close.left;
-    if (hovered == CustomTitleBarHoveredButton_Minimize) {
-        Gdiplus::SolidBrush hf(Gdiplus::Color(255, GetRValue(guic::cPanel2),
-                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-        g.FillRectangle(&hf, br.minimize.left, br.minimize.top, buttonW,
-                        br.minimize.bottom - br.minimize.top);
-    }
-    {   // minimize glyph: main.c's 10x1 px line, centered in the button.
-        const int lineW = S(10);
-        const int cx = br.minimize.left + buttonW / 2;
-        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2;
-        Gdiplus::SolidBrush glyph(Gdiplus::Color(255, GetRValue(item),
-                                                 GetGValue(item), GetBValue(item)));
-        g.FillRectangle(&glyph, cx - lineW / 2, cy, lineW, 1);
-    }
-    if (hovered == CustomTitleBarHoveredButton_Close) {
-        // main.c's close hover: the red face, the white X.
-        Gdiplus::SolidBrush rf(Gdiplus::Color(255, 0xCC, 0, 0));
-        g.FillRectangle(&rf, br.close.left, br.close.top, buttonW,
-                        br.close.bottom - br.close.top);
-    }
-    {
-        const int cx = br.close.left + buttonW / 2;
-        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
-        const COLORREF xcol = (hovered == CustomTitleBarHoveredButton_Close)
-                            ? RGB(0xFF, 0xFF, 0xFF) : item;
-        Gdiplus::Pen xp(Gdiplus::Color(255, GetRValue(xcol),
-                                       GetGValue(xcol), GetBValue(xcol)),
-                        Sf(1.25f) < 1.0f ? 1.0f : Sf(1.25f));
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.DrawLine(&xp, cx - S(5), cy - S(5), cx + S(5), cy + S(5));   // the modern thin X --
-        g.DrawLine(&xp, cx + S(5), cy - S(5), cx - S(5), cy + S(5));   // the DWM close glyph's
-        g.SetSmoothingMode(Gdiplus::SmoothingModeNone);                // own shape, drawn ours
-    }
-    // the product name, theme-aware (see the v7.1.4 note above).
-    if (g_fTitle) {
-        const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
-                            GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma
-        Gdiplus::Font tf(dc, g_fTitle);
-        const Gdiplus::RectF tr(Sf(12), Sf(3), Sf(220), (Gdiplus::REAL)(kCapH - S(7)));
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentNear);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        if (!active) {
-            // v7.1.20: inactive -- the title steps down to the dim color
-            Gdiplus::SolidBrush nb(GCol(guic::cDim));
-            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &nb);
-        } else if (dark) {
-            Gdiplus::LinearGradientBrush gb(
-                tr, Gdiplus::Color(255, 160, 200, 205),   // cyan gray, light -- top
-                    Gdiplus::Color(255, 108, 134, 140),   // slate cyan gray -- bottom
-                Gdiplus::LinearGradientModeVertical);
-            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &gb);
-        } else {
-            Gdiplus::SolidBrush nb(Gdiplus::Color(255, GetRValue(guic::cText),
-                                                  GetGValue(guic::cText), GetBValue(guic::cText)));
-            g.DrawString(kCapTitle, -1, &tf, tr, &sf, &nb);
-        }
-    }
+    // v7.5.0: the buttons, the icon and the title text are customWindow.h's
+    // (layout, hover faces, glyphs, the title = the WINDOW TITLE, every
+    // color = the API state seeded from the theme). Painted AFTER the edge
+    // rows, exactly the z-order v7.4.11's render used.
+    cwPaintBarForeground(g, w, ww, active);
 }
 // v7.1.29 THE SHEET ROW, BYTE-EXACT. GDI+ brushes cannot be trusted to
 // write the alpha byte of an HDC-backed surface (and on the old DDB there
@@ -5457,10 +5381,9 @@ static void guiCommitSheetRowFast(HWND w, bool active) {
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
-    // v7.1.24: the hovered slot rides GWLP_USERDATA exactly like main.c;
-    // the blit target is the CLIENT dc -- the window owns a real frame now,
-    // so the bar is client pixels at (0,0), not window pixels.
-    const int  hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
+    // v7.5.0: the hover state lives in customWindow.h now (the header's
+    // WM_NCMOUSEMOVE tracks it); the blit target is still the CLIENT dc --
+    // the window owns a real frame, so the bar is client pixels at (0,0).
     // v7.2.3: g_forceInactiveFace -- WM_NCACTIVATE(FALSE) runs BEFORE the
     // deactivation completes, so GetActiveWindow() still returns this window
     // and the plain read would repaint the ACTIVE face into what must be the
@@ -5507,11 +5430,11 @@ static void guiPaintBar(HWND w) {
     HDC wdc = GetDC(w);
     if (!wdc) return;
     if (guiBarBufEnsure(cw, kCapH)) {
-        guiRenderBar(g_barDc, cw, hovered, active);
+        guiRenderBar(g_barDc, w, cw, active);
         guiBarPatchSheetRow(cw, active);   // v7.1.29: the alpha IS the delivery
         BitBlt(wdc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
     } else {
-        guiRenderBar(wdc, cw, hovered, active);   // no buffer: draw straight
+        guiRenderBar(wdc, w, cw, active);   // no buffer: draw straight
     }
     ReleaseDC(w, wdc);
     // v7.2.2: gdi32 batches drawing calls per thread -- without a flush the
@@ -5638,11 +5561,17 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
-    // v7.1.0: the titlebar's product name -- Segoe UI Semibold 14 px, drawn
-    // in the dark-blue -> teal vertical gradient (see guiPaintBar).
-    g_fTitle = CreateFontA(-S(14), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    // v7.5.0: the titlebar's product name is customWindow.h's now -- the
+    // SAME face/size/weight this HFONT carried (Segoe UI, -14 px, semibold,
+    // a Gdiplus::Font built from the LOGFONT), seeded through the API. The
+    // launch-constant policy seeds ride here too; applyTheme owns colors.
+    cwSeedTitleFont("Segoe UI", 14, FW_SEMIBOLD);
+    changeWinTextFont("Segoe UI");
+    setWinTitlebarButtonLayout(true, false);   // minimize + close, no maximize --
+                                               // the v7.1.24 size-lock layout
+    setCanWinResize(false);                    // the window is fixed-size
+    enableWinIcon(false);                      // no bar icon (the v7.4.11 look)
+    enableCustomWin(true);
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
 }
 
@@ -5659,6 +5588,33 @@ static void applyTheme(int i) {
     guic::cDim = t.dim;         guic::cAccent  = t.accent;  guic::cAccentDk = t.accentDk;
     guic::cOnText = t.onText;   guic::cStop    = t.stop;    guic::cLog    = t.log;
     guic::cLogBg = t.logBg;
+    // v7.5.0: THE CHROME RE-SEED. The bar's face, title text, glyphs and
+    // hover faces are customWindow.h state now -- re-seeded from the live
+    // theme here. The seed runs at boot too (before any window exists;
+    // the header's repaint no-ops with no host). Byte-for-byte v7.4.11's
+    // render:
+    //   face    active   lerp(cBg, white, 0.07) -> cBg, the top-lit gradient
+    //           inactive lerp(cBg, white, 0.03) -> cBg (the v7.1.20 dim)
+    //   title   active   dark bg: (160,200,205) -> (108,134,140) vertical,
+    //                    the exact gradient the bar drew; light bg: solid
+    //                    cText -- the luma branch moves INTO the seed (a
+    //                    solid is a gradient between equal colors)
+    //           unfocused cDim (the v7.1.20 dim step)
+    //   glyphs  active cText / unfocused cDim -- main.c's item color
+    //   hover   cPanel2, the panel gray both buttons used
+    {
+        const COLORREF liftA = guiLerpRGB(guic::cBg, RGB(255, 255, 255), 0.07);
+        const COLORREF liftI = guiLerpRGB(guic::cBg, RGB(255, 255, 255), 0.03);
+        const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
+                            GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma
+        cwSeedChrome(cwArgbOf(liftA), cwArgbOf(guic::cBg),
+                     cwArgbOf(liftI), cwArgbOf(guic::cBg),
+                     dark ? cwArgbOf(RGB(160, 200, 205)) : cwArgbOf(guic::cText),
+                     dark ? cwArgbOf(RGB(108, 134, 140)) : cwArgbOf(guic::cText),
+                     cwArgbOf(guic::cDim),
+                     cwArgbOf(guic::cText),
+                     cwArgbOf(guic::cPanel2), cwArgbOf(guic::cPanel2));
+    }
     #define TSREBR(b, c) do { if (b) DeleteObject(b); (b) = CreateSolidBrush(c); } while (0)
     TSREBR(g_brBg,     guic::cBg);
     TSREBR(g_brPanel,  guic::cPanel);
@@ -7514,6 +7470,13 @@ static bool guiCreateRealWindow() {
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
+    // v7.5.0: the chrome meets its host -- the repaint callback lands the
+    // bar's pixels on every hover/color change, and putWindowinTray rides
+    // twinspeak's own gestures: the SILENT hide-to-tray (position capture +
+    // icon + hide -- the balloon stays in WM_CLOSE) and guiRestoreWindow's
+    // full come-up machinery.
+    cwAttach(g_hwnd, guiPaintBar);
+    cwSetTrayHost(guiHideToTray, cwTrayShowHost);
     // v7.4.9: the per-window System.AppUserModel.ID (v7.1.25) is RETIRED --
     // the panel is a fully vanilla window again (see the retirement note
     // where the setter used to live). The process AUMID (v7.1.23, below in
@@ -7889,6 +7852,31 @@ static void guiRestoreWindow() {
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
 
+// v7.5.0: the adapter -- the header's tray-show slot carries void(*)(HWND);
+// twinspeak's come-up is parameterless guiRestoreWindow(), unchanged.
+static void cwTrayShowHost(HWND) { guiRestoreWindow(); }
+
+// v7.5.0: the close-to-tray gesture, extracted from WM_CLOSE so that
+// putWindowinTray(true) (customWindow.h's API) performs the same gesture:
+// position captured for the ini, the 250 ms tick put to sleep, the icon
+// ensured, the window hidden. The engine keeps running -- real exit stays
+// in the tray menu and the system menu's "Exit twinspeak".
+// v7.5.0 (field): the NOTIFICATION is NOT part of the gesture -- the API's
+// hide is SILENT. The "still running" balloon lives in WM_CLOSE alone: it
+// answers a USER close (the X), where "where did my window go" is a real
+// question; a programmatic putWindowinTray(true) already knows where the
+// window went. The first-three-closes cap and the balloon code stay in
+// twinspeak.cpp, right where they have lived since v7.2.12.
+static void guiHideToTray(HWND w) {
+    guiCaptureWindowPos(w);
+    KillTimer(w, 1);
+    // v7.1.26: no DeleteTab -- hiding a window removes its native
+    // taskbar button by itself.
+    trayAdd(true);   // ensure the icon: the window must stay reachable
+                     // (and the rare icon-was-missing re-add)
+    ShowWindow(w, SW_HIDE);
+}
+
 // ---- v7.0.9: the frame render buffer (THE WATERMARK-FLICKER FIX)  -----------
 // The frame face is rendered into this memory surface and lands on the screen
 // as ONE blit -- no erase pass, no partial updates, nothing for DWM to sample
@@ -7944,8 +7932,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.11 |  %s",  // v7.4.11 the forced replay: the tray come-up takes the foreground
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // before the blip; v7.4.10's plain process + second activation stay
+    snprintf(vbuf, sizeof(vbuf), "v7.5.0 |  %s",  // v7.5.0 the one-file window: the chrome lives in customWindow.h
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -7986,6 +7974,13 @@ static bool guiIsToggle(int id) {
 }
 
 static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    // v7.5.0: the chrome answers FIRST (customWindow.h owns WM_NCCALCSIZE,
+    // WM_NCHITTEST, the caption buttons' NC messages, the caption sysmenu,
+    // WM_SETCURSOR and the hover reset). Unhandled messages fall through to
+    // twinspeak's own cases below, unchanged -- including TaskbarCreated,
+    // WM_NCACTIVATE (the RAD present), WM_NCPAINT and WM_CLOSE.
+    LRESULT cwAnswer = 0;
+    if (cwWndProc(w, msg, wp, lp, &cwAnswer)) return cwAnswer;
     // v6.6.1: explorer restarted -- the tray icon vanished; re-add it. v7.1.6
     // TRAY-FIRST: re-add ALWAYS (trayRemove + trayAdd): the icon owner may be
     // the invisible tray window (no control window exists yet), and explorer
@@ -8017,109 +8012,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
           SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
         );
         break;
-    case WM_NCCALCSIZE: {
-        // v7.1.24 (main.c verbatim): when wParam is TRUE the client is the
-        // whole window MINUS the frame insets on left/right/bottom (top
-        // only when maximized -- unreachable here, the size lock refuses
-        // every maximize). The DWM border + drop shadow own a real NC
-        // strip again, and no frame painter -- themed, classic, or the
-        // undocumented 0x00AE/0x00AF pair -- can strike into the client
-        // pixels anymore: there is simply no client pixel it may paint.
-        // The designed 880x620+kCapH client survives because the creation
-        // size grew by the same insets (guiCalcFrameInsets).
-        // v7.1.27: the TOP stays client-covered on purpose -- with any top
-        // gap the DWM decides the client no longer covers the caption and
-        // paints a ghost caption OUTSIDE the window rect (see the v7.1.27
-        // notes). The real top border arrives through the DWM glass sheet
-        // (DwmExtendFrameIntoClientArea in guiCreateRealWindow) instead.
-        if (!wp) break;   // wParam FALSE: DefWindowProc
-        int frame_x = GetSystemMetrics(SM_CXFRAME);
-        int frame_y = GetSystemMetrics(SM_CYFRAME);
-        int padding = GetSystemMetrics(SM_CXPADDEDBORDER);
-
-        NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
-        RECT* requested_client_rect = params->rgrc;
-
-        requested_client_rect->right  -= frame_x + padding;
-        requested_client_rect->left   += frame_x + padding;
-        requested_client_rect->bottom -= frame_y + padding;
-
-        if (win32_window_is_maximized(w)) {
-            requested_client_rect->top += frame_y + padding;
-        }
-
-        return 0; }
-    case WM_NCHITTEST: {
-        // v7.1.24 (main.c): let the default procedure handle the resizing
-        // areas (the v7.1.20 size lock still refuses every actual resize,
-        // so an edge drag ends where it started). Then the example's
-        // manual fix for the top hit area the NCCALCSIZE adjustment
-        // confuses, then the caption: the whole bar strip (client
-        // y < kCapH) is HTCAPTION -- drag, snap, Alt+Space and the
-        // right-click system menu all work through it, and the caption
-        // buttons ride HTCAPTION exactly like the example (their clicks
-        // are intercepted in the NC button messages via the hovered slot).
-        // No HTMAXBUTTON hook: there is no maximize button (no SnapLayout).
-        LRESULT hit = DefWindowProcW(w, msg, wp, lp);   // v7.1.26: W -- the window is Unicode
-        switch (hit) {
-            case HTNOWHERE:
-            case HTRIGHT:
-            case HTLEFT:
-            case HTTOPLEFT:
-            case HTTOP:
-            case HTTOPRIGHT:
-            case HTBOTTOMRIGHT:
-            case HTBOTTOM:
-            case HTBOTTOMLEFT: {
-                return hit;
-            }
-        }
-        POINT cursor_point = {0};
-        cursor_point.x = GET_X_PARAM(lp);
-        cursor_point.y = GET_Y_PARAM(lp);
-        ScreenToClient(w, &cursor_point);
-        // We should not return HTTOP when hit-testing a maximized window
-        if (!win32_window_is_maximized(w) && cursor_point.y > 0 &&
-            cursor_point.y < g_frmInsY) {
-            return HTTOP;
-        }
-
-        // Since we are drawing our own caption, this needs a custom test
-        if (cursor_point.y < kCapH) {
-            return HTCAPTION;
-        }
-
-        return HTCLIENT; }
-    case WM_NCMOUSEMOVE: {
-        // v7.1.24 (main.c): track which caption button the mouse is over
-        // -- the hovered slot rides GWLP_USERDATA, exactly like the
-        // example. The buffered bar repaints as ONE blit on every change
-        // (the example invalidates the three button rects; the buffered
-        // full-bar blit lands the same pixels with no intermediate state).
-        POINT cursor_point;
-        GetCursorPos(&cursor_point);
-        ScreenToClient(w, &cursor_point);
-
-        RECT cr; GetClientRect(w, &cr);
-        const RECT bar = { 0, 0, cr.right, kCapH };
-        const CustomTitleBarButtonRects button_rects =
-            win32_get_title_bar_button_rects(w, &bar);
-
-        int new_hovered_button = CustomTitleBarHoveredButton_None;
-        if (PtInRect(&button_rects.close, cursor_point)) {
-            new_hovered_button = CustomTitleBarHoveredButton_Close;
-        } else if (PtInRect(&button_rects.minimize, cursor_point)) {
-            new_hovered_button = CustomTitleBarHoveredButton_Minimize;
-        }
-        if (new_hovered_button != (int)GetWindowLongPtrW(w, GWLP_USERDATA)) {
-            // v7.1.24: the slot updates FIRST, then the bar repaints -- the
-            // buffered blit is synchronous and would otherwise land the
-            // STALE face (the example's InvalidateRect is async, so its
-            // invalidate-before-set order never shows the old state).
-            SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)new_hovered_button);
-            guiPaintBar(w);
-        }
-        return DefWindowProcW(w, msg, wp, lp); }   // v7.1.26: W, not the A macro
     case WM_NCACTIVATE:
         // v7.2.9: latch the frame's OWN state FIRST -- WM_NCACTIVATE's
         // wParam is the activation state win32k is rolling out RIGHT NOW,
@@ -8605,82 +8497,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (dc != d->hDC)
             BitBlt(d->hDC, rc.left, rc.top, bw, bh, dc, 0, 0, SRCCOPY);
         return TRUE; }
-    case WM_NCLBUTTONDOWN:
-        // v7.1.24 (main.c): clicks on the caption buttons are handled in
-        // WM_NCLBUTTONUP, but the DOWN must not count as a drag start --
-        // swallow it when a button slot is hovered. Everything else keeps
-        // the default handling (dragging, and the double-click maximize
-        // that the size lock refuses anyway). Ideally you also want to
-        // check that the mouse hasn't moved out or too much between DOWN
-        // and UP messages -- the example's own caveat, kept: the hovered
-        // slot re-evaluates on every NC mouse move, so a release off the
-        // button simply dispatches nowhere.
-        if (GetWindowLongPtrW(w, GWLP_USERDATA)) {
-            return 0;
-        }
-        break;
-    // v7.1.24 (main.c): map the button clicks to the right messages. The
-    // close posts WM_CLOSE -- twinspeak's WM_CLOSE hides to the tray with
-    // the engine still running, unchanged. Minimize is new (the example's
-    // SW_MINIMIZE; the taskbar button restores it via SC_RESTORE, which
-    // WM_SYSCOMMAND passes again). There is no maximize branch: no
-    // maximize button is drawn, the size lock refuses SC_MAXIMIZE.
-    case WM_NCLBUTTONUP: {
-        const int hovered = (int)GetWindowLongPtrW(w, GWLP_USERDATA);
-        if (hovered == CustomTitleBarHoveredButton_Close) {
-            PostMessageA(w, WM_CLOSE, 0, 0);
-            return 0;
-        } else if (hovered == CustomTitleBarHoveredButton_Minimize) {
-            ShowWindow(w, SW_MINIMIZE);
-            return 0;
-        }
-        break; }
-    case WM_NCRBUTTONUP:
-        // v7.1.24 (main.c): right-click the caption -- the system menu with
-        // the item states the size lock actually honors. The example
-        // enables Move/Size/Maximize on a non-maximized window; here the
-        // v7.1.20 size lock refuses Size and Maximize outright, so those
-        // two are DISABLED (a dead menu item is the same lie as a dead
-        // button) while Move (dragging works), Minimize, Close and the
-        // appended "Exit twinspeak" (IDM_TRAY_EXIT through WM_SYSCOMMAND)
-        // stay real. ONE further deviation from the example: the handled
-        // case returns 0, because DefWindowProc(WM_NCRBUTTONUP) posts its
-        // own SC_MOUSEMENU menu on top of the one already shown.
-        if (wp == HTCAPTION) {
-            BOOL const isMaximized = IsZoomed(w);
-            MENUITEMINFO menu_item_info;
-            memset(&menu_item_info, 0, sizeof(menu_item_info));
-            menu_item_info.cbSize = sizeof(menu_item_info);
-            menu_item_info.fMask  = MIIM_STATE;
-            HMENU const sys_menu = GetSystemMenu(w, false);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_RESTORE,  isMaximized);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_MOVE,     true);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_SIZE,     false);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_MINIMIZE, true);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_MAXIMIZE, false);
-            set_menu_item_state(sys_menu, &menu_item_info, SC_CLOSE,    true);
-            BOOL const result = TrackPopupMenu(sys_menu, TPM_RETURNCMD,
-                                               GET_X_PARAM(lp), GET_Y_PARAM(lp),
-                                               0, w, NULL);
-            if (result != 0) {
-                PostMessageA(w, WM_SYSCOMMAND, result, 0);
-            }
-            return 0;
-        }
-        break;
-    case WM_SETCURSOR:
-        // v7.1.24 (main.c): show an arrow instead of the busy cursor.
-        SetCursor(LoadCursor(nullptr, IDC_ARROW));
-        break;
-    case WM_MOUSEMOVE:
-        // v7.1.24 (main.c): if the mouse gets into the client area then no
-        // caption button is hovered -- reset the hover state.
-        if (GetWindowLongPtrW(w, GWLP_USERDATA)) {
-            SetWindowLongPtrW(w, GWLP_USERDATA,
-                              (LONG_PTR)CustomTitleBarHoveredButton_None);
-            guiPaintBar(w);
-        }
-        break;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
         if (code != BN_CLICKED) break;
@@ -9012,25 +8828,23 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // tick sleep while hidden (it returns in guiRestoreWindow). The
         // hidden tray surrogate ignores WM_CLOSE entirely (taskkill
         // broadcasts reach it too).
+        // v7.5.0: the hide itself is guiHideToTray -- the same SILENT
+        // gesture putWindowinTray(true) performs through the API. The
+        // balloon stays HERE, in twinspeak.cpp: it answers a user's close,
+        // never an API-driven hide.
         if (w == g_trayWnd) return 0;
-        guiCaptureWindowPos(w);
-        KillTimer(w, 1);
-        // v7.1.26: no DeleteTab -- hiding a window removes its native
-        // taskbar button by itself.
         // v7.2.12: the "still running" hint used to ride trayAdd(true) --
         // but trayAdd early-returns while the icon is ALREADY in the tray,
         // i.e. ALWAYS in the normal close-to-tray flow, so the first-three-
         // closes balloon never fired even once (dead code since v7.1.20).
-        // It shows here now, directly, still capped at three per session;
-        // trayAdd(true) stays for the rare icon-was-missing re-add case.
+        // It shows here now, directly, still capped at three per session.
         if (g_trayVisible && g_closeHints < 3) {
             ++g_closeHints;
             trayBalloon("Still running -- the engine stays up.\n"
                         "Click this icon to reopen the window; "
                         "right-click for Start/Stop and Exit.");
         }
-        trayAdd(true);
-        ShowWindow(w, SW_HIDE);
+        guiHideToTray(w);
         return 0;
     case WM_DESTROY:
         trayRemove();
