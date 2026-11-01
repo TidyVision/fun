@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,24 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.8 THE BUTTON AUDIT. Field, after v7.4.7's activating show: "I
+//            still don't see it on the taskbar." The button's birth rides
+//            the shell's event channels, and the field machine missed it
+//            on both: the show event (v7.1.7's no-activate lag -- v7.4.7
+//            fixed the show and the button still stayed unborn) and the
+//            foreground event (the launch activation can be suppressed by
+//            the foreground lock, so no foreground event ever fires for
+//            the window -- the user's own unfocus + refocus cycle is the
+//            first real foreground event the shell sees, which is exactly
+//            when the button appeared). tsEnsureTaskbarButton now runs
+//            after EVERY first show (plain start AND guiRestoreWindow):
+//            the thread-input attach dance takes the foreground when the
+//            launch activation was suppressed, and WS_EX_APPWINDOW is
+//            asserted once -- a button-worthiness STYLE change, a third
+//            channel that depends on neither of the others; the taskbar
+//            re-evaluates the window and births the NATIVE button (this
+//            is a style bit, not ITaskbarList::AddTab -- AddTab is the
+//            v7.1.26 one-letter-stub trap).
 //    v7.4.7 THE BUTTON RIDE. Field: "The 'TidyVision TwinSpeak' will not
 //            show up anywhere on the taskbar until I unfocus and refocus
 //            the window" -- a plain launch opened the panel but the
@@ -7585,6 +7603,51 @@ static void tsSetWindowAumid(HWND w, const wchar_t* id) {
          SUCCEEDED(hr) ? "set" : "FAILED", (unsigned long)hr);
 }
 
+// ---- v7.4.8: THE BUTTON AUDIT ------------------------------------------------
+// The taskbar button is the shell's own birth: a visible top-level window
+// gets one. But the birth rides the shell's event channels, and the field
+// machine has now missed it on BOTH: the show event (v7.1.7's "a button
+// that lagged behind a no-activate show" -- v7.4.7 made the first show
+// activating and the button STILL stayed unborn), and the foreground event
+// (the launch activation can be suppressed by the foreground lock, so no
+// foreground event fires for the window at all -- the user's own unfocus +
+// refocus cycle is the first real foreground event the shell sees, which is
+// exactly when the button finally appeared). The audit makes the birth
+// independent of both channels, after every first show:
+//   1. If the window did not actually win the foreground, take it with the
+//      thread-input attach dance (the classic SetForegroundWindow unlock:
+//      attach to the foreground thread's input queue, call, detach -- the
+//      foreground lock denies a plain call from a process whose launch
+//      grant has gone stale).
+//   2. Assert WS_EX_APPWINDOW once. A button-worthiness style change is a
+//      THIRD channel that depends on neither the show event nor the
+//      foreground event -- win32k announces the style change, the taskbar
+//      re-evaluates the window and births the NATIVE button (full size,
+//      full label). This is a style bit, NOT ITaskbarList::AddTab -- AddTab
+//      is what Win11 files as a TAB and renders as a one-letter stub (the
+//      v7.1.26 trap). For a normal top-level window the bit is what the
+//      default styles already produce, so it changes nothing visually; it
+//      only guarantees the button can never stay unborn.
+static void tsEnsureTaskbarButton(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    if (GetForegroundWindow() != w) {
+        const DWORD fgTid = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        const DWORD myTid = GetCurrentThreadId();
+        const BOOL attached = (fgTid && fgTid != myTid)
+                              ? AttachThreadInput(myTid, fgTid, TRUE) : FALSE;
+        SetForegroundWindow(w);
+        SetFocus(w);
+        if (attached) AttachThreadInput(myTid, fgTid, FALSE);
+    }
+    const LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+    if (!(ex & WS_EX_APPWINDOW)) {
+        SetWindowLongPtrW(w, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
+        SetWindowPos(w, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 static void guiRestoreWindow() {
     // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
     // tray menu, second instance); every later ask just shows it.
@@ -7592,6 +7655,7 @@ static void guiRestoreWindow() {
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_hwnd);
+    tsEnsureTaskbarButton(g_hwnd);   // v7.4.8: the audit -- birth the button if the shell missed it
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
@@ -7699,8 +7763,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.7  |  %s",  // v7.4.7 the button ride: the first show activates (SW_SHOW) so the taskbar
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // button is born with it; v7.4.6 retired CS_DROPSHADOW (the tray-reopen ghost)
+    snprintf(vbuf, sizeof(vbuf), "v7.4.8  |  %s",  // v7.4.8 the button audit: the foreground dance + WS_EX_APPWINDOW after every
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // first show; v7.4.7 made the first show activating (SW_SHOW)
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -9024,6 +9088,14 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // pre-render already made activation safe.
         SetForegroundWindow(g_hwnd);
         SetActiveWindow(g_hwnd);
+        // v7.4.8 THE BUTTON AUDIT: the activating show (v7.4.7) was still
+        // not enough on the field machine -- the button stayed unborn until
+        // an unfocus + refocus cycle. The audit takes the foreground with
+        // the attach dance when the launch activation was suppressed, and
+        // asserts WS_EX_APPWINDOW -- a button-worthiness style change on a
+        // channel that depends on neither the show nor the foreground
+        // event (see the helper above for the full mechanism).
+        tsEnsureTaskbarButton(g_hwnd);
         // v7.1.26: no AddTab -- the native button arrives with the show.
         guiClampToWorkArea(g_hwnd);      // v7.1.20: never open half off-screen
         g_userShown = true;              // v7.1.20: a user double-clicked -- boot yields
