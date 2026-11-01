@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,23 +23,6 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.4.6 THE SHADOW SCRUB. Field, after v7.4.5: "Yet again, I still
-//            get this. Is there even a proper way of having the window
-//            show when the tray icon is clicked?" The luminance scan of
-//            the field's screenshot settles it: the ghost is STACKED
-//            shadow bands below/right of the true rect -- one layer
-//            stranded per hide/show cycle -- and the earlier move fix
-//            died because both SetWindowPos calls shared one dispatch,
-//            so DWM never committed a frame at the offset. Three moves
-//            now: WM_CLOSE sets DWMWA_NCRENDERING_POLICY DISABLED before
-//            the hide (the hide retires an empty frame visualization --
-//            nothing stale survives it); the show sets ENABLED (DWM
-//            rebuilds the visualization from zero); then the TWO-COMPOSE
-//            SCRUB -- two pixels diagonally, DwmFlush, back, DwmFlush --
-//            pinning one compose at the offset and one at the true rect.
-//            The v7.4.5 sheet re-commit is retired (measured no-op);
-//            the v7.4.4 frame nudge stays (measured: shrank the ghost).
-//            Version steps to 7.4.6.
 //    v7.4.5 THE SHEET RE-COMMIT. Field, after v7.4.4: "At least only the
 //            right and bottom ghost shadow appears now, but I want to get
 //            rid of it. I would do option 2." The v7.4.4 frame-change
@@ -7567,30 +7550,6 @@ static void guiRestoreWindow() {
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
-    // v7.4.6 THE RELIGHT. The screenshot's pixel profile (the field's
-    // image, luminance-scanned edge by edge) shows the ghost for what it
-    // is: STACKED shadow bands below and right of the true rect -- one
-    // layer stranded per close/reopen cycle (three bands under the
-    // bottom edge in the field's shot; the top/left twins hide under
-    // the window itself). DWMWA_NCRENDERING_POLICY is the documented
-    // kill switch for the whole DWM frame visualization -- borders and
-    // drop shadow both. The cycle now runs: WM_CLOSE sets DISABLED
-    // before the hide (the hide retires an empty visualization; nothing
-    // stale can survive it), and the show sets ENABLED here -- DWM
-    // rebuilds the visualization from zero, sheet margins persist
-    // through the toggle. Both land inside their own dispatch, so no
-    // visible frame ever runs with NC rendering off; even if one did,
-    // row 0 would render as the bar's own dark byte, never white.
-    {
-        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
-        const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
-            LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
-        if (dwmSet) {
-            const int ncrp = 2;   // DWMNCRP_ENABLED -- the relight
-            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrp,
-                   sizeof(ncrp));
-        }
-    }
     // v7.4.4 THE SHADOW REBUILD. Close-to-tray hides with SW_HIDE, which
     // retires the window's DWM visual -- the drop shadow goes with it.
     // SW_SHOW resurrects the window from the frame metadata cached at the
@@ -7602,36 +7561,40 @@ static void guiRestoreWindow() {
     // the frame + shadow against the live rect. NOACTIVATE: the
     // SetForegroundWindow above just ran; the nudge must not start a second
     // activation flip behind it. Geometry only -- the glass sheet, the
-    // recipe rows and every painted byte are untouched. (v7.4.4 measured:
-    // it shrank the ghost to the right/bottom bands.)
+    // recipe rows and every painted byte are untouched.
     SetWindowPos(
       g_hwnd, NULL,
       0, 0, 0, 0,
       SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
       SWP_NOACTIVATE
     );
-    // v7.4.6 THE TWO-COMPOSE SCRUB. The earlier one-dispatch move was
-    // measured dead -- and the scan shows why: both SetWindowPos calls
-    // landed inside ONE message dispatch, and DWM composes ASYNC to this
-    // thread, so it can treat the net change as zero and never commit a
-    // frame at the offset at all. The scrub pins the two composes: move
-    // two pixels diagonally, DwmFlush (the v7.3.0 house handle -- blocks
-    // until a compose has COMPLETED, i.e. a frame now exists with the
-    // window at the offset), move back, DwmFlush again (a frame exists
-    // at the true rect). Two guaranteed DISTINCT composes: whatever
-    // shadow layer survived the cycle is rebuilt at the offset and
-    // re-landed at the true rect, and the bands stranded by PREVIOUS
-    // cycles are recomposed away by the same two frames. Sub-perceptual:
-    // two pixels for one compose, no repaint, no bar byte touched,
-    // never the white top bar.
-    RECT wr;
-    if (GetWindowRect(g_hwnd, &wr)) {
-        SetWindowPos(g_hwnd, NULL, wr.left + 2, wr.top + 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        if (g_dwmFlush) g_dwmFlush();
-        SetWindowPos(g_hwnd, NULL, wr.left, wr.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        if (g_dwmFlush) g_dwmFlush();
+    // v7.4.5 THE SHEET RE-COMMIT (option 2). The field, after v7.4.4: "At
+    // least only the right and bottom ghost shadow appears now, but I want
+    // to get rid of it." The nudge recomputes the win32 side of the frame;
+    // the DWM side can still resurrect the visual retired at SW_HIDE --
+    // the right/bottom ghost is DWM's stale shadow projection outliving
+    // the frame change. The sheet is the DWM-side half of the frame
+    // commitment (v7.1.27), and WM_DWMCOMPOSITIONCHANGED has re-committed
+    // it since v7.3.1 (the RAD adoption) whenever DWM's frame state goes
+    // stale -- a tray hide/show is exactly such a staleness. Two commits,
+    // not one: a re-extend of UNCHANGED margins can be filtered as a
+    // no-op, so first {0,0,0,0} (a real change -- the stale frame
+    // visualization is dropped) and then {0,0,1,0} (a real change --
+    // frame + shadow are rebuilt against the live rect). Both land inside
+    // this one dispatch; the settled state is the exact v7.1.27 sheet.
+    // The bar's bytes never move -- worst case one compose lands between
+    // the commits and row 0 renders one frame as its plain painted pixel
+    // (the recipe's dark gray or black, never white).
+    typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
+    typedef struct { int cxLeftWidth, cxRightWidth,
+                     cyTopHeight, cyBottomHeight; } TS_MARGINS;
+    const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
+        LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+    if (dwmExtend) {
+        const TS_MARGINS off   = { 0, 0, 0, 0 };
+        const TS_MARGINS sheet = { 0, 0, 1, 0 };
+        dwmExtend(g_hwnd, &off);
+        g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
     }
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
@@ -7691,7 +7654,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.6  |  %s",  // v7.4.6 the shadow scrub: NC kill/relight + two-compose move, every cycle
+    snprintf(vbuf, sizeof(vbuf), "v7.4.5  |  %s",  // v7.4.5 the sheet re-commit: 0 -> {0,0,1,0} after the v7.4.4 frame nudge, every restore
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8758,28 +8721,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                         "right-click for Start/Stop and Exit.");
         }
         trayAdd(true);
-        // v7.4.6 THE KILL. The close half of the shadow cycle: retire the
-        // window's whole DWM frame visualization (borders + drop shadow)
-        // BEFORE the hide, so the hide retires an EMPTY visualization and
-        // nothing stale can survive into the next show (the relight lives
-        // in guiRestoreWindow). The screenshot scan shows the ghost as
-        // shadow layers stranded per hide/show cycle -- this is where the
-        // cycle stops carrying them. Attribute 2 = DWMWA_NCRENDERING_POLICY,
-        // value 1 = DWMNCRP_DISABLED; dwmapi.h is not included -- the house
-        // spelled-out typedef, same as every attribute call here. The
-        // window is about to hide, so no visible frame runs without the
-        // frame visualization; if one ever did, row 0 renders as the
-        // bar's own dark byte, never white.
-        {
-            typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
-            const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
-                LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
-            if (dwmSet) {
-                const int ncrp = 1;   // DWMNCRP_DISABLED -- the kill
-                dwmSet(w, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrp,
-                       sizeof(ncrp));
-            }
-        }
         ShowWindow(w, SW_HIDE);
         return 0;
     case WM_DESTROY:
