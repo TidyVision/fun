@@ -1,4 +1,11 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.10: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.2.11: version bump
+// (the latch answers for every path: the v7.2.9 NC latch moves into
+// guiPaintBar, so no painter -- WM_PAINT, the bar hover paths, the
+// settle-burst ticks, applyTheme -- can re-land the stale ACTIVE face and
+// the alpha-0 bare-glass row in the transaction window between
+// WM_NCACTIVATE and WM_ACTIVATE anymore; that stale face was the black
+// caption + vanished top border the field's second tape catches on every
+// unfocus). v7.2.10: version bump
 // (the ever-seeded cache: the standalone seeder timer owns the initial
 // g_instantInactive seed -- the burst-tail measure can lose the race against
 // the quick-toggle test loop and the cache stayed empty for whole sessions,
@@ -26,8 +33,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,2,10,0
-PRODUCTVERSION  7,2,10,0
+FILEVERSION     7,2,11,0
+PRODUCTVERSION  7,2,11,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -38,12 +45,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.2.10.0"
+            VALUE "FileVersion",      "7.2.11.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.2.10.0"
+            VALUE "ProductVersion",   "7.2.11.0"
         END
     END
     BLOCK "VarFileInfo"

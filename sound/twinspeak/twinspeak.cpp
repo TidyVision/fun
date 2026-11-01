@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.2.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.2.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,36 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.2.11 THE LATCH ANSWERS FOR EVERY PATH. The field's second tape
+//            (60 fps, the top border parked on the white titlebar of OBS):
+//            on EVERY unfocus the deactivation plays one correct inactive
+//            frame, then TWO frames where the caption flips back to BLACK
+//            and the top border VANISHES against the white surface, then
+//            the settled inactive face -- the exact "redrawn as the input
+//            has never been gotten yet until the second frame" report, on
+//            the version that already carries the ever-seeded cache. The
+//            tape kills the no-cache theory for this artifact: the flash
+//            is not the row riding the glass fade, it is a STALE FACE --
+//            a painter running between WM_NCACTIVATE(FALSE) and
+//            WM_ACTIVATE (the queue's view of activation has not caught
+//            up; GetActiveWindow still returns us) that read the plain
+//            queue view in guiPaintBar and re-landed the ACTIVE bar: the
+//            black caption AND the ACTIVE row bytes, alpha 0 = bare glass
+//            = the bright row over the light backdrop. v7.2.9 taught
+//            WM_NCPAINT to follow the NC latch (g_ncActive, the frame's
+//            own activation state, latched inside the transaction); this
+//            version HOISTS that latch into guiPaintBar itself -- the one
+//            function every painter passes through (WM_PAINT, the bar
+//            hover paths WM_NCMOUSEMOVE/WM_MOUSEMOVE, the settle-burst
+//            timer ticks, applyTheme's synchronous repaint): when the
+//            latch and the queue view disagree the transaction is still
+//            open and the LATCHED state paints, so no path can re-land a
+//            stale face in the transaction window anymore; after
+//            WM_ACTIVATE the views agree and every path reads the plain
+//            truth exactly as before. The force flags (v7.2.3 deactivation
+//            pre-flip present, v7.2.9 symmetric activation present and
+//            WM_NCPAINT mid-transaction branch) keep winning unchanged.
+//            Version steps to 7.2.11.
 //    v7.2.10 THE EVER-SEEDED CACHE. The field: "My only issue is that
 //            the window titlebar's top border is flashing whenever I
 //            deactivate the window... the window is redrawn as the
@@ -4916,9 +4946,38 @@ static void guiPaintBar(HWND w) {
     // present (WM_NCACTIVATE(TRUE)) and a mid-transaction WM_NCPAINT use
     // it when the NC state has flipped but the queue has not caught up
     // (GetActiveWindow still returns the OTHER window there).
+    // v7.2.11 THE LATCH ANSWERS FOR EVERY PATH. The v7.2.9 NC latch guarded
+    // exactly one painter -- WM_NCPAINT. But it is only ONE of the painters
+    // that can run while the activation transaction is open, between
+    // WM_NCACTIVATE and WM_ACTIVATE, with the queue's view (GetActiveWindow)
+    // still reporting the OLD state: WM_PAINT, the bar hover paths
+    // (WM_NCMOUSEMOVE, WM_MOUSEMOVE), the settle-burst timer ticks,
+    // applyTheme's synchronous repaint -- every one of them read the plain
+    // queue view at this exact line, and on a deactivation that view is
+    // STALE: it still reports ACTIVE, so any such paint re-landed the
+    // ACTIVE face (the caption flips back to black) and the ACTIVE row
+    // bytes (alpha 0 = bare glass = the bright row over a light backdrop)
+    // for one to two composes, until WM_ACTIVATE -- one queue hop later --
+    // painted the truth. The field's 60 fps tape catches exactly that
+    // sequence on every unfocus: one correct inactive frame (the v7.2.3
+    // pre-flip present), then two frames of black caption + vanished top
+    // border, then the settled inactive face. The fix is the WM_NCPAINT
+    // latch, hoisted to the ONE place every painter passes through: when
+    // the frame's own state (g_ncActive, latched at WM_NCACTIVATE -- both
+    // directions) disagrees with the queue's view, the transaction is still
+    // open -- paint the LATCHED state, never the stale one. After
+    // WM_ACTIVATE the two views agree and the ordinary read runs, unchanged
+    // for every path. (The force flags keep winning over both -- the
+    // WM_NCACTIVATE pre-flip presents and the WM_NCPAINT mid-transaction
+    // branch set them explicitly and compute the same answer.)
+    const bool queueActive = (GetActiveWindow() != nullptr);   // GUI thread only
+    const bool latchedActive =
+        (g_ncActive >= 0 && (g_ncActive != 0) != queueActive)
+            ? (g_ncActive != 0)                                // transaction open:
+            : queueActive;                                     // the frame's own truth
     const bool active = g_forceActiveFace
                         || (!g_forceInactiveFace
-                            && (GetActiveWindow() != nullptr));   // GUI thread only
+                            && latchedActive);
     RECT cr; GetClientRect(w, &cr);
     const int cw = cr.right - cr.left;
     if (cw <= 0) return;
@@ -7146,7 +7205,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.2.10  |  %s",  // v7.2.10 the ever-seeded cache (v7.2.9 the one-frame row traced and killed)
+    snprintf(vbuf, sizeof(vbuf), "v7.2.11  |  %s",  // v7.2.11 the latch answers for every path (v7.2.10 the ever-seeded cache)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7408,6 +7467,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // transaction (the normal case -- WM_ACTIVATE has run, or the
         // paint is an ordinary frame redraw) the two views agree and
         // the plain truth paints itself, unchanged from v7.2.8.
+        // v7.2.11: the latch now lives INSIDE guiPaintBar (every painter
+        // passes through it), so this branch is belt-and-braces -- the
+        // force flags below re-affirm what guiPaintBar computes on its
+        // own; they stay for the explicitness and as the outer belt.
         if (IsWindowVisible(w) && !IsIconic(w)) {
             const bool queueActive = (GetActiveWindow() != nullptr);
             if (g_ncActive >= 0 && (g_ncActive != 0) != queueActive) {
