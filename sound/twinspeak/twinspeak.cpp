@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,148 +23,39 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.3.9 THE BORDER THAT COPIES THE BORDER. Field: "This is what the
-//            top border looks like if it's layered on top of a color
-//            252,252,252." And: "Well, I want the window border's top bar
-//            like the left, right and bottom one. Totally accurate."
-//            The three DWM strips are the DWM's OWN border rendering --
-//            a semi-transparent, dark-tinted line that re-blends with
-//            whatever sits behind the window; row 0 can never BE that
-//            rendering (a top NC strip paints the ghost caption outside
-//            the rect -- v7.1.27) and must not SIMULATE it (v7.3.7's
-//            constant read "always black"). It COPIES it: while active,
-//            row 0 is the OPAQUE measured color of the actually rendered
-//            border line on the window's own left strip (one BitBlt off
-//            the composed screen, darkest-of-4-columns per scan row,
-//            median by luma -- the house statistic), kept fresh by the
-//            fade presenter's train behind a 12-tick no-sample gate (the
-//            DWM's ~200 ms activation fade rides the sticky copy -- a
-//            mid-fade sample would flash the row down and back, the
-//            v7.2.10 flash class) and re-kicked on every WM_MOVE, so
-//            dragging the window over complete white re-copies the
-//            border on the way. Inactive keeps the v7.3.2 hold/recipe
-//            byte-for-byte; the glass key survives only as the failed-
-//            sample fallback. Version steps to 7.3.9.
-//    v7.3.8 THE ROW REVERTED, THE SIZE EVENT STAYS. Field: "This just
-//            makes the top border always black. Please revert that top
-//            border change." The v7.3.7 opaque constant row is
-//            withdrawn in full: all three row-0 writers return to the
-//            exact v7.3.2-recipe behavior -- the alpha-0 glass key when
-//            active (the REAL DWM sheet shows; the blend over a white
-//            backdrop is what real glass IS, and the field prefers the
-//            real border over a constant imitation), the backdrop-
-//            tracked hold / half-alpha recipe when inactive. The other
-//            half of v7.3.7 -- the reopen's REAL one-pixel size event,
-//            gated through the size lock, after the identity
-//            re-assertion -- is NOT touched and stays. Version steps
-//            to 7.3.8.
-//    v7.3.7 THE SIZE EVENT + THE ROW THAT BLENDS WITH NOTHING. Field:
-//            "I still get the bug. Also ... the window border's top bar
-//            is blending its color wrong when being layered on complete
-//            white." Two fixes, one version.
-//            THE SHADOW: three levers are now field-falsified -- the
-//            net-zero move (v7.3.4, coalesced), the attribute re-send
-//            (v7.3.5, the shadow reads geometry not attributes), the
-//            frame change (v7.3.3/v7.3.6, no re-anchor; the changelog's
-//            claim that v7.3.3 fixed the shadow was never field-
-//            confirmed). The one path never tried is the SIZE EVENT:
-//            the shadow visual is laid out against the composition
-//            surface, and a real surface resize re-lays it out -- the
-//            same reason the shadow visibly tracks every resize on a
-//            normal window, the same class of geometry event that laid
-//            the correct shadow down at CREATE. The reopen now ends
-//            with one REAL pixel of height added and taken back, AFTER
-//            the identity re-assertion (v7.3.6's frame change ran
-//            before the attributes -- the wrong order -- and is
-//            retired). The size lock gains a two-call gate
-//            (g_reopenNudge) or it would clamp the nudge out of
-//            existence. THE BORDER: every row-0 state used to depend on
-//            the backdrop -- ACTIVE was the alpha-0 glass key (the real
-//            sheet showed, and the sheet is GLASS: over complete white
-//            it washed out -- the field's new tape) and inactive was
-//            the backdrop-tracked hold or the half-alpha recipe. The
-//            row is now the OPAQUE constant BGRA(43,43,43,255) in
-//            every state: over dark backdrops byte-for-byte the look
-//            the glass produced, over white the dark border, uniform
-//            with the three DWM strips, blending with nothing. The
-//            fade problem retires by construction. Version steps to
-//            7.3.7.
-//    v7.3.6 THE FRAME THE REBUILD WAS OWED. Field: "I still get the same
-//            issue ... when I open the system tray, my mouse also treats
-//            the window like it's going to resize but it's made not to
-//            resize." The second face is the diagnosis. The resize intent
-//            and the detached shadow are THE SAME stale geometry: the
-//            plain SW_SHOW after a SW_HIDE rebuilds the window's DWM node
-//            WITHOUT the frame-geometry notification -- the shadow
-//            re-anchors one standard frame off on right/bottom (the
-//            field tape) and the pointer's edge bands ride the phantom
-//            with it. v7.3.4 moved the rect (coalesced to no change);
-//            v7.3.5 re-asserted the attributes -- the sheet never needed
-//            it (it survives the node rebuild, which is why the top
-//            border stayed dark) and the shadow reads geometry, not
-//            attributes. The one event that re-derives BOTH is the frame
-//            change -- v7.3.3 proved it and died on ONE mistake: the
-//            re-derived sheet came up WITHOUT the immersive dark tint
-//            and nothing ever invalidated it again. So v7.3.6 runs the
-//            frame change FIRST and the v7.3.5 re-assertion AFTER it, in
-//            this one handler turn: every DwmSetWindowAttribute is
-//            itself an invalidation, so the sheet rebuild is forced a
-//            second time, now reading dark-on; the {0,0,1,0} extend
-//            re-commits after the tint; DwmFlush waits out the compose
-//            in flight; guiPaintBar (the WM_NCPAINT the frame change
-//            pumps lands there) re-lands row 0 black over the rebuilt
-//            sheet. The white top border cannot ride the frame change
-//            anymore: the tint lands after the rebuild that dropped it,
-//            every reopen. The rect is never touched (NOMOVE + NOSIZE --
-//            no resize-lock pass, no move to coalesce). Version steps
-//            to 7.3.6.
-//    v7.3.5 THE REOPEN RECIPE. Field: "Again, I still get this bug. But
-//            at least the white top bar is gone, cuz that's how I want
-//            it." So v7.3.4's one-pixel move-and-return re-anchored
-//            nothing -- and that failure is the diagnosis: the rect was
-//            never the stale input, the ATTRIBUTES were. The tray reopen
-//            re-enters DWM composition, and the rebuilt node comes up
-//            with DEFAULTS for the window's DWM identity -- the corner
-//            preference (a ROUNDED shadow on the square window bulges
-//            past the right/bottom edges: exactly the field tape), the
-//            NC rendering policy, the immersive dark mode, the glass
-//            sheet extend. DWM coalesces a back-to-back +1/-1 move pair
-//            into no change; a frame change (v7.3.3) re-derives the
-//            sheet white. So the identity is re-ASSERTED after the
-//            reopen's ShowWindow, attribute by attribute, no frame
-//            event -- the same recipe the WM_DWMCOMPOSITIONCHANGED
-//            handler runs when the DWM rebuilds itself under the
-//            window, plus the corner attribute that path never needed:
-//            33 = DWMWCP_DONOTROUND (the shadow hugs the square rect
-//            again), 2 = DWMNCRP_ENABLED, 20/19 = dark mode on (the
-//            sheet can never ride the light-mode white), the {0,0,1,0}
-//            extend re-committed -- then one bar paint + a presenter
-//            kick, so the first compose of the reopened window samples
-//            OUR bytes over the re-asserted identity. Also fixed here:
-//            the frame's version line still read v7.2.12 -- never bumped
-//            through v7.3.x, which is why the field's tape showed an old
-//            number. Version steps to 7.3.5.
-//    v7.3.4 THE SHADOW RE-ANCHORS. Field: "when opening the window from
-//            clicking the system tray icon, the drop shadow gets screwed
-//            up and it doesn't get attached to the rectangle window
-//            position anymore. This issue only happens when opening the
-//            app from clicking on the tray icon." v7.3.3 (the
-//            SWP_FRAMECHANGED reframe at every re-entry) is WITHDRAWN:
-//            it re-anchored the shadow, but the frame-change event made
-//            the DWM re-derive the glass sheet WITHOUT the immersive
-//            dark-mode tint -- the v7.1.27 white top border, back. The
-//            base is the field's v7.3.2 zip, byte-for-byte, and the fix
-//            is the smallest lever that re-anchors a shadow WITHOUT any
-//            frame event: after the ShowWindow in guiRestoreWindow the
-//            window moves one pixel right and back, inside this one
-//            handler turn. The rect change is the one input DWM
-//            re-derives a shadow's anchor from; the sheet, the NC
-//            strips, the corner preference and WM_NCCALCSIZE are never
-//            touched, so nothing can re-white the border. A compose
-//            sampling between the two back-to-back calls would show a
-//            one-frame 1 px offset; the calls are microseconds apart --
-//            the same wager the row-first commit already wins every
-//            activation. Version steps to 7.3.4.
+//    v7.4.0 THE GLASS KEY, BOTH STATES. Field: "Start over from here.
+//            And make sure the top bar does not blend at the slightest."
+//            Then the pin: "Now remember, this top border issue only
+//            happens when the window is unfocused." Exactly -- and the
+//            asymmetry names the cause. While ACTIVE, row 0 is the glass
+//            key BGRA(0,0,0,0) and the DWM paints its REAL border through
+//            the sheet -- the very painter that draws the left/right/
+//            bottom strips -- which is why the focused window never
+//            blends. While INACTIVE, every writer landed a COMPUTED
+//            stand-in instead: the v7.3.2 tracked opaque row (43 +
+//            127*backdrop/255, median-measured from the desktop strip
+//            above the window) or, on a failed measurement, the recipe's
+//            half-alpha BGRA(43,43,43,128). Over a complete-white
+//            backdrop neither matches the DWM's own inactive strips --
+//            the stand-in washes out toward #A8A8A8 while the strips
+//            keep their real border color: the fade the field screenshotted.
+//            No constant, measurement or alpha of ours can imitate the
+//            strips on every backdrop -- only the DWM itself can. So the
+//            imitation stack is RETIRED whole and the glass key is now
+//            the row in BOTH states: the same proven bytes the active
+//            window has carried since v7.1.27. The DWM paints its own
+//            border through the sheet, flips it with the same state
+//            machine and the same compose that flip the three strips,
+//            and nothing of ours touches the pixel: not at half alpha,
+//            not through a measurement, not at the slightest. Retired
+//            with it: the backdrop measurement (guiHoldPxForBackdrop --
+//            the screen read, the luma median, the 43 + 127*B/255 math),
+//            the g_holdLive/g_holdPx latch pair, and the hold branches
+//            in all three writers. The fade presenter stays (it now
+//            re-presents a constant row -- pure belt), as do the
+//            row-first commit, the lParam -1 answer, DwmFlush, the sheet
+//            re-commit on WM_DWMCOMPOSITIONCHANGED and the no-sheet
+//            fallback. Version steps to 7.4.0.
 //    v7.3.2 THE HOLD THAT DOES NOT EXPIRE. Field: "I just see a
 //            transparency issue on the top border itself ... I think I
 //            might have experienced that 240ms timer that redrew the
@@ -5027,8 +4918,10 @@ static std::atomic<int> g_ncActive{-1};      // v7.2.9: the NC-latched activatio
 // window's REAL top border since v7.1.27: the DWM glass sheet shows
 // through the row while active (the accent color with the Windows
 // override, the default semi-transparent gray without), and since
-// v7.1.29 the recipe's premultiplied half-alpha gray BGRA(43,43,43,128)
-// -- composited BY THE DWM over the sheet -- while inactive.
+// v7.4.0 in BOTH states -- the glass key is the row active and inactive
+// alike, so the DWM's own border painter owns the pixel exactly like it
+// owns the left/right/bottom strips (the recipe's half-alpha gray and
+// the v7.3.x tracked hold are retired -- see the sheet-row essay).
 // The bar also dims when the window is INACTIVE
 // (GetActiveWindow) -- dim item color, dim title -- so the chrome reads
 // active vs. inactive like every native caption does.
@@ -5113,8 +5006,13 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
     // belongs to the border alone.
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
-        rowCol = active ? Gdiplus::Color(255, 0, 0, 0)       // the DWM frame
-                        : Gdiplus::Color(128, 43, 43, 43);   // RGBA(43, 0.5)
+        // v7.4.0: ONE brush for both states -- the glass key. The byte-exact
+        // patch (guiBarPatchSheetRow) lands BGRA(0,0,0,0) over this row in
+        // the buffered path anyway; the brush only keeps the rare
+        // straight-to-screen path consistent. The DWM paints its own border
+        // through the sheet, active AND inactive -- the same painter that
+        // owns the left/right/bottom strips, nothing of ours on the pixel.
+        rowCol = Gdiplus::Color(255, 0, 0, 0);               // the DWM frame, BOTH states
     } else {
         const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
         const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
@@ -5282,251 +5180,34 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // orders the GUI writes before the thread's reads.
 typedef HRESULT (WINAPI *TS_DWMFLUSH)(void);
 static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRealWindow (the house trick)
-// v7.3.2 THE HOLD THAT DOES NOT EXPIRE (the field: "basically remove the
-// 240ms timer"). The deactivation hold is a LATCH, not a clock:
-// g_holdLive is stamped 1 at WM_NCACTIVATE(FALSE) when a backdrop color
-// landed in g_holdPx, and stays set for the WHOLE inactive period --
-// every writer (guiBarPatchSheetRow, guiCommitSheetRowFast,
-// guiFadePresenter) lands the tracked OPAQUE row while it is set, so
-// the top border never snaps back to the see-through half-alpha blend
-// mid-inactivity. Cleared at WM_NCACTIVATE(TRUE) (the glass key returns)
-// and on a failed measurement (the vanilla recipe row rides). The old
-// 240 ms stamp (kHoldMs, g_holdUntil, the GetTickCount64 comparisons in
-// all three writers and the presenter's handover present) is retired
-// with the timer the field named.
-static std::atomic<int> g_holdLive{0};   // 1 = the tracked opaque row IS the inactive border
-static std::atomic<unsigned> g_holdPx{0};// the held OPAQUE row pixel (BGRA, alpha 255)
-// v7.3.9 THE SIDE-BORDER COPY, the state. While ACTIVE, row 0 is the
-// measured OPAQUE color of the DWM's own rendered border line (the left
-// strip, sampled off the composed screen by guiSideBorderPx below) -- the
-// same rendering the left/right/bottom strips carry, "totally accurate"
-// by being a copy of the real thing instead of a simulation of it.
-// g_sideLive = 1 once a sample landed; g_sidePx = the copied pixel (BGRA,
-// alpha 255 -- an opaque pixel on the sheet displays AS-IS, the v7.2.0
-// finding, so no blend math and no fade can touch it). Written by the
-// fade presenter thread ONLY (the train's active ticks); read by the row
-// writers on the GUI thread (release/acquire, the g_guiRowCommit
-// discipline). g_sideFadeGate = train ticks that must NOT sample:
-// WM_NCACTIVATE(TRUE) stamps 12 (~240 ms, clear of the DWM's ~200 ms
-// activation fade) so the fade rides the STICKY copy -- a mid-fade
-// sample would flash the row down to the dimming line color and back
-// (the v7.2.10 flash class); the train's tail ticks re-sample the
-// settled line. WM_MOVE kicks stamp nothing -- a drag samples
-// immediately, that is the tracking the field asked for.
-static std::atomic<int>      g_sideLive{0};     // 1 = the measured side-border copy IS the active row
-static std::atomic<unsigned> g_sidePx{0};       // the copied OPAQUE side-border pixel (BGRA, alpha 255)
-static std::atomic<int>      g_sideFadeGate{0}; // train ticks that must not sample (the activation fade)
-static unsigned g_holdScan[4 * 512];   // the sparse-scan scratch (guiHoldPxForBackdrop is the only writer)
-static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vanilla recipe row
-    HWND w = g_hwnd;
-    if (!w || !g_glassSheet || !IsWindow(w)) return 0;
-    RECT wr;
-    if (!GetWindowRect(w, &wr)) return 0;
-    MONITORINFO mi; mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
-    // the strip: rows 14..34 px ABOVE the window's top edge -- far enough
-    // to clear most of our own drop shadow's darkest band, close enough
-    // to track the blur neighborhood the DWM samples at row 0.
-    const int stripTop = wr.top - 34, stripBottom = wr.top - 14;
-    if (stripTop < mi.rcMonitor.top || stripBottom <= stripTop) return 0; // docked at a monitor top
-    const int x0 = (wr.left + 16 > mi.rcMonitor.left) ? wr.left + 16 : mi.rcMonitor.left;
-    const int x1 = (wr.right - 16 < mi.rcMonitor.right) ? wr.right - 16 : mi.rcMonitor.right;
-    if (x1 - x0 < 32) return 0;
-    const int sw = x1 - x0, sh = stripBottom - stripTop;
-    // persistent strip DIB, grown on demand (single-threaded owner: no lock).
-    static HDC     s_dibDc = nullptr;
-    static HBITMAP s_bm    = nullptr;
-    static void*   s_bits  = nullptr;
-    static int     s_w = 0, s_h = 0;
-    if (!s_dibDc) {
-        HDC sdc = GetDC(nullptr);
-        if (!sdc) return 0;
-        s_dibDc = CreateCompatibleDC(sdc);
-        ReleaseDC(nullptr, sdc);
-        if (!s_dibDc) return 0;
-    }
-    if (sw > s_w || sh > s_h) {
-        if (s_bm) { DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr; s_w = s_h = 0; }
-        BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
-        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biPlanes      = 1;
-        bi.bmiHeader.biBitCount    = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        bi.bmiHeader.biWidth       = sw;
-        bi.bmiHeader.biHeight      = -sh;             // top-down
-        HDC sdc = GetDC(nullptr);
-        s_bm = sdc ? CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &s_bits, nullptr, 0) : nullptr;
-        if (sdc) ReleaseDC(nullptr, sdc);
-        if (!s_bm || !s_bits) return 0;
-        if (!SelectObject(s_dibDc, s_bm)) { DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr; return 0; }
-        s_w = sw; s_h = sh;
-    }
-    HDC sdc = GetDC(nullptr);
-    if (!sdc) return 0;
-    const BOOL ok = BitBlt(s_dibDc, 0, 0, sw, sh, sdc, x0, stripTop, SRCCOPY);
-    ReleaseDC(nullptr, sdc);
-    if (!ok) return 0;
-    // sparse scan: every 8th px on four rows spread across the strip;
-    // MEDIAN BY LUMA (the v7.2.13 statistic -- one hot pixel, a cursor or
-    // a notification corner, cannot steer the color).
-    const int cap = (int)(sizeof(g_holdScan) / sizeof(g_holdScan[0]));
-    unsigned luma[sizeof(g_holdScan) / sizeof(g_holdScan[0])];
-    int n = 0;
-    const int rows[4] = { 0, sh / 3, (2 * sh) / 3, sh - 1 };
-    for (int ri = 0; ri < 4; ++ri) {
-        const unsigned* row = (const unsigned*)((const unsigned char*)s_bits
-                              + (size_t)rows[ri] * (size_t)(s_w * 4));
-        for (int x = 4; x < sw && n < cap; x += 8) g_holdScan[n++] = row[x];
-    }
-    if (n < 8) return 0;
-    for (int i = 0; i < n; ++i) {
-        const unsigned p = g_holdScan[i];
-        luma[i] = (unsigned)((((int)(p >> 16) & 0xFF) * 77 +  // Rec.601-ish, the
-                              ((int)(p >> 8) & 0xFF) * 150 +  // house weights
-                              ((int)p & 0xFF) * 29) >> 8);    // (guiRenderBar)
-    }
-    // insertion sort of <= ~500 pairs, once per deactivation -- nothing.
-    for (int i = 1; i < n; ++i) {
-        const unsigned lv = luma[i], sv = g_holdScan[i];
-        int j = i - 1;
-        while (j >= 0 && luma[j] > lv) { luma[j + 1] = luma[j]; g_holdScan[j + 1] = g_holdScan[j]; --j; }
-        luma[j + 1] = lv; g_holdScan[j + 1] = sv;
-    }
-    const unsigned med = g_holdScan[n / 2];
-    // the settled recipe composite over THIS backdrop: 43 + 127*B/255.
-    const int cr = 43 + (((int)(med >> 16) & 0xFF) * 127 + 127) / 255;
-    const int cg = 43 + (((int)(med >> 8) & 0xFF) * 127 + 127) / 255;
-    const int cb = 43 + (((int)med & 0xFF) * 127 + 127) / 255;
-    return 0xFF000000u | ((unsigned)cr << 16) | ((unsigned)cg << 8) | (unsigned)cb; // BGRA, opaque
-}
-// v7.3.9 THE SIDE-BORDER COPY, the measurement. The field: "I want the
-// window border's top bar like the left, right and bottom one. Totally
-// accurate." The three DWM strips are the DWM's OWN border rendering --
-// a semi-transparent, dark-tinted line that re-blends with whatever sits
-// behind the window. Row 0 cannot BE that rendering (a top NC strip
-// makes the DWM paint a ghost caption OUTSIDE the window rect -- the
-// v7.1.27 lesson) and must not SIMULATE it (v7.3.7's constant read
-// "always black": a model of the border is always one model error away
-// from the border). It COPIES it instead: the actually rendered border
-// line, sampled off the COMPOSED SCREEN on the window's own left strip
-// -- whatever the DWM does to the strips (dark mode tint, an accent
-// override, the system transparency setting, the live backdrop), the
-// copy is byte-for-byte what the strips show.
-// Sampling: ONE BitBlt of a 4 x 60 px block at the window's left edge,
-// 17 scan rows starting 4 px below the top (clear of the corner blend),
-// the DARKEST-by-luma pixel per row (the border line is the darkest
-// element of the strip -- robust to which column DWM draws it on),
-// MEDIAN by luma across the rows (the house statistic -- one hot pixel,
-// a cursor crossing the edge, cannot steer the color). The LEFT edge on
-// purpose: the misanchored reopen shadow (the still-open tray-reopen
-// bug) rides right/down -- the left strip is the clean one. OPAQUE BGRA
-// out (an opaque pixel on the sheet displays as-is -- the v7.2.0
-// finding -- so the copy needs no blend math at all). 0 = no sample
-// (sheet failed, edge off-monitor, BitBlt failed): the writers ride the
-// sticky copy, else the v7.3.8 glass key -- never a made-up color.
-// Threading: the fade presenter thread is the ONLY caller (its active
-// train ticks); the scratch DIB below is its private state, exactly
-// like guiHoldPxForBackdrop's strip DIB is the GUI thread's.
-static unsigned guiSideBorderPx() {
-    HWND w = g_hwnd;
-    if (!w || !g_glassSheet || !IsWindow(w)) return 0;
-    RECT wr;
-    if (!GetWindowRect(w, &wr)) return 0;
-    MONITORINFO mi; mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
-    // the whole sampled block must sit on-screen: rows wr.top+4..+52 and
-    // columns wr.left..+3 are all inside the left NC strip.
-    if (wr.left < mi.rcMonitor.left || wr.left + 4 > mi.rcMonitor.right ||
-        wr.top + 60 > mi.rcMonitor.bottom) return 0;
-    // persistent sample DIB, created once (single-threaded owner: no lock).
-    static HDC     s_dibDc = nullptr;
-    static HBITMAP s_bm    = nullptr;
-    static void*   s_bits  = nullptr;
-    if (!s_dibDc) {
-        HDC sdc = GetDC(nullptr);
-        if (!sdc) return 0;
-        s_dibDc = CreateCompatibleDC(sdc);
-        ReleaseDC(nullptr, sdc);
-        if (!s_dibDc) return 0;
-        BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
-        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biPlanes      = 1;
-        bi.bmiHeader.biBitCount    = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        bi.bmiHeader.biWidth       = 4;
-        bi.bmiHeader.biHeight      = -60;            // top-down
-        HDC sdc2 = GetDC(nullptr);
-        s_bm = sdc2 ? CreateDIBSection(sdc2, &bi, DIB_RGB_COLORS, &s_bits, nullptr, 0) : nullptr;
-        if (sdc2) ReleaseDC(nullptr, sdc2);
-        if (!s_bm || !s_bits) { DeleteDC(s_dibDc); s_dibDc = nullptr; return 0; }
-        if (!SelectObject(s_dibDc, s_bm)) {
-            DeleteObject(s_bm); s_bm = nullptr; s_bits = nullptr;
-            DeleteDC(s_dibDc); s_dibDc = nullptr; return 0;
-        }
-    }
-    HDC sdc = GetDC(nullptr);
-    if (!sdc) return 0;
-    const BOOL ok = BitBlt(s_dibDc, 0, 0, 4, 60, sdc, wr.left, wr.top, SRCCOPY);
-    ReleaseDC(nullptr, sdc);
-    if (!ok) return 0;
-    // 17 scan rows, 4 px below the top edge, every 3rd row; the darkest
-    // pixel by luma per row (the line), MEDIAN by luma across the rows.
-    unsigned scan[17];
-    unsigned luma[17];
-    int n = 0;
-    for (int ri = 0; ri < 17; ++ri) {
-        const unsigned* row = (const unsigned*)((const unsigned char*)s_bits
-                              + (size_t)(4 + ri * 3) * (size_t)(4 * 4));
-        unsigned best = 0, bestL = 0xFFFFFFFFu;
-        for (int x = 0; x < 4; ++x) {
-            const unsigned p = row[x];
-            const unsigned l = (unsigned)((((int)(p >> 16) & 0xFF) * 77 +  // Rec.601-ish, the
-                                           ((int)(p >> 8) & 0xFF) * 150 + // house weights
-                                           ((int)p & 0xFF) * 29) >> 8);
-            if (l < bestL) { bestL = l; best = p; }
-        }
-        scan[n] = best; luma[n] = bestL; ++n;
-    }
-    // insertion sort of 17 pairs (the hold's sort, verbatim shape).
-    for (int i = 1; i < n; ++i) {
-        const unsigned lv = luma[i], sv = scan[i];
-        int j = i - 1;
-        while (j >= 0 && luma[j] > lv) { luma[j + 1] = luma[j]; scan[j + 1] = scan[j]; --j; }
-        luma[j + 1] = lv; scan[j + 1] = sv;
-    }
-    const unsigned med = scan[n / 2];
-    return 0xFF000000u | (med & 0x00FFFFFFu);        // opaque BGRA
-}
-// v7.3.8 THE REVERT. The field: "This just makes the top border always
-// black." The v7.3.7 opaque constant is withdrawn in full -- the row
-// returns to the exact v7.3.2-recipe behavior: the glass key when
-// active (the REAL sheet shows -- the field prefers the real border,
-// and the blend over a white backdrop is what real glass IS), the
-// backdrop-tracked hold / half-alpha recipe when inactive. The size
-// event (the other half of v7.3.7) is NOT touched.
+// ---- v7.4.0: THE GLASS KEY, BOTH STATES ------------------------------------
+// The v7.3.0 "chrome contract, tracked" and the v7.3.2 hold latch are
+// RETIRED whole: the backdrop measurement (guiHoldPxForBackdrop -- the
+// screen read above the window, the luma median, the 43 + 127*B/255
+// composite), the g_holdLive/g_holdPx pair and the hold branches in
+// guiBarPatchSheetRow / guiCommitSheetRowFast / guiFadePresenter.
+//
+// Why: the hold's tracked color is an IMITATION of what the settled
+// half-alpha blend WOULD show over the sampled backdrop -- but the
+// left/right/bottom strips are the DWM's OWN border pixels, and over a
+// complete-white backdrop the imitation diverges from them (the tracked
+// row washes out toward #A8A8A8; the recipe's half-alpha row blends 50/50
+// with the glass). The field pinned it exactly: the blending "only
+// happens when the window is unfocused" -- active row 0 has been the
+// glass key since v7.1.27 and the DWM paints its REAL border there, the
+// same painter that owns the three strips. So the imitation can never be
+// "totally accurate"; only the DWM can. Row 0 is now the glass key
+// BGRA(0,0,0,0) in BOTH states: zero alpha of ours on the sheet, the
+// DWM's border flips active/inactive with the very same state machine and
+// compose that flip the strips -- pixel-identical material, nothing to
+// blend, on every backdrop. (The no-sheet fallback in guiRenderBar keeps
+// its own opaque faces: without the extend there is no DWM border to
+// show, and a dead black line is still forbidden -- unchanged since
+// v7.1.26.)
 static void guiBarPatchSheetRow(int cw, bool active) {
     if (!g_barBits || !g_glassSheet || cw <= 0) return;
-    unsigned px;
-    if (active) {
-        // v7.3.9: the OPAQUE COPY of the DWM's own rendered side border
-        // (the fade presenter's train keeps g_sidePx fresh; the glass
-        // key rides only before the first sample / a failed one).
-        px = g_sideLive.load(std::memory_order_acquire)
-           ? g_sidePx.load(std::memory_order_acquire)
-           : 0x00000000u;
-    } else {
-        // v7.3.0: while the deactivation hold is stamped, EVERY painter
-        // lands the tracked OPAQUE row (the Chrome contract -- an opaque
-        // pixel on the sheet displays as-is, no glass blend to re-bake).
-        // v7.3.2: the hold is the latch (g_holdLive), not a clock -- it
-        // lasts the whole inactive period; the recipe's half-alpha row
-        // rides only a failed backdrop measurement (no stamp).
-        px = g_holdLive.load(std::memory_order_relaxed)
-           ? g_holdPx.load(std::memory_order_relaxed)
-           : 0x802B2B2Bu;                       // the recipe: BGRA(43, 43, 43, 128)
-    }
     unsigned* row = (unsigned*)g_barBits;       // top-down: row 0 first
-    for (int x = 0; x < cw; ++x) row[x] = px;
+    for (int x = 0; x < cw; ++x) row[x] = 0x00000000u;   // v7.4.0: the glass key, BOTH states
 }
 // v7.3.1 THE ROW-FIRST COMMIT (the RAD debugger's shape of mind, adopted).
 // The full-bar paint in guiPaintBar is a GDI+ render -- gradient, glyphs,
@@ -5547,26 +5228,12 @@ static void guiBarPatchSheetRow(int cw, bool active) {
 // missing (the first frames): skip -- the full paint covers it.
 static void guiCommitSheetRowFast(HWND w, bool active) {
     if (!g_glassSheet) return;
-    unsigned px;
-    if (active) {
-        // v7.3.9: the STICKY side-border copy -- the last SETTLED sample,
-        // correct on the flip frame whenever the backdrop did not change
-        // (the train's tail re-samples after the fade; the writer comment
-        // in guiBarPatchSheetRow carries the full rationale). The glass
-        // key rides only before the first sample / a failed one.
-        px = g_sideLive.load(std::memory_order_acquire)
-           ? g_sidePx.load(std::memory_order_acquire)
-           : 0x00000000u;
-    } else {
-        px = g_holdLive.load(std::memory_order_relaxed)  // v7.3.2: the latch, not a clock
-           ? g_holdPx.load(std::memory_order_relaxed)
-           : 0x802B2B2Bu;                     // the recipe row: a failed measurement only
-    }
     RECT cr;
     if (!GetClientRect(w, &cr) || cr.right <= 0) return;
     if (!guiBarBufEnsure(cr.right, kCapH)) return;
     unsigned* row = (unsigned*)g_barBits;     // top-down: row 0 first
-    for (int x = 0; x < cr.right; ++x) row[x] = px;
+    for (int x = 0; x < cr.right; ++x)
+        row[x] = 0x00000000u;                 // v7.4.0: the glass key, BOTH states
     HDC wdc = GetDC(w);
     if (wdc) {
         BitBlt(wdc, 0, 0, cr.right, 1, g_barDc, 0, 0, SRCCOPY);
@@ -5653,14 +5320,12 @@ static void guiPaintBar(HWND w) {
 // re-presents row 0 from OUTSIDE the message queue.
 //
 // The surface is a PRIVATE 1 px top-down 32bpp DIB section. That is enough
-// because the sheet row is ONE uniform constant per state in
-// (guiBarPatchSheetRow): active the v7.3.9 measured SIDE-BORDER COPY
-// (g_sidePx -- the DWM's own rendered border line, re-sampled below; the
-// glass key only before the first sample / a failed one), inactive
-// BGRA(43,43,43,128) -- the recipe's half-alpha gray. The thread never
-// touches the UI thread's bar buffer, so no GDI object is shared: the
-// worst interleaving is a redundant blit of the same bytes the NC latch
-// already chose.
+// because the sheet row is ONE uniform constant in both states
+// (guiBarPatchSheetRow): active BGRA(0,0,0,0) -- the glass key, the DWM's own
+// border -- inactive BGRA(43,43,43,128) -- the recipe's half-alpha gray. The
+// thread never touches the UI thread's bar buffer, so no GDI object is
+// shared: the worst interleaving is a redundant blit of the same bytes the
+// NC latch already chose.
 //
 // v7.3.0: the inactive constant has TWO forms -- the tracked OPAQUE color
 // while the deactivation hold is stamped, the recipe's half-alpha row
@@ -5668,14 +5333,12 @@ static void guiPaintBar(HWND w) {
 // (g_holdLive) spans the whole inactive period, so the two forms are
 // "inactive with a measurement" vs "inactive without one"; the handover
 // present (the first tick past a 240 ms stamp re-landing the recipe row)
-// is retired with the stamp. v7.3.9: the thread MEASURES now -- the
-// active ticks sample the DWM's own border line off the composed screen
-// (guiSideBorderPx, a private scratch DIB inside) and keep
-// g_sidePx/g_sideLive fresh; the inactive ticks stay read-only on the
-// hold atomics (g_holdLive/g_holdPx, written by WM_NCACTIVATE on the
-// GUI thread; the kick's SetEvent orders the writes before these reads).
-// Every tick still mirrors what guiBarPatchSheetRow would write -- the
-// worst interleaving stays a redundant blit of the same bytes.
+// is retired with the stamp. The thread never measures and holds no
+// state beyond its DIB: it reads the hold atomics (g_holdLive/g_holdPx,
+// written by WM_NCACTIVATE on the GUI thread; the kick's SetEvent orders
+// the writes before these reads) and mirrors what guiBarPatchSheetRow
+// would write -- the worst interleaving stays a redundant blit of the
+// same bytes.
 //
 // Each tick: fill the constant, GetDC(g_hwnd), BitBlt the 1 px strip,
 // ReleaseDC, GdiFlush. GetDC/BitBlt from another thread of the same process
@@ -5728,45 +5391,8 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
             if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
             rowW = cr.right;
         }
-        unsigned px;
-        if (nc != 0) {
-            g_holdLive.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
-            // v7.3.9 THE ACTIVE TICKS SAMPLE THE BORDER. While the fade
-            // gate is up (stamped by WM_NCACTIVATE(TRUE): ~240 ms of
-            // train) the STICKY copy rides -- the DWM's ~200 ms
-            // activation fade animates the strips' own line, and a
-            // mid-fade sample would flash the row down to the dimming
-            // color and back (the v7.2.10 flash class). Past the gate
-            // every tick re-samples the settled line and lands it, so
-            // the copy tracks the backdrop the window sits over -- the
-            // WM_MOVE kicks make a drag over white re-copy the border
-            // on the way. Failed sample: the sticky copy, else the
-            // glass key -- never a made-up color.
-            const int skip = g_sideFadeGate.load(std::memory_order_acquire);
-            if (skip > 0) g_sideFadeGate.store(skip - 1, std::memory_order_release);
-            const unsigned fresh = (skip > 0) ? 0u : guiSideBorderPx();
-            if (fresh) {
-                g_sidePx.store(fresh, std::memory_order_release);
-                g_sideLive.store(1, std::memory_order_release);
-                px = fresh;
-            } else {
-                px = g_sideLive.load(std::memory_order_acquire)
-                   ? g_sidePx.load(std::memory_order_acquire)
-                   : 0x00000000u;
-            }
-        } else {
-            // v7.3.0: inside the hold window re-present the tracked OPAQUE
-            // color. v7.3.2: the hold is the latch, not a clock -- while
-            // it is set every tick lands the SAME opaque row and the row
-            // never hands back mid-inactivity; the HANDOVER present (the
-            // first tick past a 240 ms stamp re-landing the recipe's
-            // half-alpha row -- the transparency snap the field caught)
-            // is retired with the stamp. The recipe row rides only a
-            // failed measurement (no stamp -- see WM_NCACTIVATE).
-            px = g_holdLive.load(std::memory_order_relaxed)
-               ? g_holdPx.load(std::memory_order_relaxed)
-               : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
-        }
+        unsigned px = 0x00000000u;            // v7.4.0: the glass key, BOTH states --
+                                              // the DWM's own border; nothing to track
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
@@ -7861,105 +7487,12 @@ static void tsSetWindowAumid(HWND w, const wchar_t* id) {
          SUCCEEDED(hr) ? "set" : "FAILED", (unsigned long)hr);
 }
 
-// v7.3.7: the reopen size nudge's gate. True ONLY across the two
-// back-to-back sizing calls inside guiRestoreWindow; WM_WINDOWPOSCHANGING's
-// size lock lets exactly those two passes through untouched (without the
-// gate the lock would clamp the +1 px back to the designed size before
-// USER ever saw it, and the size event -- the shadow re-anchor trigger --
-// would never exist).
-static bool g_reopenNudge = false;
-
 static void guiRestoreWindow() {
     // v7.1.6 TRAY-FIRST: the first ask BUILDS the panel (tray double-click,
     // tray menu, second instance); every later ask just shows it.
     if (!guiCreateRealWindow()) return;
     g_userShown = true;   // v7.1.5: a user asked for the window -- boot yields stop
     ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
-    // v7.3.7 THE IDENTITY FIRST, THE SIZE EVENT LAST. The plain SW_SHOW
-    // after a SW_HIDE rebuilds the window's DWM node, and the rebuilt
-    // shadow comes back one standard frame off on right/bottom (the field
-    // tape) with the pointer's edge bands riding the same phantom. THREE
-    // levers are now field-falsified: the net-zero move (v7.3.4 -- DWM
-    // coalesces it), the attribute re-send (v7.3.5 -- the shadow reads
-    // geometry, not attributes), and the frame change itself (v7.3.3/
-    // v7.3.6 -- no re-anchor; the changelog's claim that v7.3.3 fixed the
-    // shadow was never field-confirmed, the field only ever saw its white
-    // top). The one path never tried is the SIZE EVENT: the shadow visual
-    // is laid out against the composition SURFACE, and a real surface
-    // resize re-lays it out -- the same reason the shadow visibly tracks
-    // every resize on a normal window, and the same class of geometry
-    // event that laid the correct shadow down at CREATE. So the reopen
-    // ends with one REAL pixel of height added and taken back, AFTER the
-    // identity re-assertion below: the rebuilt geometry must be derived
-    // with the square corner and the dark tint already in place
-    // (v7.3.6's frame change ran BEFORE the attributes -- the wrong
-    // order -- and is retired with this edit). WM_NCCALCSIZE runs on each
-    // sizing pass, so the frame recalc a frame change would have forced
-    // happens here too; the rect ends where it started, the intermediate
-    // +1 px state lives for the microseconds between two back-to-back
-    // calls, and no paint pumps between them.
-    //
-    // v7.3.5 THE REOPEN RECIPE (v7.3.7: runs BEFORE the size event). The
-    // tray reopen re-enters DWM composition and the rebuilt node comes up
-    // with DEFAULTS for the window's DWM identity -- corner preference,
-    // NC rendering, dark mode, the sheet. The identity is re-ASSERTED
-    // attribute by attribute (the WM_DWMCOMPOSITIONCHANGED recipe plus
-    // the corner attribute) so the size event's geometry re-derivation
-    // below reads the square corner and the dark tint, never the
-    // node-default rounded light state.
-    // (The sheet extend stays -- the DWM still reads the extended frame for
-    // its border/shadow layout -- but since v7.3.7 the border LOOK does not
-    // ride it anymore: row 0 is the opaque constant, see guiBarPatchSheetRow,
-    // so no sheet re-derivation can change what the border shows. v7.3.3's
-    // white-top concern is retired by construction.)
-    {
-        typedef HRESULT (WINAPI *TS_DWMEA)(HWND, const void*);
-        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
-        typedef struct { int cxLeftWidth, cxRightWidth,
-                         cyTopHeight, cyBottomHeight; } TS_MARGINS;
-        const HMODULE dwm = LoadLibraryA("dwmapi.dll");
-        const TS_DWMSA dwmSet = dwm ? (TS_DWMSA)GetProcAddress(
-            dwm, "DwmSetWindowAttribute") : nullptr;
-        const TS_DWMEA dwmExtend = dwm ? (TS_DWMEA)GetProcAddress(
-            dwm, "DwmExtendFrameIntoClientArea") : nullptr;
-        if (dwmSet) {
-            const int corner = 1;   // DWMWCP_DONOTROUND -- stays square
-            dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                   &corner, sizeof(corner));
-            const int ncrp = 2;     // DWMNCRP_ENABLED
-            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
-                   &ncrp, sizeof(ncrp));
-            const int darkOn = 1;
-            if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                              &darkOn, sizeof(darkOn)))) {
-                dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
-            }
-        }
-        if (dwmExtend) {
-            const TS_MARGINS sheet = { 0, 0, 1, 0 };
-            g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
-        }
-    }
-    if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight -- the size event's composes start after every write above (the v7.3.0 belt)
-    // v7.3.7 THE SIZE EVENT (the re-anchor that was never tried). One REAL
-    // pixel of height added and taken back, back-to-back on this thread:
-    // two genuine surface resizes for DWM -- the shadow visual is re-laid
-    // out against the resized surface, ending at the designed geometry
-    // with the identity above already in place. The gate g_reopenNudge
-    // lets exactly these two passes past the size lock.
-    {   RECT rn;
-        if (GetWindowRect(g_hwnd, &rn)) {
-            const int rw = rn.right - rn.left, rh = rn.bottom - rn.top;
-            g_reopenNudge = true;
-            SetWindowPos(g_hwnd, nullptr, 0, 0, rw, rh + 1,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            SetWindowPos(g_hwnd, nullptr, 0, 0, rw, rh,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            g_reopenNudge = false;
-        }
-    }
-    guiPaintBar(g_hwnd);               // face + row 0 (the opaque constant)
-    guiFadeKick();
     SetForegroundWindow(g_hwnd);
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
@@ -8022,7 +7555,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.3.9  |  %s",  // v7.3.9: the active row COPIES the DWM's own rendered side border (measured, not simulated); the hold/recipe inactive row and the size-event reopen stay
+    snprintf(vbuf, sizeof(vbuf), "v7.4.0  |  %s",  // v7.4.0 the glass key, BOTH states (v7.3.2 the latch)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8257,24 +7790,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // paints its own border through it) and any hold is retired.
         if (IsWindowVisible(w) && !IsIconic(w)) {
             if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight (v7.3.0, both directions)
-            if (wp) {
-                g_holdLive.store(0, std::memory_order_relaxed); // activation retires the hold
-                // v7.3.9: the activation fade rides the sticky copy --
-                // stamp the train's no-sample lead-in (see the tick
-                // comment in guiFadePresenter).
-                g_sideFadeGate.store(12, std::memory_order_release);
-            } else {
-                // v7.3.0: the tracked opaque row, from the live backdrop.
-                // v7.3.2: the hold is the LATCH (no 240 ms stamp, no
-                // handover) -- it spans the whole inactive period.
-                const unsigned holdPx = guiHoldPxForBackdrop();
-                if (holdPx) {
-                    g_holdPx.store(holdPx, std::memory_order_relaxed);
-                    g_holdLive.store(1, std::memory_order_relaxed);
-                } else {
-                    g_holdLive.store(0, std::memory_order_relaxed); // vanilla ride
-                }
-            }
+            // v7.4.0: nothing to stamp, nothing to retire. The v7.3.0/v7.3.2
+            // hold machine (guiHoldPxForBackdrop + the g_holdLive/g_holdPx
+            // latch) is RETIRED -- row 0 is the glass key in BOTH states
+            // (see the sheet-row essay), so every writer below lands the
+            // same constant row and the DWM's own border shows through it,
+            // exactly like the left/right/bottom strips. The measured
+            // imitation was the wash-out the field caught on white:
+            // inactive, the row read #A8A8A8-ish while the strips kept the
+            // real border color. No more imitation -- at any alpha.
             // v7.3.1 THE ROW-FIRST COMMIT: the 1 px border row reaches the
             // redirection surface BEFORE the multi-millisecond GDI+ face
             // render starts -- a flip-carrying compose can no longer sample
@@ -8427,17 +7951,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                          RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
         break;
-    case WM_MOVE:
-        // v7.3.9: a MOVE re-kicks the fade presenter's train -- while
-        // active, its past-the-gate ticks re-sample the DWM's own border
-        // line off the composed screen, so dragging the window over a
-        // new backdrop (the field's "layered on top of a color
-        // 252,252,252") re-copies the border on the way: row 0 tracks
-        // the strips' live re-blend at the train's 50 Hz cadence and
-        // settles with it after the drop. Kicks while inactive only
-        // re-land the hold row (the inactive branch never samples).
-        guiFadeKick();
-        break;
     case WM_WINDOWPOSCHANGING: {
         // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
         // (Win+arrow, drag-to-edge) and any SetWindowPos resize; those paths
@@ -8447,15 +7960,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // SC_MAXIMIZE on top; WM_GETMINMAXINFO stays as the third belt.)
         // v7.1.24: the designed size is now the CLIENT plus the frame
         // insets WM_NCCALCSIZE takes back out.
-        // v7.3.7: the reopen nudge's own two sizing passes pass through
-        // untouched -- the lock would otherwise clamp the +1 px back to
-        // the designed size before USER ever saw it, and the size event
-        // (the shadow's re-anchor trigger) would never exist. The gate
-        // (g_reopenNudge) is set only around the two nudges inside
-        // guiRestoreWindow; every other sizing pass -- Aero snap, an
-        // external SetWindowPos -- still gets pinned below.
         WINDOWPOS* p = (WINDOWPOS*)lp;
-        if (p && !(p->flags & SWP_NOSIZE) && !g_reopenNudge) {
+        if (p && !(p->flags & SWP_NOSIZE)) {
             p->cx = KCLI_W + 2 * g_frmInsX;
             p->cy = KCLI_H + kCapH + g_frmInsY;
         }
