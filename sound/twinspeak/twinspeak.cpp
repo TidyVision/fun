@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.4.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,41 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.4.9 THE VANILLA WINDOW + THE NAME-CHANGE CHANNEL. Field, after
+//            v7.4.8's audit: "I still don't see it. See what hides it from
+//            taskbar (initially from --tray) and fix it so it only hides
+//            on --tray." The audit's three channels (show, foreground,
+//            style) were all exercised and the button still stayed unborn
+//            -- so the audit moves to the window itself. The panel was the
+//            only window in the app carrying a per-window
+//            System.AppUserModel.ID property (SHGetPropertyStoreForWindow,
+//            v7.1.25) -- the one thing that made it not-a-normal-window.
+//            On Win11's labeled taskbar an AUMID-carrying window's button
+//            belongs to the AUMID group's lifecycle, not the plain window
+//            path -- and this app runs the exact setup the labeled taskbar
+//            mishandles: two processes (the sign-in --tray twin and the
+//            plain launch) sharing one AUMID. The property also never
+//            fixed what it was added for: its own birth note says the
+//            one-letter stub survived v7.1.23's process AUMID AND
+//            v7.1.25's property -- the stub died with v7.1.26's Unicode
+//            conversion. RETIRED: the panel is fully vanilla again --
+//            visible top-level window -> native button on show/activation,
+//            the default path every normal app rides; the process AUMID
+//            stays for grouping/label/jumplist/balloons. And the birth
+//            channel that cannot be filtered: EVENT_OBJECT_NAMECHANGE --
+//            tsEnsureTaskbarButton re-announces the window title twice
+//            (flip to title+space, back; invisible -- the bar paints its
+//            own title) immediately after every first show, plus a nag
+//            budget (12 x 250 ms) that keeps re-announcing while visible,
+//            covering the sign-in race (a panel shown while the taskbar
+//            is still starting misses every birth event; the re-announce
+//            is the first channel it processes once it listens). Also in
+//            v7.4.9: the double-clicked duplicate transfers its foreground
+//            grant to the running instance before forwarding "come up"
+//            (AllowSetForegroundWindow -- the documented single-instance
+//            pattern), so the background twin's SetForegroundWindow is no
+//            longer denied on the come-up path. --tray starts untouched:
+//            no window, no button, by design. Version steps to 7.4.9.
 //    v7.4.8 THE BUTTON AUDIT. Field, after v7.4.7's activating show: "I
 //            still don't see it on the taskbar." The button's birth rides
 //            the shell's event channels, and the field machine missed it
@@ -7389,8 +7424,6 @@ static void guiCaptureWindowPos(HWND w) {
 // so nothing takes a taskbar slot; the moment the panel opens it gets its
 // taskbar button (and Alt-Tab entry) so it can be seen and reached like any
 // window; closing hides it and the button goes away -- the tray icon remains.
-// v7.1.25: fwd -- the definition sits with the ITaskbarList helpers below.
-static void tsSetWindowAumid(HWND w, const wchar_t* id);
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
@@ -7422,12 +7455,12 @@ static bool guiCreateRealWindow() {
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
-    // v7.1.25 THE TASKBAR LABEL, window-level: the process AUMID alone
-    // left the Win11 labeled taskbar free to shrink this button to a
-    // one-letter stub on the field machine. The per-window
-    // System.AppUserModel.ID is the identity the shell reads for THIS
-    // window's grouping and label; set it BEFORE the first paint.
-    tsSetWindowAumid(g_hwnd, L"TidyVision.TwinSpeak");
+    // v7.4.9: the per-window System.AppUserModel.ID (v7.1.25) is RETIRED --
+    // the panel is a fully vanilla window again (see the retirement note
+    // where the setter used to live). The process AUMID (v7.1.23, below in
+    // guiMain) still owns the grouping, the label, the jumplist and the
+    // balloons; the button birth now rides the default window path every
+    // normal app uses, plus the v7.4.9 name-change re-announce.
     {   // v7.1.17 THE DWM FRAME, USED PROPERLY: nothing fights it anymore.
         // The window carries NO region and NO WS_CAPTION -- the shadow
         // lives on WS_THICKFRAME, and the DWM composites its standard drop
@@ -7542,65 +7575,53 @@ static bool guiCreateRealWindow() {
 // visible top-level window gets its NATIVE button when shown (full size,
 // full label, native active highlight) and loses it when hidden, with zero
 // registration from us. The whole hand-rolled ITaskbarList vtable goes with
-// it; the per-window System.AppUserModel.ID (v7.1.25) stays -- it is the
-// documented grouping/label identity and costs nothing.
+// it; the per-window System.AppUserModel.ID (v7.1.25) went with v7.4.9.
 
-// ---- v7.1.25: the taskbar label, claimed at the WINDOW level ----------------
-// The process-wide AppUserModelID (guiMain, before any window -- v7.1.23)
-// did not reach every shell path: the field machine still saw Win11's
-// labeled taskbar shrink the button to a one-letter stub. The per-window
-// property is the identity the shell reads for THIS window's grouping AND
-// label text -- the same System.AppUserModel.ID value a Start-menu
-// shortcut carries -- set through SHGetPropertyStoreForWindow +
-// IPropertyStore::SetValue (shell32 export, Win7+; resolved dynamically so
-// the header surface stays untouched -- the same house trick as the
-// ITaskbarList vtable above). The value replaces nothing: the process
-// claim, the grouping, the jumplist and the label all read the same id.
-static const IID kTSIID_PropertyStore =
-    { 0x886d8eeb, 0x8cf2, 0x4446, { 0x8d, 0x02, 0xdb, 0xba, 0x10, 0x72, 0x22, 0x1f } };
-static const GUID kTSPKEY_AppUserModel_ID =
-    { 0x9f4c2855, 0x9f79, 0x4b39, { 0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3 } };
-struct TS_PROPERTYKEY { GUID fmtid; DWORD pid; };
-struct TS_PROPVARIANT {          // x64 PROPVARIANT, VT_LPWSTR slice:
-    WORD   vt;                   // offset 0  (VT_LPWSTR = 31)
-    WORD   r1, r2, r3;           // offsets 2..6 (reserved)
-    LPWSTR pwszVal;              // offset 8  (the union's pointer arm)
-};
-struct TS_IPropertyStoreVtbl {
-    HRESULT (__stdcall *QueryInterface)(void*, const IID&, void**);
-    ULONG   (__stdcall *AddRef)(void*);
-    ULONG   (__stdcall *Release)(void*);
-    HRESULT (__stdcall *GetCount)(void*, DWORD*);
-    HRESULT (__stdcall *GetAt)(void*, DWORD, TS_PROPERTYKEY*);
-    HRESULT (__stdcall *GetValue)(void*, const TS_PROPERTYKEY&, TS_PROPVARIANT*);
-    HRESULT (__stdcall *SetValue)(void*, const TS_PROPERTYKEY&, const TS_PROPVARIANT&);
-    HRESULT (__stdcall *Commit)(void*);
-};
-static void tsSetWindowAumid(HWND w, const wchar_t* id) {
-    if (!w || !id) return;
-    typedef HRESULT (WINAPI *TS_SGPSFW)(HWND, const IID&, void**);
-    HMODULE sh = GetModuleHandleA("shell32.dll");
-    if (!sh) sh = LoadLibraryA("shell32.dll");
-    if (!sh) { tlog("[twinspeak] gui           : window AppUserModelID skipped -- shell32 unreachable\n"); return; }
-    const TS_SGPSFW getStore =
-        (TS_SGPSFW)(void*)GetProcAddress(sh, "SHGetPropertyStoreForWindow");
-    if (!getStore) { tlog("[twinspeak] gui           : window AppUserModelID skipped -- no SHGetPropertyStoreForWindow\n"); return; }
-    void* ps = nullptr;
-    if (FAILED(getStore(w, kTSIID_PropertyStore, &ps)) || !ps) {
-        tlog("[twinspeak] gui           : window AppUserModelID failed -- no property store\n");
-        return;
-    }
-    TS_IPropertyStoreVtbl* v = (TS_IPropertyStoreVtbl*)*(void**)ps;
-    TS_PROPERTYKEY key; key.fmtid = kTSPKEY_AppUserModel_ID; key.pid = 5;
-    TS_PROPVARIANT val; ZeroMemory(&val, sizeof(val));
-    val.vt      = 31;              // VT_LPWSTR
-    val.pwszVal = (LPWSTR)id;      // const cast: SetValue copies the string
-    const HRESULT hr = v->SetValue(ps, key, val);
-    if (SUCCEEDED(hr)) v->Commit(ps);
-    v->Release(ps);
-    tlog("[twinspeak] gui           : window AppUserModelID %s (0x%08lX) -- the taskbar label\n"
-         "                            reads the window's own identity now\n",
-         SUCCEEDED(hr) ? "set" : "FAILED", (unsigned long)hr);
+// ---- v7.1.25 was: the taskbar label, claimed at the WINDOW level. RETIRED
+// ---- v7.4.9. --------------------------------------------------------------
+// The panel carried a per-window System.AppUserModel.ID through
+// SHGetPropertyStoreForWindow + IPropertyStore::SetValue (shell32 exports,
+// resolved dynamically -- the house trick). v7.4.9 retires it whole, and the
+// panel is a fully VANILLA window again. Why:
+//   * It never fixed what it was added for. Its own birth note (v7.1.25)
+//     says the one-letter stub "the field kept seeing" survived the
+//     process AUMID (v7.1.23) AND this property; the stub actually died
+//     with v7.1.26's end-to-end Unicode conversion (an ANSI title read of
+//     a UTF-16 title stops at the first byte -- "T").
+//   * It was the ONE thing that made this window not-a-normal-window. On
+//     Win11's labeled taskbar an AUMID-carrying window's button belongs to
+//     the AUMID group's lifecycle rather than the plain window path -- and
+//     this app runs the exact setup the labeled taskbar is documented to
+//     mishandle: TWO processes (the sign-in --tray twin and the plain
+//     launch) sharing one AUMID. v7.4.7/v7.4.8 exercised the show, the
+//     foreground and the style channels and the button still stayed
+//     unborn; a vanilla window rides the default path instead -- visible
+//     top-level window -> NATIVE button on show/activation, the path every
+//     normal Win32 app uses and the path the user's own unfocus/refocus
+//     was already successfully forcing.
+//   * The process AUMID (v7.1.23, guiMain) stays: grouping, jumplist and
+//     the balloon notifications hang off it, and the taskbar label reads
+//     the window TITLE ("TidyVision TwinSpeak") like any normal window.
+
+// ---- v7.4.9: THE NAME-CHANGE CHANNEL ---------------------------------------
+// The fourth and last birth channel, and the one that cannot be filtered by
+// the paths above: EVENT_OBJECT_NAMECHANGE. A title write on a visible
+// top-level window makes the taskbar re-read the window and birth the
+// NATIVE button if it is still missing -- the standard remedy for a button
+// that never appeared. The flip is invisible: the trailing space renders
+// identically, and the bar paints its own title bytes anyway.
+static int g_tbNag = 0;   // v7.4.9: pending re-announces, one per 250 ms tick
+
+static void tsAnnounceToTaskbar(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    wchar_t title[128];
+    const int n = GetWindowTextW(w, title, 126);
+    if (n <= 0) return;
+    wchar_t bumped[128];
+    wcscpy(bumped, title);
+    wcscat(bumped, L" ");
+    SetWindowTextW(w, bumped);   // fires EVENT_OBJECT_NAMECHANGE
+    SetWindowTextW(w, title);    // fires it again, restores the exact title
 }
 
 // ---- v7.4.8: THE BUTTON AUDIT ------------------------------------------------
@@ -7628,6 +7649,8 @@ static void tsSetWindowAumid(HWND w, const wchar_t* id) {
 //      v7.1.26 trap). For a normal top-level window the bit is what the
 //      default styles already produce, so it changes nothing visually; it
 //      only guarantees the button can never stay unborn.
+//   3. (v7.4.9) Re-announce the window title (the name-change channel) and
+//      arm the 250 ms nag budget -- see tsAnnounceToTaskbar below.
 static void tsEnsureTaskbarButton(HWND w) {
     if (!w || !IsWindow(w)) return;
     if (GetForegroundWindow() != w) {
@@ -7646,6 +7669,16 @@ static void tsEnsureTaskbarButton(HWND w) {
                      SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
                      SWP_NOZORDER | SWP_NOACTIVATE);
     }
+    // v7.4.9: the name-change channel -- the birth channel that depends on
+    // neither the show, nor the foreground, nor the style event. Fired here
+    // once immediately and then once per 250 ms tick for ~3 s (the nag
+    // budget), which covers the sign-in race: a panel shown while the
+    // taskbar is still starting misses EVERY birth event, and the
+    // re-announce is the first channel it processes once it listens.
+    // Announce-only: no foreground stealing, no style churn, invisible (the
+    // bar paints its own title; the flip is one trailing space apart).
+    tsAnnounceToTaskbar(w);
+    g_tbNag = 12;
 }
 
 static void guiRestoreWindow() {
@@ -7763,8 +7796,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.4.8  |  %s",  // v7.4.8 the button audit: the foreground dance + WS_EX_APPWINDOW after every
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // first show; v7.4.7 made the first show activating (SW_SHOW)
+    snprintf(vbuf, sizeof(vbuf), "v7.4.9  |  %s",  // v7.4.9 the vanilla window: per-window AUMID retired + the name-change
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // re-announce (immediate + 3 s nag); v7.4.8's dance and APPWINDOW stay
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8638,6 +8671,15 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
         return 0; }
     case WM_TIMER: {
+        // v7.4.9: the taskbar nag -- the name-change re-announce budget set
+        // by tsEnsureTaskbarButton, spent one per tick while the panel is
+        // visible (covers the sign-in race: a taskbar that was still
+        // starting at the first show hears the re-announce the moment it
+        // listens). Announce-only: no focus stealing, no style churn.
+        if (g_tbNag > 0) {
+            --g_tbNag;
+            if (IsWindowVisible(w)) tsAnnounceToTaskbar(w);
+        }
         // v7.2.15: the wp == 4 fade-tracking tick is RETIRED -- the train is
         // the presenter thread now (see guiFadePresenter), because WM_TIMER
         // ticks starved behind queue traffic and froze the DWM's
@@ -8895,6 +8937,31 @@ static int guiMain(const std::string& iniPath, bool startTray) {
                     CloseHandle(mutex);
                     return 0;                       // boot twin: silent exit
                 }
+                // v7.4.9 THE FOREGROUND HANDOFF: this duplicate is the
+                // process the user just launched -- the double-click handed
+                // IT the right to take the foreground, and that right dies
+                // with it when it exits below. The instance that actually
+                // shows the window is the background --tray twin: its own
+                // SetForegroundWindow (guiRestoreWindow) would be denied,
+                // the panel would come up unactivated, and the shell would
+                // defer its taskbar button to the first focus click (the
+                // "no tab until I unfocus and refocus" report).
+                // AllowSetForegroundWindow moves the grant across BEFORE
+                // the ask, so the surviving instance consumes it inside
+                // this same synchronous round trip. (Resolved dynamically
+                // -- the house trick -- so no header surface moves.)
+                {
+                    typedef BOOL (WINAPI *TS_ASFW)(DWORD);
+                    HMODULE u32 = GetModuleHandleA("user32.dll");
+                    if (!u32) u32 = LoadLibraryA("user32.dll");
+                    const TS_ASFW allowFg =
+                        u32 ? (TS_ASFW)(void*)GetProcAddress(
+                                  u32, "AllowSetForegroundWindow")
+                            : nullptr;
+                    DWORD otherPid = 0;
+                    GetWindowThreadProcessId(other, &otherPid);
+                    if (allowFg && otherPid) allowFg(otherPid);
+                }
                 DWORD_PTR res = 0;
                 if (SendMessageTimeoutA(other, WM_APP + 4, 0, 0,
                                         SMTO_ABORTIFHUNG, 4000, &res)) {
@@ -8928,12 +8995,14 @@ static int guiMain(const std::string& iniPath, bool startTray) {
     // hang off it. (shell32 export, Win7+; resolved dynamically so the
     // header surface stays untouched.)
     // v7.1.25 STILL ONE LETTER ON THE FIELD even with this call verbatim
-    // in the binary -- so the claim is now made in TWO places: this
-    // process-wide one (hardened with a LoadLibrary fallback, its outcome
-    // logged) and the per-window property on the panel itself
-    // (tsSetWindowAumid in guiCreateRealWindow). The shell reads the
-    // window's own System.AppUserModel.ID for the label; the process id
-    // stays for grouping, the jumplist and the balloons.
+    // in the binary -- so v7.1.25 added the claim in a SECOND place, the
+    // per-window property on the panel (tsSetWindowAumid). That second
+    // place never fixed what it was added for (the stub died with
+    // v7.1.26's Unicode conversion, not with the property) and on the
+    // labeled taskbar it routed the button out of the default window
+    // path -- v7.4.9 retires it; the panel is a vanilla window again and
+    // this process-wide claim (grouping, jumplist, balloons, label) is
+    // the only AUMID left.
     {
         typedef HRESULT (WINAPI *TS_SCAPID)(PCWSTR);
         HMODULE sh = GetModuleHandleA("shell32.dll");
