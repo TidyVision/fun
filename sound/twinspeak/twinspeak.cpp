@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.3.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.3.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,31 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.3.2 THE HOLD THAT DOES NOT EXPIRE. Field: "I just see a
+//            transparency issue on the top border itself ... I think I
+//            might have experienced that 240ms timer that redrew the
+//            window afterward. Find references of it and also fix the
+//            issue how I like it. Basically remove the 240ms timer."
+//            Found, every reference: the wall-clock stamp (kHoldMs =
+//            240, g_holdUntil) written at WM_NCACTIVATE(FALSE), the
+//            clock checks in guiBarPatchSheetRow, guiCommitSheetRowFast
+//            and guiFadePresenter, and the presenter's HANDOVER present
+//            -- the first tick past the stamp re-landed the recipe's
+//            half-alpha row and retired the stamp. That handover was
+//            the transparency the field caught: 240 ms after every
+//            deactivation the solid, backdrop-tracked border row
+//            snapped back to the see-through 50/50 glass blend. The
+//            timer is gone. The deactivation hold is a LATCH now
+//            (g_holdLive): stamped with the measured backdrop color at
+//            WM_NCACTIVATE(FALSE), honored by every writer for the
+//            WHOLE inactive period -- the top border stays the solid
+//            tracked color until the window activates again, and the
+//            glass key (the DWM's own border) returns with the
+//            activation exactly as before. The half-alpha recipe row
+//            remains only as the ride for a failed measurement (window
+//            docked at a monitor edge), unchanged. Nothing else moves:
+//            the row-first commit, the lParam -1 answer, the presenter
+//            stand-down, DwmFlush -- all v7.3.1. Version steps to 7.3.2.
 //    v7.3.1 THE ROW-FIRST COMMIT, THE RAD CONTRACT. Field: "I still
 //            sometimes get the one-frame delay of the window border ... I
 //            want the accurate window borders from window activation to
@@ -4804,11 +4829,14 @@ static bool g_glassSheet = false;
 // twenty times ~20 ms apart (see guiFadePresenter, after guiPaintBar).
 // v7.3.0: A TAMED opaque row returns -- the Chrome contract with backdrop
 // tracking (see guiHoldPxForBackdrop, after the sheet-row essay): computed
-// live at WM_NCACTIVATE(FALSE) from the desktop strip above the window,
-// held OPAQUE 240 ms by a wall-clock stamp, handed back to the recipe
-// bytes INSIDE this train (the first tick past the stamp). None of the
-// v7.2.14-retired machinery returns: no measured cache, no seeder, no
-// mouse hook, no 400 ms tail timer.
+// live at WM_NCACTIVATE(FALSE) from the desktop strip above the window.
+// v7.3.2: the 240 ms wall-clock stamp and its handover present are
+// RETIRED (the field caught the handover as "a transparency issue on the
+// top border itself"): the hold is a LATCH that lasts the whole inactive
+// period -- this train re-presents the same tracked opaque row while it
+// is set, and the recipe bytes ride only a failed measurement. None of
+// the v7.2.14-retired machinery returns: no measured cache, no seeder,
+// no mouse hook, no 400 ms tail timer.
 static HANDLE g_fadeKick  = nullptr;   // auto-reset: one SetEvent = one burst
 static HANDLE g_fadeThread = nullptr;  // created with the window, joined at exit
 static std::atomic<bool> g_fadeQuit{false};
@@ -5095,15 +5123,16 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // approved the look; v7.2.14 retired the machine around it, not the
 // math): one BitBlt into a persistent DIB, a sparse scan of the rows
 // farthest from our own drop shadow, median by luma. The held row then
-// equals what the settled blend WOULD show over the current backdrop, so
-// the handover to the recipe bytes at the end of the fade is invisible
-// over an unchanged backdrop and a one-snap re-convergence over a changed
-// one. NOTHING ELSE of the retired machine returns: no measured cache, no
-// seeder, no mouse hook, no tail timer -- the hold is a wall-clock stamp
-// (240 ms, ~the DWM's 200 ms border fade + one compose) that the fade
-// presenter's own train hands back (see guiFadePresenter), and every
-// writer checks the clock (see guiBarPatchSheetRow), so a hold can never
-// outlive the fade window.
+// equals what the settled blend WOULD show over the current backdrop.
+// v7.3.2: the wall-clock stamp is RETIRED -- the field caught its
+// handover ("the first tick past the stamp re-lands the recipe's
+// half-alpha row") as "a transparency issue on the top border itself"
+// and asked for the timer's head ("basically remove the 240ms timer"):
+// the hold is a LATCH now (g_holdLive), it spans the WHOLE inactive
+// period, the border never reads see-through while the window is
+// inactive, and the recipe bytes ride only a failed measurement.
+// NOTHING ELSE of the retired machine returns: no measured cache, no
+// seeder, no mouse hook, no tail timer.
 //
 // Threading: the measurement runs on the GUI thread only (inside
 // WM_NCACTIVATE); the strip DIB below is owned by it. The presenter
@@ -5111,9 +5140,20 @@ static void guiRenderBar(HDC dc, int ww, int hovered, bool active) {
 // orders the GUI writes before the thread's reads.
 typedef HRESULT (WINAPI *TS_DWMFLUSH)(void);
 static TS_DWMFLUSH g_dwmFlush = nullptr; // v7.3.0: fetched once in guiCreateRealWindow (the house trick)
-static std::atomic<unsigned long long> g_holdUntil{0}; // stamp expiry (GetTickCount64 ms); 0 = no hold
-static std::atomic<unsigned> g_holdPx{0};              // the held OPAQUE row pixel (BGRA, alpha 255)
-static const unsigned long long kHoldMs = 240;
+// v7.3.2 THE HOLD THAT DOES NOT EXPIRE (the field: "basically remove the
+// 240ms timer"). The deactivation hold is a LATCH, not a clock:
+// g_holdLive is stamped 1 at WM_NCACTIVATE(FALSE) when a backdrop color
+// landed in g_holdPx, and stays set for the WHOLE inactive period --
+// every writer (guiBarPatchSheetRow, guiCommitSheetRowFast,
+// guiFadePresenter) lands the tracked OPAQUE row while it is set, so
+// the top border never snaps back to the see-through half-alpha blend
+// mid-inactivity. Cleared at WM_NCACTIVATE(TRUE) (the glass key returns)
+// and on a failed measurement (the vanilla recipe row rides). The old
+// 240 ms stamp (kHoldMs, g_holdUntil, the GetTickCount64 comparisons in
+// all three writers and the presenter's handover present) is retired
+// with the timer the field named.
+static std::atomic<int> g_holdLive{0};   // 1 = the tracked opaque row IS the inactive border
+static std::atomic<unsigned> g_holdPx{0};// the held OPAQUE row pixel (BGRA, alpha 255)
 static unsigned g_holdScan[4 * 512];   // the sparse-scan scratch (guiHoldPxForBackdrop is the only writer)
 static unsigned guiHoldPxForBackdrop() { // 0 = no strip readable: ride the vanilla recipe row
     HWND w = g_hwnd;
@@ -5205,12 +5245,11 @@ static void guiBarPatchSheetRow(int cw, bool active) {
     } else {
         // v7.3.0: while the deactivation hold is stamped, EVERY painter
         // lands the tracked OPAQUE row (the Chrome contract -- an opaque
-        // pixel on the sheet displays as-is, no glass blend to re-bake);
-        // past the stamp the recipe's half-alpha row returns. The clock
-        // check makes the hold self-expiring for every writer, so it can
-        // never outlive the fade window (the v7.2.14 belt, kept).
-        const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
-        px = (until && GetTickCount64() < until)
+        // pixel on the sheet displays as-is, no glass blend to re-bake).
+        // v7.3.2: the hold is the latch (g_holdLive), not a clock -- it
+        // lasts the whole inactive period; the recipe's half-alpha row
+        // rides only a failed backdrop measurement (no stamp).
+        px = g_holdLive.load(std::memory_order_relaxed)
            ? g_holdPx.load(std::memory_order_relaxed)
            : 0x802B2B2Bu;                       // the recipe: BGRA(43, 43, 43, 128)
     }
@@ -5240,10 +5279,9 @@ static void guiCommitSheetRowFast(HWND w, bool active) {
     if (active) {
         px = 0x00000000u;                     // the glass key: the DWM's own frame
     } else {
-        const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
-        px = (until && GetTickCount64() < until)
+        px = g_holdLive.load(std::memory_order_relaxed)  // v7.3.2: the latch, not a clock
            ? g_holdPx.load(std::memory_order_relaxed)
-           : 0x802B2B2Bu;                     // the recipe: BGRA(43, 43, 43, 128)
+           : 0x802B2B2Bu;                     // the recipe row: a failed measurement only
     }
     RECT cr;
     if (!GetClientRect(w, &cr) || cr.right <= 0) return;
@@ -5343,14 +5381,18 @@ static void guiPaintBar(HWND w) {
 // shared: the worst interleaving is a redundant blit of the same bytes the
 // NC latch already chose.
 //
-// v7.3.0: the inactive constant has TWO forms over time now -- the tracked
-// OPAQUE color while the deactivation hold is stamped, the recipe's
-// half-alpha row once it expires (the handover present). The thread never
-// measures and holds no state beyond its DIB: it reads the hold atomics
-// (g_holdUntil/g_holdPx, written by WM_NCACTIVATE on the GUI thread; the
-// kick's SetEvent orders the writes before these reads) and mirrors what
-// guiBarPatchSheetRow would write -- the worst interleaving stays a
-// redundant blit of the same bytes.
+// v7.3.0: the inactive constant has TWO forms -- the tracked OPAQUE color
+// while the deactivation hold is stamped, the recipe's half-alpha row
+// when it is not. v7.3.2: the hold no longer EXPIRES -- the latch
+// (g_holdLive) spans the whole inactive period, so the two forms are
+// "inactive with a measurement" vs "inactive without one"; the handover
+// present (the first tick past a 240 ms stamp re-landing the recipe row)
+// is retired with the stamp. The thread never measures and holds no
+// state beyond its DIB: it reads the hold atomics (g_holdLive/g_holdPx,
+// written by WM_NCACTIVATE on the GUI thread; the kick's SetEvent orders
+// the writes before these reads) and mirrors what guiBarPatchSheetRow
+// would write -- the worst interleaving stays a redundant blit of the
+// same bytes.
 //
 // Each tick: fill the constant, GetDC(g_hwnd), BitBlt the 1 px strip,
 // ReleaseDC, GdiFlush. GetDC/BitBlt from another thread of the same process
@@ -5405,22 +5447,20 @@ static DWORD WINAPI guiFadePresenter(LPVOID) {
         }
         unsigned px;
         if (nc != 0) {
-            g_holdUntil.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
+            g_holdLive.store(0, std::memory_order_relaxed);  // v7.3.0: activation retires any hold
             px = 0x00000000u;                     // the glass key: the DWM's own frame
         } else {
             // v7.3.0: inside the hold window re-present the tracked OPAQUE
-            // color; the first tick PAST the stamp lands the HANDOVER --
-            // the recipe's half-alpha row -- and retires the stamp. No
-            // tail timer: the train IS the handover (the v7.2.14 400 ms
-            // tail objection stays retired). The stamp self-expires for
-            // every other writer too (see guiBarPatchSheetRow), so a hold
-            // can never outlive the fade window.
-            const unsigned long long until = g_holdUntil.load(std::memory_order_relaxed);
-            const unsigned long long now   = GetTickCount64();
-            px = (until && now < until) ? g_holdPx.load(std::memory_order_relaxed)
-                                        : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
-            if (until && now >= until)
-                g_holdUntil.store(0, std::memory_order_relaxed);
+            // color. v7.3.2: the hold is the latch, not a clock -- while
+            // it is set every tick lands the SAME opaque row and the row
+            // never hands back mid-inactivity; the HANDOVER present (the
+            // first tick past a 240 ms stamp re-landing the recipe's
+            // half-alpha row -- the transparency snap the field caught)
+            // is retired with the stamp. The recipe row rides only a
+            // failed measurement (no stamp -- see WM_NCACTIVATE).
+            px = g_holdLive.load(std::memory_order_relaxed)
+               ? g_holdPx.load(std::memory_order_relaxed)
+               : 0x802B2B2Bu;  // the recipe: BGRA(43, 43, 43, 128)
         }
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
@@ -7802,11 +7842,14 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         //       now the Chrome contract instead: OPAQUE, computed live
         //       from the backdrop actually above the window
         //       (guiHoldPxForBackdrop -- the settled recipe composite
-        //       43 + 127*backdrop/255 per channel), stamped for 240 ms,
-        //       and handed back to the recipe bytes by the fade
-        //       presenter's own train once the stamp expires -- over an
-        //       unchanged backdrop the swap is invisible (the held color
-        //       IS the recipe's settled composite there). Opaque on the
+        //       43 + 127*backdrop/255 per channel). v7.3.2: the 240 ms
+        //       stamp and its handover are RETIRED -- the field caught
+        //       the handover as "a transparency issue on the top border
+        //       itself" and named the timer ("basically remove the
+        //       240ms timer"); the tracked OPAQUE row now spans the
+        //       WHOLE inactive period (the g_holdLive latch), so there
+        //       is no swap to be invisible and the border never reads
+        //       see-through while the window is inactive. Opaque on the
         //       sheet displays AS-IS (the v7.2.0 finding): no glass blend
         //       to re-bake, nothing to fade, nothing to sample stale --
         //       Chrome-instant, with the backdrop tracking Chrome never
@@ -7817,16 +7860,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (IsWindowVisible(w) && !IsIconic(w)) {
             if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight (v7.3.0, both directions)
             if (wp) {
-                g_holdUntil.store(0, std::memory_order_relaxed); // activation retires any hold
+                g_holdLive.store(0, std::memory_order_relaxed); // activation retires the hold
             } else {
-                // v7.3.0: the tracked opaque hold, from the live backdrop.
+                // v7.3.0: the tracked opaque row, from the live backdrop.
+                // v7.3.2: the hold is the LATCH (no 240 ms stamp, no
+                // handover) -- it spans the whole inactive period.
                 const unsigned holdPx = guiHoldPxForBackdrop();
                 if (holdPx) {
                     g_holdPx.store(holdPx, std::memory_order_relaxed);
-                    g_holdUntil.store(GetTickCount64() + kHoldMs,
-                                      std::memory_order_relaxed);
+                    g_holdLive.store(1, std::memory_order_relaxed);
                 } else {
-                    g_holdUntil.store(0, std::memory_order_relaxed); // vanilla ride
+                    g_holdLive.store(0, std::memory_order_relaxed); // vanilla ride
                 }
             }
             // v7.3.1 THE ROW-FIRST COMMIT: the 1 px border row reaches the

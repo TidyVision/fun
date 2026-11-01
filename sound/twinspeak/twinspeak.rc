@@ -1,4 +1,10 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.1: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.3.2: version bump
+// (the hold that does not expire: the deactivation hold is a LATCH --
+// g_holdLive -- spanning the whole inactive period; the 240 ms
+// wall-clock stamp, the clock checks in all three row writers and the
+// presenter's handover present are retired -- the field caught the
+// handover as "a transparency issue on the top border itself" and
+// asked for the timer's head). v7.3.1: version bump
 // (the row-first commit, the RAD
 // contract: WM_NCACTIVATE lands the 1 px border row alone FIRST --
 // guiCommitSheetRowFast -- before the full GDI+ face render, and answers
@@ -9,8 +15,9 @@
 // settled recipe composite over the CURRENT backdrop -- computed live from
 // the desktop strip above the window, v7.2.13's estimator -- stamped 240 ms
 // and handed back to the recipe's half-alpha row by the fade presenter's
-// own train; DwmFlush() is back before the pre-flip present so a compose
-// in flight can never carry the flip off a stale snapshot).
+// own train [the stamp and the handover retired in v7.3.2]; DwmFlush() is
+// back before the pre-flip present so a compose in flight can never carry
+// the flip off a stale snapshot).
 // v7.2.12: version bump
 // (the hook thread goes quiet + the tray audit: the settle burst renders
 // only when it must -- with a measured cache one tail tick replaces the
@@ -58,8 +65,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,3,0,0
-PRODUCTVERSION  7,3,0,0
+FILEVERSION     7,3,2,0
+PRODUCTVERSION  7,3,2,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -70,12 +77,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.3.1.0"
+            VALUE "FileVersion",      "7.3.2.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.3.1.0"
+            VALUE "ProductVersion",   "7.3.2.0"
         END
     END
     BLOCK "VarFileInfo"
