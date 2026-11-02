@@ -23,6 +23,33 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.7 THE GRAY RETURNS (the release frame is the inactive bar's row).
+//            Field, after v7.5.6: "the only issue that's persistent now is
+//            that the frame you release the mouse for the minimize button,
+//            the top bar's color simply disappears, and I want that color
+//            to be Gdiplus::Color(128,43,43,43), like how it'd work on the
+//            inactive bar." THE VERDICT ON THE OPAQUE BYTE: it erased the
+//            row. The release frame is where the top bar must SHOW the
+//            field's color -- the half-alpha gray, the exact byte the
+//            inactive bar lands (BGRA(43,43,43,128) /
+//            Gdiplus::Color(128,43,43,43)) -- not a byte that fights the
+//            sheet. THE FIX is the byte alone: g_sheetRowMinimize is
+//            0x802B2B2B again (the INACTIVE byte), the GDI+ fallback paints
+//            Color(128,43,43,43) for the minimize present, and every row
+//            writer (the row-first commit, the buffered patch, the
+//            fallback, the presenter's ticks, the pre-flip
+//            WM_NCACTIVATE(FALSE)) lands it through the SAME state
+//            plumbing as before. THE THREE-STATE LATCH STAYS: state 2
+//            (MINIMIZING) was and remains the release-to-flip guard that
+//            keeps the alpha-0 glass key from re-landing over the ordered
+//            gray (the v7.5.5 race -- the real "transparent glass" frame);
+//            with it in force the gray commits once and rides the whole
+//            shrink, blending with the sheet exactly like the inactive
+//            bar's row does. The resting split is untouched: INACTIVE =
+//            Color(128,43,43,43), focused = the glass key Color(255,0,0,0)
+//            (still the press frame too -- SC_MINIMIZE only fires on the
+//            release). Restore: WM_NCACTIVATE(TRUE) re-latches 1, the key
+//            returns with the fade. Version steps to 7.5.7.
 //    v7.5.6 THE OPAQUE MINIMIZE BYTE (the glass bleeds no more). Field,
 //            after v7.5.5: "Actually, when taking a look again, I still
 //            see a transparent glass. What's even causing the top bar to
@@ -5365,8 +5392,9 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
         // FALLBACK only: the buffered path overwrites row 0 byte-direct
         // through cwPatchSheetRow after the GDI+ pass.
         const int ls = cwSheetRowLatchValue();   // v7.5.6: 2 = the minimize present
-        rowCol = (ls == 2) ? Gdiplus::Color(255, 43, 43, 43)   // OPAQUE: no sheet
-                                                                    // material can mix
+        rowCol = (ls == 2) ? Gdiplus::Color(128, 43, 43, 43)   // v7.5.7: the release frame is
+                                                                    // the field's half-alpha gray --
+                                                                    // the INACTIVE byte, byte for byte
                  : active ? Gdiplus::Color(255, 0, 0, 0)
                           : Gdiplus::Color(128, 43, 43, 43);
     } else {
@@ -5426,6 +5454,15 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
 // untouched. The face's own row-0 GDI+ fill above is the
 // straight-to-screen FALLBACK only; the buffered path overwrites row 0
 // byte-direct through cwPatchSheetRow after the GDI+ pass.
+// v7.5.7: THE GRAY RETURNS. The field, on the opaque byte: "the frame you
+// release the mouse for the minimize button, the top bar's color simply
+// disappears, and I want that color to be Gdiplus::Color(128,43,43,43),
+// like how it'd work on the inactive bar." The release byte is the
+// half-alpha gray again (g_sheetRowMinimize = 0x802B2B2B, the INACTIVE
+// byte): the row must BLEND with the sheet the way the inactive bar's
+// does, not occlude it. The three-state latch STAYS -- state 2 remains
+// the release-to-flip guard that keeps the alpha-0 key from re-landing
+// (the v7.5.5 race); only the byte it lands changed.
 // v7.3.0: DwmFlush blocks until the compose in flight has retired; the
 // ordered presents (WM_NCACTIVATE, WM_SYSCOMMAND(SC_MINIMIZE)) call it
 // before their pre-flip present so every compose that can carry the flip
@@ -5508,9 +5545,9 @@ static void guiPaintBar(HWND w) {
     if (guiBarBufEnsure(cw, kCapH)) {
         guiRenderBar(g_barDc, w, cw, active);
         if (g_glassSheet) {
-            // v7.5.6: the ROW byte follows the latch STATE, not the face:
-            // state 2 (the minimize present) lands the OPAQUE minimize byte
-            // -- the shrink must ride a row no sheet glass can mix into
+            // v7.5.6: the ROW byte follows the latch STATE, not the face.
+            // v7.5.7: state 2 (the minimize present) lands the field's
+            // half-alpha gray -- byte for byte the inactive bar's row
             // (v7.1.29 still holds: the alpha IS the delivery).
             const int rowState = (ncLatch == 2) ? 2 : (active ? 1 : 0);
             cwPatchSheetRowPx(g_barBits, cw, cwSheetRowBytesState(rowState));
@@ -7911,7 +7948,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.6 |  %s",  // v7.5.6 the OPAQUE minimize byte: glass cannot mix into the shrink
+    snprintf(vbuf, sizeof(vbuf), "v7.5.7 |  %s",  // v7.5.7 the release byte is the half-alpha gray again --
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8005,11 +8042,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // the gate and the latch are customWindow.h's -- cwSheetRowGate /
         // cwSheetRowLatch.)
         cwSheetRowGate(true);
-        // v7.5.6: FALSE must not downgrade a MINIMIZE in flight. The
-        // pre-flip NCACTIVATE(FALSE) (the race the placement flip usually
-        // wins) used to re-latch 0 and re-commit the half-alpha gray over
-        // the state-2 present -- the active glass bled right back. Keep 2:
-        // only an activation (TRUE) or an ordinary unfocus may latch 0.
+        // v7.5.6: FALSE must not downgrade a MINIMIZE in flight (a pre-flip
+        // FALSE re-latching 0 mid-release re-committed under the ordered
+        // present's feet -- the v7.5.5 key re-land rode exactly that
+        // window). v7.5.7: state 2 and state 0 land the SAME byte now (the
+        // field's half-alpha gray), and the guard stays: only an activation
+        // (TRUE) or an ordinary unfocus may latch 0, so the release present
+        // owns its row until the placement flips.
         cwSheetRowLatch(wp ? 1 : (cwSheetRowLatchValue() == 2 ? 2 : 0));
         // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED,
         // v7.3.1 ROW-FIRST + THE lParam -1 ANSWER.
@@ -8061,8 +8100,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // render starts -- a flip-carrying compose can no longer sample
             // the pre-flip row (see cwCommitSheetRowFast).
             // v7.5.6: the commit carries the state -- a FALSE landing
-            // while latch 2 (minimize in flight) re-commits the OPAQUE
-            // minimize byte, not the half-alpha gray.
+            // while latch 2 (minimize in flight) re-commits the release
+            // byte; v7.5.7: that byte is the half-alpha gray, the inactive
+            // bar's own.
             cwCommitSheetRowState(w, (wp != 0) ? 1
                                      : (cwSheetRowLatchValue() == 2 ? 2 : 0));
             g_forceActiveFace   = (wp != 0);   // the face must match the flip
@@ -8301,21 +8341,25 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // frame (mouse down, not released) keeps the key: SC_MINIMIZE
             // only fires on the release.
             // v7.5.6: the truth flips to MINIMIZE (2), not merely
-            // INACTIVE. v7.5.5's latch(0) stopped the key re-land and the
-            // field STILL saw the glass -- the release-to-flip row was the
-            // HALF-ALPHA gray, and the DWM composites that row 50/50 with
-            // the sheet, whose material all through the shrink is the
-            // ACTIVE registry accent ("toggling window border colors in
-            // settings exposes the issue much nastier"). The MINIMIZE byte
-            // is OPAQUE now: RGB(43,43,43) at full alpha -- the same gray,
-            // nothing behind it. State 2 sends every writer (this commit,
-            // the buffered patch, the GDI+ fallback, any presenter tick,
-            // the pre-flip WM_NCACTIVATE(FALSE)) to the opaque byte.
+            // INACTIVE -- the pre-flip is what stops the alpha-0 key from
+            // re-landing inside the release-to-flip window (the v7.5.5
+            // race: the kicked train's tick used to ride the still-ACTIVE
+            // latch and bake the hybrid frame -- the real "transparent
+            // glass" the field kept catching). v7.5.7: state 2 lands the
+            // field's HALF-ALPHA gray again -- Gdiplus::Color(128,43,43,
+            // 43), byte for byte the inactive bar's row. The v7.5.6 opaque
+            // byte erased the row's color at the release (the field: "the
+            // top bar's color simply disappears"); the row must blend with
+            // the sheet like the inactive bar's does. State 2 still sends
+            // every writer (this commit, the buffered patch, the GDI+
+            // fallback, any presenter tick, the pre-flip
+            // WM_NCACTIVATE(FALSE)) to one state, and the key cannot come
+            // back before the placement flips.
             cwSheetRowLatch(2);
             cwSheetRowGate(true);
             if (g_dwmFlush) g_dwmFlush();
-            cwCommitSheetRowState(w, 2);       // the row lands first -- the OPAQUE MINIMIZE
-                                               // byte; the shrink rides it, glass cannot bleed
+            cwCommitSheetRowState(w, 2);       // the row lands first -- the field's half-alpha
+                                               // gray (the inactive bar's byte); the shrink rides it
             g_forceActiveFace   = false;
             g_forceInactiveFace = true;
             guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
@@ -8326,8 +8370,8 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // pre-flipped its ticks would land the gray anyway -- but the
             // face was presented synchronously, the shrink needs no train,
             // and the WM_NCACTIVATE(FALSE) tail owns the next kick; with
-            // the latch at 2 even that burst lands the OPAQUE gray or is
-            // IsIconic-skipped.
+            // the latch at 2 even that burst lands the release gray (the
+            // field's half-alpha byte, v7.5.7) or is IsIconic-skipped.
         }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();

@@ -518,6 +518,27 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 //                                                   Color(255,0,0,0) on the
 //                                                   window DC -- opaque black
 //                                                   RGB, the key itself).
+//   v7.5.6           minimize  BGRA(43,43,43,0xFF) ONE VERSION ONLY: the
+//                                                   opaque release byte -- and
+//                                                   the field saw the row's
+//                                                   color itself vanish: "the
+//                                                   frame you release the
+//                                                   mouse for the minimize
+//                                                   button, the top bar's
+//                                                   color simply disappears."
+//   v7.5.7           minimize  BGRA(43,43,43,0x80) THE GRAY RETURNS: the
+//                                                   release frame carries the
+//                                                   field's Gdiplus::Color(
+//                                                   128,43,43,43) again --
+//                                                   byte for byte the INACTIVE
+//                                                   bar's row. The three-state
+//                                                   latch STAYS: state 2 is
+//                                                   what keeps the alpha-0 key
+//                                                   from re-landing inside the
+//                                                   release-to-flip window (the
+//                                                   v7.5.5 race); only the byte
+//                                                   it lands is the field's
+//                                                   gray again.
 // The transparent-glass flash therefore has its old ONE window back: the
 // frames between the placement flip and the first gray present. The v7.5.2
 // ordered present owns it, load-bearing again: inside WM_SYSCOMMAND
@@ -573,19 +594,18 @@ inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): t
                                                   // the INACTIVE/DEFAULT byte (the GDI+ fallback paints
                                                   // Gdiplus::Color(128,43,43,43) -- the field's default
                                                   // state, v7.5.4 spec, unchanged)
-inline unsigned g_sheetRowMinimize = 0xFF2B2B2Bu; // v7.5.6 THE OPAQUE MINIMIZE BYTE: the SAME RGB(43,43,43)
-                                                  // at FULL alpha. The proof that killed the half-alpha
-                                                  // minimize byte: the DWM composites the sheet row 50/50
-                                                  // with its own glass (the app's contract since v7.1.28),
-                                                  // and for the WHOLE shrink the window still carries its
-                                                  // ACTIVE chrome -- so the glass under the row is the
-                                                  // registry accent material. Half gray + half accent
-                                                  // glass = the "transparent glass" the field kept seeing
-                                                  // at the release, and every border-color toggle in
-                                                  // Settings retints exactly that mix ("exposes the issue
-                                                  // much nastier"). A half-alpha row can never occlude
-                                                  // the sheet; alpha 0xFF is the only byte that carries
-                                                  // its own color with NOTHING behind it.
+inline unsigned g_sheetRowMinimize = 0x802B2B2Bu; // v7.5.7 THE GRAY RETURNS: the release frame lands the
+                                                  // field's half-alpha gray -- Gdiplus::Color(128,43,43,
+                                                  // 43), byte for byte the INACTIVE bar's row. The opaque
+                                                  // v7.5.6 byte (0xFF2B2B2B) erased the row's color at the
+                                                  // release (the field: "the frame you release the mouse
+                                                  // for the minimize button, the top bar's color simply
+                                                  // disappears") -- the row must BLEND with the sheet the
+                                                  // way the inactive bar does, not occlude it. The
+                                                  // three-state latch STAYS: state 2 remains the
+                                                  // release-to-flip guard that keeps the alpha-0 glass key
+                                                  // from re-landing (the v7.5.5 race); only the byte it
+                                                  // lands changed.
 inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
 inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
 inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
@@ -601,13 +621,15 @@ inline int     g_rowW    = 0;
 inline unsigned cwSheetRowBytes(bool active) {
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
-// v7.5.6: the NC latch is a THREE-state now: -1 never seen, 0 inactive /
+// v7.5.6: the NC latch is a THREE-state: -1 never seen, 0 inactive /
 // default, 1 active (the glass key), 2 MINIMIZING -- the release-to-restore
-// transition. State 2 reads as INACTIVE for the face and lands the OPAQUE
-// minimize byte for the row: the shrink must ride a color, not a blend.
+// transition. State 2 reads as INACTIVE for the face; v7.5.7: it lands the
+// HALF-ALPHA gray for the row -- byte for byte the inactive bar's row, the
+// field's Gdiplus::Color(128,43,43,43) (the opaque v7.5.6 byte vanished).
 inline unsigned cwSheetRowBytesState(int state) {
     if (state == 1) return g_sheetRowActive;     // the glass key (focused, resting)
-    if (state == 2) return g_sheetRowMinimize;   // opaque RGB(43,43,43) -- nothing behind it
+    if (state == 2) return g_sheetRowMinimize;   // the release frame: the half-alpha gray,
+                                                 // the INACTIVE byte (v7.5.7)
     return g_sheetRowInactive;                   // the half-alpha gray (inactive/default)
 }
 
@@ -682,10 +704,13 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {   // the v7.3.1 bool API
 // stopped the key re-land and the field STILL saw the glass -- the
 // release-to-flip row was the HALF-ALPHA gray and the DWM blends it 50/50
 // with the sheet, whose material all through the shrink is the ACTIVE
-// registry accent. State 2 routes every writer to the OPAQUE minimize
-// byte; WM_NCACTIVATE(FALSE) must NOT downgrade a 2 (a pre-flip FALSE
-// re-commits state 2), and WM_NCACTIVATE(TRUE) (the restore) re-latches
-// 1 and the key returns with the fade.
+// registry accent. v7.5.7: state 2 routes every writer to the SAME
+// half-alpha gray as state 0 (the field's verdict -- the release frame is
+// the inactive bar's row, Gdiplus::Color(128,43,43,43)); the state stays
+// because the pre-flip -- not the byte -- is what keeps the alpha-0 key
+// off the surface. WM_NCACTIVATE(FALSE) must NOT downgrade a 2 (a
+// pre-flip FALSE re-commits state 2), and WM_NCACTIVATE(TRUE) (the
+// restore) re-latches 1 and the key returns with the fade.
 inline void cwSheetRowLatch(int state) {       // the frame's own truth (WM_NCACTIVATE writes FIRST)
     g_ncActive.store(state);                   // seq_cst: the presenter reads relaxed, the kick orders
 }
@@ -747,9 +772,9 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
             rowW = cr.right;
         }
-        const unsigned px = cwSheetRowBytesState(nc);   // v7.5.6: state bytes -- key on 1, the OPAQUE
-                                                        // gray on 2 (minimize), the field's half-alpha
-                                                        // gray on 0 (the split itself is v7.5.4's)
+        const unsigned px = cwSheetRowBytesState(nc);   // state bytes -- the key on 1, the field's
+                                                        // half-alpha gray on 2 (minimize, v7.5.7) and
+                                                        // on 0 (inactive; the split itself is v7.5.4's)
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);

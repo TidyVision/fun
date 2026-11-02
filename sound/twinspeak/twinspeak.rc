@@ -1,9 +1,10 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.6: version bump
-// (the OPAQUE minimize byte: a third latch state, 2 = MINIMIZING, lands
-// BGRA(43,43,43,255) for the release-to-shrink row -- the half-alpha gray
-// was composited 50/50 with the ACTIVE accent glass all through the
-// shrink, the field's "transparent glass", nastier with every border-
-// color toggle in Settings; the resting split is untouched. v7.5.5:
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.7: version bump
+// (THE GRAY RETURNS: the minimize release byte is the field's half-alpha
+// gray again -- BGRA(43,43,43,128) / Gdiplus::Color(128,43,43,43), byte
+// for byte the INACTIVE bar's row; the opaque v7.5.6 byte erased the
+// row's color at the release. The three-state latch stays: 2 = MINIMIZING
+// keeps the alpha-0 glass key from re-landing inside the release-to-flip
+// window; the resting split is untouched. v7.5.5:
 // version bump (the uniform sheet row: the ACTIVE row joins the INACTIVE byte --
 // Gdiplus::Color(128,43,43,43), the field's pick -- so no alpha-0 row exists
 // anywhere and the minimize glass flash is impossible by construction; and
@@ -172,8 +173,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,5,6,0
-PRODUCTVERSION  7,5,6,0
+FILEVERSION     7,5,7,0
+PRODUCTVERSION  7,5,7,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -184,12 +185,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.5.6.0"
+            VALUE "FileVersion",      "7.5.7.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.5.6.0"
+            VALUE "ProductVersion",   "7.5.7.0"
         END
     END
     BLOCK "VarFileInfo"
