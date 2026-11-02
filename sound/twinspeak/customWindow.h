@@ -110,6 +110,11 @@
 //                                           latch (-1/0/1, the frame's truth)
 //     cwSheetPresenterStart(w) / cwSheetPresenterStop()   the fade train
 //
+//     (v7.5.3b: the sheet itself is the header's too -- cwAttach runs
+//      cwSheetSetup, the {0,0,1,0} extend + the immersive dark mode
+//      border, and the WM_SYSCOMMAND(SC_MINIMIZE) ordered present lives
+//      in cwWndProc. A fresh consumer needs NO host DWM code at all.)
+//
 // Host contract (twinspeak already meets all of it):
 //   * GDI+ started (GdiplusStartup) before the first paint.
 //   * The window class carries the icon (hIcon/hIconSm) for enableWinIcon
@@ -549,9 +554,10 @@ inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplu
 inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
 inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
 inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
-// v7.5.3a THE ANIMATION HOLD -- the focused state's timing gate. The host
-// arms it in the WM_SYSCOMMAND(SC_MINIMIZE) ordered present (the caption
-// button's click rides that message now); the fade train releases it ~280 ms
+// v7.5.3a THE ANIMATION HOLD -- the focused state's timing gate. The header
+// arms it in its own WM_SYSCOMMAND(SC_MINIMIZE) ordered present (every
+// minimize source rides that message -- the caption button posts it since
+// v7.5.3a); the fade train releases it ~280 ms
 // into a presenting run -- the restore animation is over by then. While it
 // stands, cwSheetRowBytes lands the field's gray for BOTH states: every
 // frame of the shrink and the restore carries the same composited gray (the
@@ -565,14 +571,68 @@ inline std::atomic<bool> g_sheetRowAnim{false};
 // that covers the accent exactly like the gray does -- an alpha-0 row is
 // the only way the accent shows (the v7.4.0 receipt).
 inline unsigned g_sheetRowFocusIdle = 0x00000000u;
-// mirror of the host's g_glassSheet: the header's own writers (the commit
-// and the train) must never land the glass key when no sheet is behind row 0
+// the sheet's own state now (v7.5.3b): the header extends the 1 px glass
+// sheet itself (cwSheetSetup, run from cwAttach and on
+// WM_DWMCOMPOSITIONCHANGED) and records whether row 0 has glass behind it
+// -- the header's writers (the commit and the train) must never land the
+// glass key over a bare row. Hosts that run their own sheet machinery can
+// still mirror theirs through the public cwSheetGlass().
 inline std::atomic<bool> g_sheetHasGlass{false};
+
+// v7.5.3b THE HEADER'S OWN DWMAPI SEAM -- the house trick (no dwmapi.h, no
+// link dependency): the three pointers are fetched once into function-local
+// statics, exactly how the host fetched its own. The sheet setup and
+// DwmFlush live in the header now, so a fresh consumer gets the exact
+// Windows 10 top edge from this file alone: the 1 px glass sheet under row
+// 0 (the DWM's colorized border shows through the focused alpha-0 key) and
+// the immersive dark mode attribute (without it the extended sheet paints
+// WHITE in light mode -- the documented light-mode border bug). Idempotent
+// with a host that runs its own copies (twinspeak does).
+typedef HRESULT (WINAPI *CwDwmFlushFn)();
+typedef HRESULT (WINAPI *CwDwmExtendFn)(HWND, const void*);
+typedef HRESULT (WINAPI *CwDwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
+typedef struct { int cxLeftWidth, cxRightWidth,
+                 cyTopHeight, cyBottomHeight; } CwMargins;
+inline CwDwmFlushFn cwDwmFlushPtr() {
+    static CwDwmFlushFn fn =
+        (CwDwmFlushFn)GetProcAddress(LoadLibraryA("dwmapi.dll"), "DwmFlush");
+    return fn;
+}
+inline CwDwmExtendFn cwDwmExtendPtr() {
+    static CwDwmExtendFn fn =
+        (CwDwmExtendFn)GetProcAddress(LoadLibraryA("dwmapi.dll"),
+                                      "DwmExtendFrameIntoClientArea");
+    return fn;
+}
+inline CwDwmSetAttrFn cwDwmSetAttrPtr() {
+    static CwDwmSetAttrFn fn =
+        (CwDwmSetAttrFn)GetProcAddress(LoadLibraryA("dwmapi.dll"),
+                                       "DwmSetWindowAttribute");
+    return fn;
+}
+inline void cwDwmFlush() {                     // retire the compose in flight (the v7.3.0 ordering)
+    if (CwDwmFlushFn fn = cwDwmFlushPtr()) fn();
+}
+inline bool cwSheetSetup(HWND w) {             // the sheet + the dark-mode border, one call
+    if (!w || !IsWindow(w)) return false;
+    if (CwDwmSetAttrFn set = cwDwmSetAttrPtr()) {
+        const int darkOn = 1;                  // attribute 20 since 1903, 19 on the early Insider builds
+        if (FAILED(set(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                       &darkOn, sizeof(darkOn))))
+            set(w, 19, &darkOn, sizeof(darkOn));
+    }
+    CwDwmExtendFn ext = cwDwmExtendPtr();
+    if (!ext) return false;
+    const CwMargins sheet = { 0, 0, 1, 0 };    // row 0 becomes the DWM's own top border
+    const bool on = SUCCEEDED(ext(w, &sheet));
+    g_sheetHasGlass.store(on, std::memory_order_release);
+    return on;
+}
 
 inline void cwSheetRowAnimHold(bool on) {      // armed at the minimize present; the train releases it
     g_sheetRowAnim.store(on, std::memory_order_release);
 }
-inline void cwSheetGlass(bool on) {            // the host mirrors g_glassSheet here (3 sites)
+inline void cwSheetGlass(bool on) {            // hosts that run their own sheet mirror it here
     g_sheetHasGlass.store(on, std::memory_order_release);
 }
 inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
@@ -678,8 +738,11 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
     void*   bits = nullptr;
     int     rowW = 0, ticks = 0;
     for (;;) {
+        // v7.5.3b PERF: the idle wait owns the thread until the next kick
+        // (the old 250 ms poll woke four times a second to present nothing;
+        // the presenting cadence itself is untouched -- 20 ms per tick).
         const bool kicked =
-            WaitForSingleObject(g_fadeKick, ticks ? 20 : 250) == WAIT_OBJECT_0;
+            WaitForSingleObject(g_fadeKick, ticks ? 20 : INFINITE) == WAIT_OBJECT_0;
         if (kicked) ticks = 20;               // every kick restarts the train
         else if (ticks) --ticks;
         if (!ticks) continue;                 // idle: the event owns the wait
@@ -784,6 +847,24 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
     *out = 0;
     if (!g_enabled) return false;
     switch (msg) {
+    case WM_NCACTIVATE:
+        // v7.5.3b: the NC latch is latched HERE now, at the very top of
+        // the dispatch -- the frame's own truth (wParam carries the state
+        // the frame is flipping to), readable by every painter inside the
+        // activation transaction. The message itself keeps flowing to the
+        // host's own case and DefWindowProc.
+        cwSheetRowLatch(wp ? 1 : 0);
+        return false;
+    case WM_DWMCOMPOSITIONCHANGED:
+        // v7.5.3b: composition can restart under the window (driver reset,
+        // an RDP session) -- the {0,0,1,0} sheet is a geometry commitment
+        // to a DWM that no longer exists. The header re-runs its own sheet
+        // setup (re-extend + the dark-mode border; the glass flag follows
+        // the result), re-lands the bar and re-kicks the train. A host's
+        // own case, if it has one, still runs after this -- idempotent.
+        cwSheetSetup(w);
+        if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
+        return false;
     case WM_NCCALCSIZE: {
         // main.c verbatim: the client is the whole window MINUS the frame
         // insets on left/right/bottom (top only when maximized). The DWM
@@ -866,9 +947,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // setCanWinResize(false) -- a dead button for a host that asked)
         if (g_hover == cwHovClose)      { PostMessageW(w, WM_CLOSE, 0, 0); *out = 0; return true; }
         // v7.5.3a: the click rides WM_SYSCOMMAND(SC_MINIMIZE) now, not a
-        // raw ShowWindow -- the host's ordered present (DwmFlush, the
-        // row-first gray commit, the face, the kick) and the animation hold
-        // arm BEFORE DefWindowProc flips anything. A raw ShowWindow skipped
+        // raw ShowWindow -- the header's ordered present (the WM_SYSCOMMAND
+        // case below: the hold, DwmFlush, the row-first gray commit, the
+        // face, the kick) arms BEFORE DefWindowProc flips anything. A raw ShowWindow skipped
         // all of it: the surface kept the focused glass key and the shrink
         // flew transparent (the v7.5.4..v7.5.10 flash).
         if (g_hover == cwHovMin)        { PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0); *out = 0; return true; }
@@ -907,12 +988,36 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
             *out = 0; return true;
         }
         return false;
-    case WM_SYSCOMMAND:
-        if (!g_resizable) {
-            const UINT sc = (UINT)(wp & 0xFFF0);
-            if (sc == SC_MAXIMIZE || sc == SC_SIZE) { *out = 0; return true; }
+    case WM_SYSCOMMAND: {
+        const UINT sc = (UINT)(wp & 0xFFF0);
+        if (!g_resizable && (sc == SC_MAXIMIZE || sc == SC_SIZE)) { *out = 0; return true; }
+        // v7.5.3b THE ORDERED MINIMIZE PRESENT -- the header's now (the
+        // host's copy retired with the move). Every minimize source -- the
+        // caption button (posts this message since v7.5.3a), the taskbar,
+        // the system menu, the keyboard -- presents through this one
+        // recipe BEFORE DefWindowProc flips the placement iconic: the
+        // animation hold arms (the gray may show only while an animation
+        // plays), the gate stands the train down, the latch flips FIRST
+        // (the frame's own truth -- the repaint below answers through it
+        // and lands the INACTIVE face, the same bytes the
+        // WM_NCACTIVATE(FALSE) present would), DwmFlush retires the
+        // compose in flight, the row lands (the half-alpha gray,
+        // byte-idempotent -- the FACE is what this present orders), then
+        // the gate clears and the train kicks. The restore's own
+        // activation re-kicks; ~280 ms into that presenting run the train
+        // releases the hold and the focused glass key -- the DWM's accent
+        // border -- bakes once no animation is playing.
+        if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            cwSheetRowAnimHold(true);
+            cwSheetRowGate(true);
+            cwSheetRowLatch(0);
+            cwDwmFlush();
+            cwCommitSheetRowFast(w, false);
+            cwRepaint();                   // the inactive face, through the latch answer
+            cwSheetRowGate(false);
+            cwSheetRowKick();
         }
-        return false;
+        return false; }
     case WM_SETCURSOR:
         // the arrow instead of the busy cursor (main.c)
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
@@ -1012,6 +1117,7 @@ inline void putWindowinTray(bool hide) {
 
 inline void cwAttach(HWND w, void (*repaint)(HWND)) {
     cwd::g_host = w; cwd::g_repaint = repaint;
+    cwd::cwSheetSetup(w);   // v7.5.3b: the sheet + the dark-mode border -- the header's own
 }
 inline void cwSetBarHeight(int px)                  { cwd::g_barH = px; }
 inline void cwSetTrayHost(void (*hide)(HWND), void (*show)(HWND)) {

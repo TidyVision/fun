@@ -7390,7 +7390,6 @@ static bool guiCreateRealWindow() {
             if (dwmExtend) {
                 const TS_MARGINS sheet = { 0, 0, 1, 0 };
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
-                cwSheetGlass(g_glassSheet);   // v7.5.3a: the header's writers read the mirror
             }
             // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
             // Without it the DWM paints the extended sheet WHITE in light
@@ -7707,7 +7706,6 @@ static void guiRestoreWindow() {
         const TS_MARGINS sheet = { 0, 0, 1, 0 };
         dwmExtend(g_hwnd, &off);
         g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
-        cwSheetGlass(g_glassSheet);           // v7.5.3a: the header's writers read the mirror
     }
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
@@ -7886,7 +7884,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // the gate and the latch are customWindow.h's -- cwSheetRowGate /
         // cwSheetRowLatch.)
         cwSheetRowGate(true);
-        cwSheetRowLatch(wp ? 1 : 0);
+        // v7.5.3b: the latch flip itself moved into customWindow.h -- the
+        // header's WM_NCACTIVATE case latches at the very top of the
+        // dispatch (cwWndProc runs before this switch). Same value, one
+        // writer; the row bytes are per-state constants now, so a train
+        // tick that catches the latch before this gate still lands
+        // byte-identical bytes.
         // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED,
         // v7.3.1 ROW-FIRST + THE lParam -1 ANSWER.
         // The bar -- the face AND row 0 -- is painted in the state wParam
@@ -7993,7 +7996,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (dwmExtend) {
                 const TS_MARGINS sheet = { 0, 0, 1, 0 };
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
-                cwSheetGlass(g_glassSheet);   // v7.5.3a: the header's writers read the mirror
             }
             typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
             const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
@@ -8110,58 +8112,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // minimize button, and the taskbar's restore click rides SC_RESTORE.
         const int sc = (int)(wp & 0xFFF0);
         if (sc == SC_MAXIMIZE || sc == SC_SIZE) return 0;
-        // v7.5.2 THE MINIMIZE PRESENT. The field, after the v7.5.1 freeze:
-        // "I actually see that fake top border bar turns transparent glass
-        // the moment the minimize button is pressed" -- with the spec from
-        // the earlier report: "the frame the minimize button is pressed
-        // that the fabricated top title bar is changed to be something
-        // like 60,60,60. Right now, there's no dwmflush on the frame the
-        // minimize button is pressed." THE WHY: DefWindowProc(SC_MINIMIZE)
-        // flips the placement iconic immediately, and WM_NCACTIVATE(FALSE)'s
-        // synchronous present is guarded !IsIconic -- when the flip wins
-        // that race (it usually does), NOTHING ever presents the inactive
-        // style, and the bar rides the whole shrink with its ACTIVE bytes,
-        // whose sheet row IS the alpha-0 glass key -- the transparent
-        // glass the field sees over a light backdrop. (The v7.5.1 freeze
-        // correctly silenced the OTHER painters mid-animation; it never
-        // gave the press frame a draw of its own.) THE PRESENT: the press
-        // frame gets the full ordered recipe BEFORE DefWindowProc flips
-        // anything -- DwmFlush (retire the compose in flight), the
-        // row-first INACTIVE commit, the INACTIVE face, GdiFlush -- the
-        // same bytes and the same order the WM_NCACTIVATE(FALSE) present
-        // lands on an ordinary unfocus. The row is the half-alpha
-        // RGB(43,43,43) (v7.4.3, the field's gray) -- and v7.5.3 makes it
-        // the ACTIVE row's byte too (the field's pick,
-        // Gdiplus::Color(128,43,43,43)): the row commit here is
-        // byte-idempotent now and the glass flash is impossible by
-        // construction (no alpha-0 row exists anywhere); this present is
-        // ordered for the FACE, which still flips.
-        // ALREADY carries the inactive bar, the shrink animation rides it,
-        // and the v7.5.1 iconic guards hold every other painter off the
-        // surface until restore. The WM_NCACTIVATE(FALSE) that follows
-        // either re-presents byte-identical bytes or skips; both stand.
-        if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
-            // v7.5.3a THE ANIMATION HOLD arms here (the caption button's
-            // click rides this message now, so EVERY minimize source --
-            // button, taskbar, system menu, keyboard -- presents through
-            // this ordered recipe). Until the fade train releases it after
-            // the restore, cwSheetRowBytes lands the field's gray for BOTH
-            // states: the shrink and the restore fly with the composited
-            // gray row (v7.5.3's construction -- no transparent glass), and
-            // the focused glass key (the accent) returns only once no
-            // animation is playing.
-            cwSheetRowAnimHold(true);
-            cwSheetRowGate(true);
-            if (g_dwmFlush) g_dwmFlush();
-            cwCommitSheetRowFast(w, false);    // the row lands first (v7.5.3: byte-idempotent --
-                                               // the FACE is what this present still orders)
-            g_forceActiveFace   = false;
-            g_forceInactiveFace = true;
-            guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
-            g_forceInactiveFace = false;
-            cwSheetRowGate(false);
-            cwSheetRowKick();
-        }
+        // v7.5.3b: THE MINIMIZE PRESENT moved into customWindow.h -- the
+        // header's own WM_SYSCOMMAND case answers this message first
+        // (cwWndProc runs before this switch) with the whole ordered
+        // recipe: the animation hold, the latch flip, DwmFlush, the
+        // row-first gray commit, the inactive face, the gate, the kick.
+        // This case keeps the refusals and the tray exit.
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
             if (g_engState.load() != 0) guiStopEngine();
