@@ -1,16 +1,5 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.10: version bump
-// (THE SHRINK TRACKS THE FADE: the release byte is unchanged -- the field's
-// half-alpha gray, BGRA(43,43,43,128) / Gdiplus::Color(128,43,43,43), byte
-// for byte the INACTIVE bar's row. What changed is the RIDE: the fade
-// presenter train's IsIconic skip retires, so the row re-presents through
-// the DWM's activation fade for the WHOLE shrink -- in lockstep with the
-// left/right/bottom strips -- instead of one bake over the still-ACTIVE
-// accent sheet riding the entire animation (the field: "I still see a
-// transparent glass being a 255,0,0 the moment I release the mouse's left
-// button for minimizing"). The three-state latch stays: 2 = MINIMIZING
-// keeps the alpha-0 glass key from re-landing inside the release-to-flip
-// window; the resting split is untouched. v7.5.5:
-// version bump (the uniform sheet row: the ACTIVE row joins the INACTIVE byte --
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump
+// (the uniform sheet row: the ACTIVE row joins the INACTIVE byte --
 // Gdiplus::Color(128,43,43,43), the field's pick -- so no alpha-0 row exists
 // anywhere and the minimize glass flash is impossible by construction; and
 // the fake top border bar engine -- the row constants, the byte-direct
@@ -178,8 +167,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,5,9,0
-PRODUCTVERSION  7,5,9,0
+FILEVERSION     7,4,10,0
+PRODUCTVERSION  7,4,10,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -190,12 +179,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.5.10.0"
+            VALUE "FileVersion",      "7.5.3.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.5.10.0"
+            VALUE "ProductVersion",   "7.5.3.0"
         END
     END
     BLOCK "VarFileInfo"
