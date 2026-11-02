@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.0)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.1)
 // =====================================================================
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
@@ -51,12 +51,15 @@
 //         Default: minimize on, maximize off.
 //
 //     setCanWinResize(bool resize)
-//         Whether the window accepts resize/maximize COMMANDS (edge hits
-//         stay owned by DefWindowProc -- with WS_THICKFRAME on, which the
-//         DWM shadow needs, a resizable window resizes; with resize off the
-//         header refuses SC_SIZE / SC_MAXIMIZE and the maximize button
-//         dispatches nowhere, so a drag "ends where it started", exactly the
-//         twinspeak size-lock contract). Default: false.
+//         Whether the window accepts resize/maximize COMMANDS. With resize
+//         on, WS_THICKFRAME (which the DWM shadow needs) resizes. With
+//         resize off (v7.5.1 THE HONEST BORDER) the header refuses
+//         SC_SIZE / SC_MAXIMIZE, the maximize button dispatches nowhere,
+//         AND the hit-test stops advertising: every edge band answers
+//         HTBORDER instead of the sizing codes, so the cursor stays an
+//         arrow and the mouse registers a fixed window as fixed -- a drag
+//         never starts, where it used to "end where it started". Default:
+//         false.
 //
 //     changeWinMinimizeHoverColor(int col) / (int col, int gradColor)
 //         The minimize button's hover face. Default: the panel gray.
@@ -505,8 +508,25 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // they started), then the manual HTTOP re-answer for the band the
         // inset confuses, then HTCAPTION across the bar, HTCLIENT below.
         LRESULT hit = DefWindowProcW(w, msg, wp, lp);
+        // v7.5.1 THE HONEST BORDER. A refused resize must not advertise
+        // itself: WS_THICKFRAME is the style (the DWM shadow lives on it),
+        // so DefWindowProc answers the edge bands the sizing codes and the
+        // mouse treated a fixed window as wanting to resize -- sizing
+        // arrows on a window whose drags end where they started. With
+        // setCanWinResize(false) in force every edge answer downgrades to
+        // HTBORDER: the arrow stays an arrow, there is nothing to grab,
+        // the drag never starts. The frame style itself is untouched --
+        // only the intent goes.
+        if (!g_resizable) {
+            switch (hit) {
+                case HTLEFT: case HTRIGHT:
+                case HTTOPLEFT: case HTTOP: case HTTOPRIGHT:
+                case HTBOTTOMLEFT: case HTBOTTOM: case HTBOTTOMRIGHT:
+                    hit = HTBORDER; break;
+            }
+        }
         switch (hit) {
-            case HTNOWHERE: case HTRIGHT: case HTLEFT:
+            case HTNOWHERE: case HTBORDER: case HTRIGHT: case HTLEFT:
             case HTTOPLEFT: case HTTOP: case HTTOPRIGHT:
             case HTBOTTOMRIGHT: case HTBOTTOM: case HTBOTTOMLEFT:
                 *out = hit; return true;
@@ -517,7 +537,8 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         ScreenToClient(w, &cursor_point);
         if (!cwIsMaximized(w) && cursor_point.y > 0 &&
             cursor_point.y < GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)) {
-            *out = HTTOP; return true;
+            *out = g_resizable ? HTTOP : HTBORDER;   // v7.5.1: the honest border
+            return true;
         }
         if (cursor_point.y < g_barH) { *out = HTCAPTION; return true; }
         *out = HTCLIENT; return true; }

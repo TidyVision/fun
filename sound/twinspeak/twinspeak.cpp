@@ -23,6 +23,55 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.1 THE MINIMIZE FREEZE + THE HONEST BORDER. Field, after v7.5.0:
+//            "a split second after pressing the minimize titlebar button,
+//            the top bar turns transparent while the rest of the bars stay
+//            accurate", then: "pressing the minimize button is when the
+//            window border gets brighter, only showing for a split second
+//            as the window is getting moved back into its taskbar, so have
+//            the top bar color draw its inactive style just once in the
+//            case of after pressing the minimize button." The taped
+//            artifact is a RACE, not a style: ShowWindow(SW_MINIMIZE)
+//            flips the placement iconic while the shrink animation is
+//            still sampling the surface, and painters with no iconic
+//            guard kept re-landing EITHER face into it -- WM_ACTIVATE's
+//            unconditional guiPaintBar (the queue view says whatever the
+//            transaction left) and a stale invalidation's WM_PAINT (whose
+//            frame blit's row 0 is not sheet bytes) -- each one a compose
+//            of the bright inactive row or the transparent active glass
+//            key, racing the DWM's own. THE FREEZE: while IsIconic,
+//            guiPaintBar draws NOTHING and WM_PAINT's body is skipped
+//            (BeginPaint/EndPaint still validate -- no paint storm); the
+//            minimize's deactivation lands its ONE draw through the
+//            existing WM_NCACTIVATE(FALSE) pre-flip present when it beats
+//            the placement flip, and otherwise the bar rides the
+//            animation untouched -- exactly one style change, or none.
+//            Restore un-freezes byte for byte: the first not-iconic paint
+//            path lands the correct face exactly as v7.5.0 did. Second
+//            field item: "Fix the mouse registering an unresizable window
+//            as it wanting to resize." customWindow.h's WM_NCHITTEST:
+//            with setCanWinResize(false) in force every edge answer
+//            (HTLEFT/HTRIGHT/HTTOP/HTBOTTOM and the four corners -- the
+//            WS_THICKFRAME style's own advertisement) downgrades to
+//            HTBORDER and the manual HTTOP band answers HTBORDER too: the
+//            cursor stays an arrow over a fixed window, there is nothing
+//            to grab, and the drag that used to end where it started now
+//            never starts. The thick frame itself stays -- the DWM shadow
+//            lives on it. Third field item: "fix the notification from
+//            twinspeak.cpp not working. And also minimize the description
+//            of said notification to just 'TwinSpeak is now in system
+//            tray.'" The close-to-tray balloon had never once shown: the
+//            v7.2.12 dispatch fired the NIF_INFO modify and THEN hid the
+//            window inside the same message -- a notification racing its
+//            owner window's vanish, which the shell drops -- and the
+//            first-three-closes cap ate every later close besides. The
+//            confirmation now lands AFTER guiHideToTray returns (icon up,
+//            window settled hidden, one NIM_MODIFY against the icon), the
+//            cap and the g_closeHints counter are gone, and the text is
+//            the field's one-liner: "TwinSpeak is now in system tray."
+//            putWindowinTray(true) stays silent -- the answer belongs to
+//            a USER's close, never an API-driven hide. Version steps to
+//            7.5.1.
 //    v7.5.0 THE ONE-FILE WINDOW. customWindow.h: every piece of Windows
 //            window chrome that is not the audio engine moves out of this
 //            file into a one-file API -- WM_NCCALCSIZE's frame insets,
@@ -4740,7 +4789,6 @@ static std::atomic<bool> g_logDirty{false};
 static NOTIFYICONDATAA g_nid = {};
 static ULONG_PTR g_gdipToken = 0;             // v6.6.5: GDI+ session token
 static bool g_trayVisible = false;             // icon currently in the tray
-static int g_closeHints  = 0;             // v7.1.20: close balloons for the first 3 closes
 static bool g_startTray   = false;             // --tray: begin hidden in the tray
 static bool g_userShown   = false;             // v7.1.5: the USER opened the window
                                                // (tray dbl-click / menu / second
@@ -4793,7 +4841,8 @@ static constexpr unsigned long long kBootWindowMs = 120000;   // 2 min after the
 // v6.6.1 forward decls (helpers defined below the page builder)
 static void guiRepaint(HWND w, int id);
 static void guiRepaintSlots(HWND w);
-static void trayAdd(bool hint);
+static void trayAdd();               // v7.5.1: no hint param -- the hide confirmation
+                                     // lives in WM_CLOSE alone, every close
 static void trayRemove();
 static void guiRestoreWindow();      // v7.5.0: fwd -- putWindowinTray(false) rides it
 static void guiHideToTray(HWND w);   // v7.5.0: fwd -- putWindowinTray(true) rides it
@@ -5381,6 +5430,21 @@ static void guiCommitSheetRowFast(HWND w, bool active) {
 }
 static void guiPaintBar(HWND w) {
     if (!w || !IsWindow(w)) return;
+    // v7.5.1 THE MINIMIZE FREEZE. IsIconic is true for the WHOLE shrink
+    // animation -- the placement flips while the pixels are still flying --
+    // and while it is, this painter draws NOTHING. The minimize's one
+    // inactive draw belongs to the WM_NCACTIVATE(FALSE) pre-flip present
+    // (below) when it beats the placement flip; every other painter that
+    // used to run iconic -- WM_ACTIVATE's unconditional re-blit, a stale
+    // invalidation's WM_PAINT, applyTheme, an API repaint -- re-landed
+    // either face mid-animation with the queue's view racing the frame's:
+    // the taped flicker of the bright inactive row and the transparent
+    // active glass key for the split second the window takes to reach the
+    // taskbar. Frozen now: whatever the one draw landed is what the
+    // animation shows. The restore un-freezes -- the first not-iconic
+    // paint path (WM_NCACTIVATE's block, WM_ACTIVATE, WM_PAINT) lands the
+    // correct face exactly as before.
+    if (IsIconic(w)) return;
     // v7.5.0: the hover state lives in customWindow.h now (the header's
     // WM_NCMOUSEMOVE tracks it); the blit target is still the CLIENT dc --
     // the window owns a real frame, so the bar is client pixels at (0,0).
@@ -7299,7 +7363,7 @@ static void trayRemove() {
     Shell_NotifyIconA(NIM_DELETE, &g_nid);
     g_trayVisible = false;
 }
-static void trayAdd(bool hint) {
+static void trayAdd() {
     if (!g_hwnd || g_trayVisible) return;
     // v7.2.12: a re-add (explorer restart) keeps the ORIGINAL owner window.
     // The old code re-pointed the icon at the current g_hwnd every time, so
@@ -7343,22 +7407,16 @@ static void trayAdd(bool hint) {
     // trayUpdateTip -- which was swallowed (the icon did not exist yet) --
     // and the tip then stayed the generic one for the whole session.
     trayUpdateTip(g_engState.load() != 0);
-    if (hint && g_closeHints < 3) {   // v7.1.20: explain the first 3 closes, not once ever
-        ++g_closeHints;
-        g_nid.uFlags       = NIF_INFO;
-        lstrcpynA(g_nid.szInfoTitle, "TidyVision TwinSpeak", (int)sizeof(g_nid.szInfoTitle));
-        lstrcpynA(g_nid.szInfo,
-                  "Still running -- the engine stays up.\n"
-                  "Click this icon to reopen the window; "
-                  "right-click for Start/Stop and Exit.",
-                  (int)sizeof(g_nid.szInfo));
-        g_nid.dwInfoFlags = NIIF_INFO;
-        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
-    }
+    // v7.5.1: the v7.1.20 "explain the first 3 closes" balloon block that
+    // lived here is GONE. It was dead code from the day it shipped (trayAdd
+    // early-returns while the icon is already up -- always, in the normal
+    // close-to-tray flow), and the one balloon twinspeak answers a close
+    // with now lives in WM_CLOSE, text the field chose, every close.
 }
-// v7.1.6 TRAY-FIRST: a balloon with caller-supplied text. The boot balloon
-// says "running in the tray" ("still running" reads wrong when nothing was
-// ever open); the close balloon stays trayAdd's own one-time hint.
+// v7.1.6: a balloon with caller-supplied text. The start refusals speak
+// through it, and since v7.5.1 so does the close-to-tray confirmation --
+// "TwinSpeak is now in system tray.", fired AFTER the hide so the shell
+// never sees a notification whose owner window is mid-vanish.
 static void trayBalloon(const char* text) {
     if (!g_trayVisible) return;
     g_nid.uFlags       = NIF_INFO;
@@ -7862,18 +7920,18 @@ static void cwTrayShowHost(HWND) { guiRestoreWindow(); }
 // ensured, the window hidden. The engine keeps running -- real exit stays
 // in the tray menu and the system menu's "Exit twinspeak".
 // v7.5.0 (field): the NOTIFICATION is NOT part of the gesture -- the API's
-// hide is SILENT. The "still running" balloon lives in WM_CLOSE alone: it
-// answers a USER close (the X), where "where did my window go" is a real
-// question; a programmatic putWindowinTray(true) already knows where the
-// window went. The first-three-closes cap and the balloon code stay in
-// twinspeak.cpp, right where they have lived since v7.2.12.
+// hide is SILENT. v7.5.1: WM_CLOSE's confirmation answers the close AFTER
+// this gesture returns (the balloon must not race the vanish -- a
+// NIF_INFO modify dispatched while the owner window is mid-SW_HIDE can be
+// dropped by the shell), and the old trayAdd(true) hint is gone with the
+// v7.1.20 first-three-closes cap: the icon ensure here is silent.
 static void guiHideToTray(HWND w) {
     guiCaptureWindowPos(w);
     KillTimer(w, 1);
     // v7.1.26: no DeleteTab -- hiding a window removes its native
     // taskbar button by itself.
-    trayAdd(true);   // ensure the icon: the window must stay reachable
-                     // (and the rare icon-was-missing re-add)
+    trayAdd();       // ensure the icon: the window must stay reachable
+                     // (and the rare icon-was-missing re-add) -- SILENT
     ShowWindow(w, SW_HIDE);
 }
 
@@ -7932,7 +7990,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.0 |  %s",  // v7.5.0 the one-file window: the chrome lives in customWindow.h
+    snprintf(vbuf, sizeof(vbuf), "v7.5.1 |  %s",  // v7.5.1 the minimize freeze + the honest border
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7996,7 +8054,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // correctly skips: g_nid.hWnd is still null.
         if (w == g_nid.hWnd) {
             trayRemove();
-            trayAdd(false);
+            trayAdd();
         }
         return 0;
     }
@@ -8273,6 +8331,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
+        // v7.5.1 THE MINIMIZE FREEZE, second half: while iconic the paint
+        // body is SKIPPED -- BeginPaint/EndPaint still run so the update
+        // region validates (no WM_PAINT storm when the animation ends),
+        // but nothing blits. The frame buffer's row 0 is NOT sheet bytes,
+        // and the blit would overwrite the frozen bar's top row
+        // mid-animation with opaque pixels -- a third face for the border
+        // to flicker through. Whatever the surface carries is what the
+        // shrink shows. (guiPaintBar's own iconic guard holds the bar
+        // re-land; this holds the frame blit with it.)
+        if (!IsIconic(w)) {
         // v7.0.9 THE WATERMARK-FLICKER FIX: the frame painted straight to the
         // screen behind an erase pass -- RDW_ERASE wiped the client blank
         // (watermark gone), GDI+ rebuilt it, and DWM sampled the blank strip
@@ -8292,6 +8360,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // can touch rows 0..31 re-lands it in the same breath (one buffered
         // blit), so no client-side repaint can ever wipe it.
         guiPaintBar(w);
+        }   // v7.5.1: the not-iconic paint body
         EndPaint(w, &ps);
         return 0; }
     case WM_ERASEBKGND:
@@ -8661,7 +8730,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v7.1.20: timer 3 = the tray-icon retry (a failed NIM_ADD at sign-in
         // re-tries every 2 s until the shell accepts it).
         if (wp == 3) {
-            if (!g_trayVisible) trayAdd(false);
+            if (!g_trayVisible) trayAdd();
             if (g_trayVisible) KillTimer(w, 3);
             return 0;
         }
@@ -8801,7 +8870,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_userShown) {
             if (g_cfg.startupEngine && g_engState.load() == 0)
                 guiStartEngine(w);
-            trayAdd(false);
+            trayAdd();
             ShowWindow(w, SW_HIDE);
         }
         return 0; }
@@ -8822,29 +8891,31 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         // v6.6.1: closing hides to the tray -- the engine keeps running.
         // Real exit lives in the tray menu (Exit) and the system menu's
-        // "Exit twinspeak" (v7.1.20). A balloon tells the user where the
-        // window went (the first three closes per session).
+        // "Exit twinspeak" (v7.1.20).
         // v7.1.20: capture the position for the ini, and let the 250 ms
         // tick sleep while hidden (it returns in guiRestoreWindow). The
         // hidden tray surrogate ignores WM_CLOSE entirely (taskkill
         // broadcasts reach it too).
         // v7.5.0: the hide itself is guiHideToTray -- the same SILENT
-        // gesture putWindowinTray(true) performs through the API. The
-        // balloon stays HERE, in twinspeak.cpp: it answers a user's close,
-        // never an API-driven hide.
+        // gesture putWindowinTray(true) performs through the API.
+        // v7.5.1 (field): the balloon NEVER SHOWED, two reasons, both gone.
+        // First, the order: the v7.2.12 dispatch fired the NIF_INFO modify
+        // and THEN hid the window inside the same message -- a notification
+        // racing its owner window's vanish, which the shell is free to
+        // drop. The confirmation now lands AFTER guiHideToTray returns:
+        // icon up, window settled hidden, then one NIM_MODIFY against the
+        // icon (the balloon belongs to the icon, not the window).
+        // Second, the cap: "the first three closes per session" ate every
+        // close after the third and read as broken. The one-liner the
+        // field chose ("TwinSpeak is now in system tray.") says exactly
+        // where the window went and nothing more -- it can fire on every
+        // close without nagging. The old two-line "Still running -- the
+        // engine stays up..." text and the g_closeHints counter are gone.
+        // putWindowinTray(true) through the API stays silent: this answer
+        // belongs to a USER's close, never an API-driven hide.
         if (w == g_trayWnd) return 0;
-        // v7.2.12: the "still running" hint used to ride trayAdd(true) --
-        // but trayAdd early-returns while the icon is ALREADY in the tray,
-        // i.e. ALWAYS in the normal close-to-tray flow, so the first-three-
-        // closes balloon never fired even once (dead code since v7.1.20).
-        // It shows here now, directly, still capped at three per session.
-        if (g_trayVisible && g_closeHints < 3) {
-            ++g_closeHints;
-            trayBalloon("Still running -- the engine stays up.\n"
-                        "Click this icon to reopen the window; "
-                        "right-click for Start/Stop and Exit.");
-        }
         guiHideToTray(w);
+        trayBalloon("TwinSpeak is now in system tray.");
         return 0;
     case WM_DESTROY:
         trayRemove();
@@ -9069,7 +9140,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         if (!g_trayWnd) { if (mutex) CloseHandle(mutex); return 1; }
         tsAllowUiMessages(g_trayWnd);   // v7.1.20: the surrogate must hear explorer + twins
         g_hwnd = g_trayWnd;
-        trayAdd(false);
+        trayAdd();
         trayBalloon("Running in the tray -- the engine is starting.\n"
                     "Click the icon to open the control panel; "
                     "right-click for Start/Stop and Exit.");
@@ -9145,7 +9216,7 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // the icon while the window is visible just re-runs
         // guiRestoreWindow: ShowWindow(SW_SHOW) on a visible window is a
         // no-op and the foreground call keeps it focused.
-        trayAdd(false);
+        trayAdd();
         tlog("[twinspeak] gui           : START runs the engine in this window; the pane below is its log.\n");
         tlog("[twinspeak] gui           : closing the window hides it to the tray -- the engine stays up.\n\n");
     }
