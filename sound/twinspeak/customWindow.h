@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.4)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.8)
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
 // real NC strips via WM_NCCALCSIZE insets, HTCAPTION drag/snap/Alt+Space,
@@ -539,18 +539,66 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 //                                                   v7.5.5 race); only the byte
 //                                                   it lands is the field's
 //                                                   gray again.
-// The transparent-glass flash therefore has its old ONE window back: the
-// frames between the placement flip and the first gray present. The v7.5.2
-// ordered present owns it, load-bearing again: inside WM_SYSCOMMAND
+//   v7.5.8           (byte unchanged)         THE SHRINK TRACKS THE FADE.
+//                                                   Three byte changes in a row
+//                                                   (v7.5.5 latch, v7.5.6
+//                                                   opaque, v7.5.7 gray) could
+//                                                   not kill the release glass,
+//                                                   and the field caught it a
+//                                                   fourth time: "I still see a
+//                                                   transparent glass being a
+//                                                   255,0,0 the moment I
+//                                                   release the mouse's left
+//                                                   button for minimizing."
+//                                                   THE VERDICT: the byte was
+//                                                   never the bug -- the RIDE
+//                                                   was. The v7.5.2 ordered
+//                                                   present lands the gray ONCE,
+//                                                   and at that instant the
+//                                                   sheet under the row is
+//                                                   still the ACTIVE material
+//                                                   (the registry accent -- the
+//                                                   field's red): the bake is
+//                                                   half gray + half accent
+//                                                   glass. Then the placement
+//                                                   flips and the DWM starts
+//                                                   its ~200 ms activation
+//                                                   fade -- the left/right/
+//                                                   bottom strips ride it --
+//                                                   but every painter is
+//                                                   IsIconic-frozen for the
+//                                                   whole shrink (v7.5.1), the
+//                                                   fade presenter train
+//                                                   included, so the row is
+//                                                   NEVER re-presented: the one
+//                                                   red-glass blend rides the
+//                                                   entire animation while the
+//                                                   strips fade without it.
+//                                                   THE FIX is the train: its
+//                                                   IsIconic skip retires and
+//                                                   the row re-presents every
+//                                                   20 ms through the fade,
+//                                                   in lockstep with the
+//                                                   strips -- the ordinary-
+//                                                   unfocus behavior the field
+//                                                   already accepts -- and it
+//                                                   settles on THIS byte, the
+//                                                   inactive bar's own.
+// The transparent-glass flash therefore has NO window left. The v7.5.2
+// ordered present still owns the FIRST bake (inside WM_SYSCOMMAND
 // (SC_MINIMIZE), before DefWindowProc flips anything -- DwmFlush retires
 // the compose in flight, the row-first gray commit lands, the inactive
-// face renders, GdiFlush -- the shrink animation rides the gray, never the
-// key. The press frame (mouse down, not released) keeps the key:
-// SC_MINIMIZE only fires on the release. (The v7.4.0 receipt still bounds
-// the design: an alpha-0 row cannot CARRY a color -- exactly what the
-// active state wants -- carry nothing, show the DWM's own border -- and
-// exactly what the inactive and minimize states must never do -- they need
-// a delivered gray.)
+// face renders, GdiFlush), and from v7.5.8 the fade presenter train owns
+// every frame after it: kicked by the WM_NCACTIVATE(FALSE) tail as the
+// flip lands, it re-presents the gray through the DWM's fade while the
+// window shrinks, the row and the strips dimming as one, and the settled
+// state is the field's gray -- Gdiplus::Color(128,43,43,43), the inactive
+// bar's row, byte for byte. The press frame (mouse down, not released)
+// keeps the key: SC_MINIMIZE only fires on the release. (The v7.4.0
+// receipt still bounds the design: an alpha-0 row cannot CARRY a color --
+// exactly what the active state wants -- carry nothing, show the DWM's
+// own border -- and exactly what the inactive and minimize states must
+// never do -- they need a delivered gray.)
 //
 // THE THREE WRITERS (each lands the state's own constant; none ever measures):
 // THE THREE WRITERS (all land the same constant; none ever measures):
@@ -626,6 +674,10 @@ inline unsigned cwSheetRowBytes(bool active) {
 // transition. State 2 reads as INACTIVE for the face; v7.5.7: it lands the
 // HALF-ALPHA gray for the row -- byte for byte the inactive bar's row, the
 // field's Gdiplus::Color(128,43,43,43) (the opaque v7.5.6 byte vanished).
+// v7.5.8: state 2 is also what the fade presenter train lands while the
+// shrink runs -- the train is no longer IsIconic-skipped, so the row rides
+// the DWM's activation fade in lockstep with the strips and settles on
+// this byte (the essay above, THE SHRINK TRACKS THE FADE).
 inline unsigned cwSheetRowBytesState(int state) {
     if (state == 1) return g_sheetRowActive;     // the glass key (focused, resting)
     if (state == 2) return g_sheetRowMinimize;   // the release frame: the half-alpha gray,
@@ -727,6 +779,22 @@ inline void cwSheetRowKick() {                 // non-blocking; safe from any me
 // the fade train (v7.2.15, moved here v7.5.3): re-presents row 0 from
 // OUTSIDE the message queue -- the DWM bakes the sheet blend at presentation
 // time (v7.1.30), and a starved repaint freezes it mid-fade.
+// v7.5.8 THE SHRINK TRACKS THE FADE: the train's IsIconic skip is RETIRED.
+// The v7.5.1 freeze silenced every FACE painter for the shrink (correct --
+// a re-landed face mid-animation is the taped flicker), but it took the ROW
+// presenter down with it, and the row is the one surface the DWM's
+// activation fade must see re-presented: the ordered present bakes the
+// gray ONCE over the sheet's still-ACTIVE material (the registry accent),
+// the flip starts the ~200 ms fade, the strips ride it -- and the frozen
+// train let that one red-tinted blend ride the ENTIRE shrink. The train now
+// ticks through the iconic state exactly as it ticks through an ordinary
+// unfocus: the row re-presents every 20 ms, blends with the sheet frame by
+// frame as the fade runs, dims in lockstep with the left/right/bottom
+// strips, and settles on the latch's byte -- the field's gray for the
+// minimize release (state 2), the key again on the restore (state 1).
+// IsWindowVisible STAYS: a HIDDEN window (the tray) has no surface worth
+// presenting to. The latch + the gate keep every tick state-carrying: no
+// tick can re-land a stale byte (the v7.5.5 race stays dead).
 inline DWORD WINAPI cwFadePresenter(LPVOID) {
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
@@ -752,9 +820,22 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
         const int nc = g_ncActive.load(std::memory_order_relaxed);
         if (nc < 0) continue;                 // no activation state latched yet
         HWND w = g_host;
-        if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+        // v7.5.8: no IsIconic here anymore -- the shrink tracks the fade
+        // (the block comment above). IsWindowVisible keeps the tray-hidden
+        // window out.
+        if (!w || !IsWindow(w) || !IsWindowVisible(w)) continue;
         RECT cr;
-        if (!GetClientRect(w, &cr) || cr.right <= 0) continue;
+        if (!GetClientRect(w, &cr) || cr.right <= 0) {
+            // v7.5.8: an iconic window can answer an EMPTY client rect, but
+            // the redirection surface keeps the pre-shrink width for the
+            // whole animation -- the cached DIB width is the truth there.
+            // (The grow branch below never fires from the cache: rowW is
+            // already the pre-shrink width by construction.) Resting-iconic
+            // ticks land the latch's byte on the hidden surface -- harmless,
+            // and the taskbar thumbnail shows the right border for it.
+            if (IsIconic(w) && rowW > 0) cr.right = rowW;
+            else continue;
+        }
         if (cr.right > rowW) {                // (re)grow the private row DIB
             if (bm) DeleteObject(bm);
             if (dc) { DeleteDC(dc); dc = nullptr; }
@@ -773,7 +854,8 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             rowW = cr.right;
         }
         const unsigned px = cwSheetRowBytesState(nc);   // state bytes -- the key on 1, the field's
-                                                        // half-alpha gray on 2 (minimize, v7.5.7) and
+                                                        // half-alpha gray on 2 (minimize, v7.5.7; the
+                                                        // shrink tracks the fade on it, v7.5.8) and
                                                         // on 0 (inactive; the split itself is v7.5.4's)
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;

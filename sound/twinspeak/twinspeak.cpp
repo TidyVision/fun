@@ -23,6 +23,32 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.8 THE SHRINK TRACKS THE FADE (the release glass is gone for
+//            good). Field, after v7.5.7: "I still see a transparent glass
+//            being a 255,0,0 the moment I release the mouse's left button
+//            for minimizing." THE VERDICT, after three byte changes could
+//            not kill it: the byte was never the bug -- the RIDE was. The
+//            v7.5.2 ordered present lands the gray row ONCE, and at that
+//            instant the sheet under it is still the ACTIVE material (the
+//            registry accent -- the red): the bake is half gray + half
+//            accent glass. Then DefWindowProc flips the placement and the
+//            DWM starts its ~200 ms activation fade -- the left/right/
+//            bottom strips ride it -- but v7.5.1's freeze IsIconic-skipped
+//            the fade presenter train along with every face painter, so
+//            the row was NEVER re-presented: that one red-tinted blend
+//            rode the ENTIRE shrink while the strips faded without it.
+//            THE FIX lives in customWindow.h: the train's IsIconic skip
+//            retires (with an iconic client-rect fallback -- an iconic
+//            window can answer an empty rect; the surface keeps the
+//            pre-shrink width). The train now ticks through the shrink
+//            exactly as it ticks through an ordinary unfocus: the row
+//            re-presents every 20 ms, blends with the sheet frame by
+//            frame as the fade runs, dims in lockstep with the strips,
+//            and settles on the field's gray -- Gdiplus::Color(128,43,43,
+//            43), byte for byte the inactive bar's row (the v7.5.7 byte
+//            stands). The latch=2 guard, the gate, the press-frame key,
+//            the face freeze and the ordered present all stay. Version
+//            steps to 7.5.8.
 //    v7.5.7 THE GRAY RETURNS (the release frame is the inactive bar's row).
 //            Field, after v7.5.6: "the only issue that's persistent now is
 //            that the frame you release the mouse for the minimize button,
@@ -7948,8 +7974,9 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.7 |  %s",  // v7.5.7 the release byte is the half-alpha gray again --
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
+    snprintf(vbuf, sizeof(vbuf), "v7.5.8 |  %s",  // v7.5.8 the shrink tracks the fade -- the release glass
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // is gone for good (the presenter train runs the
+                                                                   // shrink; the settled row is the field's gray)
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8117,6 +8144,10 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // timer's ticks starved behind queue traffic and froze the blend
         // mid-fade (the intermittent deactivation delay). Kicking even when
         // hidden is safe: the thread checks visibility on every tick.
+        // v7.5.8: kicking while ICONIC is load-bearing now -- this tail is
+        // the one that arms the train for the MINIMIZE shrink (the latch
+        // reads 2, the iconic skip is retired), so the row tracks the fade
+        // through the whole animation and settles on the release gray.
         // v7.3.1: the commit is landed and flushed -- the presenter may
         // resume; the gate clears BEFORE the kick so the train's first
         // tick is not burned by the still-set gate.
@@ -8371,7 +8402,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // face was presented synchronously, the shrink needs no train,
             // and the WM_NCACTIVATE(FALSE) tail owns the next kick; with
             // the latch at 2 even that burst lands the release gray (the
-            // field's half-alpha byte, v7.5.7) or is IsIconic-skipped.
+            // field's half-alpha byte, v7.5.7).
+            // v7.5.8 THE RIDE, CORRECTED: "or is IsIconic-skipped" is the
+            // sentence this version retires. That skip was the last window
+            // the glass had: the ordered present above bakes the row ONCE
+            // over the sheet's still-ACTIVE material (the registry accent),
+            // the flip starts the DWM's ~200 ms fade, the strips ride it --
+            // and the frozen train let that one red-tinted blend ride the
+            // ENTIRE shrink (the field: "I still see a transparent glass
+            // being a 255,0,0 the moment I release the mouse's left button
+            // for minimizing"). The train now RUNS the shrink (customWindow.h,
+            // the iconic skip retired): this tail's kick arms it, and the
+            // row re-presents every 20 ms through the fade -- lockstep with
+            // the strips -- settling on the field's gray, the inactive
+            // bar's row byte for byte.
         }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
