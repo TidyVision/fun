@@ -64,13 +64,14 @@
 //         never starts, where it used to "end where it started". Default:
 //         false.
 //
-//     changeWinMinimizeHoverColor(int col) / (int col, int gradColor)
-//         The minimize button's hover face. Default: the panel gray.
-//
-//     changeWinMaximizeHoverColor(int col) / (int gradColor)
-//         The maximize button's hover face. Default: the panel gray.
-//         (The CLOSE hover face is deliberately not configurable -- it stays
-//         the vanilla red with the white X, like every normal window.)
+//     The button hover (v7.5.3d): no longer a color knob. The minimize and
+//     maximize buttons show a 10% black tint (measured off the real thing)
+//     that fades in over 150 ms and out over 300 ms, LINEAR, painted over
+//     everything in the button, one design px short of the bar (the border
+//     row stays untinted) and with 0.5 px seams between neighbouring
+//     buttons. The close button fades its vanilla red the same way and the
+//     X whitens with it. changeWinMinimizeHoverColor /
+//     changeWinMaximizeHoverColor are retired.
 //
 //     putWindowinTray(bool hide)
 //         hide=true: hide the window to the tray NOW, SILENTLY -- the
@@ -93,6 +94,17 @@
 //     cwIsMaximized(HWND)          the sample's maximized test (WPL)
 //     cwAttach(HWND, void(*)(HWND))   the chrome window + the bar repaint fn
 //     cwSetBarHeight(int)          the caption bar height in REAL pixels
+//     cwBarHeight()                v7.5.3d: the header's own caption height
+//                                  (33 design px, dpi-scaled) -- the number
+//                                  a host adopts as its caption contract;
+//                                  cwSetBarHeight stays for hosts that keep
+//                                  their own
+//     cwTrackChild / cwRelayoutChildren / cwSetDpiHook
+//                                  v7.5.3d: the WM_DPICHANGED story. The
+//                                  header re-derives itself (dpi, bar height,
+//                                  title font), applies the suggested rect,
+//                                  calls the host's hook (constants + fonts),
+//                                  then re-seats the tracked children.
 //     cwSeedTitleFont(face, px, weight)   size/weight behind changeWinTextFont
 //     cwSeedChrome(...)            per-theme seed of every chrome color
 //     cwSetTrayHost(hideFn, showFn)   putWindowinTray delegates to these
@@ -152,6 +164,7 @@
 #include <objbase.h>
 #include <gdiplus.h>
 #include <atomic>
+#include <vector>
 
 #ifndef GET_X_PARAM
 #define GET_X_PARAM(lp) ((int)(short)LOWORD(lp))
@@ -184,10 +197,22 @@ inline int  g_textGrad    = 0xFF6C868C;   // title text gradient bottom
 inline int  g_textUn      = 0xFF7E888E;   // title text, unfocused (solid...
 inline int  g_textUnGrad  = -1;           // ...or gradient bottom when >= 0)
 inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_textCol)
-inline int  g_minHover    = 0xFF181B1F;   // minimize hover face
-inline int  g_minHoverGrad= -1;           // hover gradient bottom (-1 = solid)
-inline int  g_maxHover    = 0xFF181B1F;   // maximize hover face
-inline int  g_maxHoverGrad= -1;
+// v7.5.3d: the hover is no longer a solid face color. The min/max hover is
+// a black TINT -- 10% alpha (0x1A = 26, measured off a real Windows 10
+// caption button) -- that fades in over 150 ms and out over 300 ms, LINEAR,
+// painted OVER everything in the button (the glyph included), one design px
+// short of the bar's full height (the DWM border row stays untinted) and
+// with 0.5 px seams between neighbouring buttons (0.25 px off each inner
+// edge, anti-aliased so the seam renders as the hairline the real thing
+// shows). The close button fades its vanilla red the same way; the X lerps
+// to white with the fill.
+inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
+inline constexpr int kHovFadeInMs  = 150;   // pre-hover ramp
+inline constexpr int kHovFadeOutMs = 300;   // post-hover ramp
+inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation timer
+inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
+inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
+inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is running
 inline const DWORD kCloseHover = 0xFFCC0000;   // vanilla red, not configurable
 inline std::wstring g_fontFace = L"Segoe UI";
 inline int  g_fontPx      = 14;
@@ -199,10 +224,21 @@ inline bool g_resizable   = false;
 
 // ---- host plumbing state ---------------------------------------------------
 inline HWND   g_host      = nullptr;      // the chrome window
-inline int    g_barH      = 31;           // caption bar height, REAL px
+// v7.5.3d: the bar height is the header's own truth now -- 33 design px
+// (the real DWM caption height; the old 31 was two px short), scaled by the
+// header's DPI and re-derived on WM_DPICHANGED. A host adopts it through
+// cwBarHeight() (twinspeak) or keeps seeding cwSetBarHeight() (others).
+inline constexpr int kBarHDesign = 33;
+inline int    g_barH      = 33;           // caption bar height, REAL px
 inline void (*g_repaint)(HWND) = nullptr;  // the host's synchronous bar repaint
 inline void (*g_trayHide)(HWND) = nullptr; // putWindowinTray(true)  -> host path
 inline void (*g_trayShow)(HWND) = nullptr; // putWindowinTray(false) -> host path
+// v7.5.3d: the DPI hook -- the one thing the header cannot do for a host is
+// re-derive ITS constants and fonts. On WM_DPICHANGED the header updates
+// itself (dpi, bar height, title font) and calls this AFTER the suggested
+// rect has been applied; the host re-scales and then cwRelayoutChildren()
+// moves the tracked children. Registered once, next to cwAttach.
+inline void (*g_dpiHook)() = nullptr;
 
 // hover: 0 none, 1 minimize, 2 maximize, 3 close (replaces GWLP_USERDATA)
 enum { cwHovNone = 0, cwHovMin = 1, cwHovMax = 2, cwHovClose = 3 };
@@ -214,16 +250,40 @@ inline bool g_trayUp           = false;
 inline UINT g_trayMsg          = 0;          // WM_APP+n, registered on first use
 inline UINT g_taskbarCreated   = 0;
 
+// ---- the title font (family name or C:\Windows\Fonts file) -----------------
+inline Gdiplus::Font* g_font = nullptr;
+inline std::wstring g_fontKey;             // face|px|weight|dpi of the cached font
+inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
+
 // ---- small helpers ---------------------------------------------------------
+inline UINT g_dpi = 0;                    // 0 = seed on the first cwDpi()
 inline UINT cwDpi() {
-    static UINT dpi = 0;
-    if (!dpi) {
+    if (!g_dpi) {
         HDC dc = GetDC(nullptr);
         int d = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
         if (dc) ReleaseDC(nullptr, dc);
-        dpi = (d > 0) ? (UINT)d : 96;
+        g_dpi = (d > 0) ? (UINT)d : 96;
     }
-    return dpi;
+    return g_dpi;
+}
+// v7.5.3d: WM_DPICHANGED -- the scale moved under the window. The header's
+// whole geometry derives from this (cwS/cwSf, the bar height, the title
+// font's pixel height), so one store re-derives everything lazily; the
+// title font's cache key carries the DPI and rebuilds on the next paint.
+inline void cwDpiChanged(UINT dpi) {
+    if (dpi && dpi != g_dpi) { g_dpi = dpi; g_fontKey.clear(); }
+}
+// system metrics at the window's DPI (per-monitor-v2 correct; the plain
+// GetSystemMetrics answers the primary's sign-in scale). Loaded loose so
+// pre-1607 Windows keeps working.
+inline int cwMetric(int idx) {
+    typedef int (WINAPI *CwMetricForDpiFn)(int, UINT);
+    static CwMetricForDpiFn fn = []() -> CwMetricForDpiFn {
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        return u ? (CwMetricForDpiFn)(void*)GetProcAddress(u, "GetSystemMetricsForDpi") : nullptr;
+    }();
+    if (fn) { const int v = fn(idx, cwDpi()); if (v) return v; }
+    return GetSystemMetrics(idx);
 }
 inline int cwS(int v) { return MulDiv(v, (int)cwd::cwDpi(), 96); }        // design px -> real px (twinspeak's S())
 inline float cwSf(float v) { return v * (float)cwd::cwDpi() / 96.0f; }
@@ -245,6 +305,82 @@ inline void cwRepaint() {
     }
 }
 
+// ---- v7.5.3d: the hover fade train ------------------------------------------
+// Linear 150/300 ms ramps per button (min, max, close), driven by a private
+// 16 ms WM_TIMER on the host window; every tick repaints the bar through the
+// host's synchronous painter, which reads g_hovA. The timer lives only while
+// a ramp is in flight, then it is gone again.
+inline void cwHovAnimEnsure() {
+    if (g_hovTimerOn || !g_host || !IsWindow(g_host)) return;
+    g_hovLast = GetTickCount();
+    if (SetTimer(g_host, kHovTimerId, 16, nullptr)) g_hovTimerOn = true;
+}
+inline void cwHovAnimTick() {
+    if (!g_hovTimerOn) return;
+    const HWND w = g_host;
+    if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w)) {
+        g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;      // nothing visible: rest
+        KillTimer(w, kHovTimerId); g_hovTimerOn = false;
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DWORD dt = now - g_hovLast;
+    g_hovLast = now;
+    if (dt > 1000) dt = 1000;                       // a stalled queue must not jump the ramp
+    bool busy = false;
+    for (int i = 0; i < 3; ++i) {
+        const bool held = (g_hover == i + 1);
+        int a = g_hovA[i];
+        if (held) a += (int)(dt * 255 / kHovFadeInMs);
+        else      a -= (int)(dt * 255 / kHovFadeOutMs);
+        if (a > 255) a = 255;
+        if (a < 0) a = 0;
+        if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
+        if ((held && a < 255) || (!held && a > 0)) busy = true;
+    }
+    cwRepaint();                                    // the painter reads g_hovA
+    if (!busy) { KillTimer(w, kHovTimerId); g_hovTimerOn = false; }
+}
+
+// ---- v7.5.3d: the DPI-responsive child ledger --------------------------------
+// Children that ride below the bar (design px in, real px out) register here;
+// on WM_DPICHANGED the header re-positions every tracked child at the new
+// scale, re-seats its font (a pointer into the host's HFONT slot -- the host
+// re-creates the font in its dpi hook) and runs its per-child fixup
+// (combobox item heights).
+struct CwTrackedChild {
+    HWND    h;
+    int     x, y, w, ht;        // design px
+    bool    underBar;           // the y rides the header's bar height
+    HFONT*  font;               // the host's font slot, re-sent after a move
+    int     comboItemH;         // > 0: CB_SETITEMHEIGHT(-1) after the move
+};
+inline std::vector<CwTrackedChild> g_kids;
+inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
+                         bool underBar = true, HFONT* font = nullptr,
+                         int comboItemH = 0) {
+    for (auto& k : g_kids)
+        if (k.h == h) { k.x = x; k.y = y; k.w = w; k.ht = ht;
+                        k.underBar = underBar; k.font = font;
+                        k.comboItemH = comboItemH; return; }
+    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH });
+}
+inline void cwRelayoutChildren() {
+    for (auto& k : g_kids) {
+        if (!k.h || !IsWindow(k.h)) continue;
+        SetWindowPos(k.h, nullptr,
+                     cwS(k.x), cwS(k.y) + (k.underBar ? g_barH : 0),
+                     cwS(k.w), cwS(k.ht),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (k.font && *k.font) SendMessageW(k.h, WM_SETFONT, (WPARAM)*k.font, TRUE);
+        if (k.comboItemH > 0) {
+            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwS(k.comboItemH));
+            InvalidateRect(k.h, nullptr, FALSE);
+        }
+    }
+}
+inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
+
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
 // Client coordinates over a bar 0..g_barH tall, buttons 47 design-px wide,
 // stacked from the right edge: close always; then maximize (if present);
@@ -265,11 +401,6 @@ inline CwButtonRects cwButtonRects(int ww) {
     if (!g_btnMax) minimize = maximize;   // the empty slot collapses
     return { close, maximize, minimize };
 }
-
-// ---- the title font (family name or C:\Windows\Fonts file) -----------------
-inline Gdiplus::Font* g_font = nullptr;
-inline std::wstring g_fontKey;             // face|px|weight of the cached font
-inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
 
 inline bool cwFileExists(const std::wstring& p) {
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -302,7 +433,8 @@ inline bool cwResolveFont(const std::wstring& in) {
 
 inline Gdiplus::Font* cwFont() {
     const std::wstring key = g_fontFamily + L"|" + std::to_wstring(g_fontPx)
-                           + L"|" + std::to_wstring(g_fontWeight);
+                           + L"|" + std::to_wstring(g_fontWeight)
+                           + L"|" + std::to_wstring(cwDpi());   // v7.5.3d: the dpi rides the key
     if (g_font && key == g_fontKey) return g_font;
     delete g_font; g_font = nullptr;
     LOGFONTW lf = {0};
@@ -358,23 +490,21 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
                                              cwChannel(col, 8), cwChannel(col, 0)));
         g.FillRectangle(&b, x, y, w2, h2);
     };
-    // hover faces: flat or vertical gradient over the button rect
-    auto fillHover = [&](int col, int grad, const RECT& r) {
-        if (grad < 0) { fillARGB(col, r.left, r.top, r.right - r.left, r.bottom - r.top); return; }
-        Gdiplus::LinearGradientBrush hb(
-            Gdiplus::Rect((INT)r.left, (INT)r.top,
-                          (INT)(r.right - r.left), (INT)(r.bottom - r.top)),
-            Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
-                           cwChannel(col, 8), cwChannel(col, 0)),
-            Gdiplus::Color(cwChannel(grad, 24), cwChannel(grad, 16),
-                           cwChannel(grad, 8), cwChannel(grad, 0)),
-            Gdiplus::LinearGradientModeVertical);
-        g.FillRectangle(&hb, (INT)r.left, (INT)r.top,
-                        (INT)(r.right - r.left), (INT)(r.bottom - r.top));
+    // v7.5.3d: the hover patch -- a translucent fill with sub-pixel control.
+    // The 0.5 px seams between neighbouring buttons are 0.25 px insets on the
+    // inner edges, anti-aliased so the seam renders as the hairline the real
+    // DWM shows; the outer edges stay flush (close rides the window edge).
+    auto fillPatch = [&](const RECT& r, int col, float insetL, float insetR) {
+        Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
+                                             cwChannel(col, 8), cwChannel(col, 0)));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.FillRectangle(&b, (Gdiplus::REAL)r.left + insetL, (Gdiplus::REAL)r.top,
+                        (Gdiplus::REAL)(r.right - r.left) - insetL - insetR,
+                        (Gdiplus::REAL)(r.bottom - r.top));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
     };
     // minimize
     if (g_btnMin) {
-        if (g_hover == cwHovMin) fillHover(g_minHover, g_minHoverGrad, br.minimize);
         const int lineW = cwS(10);
         const int cx = br.minimize.left + buttonW / 2;
         const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2;
@@ -382,31 +512,44 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     }
     // maximize (square outline; double square while maximized)
     if (g_btnMax) {
-        if (g_hover == cwHovMax) fillHover(g_maxHover, g_maxHoverGrad, br.maximize);
         const int cx = br.maximize.left + buttonW / 2;
         const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2;
         const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
         Gdiplus::Pen p(Gdiplus::Color(cwChannel(item, 24), cwChannel(item, 16),
                                       cwChannel(item, 8), cwChannel(item, 0)), penW);
         if (w && cwIsMaximized(w)) {
-            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet
-            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet
+            // v7.5.3d: the front sheet OCCLUDES the back one -- the real
+            // restore glyph layers the squares, the back square's edges stop
+            // at the front square instead of showing through its interior
+            // (the maximized button used to read as see-through wireframe).
+            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));
+            Gdiplus::Region frontRegion(front);
+            g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
+            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet, occluded
+            g.ResetClip();
+            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
         } else {
             g.DrawRectangle(&p, cx - cwS(4), cy - cwS(4), cwS(9), cwS(9));
         }
     }
-    // close (always; vanilla red hover, white X)
+    // close (always; vanilla red hover, white X -- both ride the same linear
+    // 150/300 ms fade; the X stroke is the real thing's 1 design px, the old
+    // 1.25 rendered half again too thick)
     {
-        if (g_hover == cwHovClose) {
-            fillARGB((int)kCloseHover, br.close.left, br.close.top, buttonW,
-                     br.close.bottom - br.close.top);
-        }
+        const int pa = g_hovA[2];
+        if (pa > 0) fillPatch(br.close, (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0.25f, 0.0f);
         const int cx = br.close.left + buttonW / 2;
         const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
-        const int xc = (g_hover == cwHovClose) ? 0xFFFFFFFF : item;
+        int xc = item;
+        if (pa > 0) {                       // the X whitens with the red
+            const int r  = cwChannel(item, 16) + ((255 - cwChannel(item, 16)) * pa + 127) / 255;
+            const int gr = cwChannel(item,  8) + ((255 - cwChannel(item,  8)) * pa + 127) / 255;
+            const int b  = cwChannel(item,  0) + ((255 - cwChannel(item,  0)) * pa + 127) / 255;
+            xc = (int)(0xFF000000u | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
+        }
         Gdiplus::Pen xp(Gdiplus::Color(cwChannel(xc, 24), cwChannel(xc, 16),
                                        cwChannel(xc, 8), cwChannel(xc, 0)),
-                        cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f));
+                        cwSf(1.0f) < 1.0f ? 1.0f : cwSf(1.0f));
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.DrawLine(&xp, cx - cwS(5), cy - cwS(5), cx + cwS(5), cy + cwS(5));
         g.DrawLine(&xp, cx + cwS(5), cy - cwS(5), cx - cwS(5), cy + cwS(5));
@@ -469,6 +612,16 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
                 }
             }
         }
+    }
+    // v7.5.3d: the min/max hover tints land LAST -- they overlay everything
+    // in the button (the glyph included), one design px short of the bar's
+    // full height so the DWM border row stays untinted, with the 0.5 px
+    // seams against their neighbours (the outer edges stay flush).
+    {
+        const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
+        const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
+        if (g_btnMin && aMin > 0) fillPatch(br.minimize, aMin << 24, 0.0f, 0.25f);
+        if (g_btnMax && aMax > 0) fillPatch(br.maximize, aMax << 24, 0.25f, 0.25f);
     }
 }
 
@@ -856,6 +1009,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // the frame is flipping to), readable by every painter inside the
         // activation transaction. The message itself keeps flowing to the
         // host's own case and DefWindowProc.
+        if (!wp && g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
         cwSheetRowLatch(wp ? 1 : 0);
         return false;
     case WM_DWMCOMPOSITIONCHANGED:
@@ -876,9 +1030,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // caption OUTSIDE the window rect -- the real top border belongs to
         // the host's sheet/border row).
         if (!wp) return false;
-        const int frame_x = GetSystemMetrics(SM_CXFRAME);
-        const int frame_y = GetSystemMetrics(SM_CYFRAME);
-        const int padding = GetSystemMetrics(SM_CXPADDEDBORDER);
+        const int frame_x = cwMetric(SM_CXFRAME);       // v7.5.3d: per-dpi metrics
+        const int frame_y = cwMetric(SM_CYFRAME);
+        const int padding = cwMetric(SM_CXPADDEDBORDER);
         NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
         RECT* requested_client_rect = params->rgrc;
         requested_client_rect->right  -= frame_x + padding;
@@ -920,7 +1074,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         cursor_point.y = GET_Y_PARAM(lp);
         ScreenToClient(w, &cursor_point);
         if (!cwIsMaximized(w) && cursor_point.y > 0 &&
-            cursor_point.y < GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)) {
+            cursor_point.y < cwMetric(SM_CYFRAME) + cwMetric(SM_CXPADDEDBORDER)) {
             *out = g_resizable ? HTTOP : HTBORDER;   // v7.5.1: the honest border
             return true;
         }
@@ -938,7 +1092,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (PtInRect(&br.close, cursor_point)) nh = cwHovClose;
         else if (g_btnMax && PtInRect(&br.maximize, cursor_point)) nh = cwHovMax;
         else if (g_btnMin && PtInRect(&br.minimize, cursor_point)) nh = cwHovMin;
-        if (nh != g_hover) { g_hover = nh; cwRepaint(); }
+        if (nh != g_hover) { g_hover = nh; cwHovAnimEnsure(); }   // the fade owns the repaints
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT, w, 0 };
+        TrackMouseEvent(&tme);          // the leave that starts the 300 ms fade-out
         *out = DefWindowProcW(w, msg, wp, lp); return true; }
     case WM_NCLBUTTONDOWN:
         // the DOWN must not count as a drag start when a button is hovered
@@ -991,6 +1147,34 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
             *out = 0; return true;
         }
         return false;
+    case WM_NCMOUSELEAVE:
+        // the cursor left the window: the fade-out owns what is on screen now
+        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        return false;
+    case WM_TIMER:
+        // the hover fade train's own tick; every other timer is the host's
+        if (wp == kHovTimerId && g_hovTimerOn) { cwHovAnimTick(); *out = 0; return true; }
+        return false;
+    case WM_DPICHANGED: {
+        // v7.5.3d: the scale moved under the window (a system scale change, a
+        // dock, a drag across monitors). The header re-derives its own
+        // geometry (dpi, bar height, title font), applies the DWM's suggested
+        // rect, hands the host its hook (constants + fonts), then re-seats
+        // the tracked children at the new scale. Handled HERE -- the host's
+        // switch never sees it.
+        const UINT nd = HIWORD(wp);
+        if (nd && nd != cwDpi()) {
+            cwDpiChanged(nd);
+            g_barH = cwS(kBarHDesign);
+            const LPRECT r = (LPRECT)lp;
+            if (r) SetWindowPos(w, nullptr, r->left, r->top,
+                                r->right - r->left, r->bottom - r->top,
+                                SWP_NOZORDER | SWP_NOACTIVATE);
+            if (g_dpiHook) g_dpiHook();
+            cwRelayoutChildren();
+            if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
+        }
+        *out = 0; return true; }
     case WM_SYSCOMMAND: {
         const UINT sc = (UINT)(wp & 0xFFF0);
         if (!g_resizable && (sc == SC_MAXIMIZE || sc == SC_SIZE)) { *out = 0; return true; }
@@ -1027,7 +1211,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         return false;   // the host's DefWindowProc finishes the protocol
     case WM_MOUSEMOVE:
         // into the client = no caption button hovered
-        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwRepaint(); }
+        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
         return false;
     default:
         if (g_trayUp && g_trayMsg && msg == g_trayMsg) {
@@ -1097,11 +1281,9 @@ inline void setWinTitleTextColor(int color, int gradientCol) {
     setWinTitleTextColor(color, gradientCol, color, gradientCol);
 }
 
-inline void changeWinMinimizeHoverColor(int col)                 { cwd::g_minHover = col; cwd::g_minHoverGrad = -1; cwd::cwRepaint(); }
-inline void changeWinMinimizeHoverColor(int col, int gradColor)  { cwd::g_minHover = col; cwd::g_minHoverGrad = gradColor; cwd::cwRepaint(); }
-
-inline void changeWinMaximizeHoverColor(int col)                 { cwd::g_maxHover = col; cwd::g_maxHoverGrad = -1; cwd::cwRepaint(); }
-inline void changeWinMaximizeHoverColor(int col, int gradColor)  { cwd::g_maxHover = col; cwd::g_maxHoverGrad = gradColor; cwd::cwRepaint(); }
+// v7.5.3d: changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are
+// retired -- the hover is the fixed 10% black tint now (the real thing's
+// look is not a color knob).
 
 inline void changeWinTextFont(const std::string& font = "Segoe UI") {
     std::wstring wide(font.begin(), font.end());
@@ -1139,6 +1321,18 @@ inline void cwAttach(HWND w, void (*repaint)(HWND)) {
     cwd::cwSheetSetup(w);   // v7.5.3b: the sheet + the dark-mode border -- the header's own
 }
 inline void cwSetBarHeight(int px)                  { cwd::g_barH = px; }
+// v7.5.3d: the bar height is the header's own -- 33 design px at the header's
+// dpi. A host adopts this as its caption-height layout contract (the buffer
+// height, the content y offset) instead of deriving its own S(31).
+inline int  cwBarHeight()                           { return cwd::cwS(cwd::kBarHDesign); }
+inline UINT cwDpi()                                 { return cwd::cwDpi(); }   // v7.5.3d
+inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
+                         bool underBar = true, HFONT* font = nullptr,
+                         int comboItemH = 0) {   // v7.5.3d
+    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH);
+}
+inline void cwRelayoutChildren()                    { cwd::cwRelayoutChildren(); }
+inline void cwSetDpiHook(void (*hook)())            { cwd::cwSetDpiHook(hook); }
 inline void cwSetTrayHost(void (*hide)(HWND), void (*show)(HWND)) {
     cwd::g_trayHide = hide; cwd::g_trayShow = show;
 }
@@ -1149,16 +1343,16 @@ inline void cwSeedTitleFont(const std::string& face, int px, int weight) {
 }
 // per-theme seed of every chrome color (twinspeak's applyTheme re-seeds on
 // every theme switch). inactive face defaults to mirroring the active one.
+// v7.5.3d: the hover-color pair is gone from the seed -- the tint owns it.
 inline void cwSeedChrome(int faceCol, int faceGrad,
                          int faceColIn, int faceGradIn,
                          int textCol, int textGrad, int textUn,
-                         int glyphCol, int minHover, int maxHover) {
+                         int glyphCol) {
     cwd::g_faceCol = faceCol;   cwd::g_faceGrad = faceGrad;
     cwd::g_faceColIn = faceColIn < 0 ? faceCol  : faceColIn;
     cwd::g_faceGradIn = faceGradIn < 0 ? faceGrad : faceGradIn;
     cwd::g_textCol = textCol;   cwd::g_textGrad = textGrad;
     cwd::g_textUn = textUn;     cwd::g_glyph = glyphCol;
-    cwd::g_minHover = minHover; cwd::g_maxHover = maxHover;
     cwd::cwRepaint();
 }
 inline DWORD cwFrameStyle() {
@@ -1212,11 +1406,11 @@ inline void changeWinTextFont(const std::string& = "Segoe UI")         {}
 inline void enableWinIcon(bool)                                        {}
 inline void setWinTitlebarButtonLayout(bool, bool)                     {}
 inline void setCanWinResize(bool)                                      {}
-inline void changeWinMinimizeHoverColor(int)                           {}
-inline void changeWinMinimizeHoverColor(int, int)                      {}
-inline void changeWinMaximizeHoverColor(int)                           {}
-inline void changeWinMaximizeHoverColor(int, int)                      {}
 inline void putWindowinTray(bool)                                      {}
+inline int  cwBarHeight()                                              { return 33; }
+inline void cwTrackChild(void*, int, int, int, int, bool, void*, int)  {}
+inline void cwRelayoutChildren()                                       {}
+inline void cwSetDpiHook(void (*)())                                   {}
 inline void cwSeedSheetRow(unsigned, unsigned)                         {}
 inline void cwPatchSheetRow(void*, int, bool)                          {}
 inline void cwCommitSheetRowFast(void*, bool)                          {}

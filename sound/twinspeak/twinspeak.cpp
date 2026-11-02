@@ -156,7 +156,7 @@
 //            setWinTitleTextColor,
 //            changeWinTextFont (a family name or a C:/Windows/Fonts file),
 //            enableWinIcon, setWinTitlebarButtonLayout, setCanWinResize,
-//            changeWinMinimizeHoverColor, changeWinMaximizeHoverColor,
+//            (v7.5.3d: the hover-color pair is RETIRED -- the header's 10% tint),
 //            putWindowinTray -- each Windows-real, with a no-op stub for
 //            every other target. twinspeak stays consumer #1: applyTheme
 //            re-seeds every chrome color from the live theme (byte-identical
@@ -4960,24 +4960,19 @@ static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
 static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
-static int kCapH      = 31;                            // the caption bar
+static int kCapH      = 33;                            // the caption bar (v7.5.3d: 33 design px -- the real DWM height)
 static int KCLI_W     = 880, KCLI_H      = 620;        // designed client size
 static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
 static int KLOG_BOTTOM= 594;                            // log pane bottom
 static int kTabW[5]   = { 166, 166, 166, 166, 166 };   // tab face widths
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // guiInitDpi runs FIRST in guiMain -- before guiMakeGdi (fonts) and before
-// any window exists. System-aware means the DPI is fixed for the process
-// lifetime; no WM_DPICHANGED re-layout is needed (the manifest keeps the
-// door open for PerMonitorV2 if the panel ever goes resizable).
-static void guiInitDpi() {
-    HDC sdc = GetDC(nullptr);
-    if (sdc) {
-        const int d = GetDeviceCaps(sdc, LOGPIXELSX);
-        if (d > 0) g_dpi96 = (UINT)d;
-        ReleaseDC(nullptr, sdc);
-    }
-    kCapH      = S(31);
+// any window exists. v7.5.3d: the manifest is PerMonitorV2 now and the
+// WM_DPICHANGED hook re-runs the derivation at the new scale -- the
+// "system-aware, fixed for the process lifetime" rule is retired. The
+// caption height itself is customWindow.h's (cwBarHeight: 33 design px).
+static void guiApplyDpi() {
+    kCapH      = cwBarHeight();   // v7.5.3d: the header owns the height
     KCLI_W     = S(880);
     KCLI_H     = S(620);
     KPANEL_T   = S(66);
@@ -4988,6 +4983,15 @@ static void guiInitDpi() {
     KSTRIP_PAD  = S(5);
     KSTRIP_FACE_Y = S(6);
     cwSetBarHeight(kCapH);   // v7.5.0: the header's caption geometry = ours (real px)
+}
+static void guiInitDpi() {
+    HDC sdc = GetDC(nullptr);
+    if (sdc) {
+        const int d = GetDeviceCaps(sdc, LOGPIXELSX);
+        if (d > 0) g_dpi96 = (UINT)d;
+        ReleaseDC(nullptr, sdc);
+    }
+    guiApplyDpi();
 }
 
 // v7.1.24 THE WINDOW IS THE Win32 CUSTOM TITLE BAR EXAMPLE (main.c): the
@@ -5411,12 +5415,13 @@ static void guiPaintBar(HWND w) {
 
 // ---- fonts / brushes -------------------------------------------------------
 static void applyTheme(int i);   // v7.0.0: forward decl (defined right below guiMakeGdi)
-static void guiMakeGdi() {
-    // v7.1.8: the Marlett close-glyph font is RETIRED -- the bar's X is the
-    // modern thin caption shape, two antialiased GDI+ pen strokes (see
-    // guiRenderBar). (The Times New Roman header font is retired with the
-    // in-window header text it served.)
-    // v7.1.20: the pixel heights scale with the DPI (S of the design px).
+// v7.5.3d: re-runnable -- the WM_DPICHANGED hook re-creates the four fonts
+// at the new scale (the old ones die first).
+static void guiMakeFonts() {
+    if (g_fUI)   { DeleteObject(g_fUI);   g_fUI   = nullptr; }
+    if (g_fUIb)  { DeleteObject(g_fUIb);  g_fUIb  = nullptr; }
+    if (g_fSml)  { DeleteObject(g_fSml);  g_fSml  = nullptr; }
+    if (g_fMono) { DeleteObject(g_fMono); g_fMono = nullptr; }
     g_fUI   = CreateFontA(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
@@ -5429,6 +5434,15 @@ static void guiMakeGdi() {
     g_fMono = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+}
+
+static void guiMakeGdi() {
+    // v7.1.8: the Marlett close-glyph font is RETIRED -- the bar's X is the
+    // modern thin caption shape, two antialiased GDI+ pen strokes (see
+    // guiRenderBar). (The Times New Roman header font is retired with the
+    // in-window header text it served.)
+    // v7.1.20: the pixel heights scale with the DPI (S of the design px).
+    guiMakeFonts();
     // v7.5.0: the titlebar's product name is customWindow.h's now -- the
     // SAME face/size/weight this HFONT carried (Segoe UI, -14 px, semibold,
     // a Gdiplus::Font built from the LOGFONT), seeded through the API. The
@@ -5447,6 +5461,21 @@ static void guiMakeGdi() {
     enableWinIcon(false);                      // no bar icon (the v7.4.11 look)
     enableCustomWin(true);
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
+}
+
+// v7.5.3d: the WM_DPICHANGED hook -- customWindow.h re-derives its own
+// geometry (dpi, bar height, title font), applies the DWM's suggested rect
+// and calls this; the host re-derives its constants, re-makes its fonts and
+// drops the tab strip's GPU state (the strip re-inits at the new size
+// lazily on its next paint). cwRelayoutChildren() re-seats the tracked
+// children right after the hook returns.
+static void guiStripGpuRelease();   // v7.0.7 (defined with the tab strip)
+static void guiOnDpiChanged() {
+    g_dpi96 = cwDpi();
+    guiApplyDpi();
+    guiMakeFonts();
+    guiStripGpuRelease();
+    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE);
 }
 
 // (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
@@ -5486,8 +5515,7 @@ static void applyTheme(int i) {
                      dark ? cwArgbOf(RGB(160, 200, 205)) : cwArgbOf(guic::cText),
                      dark ? cwArgbOf(RGB(108, 134, 140)) : cwArgbOf(guic::cText),
                      cwArgbOf(guic::cDim),
-                     cwArgbOf(guic::cText),
-                     cwArgbOf(guic::cPanel2), cwArgbOf(guic::cPanel2));
+                     cwArgbOf(guic::cText));   // v7.5.3d: the hover pair is gone -- the header's tint owns it
     }
     #define TSREBR(b, c) do { if (b) DeleteObject(b); (b) = CreateSolidBrush(c); } while (0)
     TSREBR(g_brBg,     guic::cBg);
@@ -5683,21 +5711,25 @@ static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
 
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
     // v7.1.20: design px in, real px out (DPI scale; kCapH is already real).
+    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d: design px for the dpi ledger
     x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
+    cwTrackChild(h, dx, dy, dw2, dh, true, (f == g_fUIb) ? &g_fUIb : &g_fUI);   // v7.5.3d
     regPage(h);
     return h;
 }
 
 static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
+    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d
     x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "EDIT", val,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     guiDarkCtl(h);
+    cwTrackChild(h, dx, dy, dw2, dh, true, &g_fUI);   // v7.5.3d
     regPage(h);
     return h;
 }
@@ -5706,15 +5738,18 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
     // NOTE: deliberately NOT regPage()d here -- the tab strip and the
     // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
     // presets, REFRESH) are registered by their builders (v6.6.2).
+    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d
     x = S(x); y = S(y) + kCapH; cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUIb, TRUE);
+    cwTrackChild(h, dx, dy, dw2, dh, true, &g_fUIb);   // v7.5.3d
     return h;
 }
 
 static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
+    const int dx = x, dy = y;   // v7.5.3d
     x = S(x); y = S(y) + kCapH;   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
@@ -5723,6 +5758,7 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, S(16));
     guiDarkCtl(h);
+    cwTrackChild(h, dx, dy, CTL_W, 220, true, &g_fUI, 16);   // v7.5.3d: the item height rides too
     regPage(h);
     return h;
 }
@@ -5862,6 +5898,7 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
+    const int dx = x, dy = y, dw2 = cw;   // v7.5.3d
     x = S(x); y = S(y) + kCapH; cw = S(cw);   // v7.1.20: DPI scale
     static bool sldClass = false;      // registered once
     if (!sldClass) {
@@ -5874,6 +5911,7 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
     }
     HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP,   // v7.1.4: a tab stop
                              x, y, cw, S(28), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    cwTrackChild(h, dx, dy, dw2, 28);   // v7.5.3d: the dpi ledger (no font)
     g_sld[h] = { lo, hi, lo, false };
     InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
     regPage(h);
@@ -7014,9 +7052,10 @@ static void guiMakeTabStrip(HWND w) {
         reg = true;
     }
     // v7.1.20: the design-px strip constants scale at the creation site.
-    CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
+    HWND ts = CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
                     S(KSTRIP_X), S(KSTRIP_Y) + kCapH, S(KSTRIP_W), S(KSTRIP_H), w,
                     (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
+    cwTrackChild(ts, KSTRIP_X, KSTRIP_Y, KSTRIP_W, KSTRIP_H);   // v7.5.3d: the dpi ledger
 }
 
 static void guiBuildControls(HWND w) {
@@ -7038,12 +7077,14 @@ static void guiBuildControls(HWND w) {
                               S(14), S(458) + kCapH, S(852), S(16),
                               w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
+    cwTrackChild(st, 14, 458, 852, 16, true, &g_fMono);   // v7.5.3d: the dpi ledger
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         S(14), S(480) + kCapH, S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
+    cwTrackChild(log, 14, 480, 852, 114, true, &g_fMono);   // v7.5.3d: the dpi ledger
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -7344,6 +7385,7 @@ static bool guiCreateRealWindow() {
     // icon + hide -- the balloon stays in WM_CLOSE) and guiRestoreWindow's
     // full come-up machinery.
     cwAttach(g_hwnd, guiPaintBar);
+    cwSetDpiHook(guiOnDpiChanged);   // v7.5.3d: WM_DPICHANGED re-derives the host side too
     cwSetTrayHost(guiHideToTray, cwTrayShowHost);
     // v7.4.9: the per-window System.AppUserModel.ID (v7.1.25) is RETIRED --
     // the panel is a fully vanilla window again (see the retirement note
