@@ -23,6 +23,24 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.9 THE TRAILING FLUSH (the design, locked). Field, after the
+//            v7.5.8 flight: "the glass's color disappears while in the
+//            minimizing/collapsing animation" -- then the spec: the
+//            active state overlaps the glass with the accent material
+//            (Color(255,0,0,0) by default -- the glass key it has always
+//            been), and EVERY other state is Color(128,43,43,43), with
+//            minimizing doing an immediate dwmflush AFTER changing the
+//            top bar to the inactive state. THE MAPPING: the bytes were
+//            already exactly that (g_sheetRowActive 0x00000000;
+//            g_sheetRowInactive == g_sheetRowMinimize == 0x802B2B2B) --
+//            the new machinery is the ordered present's TRAILING
+//            DwmFlush: the inactive row + face land first, GdiFlushed,
+//            then the flush blocks until a composition has completed
+//            against them -- the release gray is SAMPLED before the
+//            handler returns and DefWindowProc flips the placement. The
+//            leading flush (v7.3.0) stays as the belt. The latch, the
+//            gate, the press frame, the train's ride: all stay. Version
+//            steps to 7.5.9.
 //    v7.5.8 THE SHRINK TRACKS THE FADE (the release glass is gone for
 //            good). Field, after v7.5.7: "I still see a transparent glass
 //            being a 255,0,0 the moment I release the mouse's left button
@@ -7974,9 +7992,9 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.8 |  %s",  // v7.5.8 the shrink tracks the fade -- the release glass
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // is gone for good (the presenter train runs the
-                                                                   // shrink; the settled row is the field's gray)
+    snprintf(vbuf, sizeof(vbuf), "v7.5.9 |  %s",  // v7.5.9 the trailing flush -- the release gray is sampled
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // before the flip (the design locked: the glass key on
+                                                                   // active, the field's gray on every other state)
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8395,6 +8413,19 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_forceInactiveFace = true;
             guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
             g_forceInactiveFace = false;
+            // v7.5.9 THE TRAILING FLUSH (the field's ordering): the inactive
+            // state is now ON the surface -- the row-first commit, the face,
+            // GdiFlush -- so a DwmFlush HERE blocks until a composition has
+            // completed against those bytes: the release gray is SAMPLED,
+            // not merely written, before this handler returns and
+            // DefWindowProc flips the placement. The v7.3.0 leading flush
+            // above stays (it retires the compose IN FLIGHT, so no stale
+            // carrier exists); this trailing flush closes the other half --
+            // the compose that carries the gray is forced to have run. Cost:
+            // one wait bounded by a refresh cycle, once per release. The
+            // gate holds through it -- no presenter tick can interleave
+            // inside the ordered present.
+            if (g_dwmFlush) g_dwmFlush();
             cwSheetRowGate(false);
             // v7.5.5: NO kick here. Kicking re-armed the train INSIDE the
             // release-to-flip window (the race above). With the latch
@@ -8416,6 +8447,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // row re-presents every 20 ms through the fade -- lockstep with
             // the strips -- settling on the field's gray, the inactive
             // bar's row byte for byte.
+            // v7.5.9 THE DESIGN, LOCKED (the field's spec): the active state
+            // keeps the glass key -- the DWM's own accent material overlaps
+            // the row (the GDI+ fallback's Color(255,0,0,0), the key the
+            // field named in v7.5.4); EVERY OTHER state -- inactive AND
+            // minimizing alike -- is the field's Gdiplus::Color(128,43,43,
+            // 43), byte for byte (g_sheetRowInactive ==
+            // g_sheetRowMinimize == 0x802B2B2B, the v7.5.7 landing). The
+            // three-state latch stays as the release-to-flip guard; the
+            // trailing flush above is the only machinery change. No byte
+            // changed in v7.5.9.
         }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();

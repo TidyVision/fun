@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.8)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.9)
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
 // real NC strips via WM_NCCALCSIZE insets, HTCAPTION drag/snap/Alt+Space,
@@ -599,6 +599,23 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 // exactly what the active state wants -- carry nothing, show the DWM's
 // own border -- and exactly what the inactive and minimize states must
 // never do -- they need a delivered gray.)
+//
+// v7.5.9 THE TRAILING FLUSH, THE DESIGN LOCKED. The field's final spec,
+// verbatim: the active state "overlaps the current glass color with the
+// accent color (255,0,0,0 by default)" -- the glass key it has always
+// been -- and "any other state (especially minimizing which would
+// immediately do dwmflush after changing the top bar color to the
+// inactive state) is 128,43,43,43". The bytes already matched that spec
+// (g_sheetRowActive 0x00000000; g_sheetRowInactive ==
+// g_sheetRowMinimize == 0x802B2B2B); the one machinery change is the
+// HOST's ordered present: the inactive row + face land first, GdiFlushed,
+// then a TRAILING DwmFlush runs INSIDE the gate, before the handler
+// returns and DefWindowProc flips the placement -- the flush blocks
+// until a composition has completed against the new bytes, so the
+// release gray is SAMPLED, not merely written. The leading flush
+// (v7.3.0, retire the compose in flight) stays as the belt. The
+// three-state latch stays as the release-to-flip guard. No byte changed
+// in v7.5.9.
 //
 // THE THREE WRITERS (each lands the state's own constant; none ever measures):
 // THE THREE WRITERS (all land the same constant; none ever measures):
