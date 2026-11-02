@@ -23,6 +23,30 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.10 THE ACCENT, SELF-FED (the delivery, accounted). Field, on
+//            the v7.5.9 screenshot: "Even then, I still get a transparent
+//            glass here." -- then the spec: "the top bar should always be
+//            at the color of Gdiplus::Color(128,43,43,43) at all times but
+//            the state of focused should always exclusively use
+//            Gdiplus::Color(255,0,0,0)" -- and, before anything moved:
+//            "look at how the accent color is painted ... Is that accounted
+//            for as well?" IT WAS THE DELIVERY. The accent was never the
+//            app's paint: the recipe clears row 0 (the key) and the DWM is
+//            supposed to colorize it from the registry -- a material that
+//            exists only while Windows' "show accent color" override draws
+//            it. With the override silent the focused key showed the BARE
+//            sheet: the transparent glass, at rest, focused. THE FIX: the
+//            app feeds the DWM the accent itself -- DWMWA_BORDER_COLOR
+//            (attribute 34) = the registry AccentColor (RGB(255,0,0) when
+//            the registry is silent -- "(255,0,0,0 by default)", the
+//            field's red), applied at attach + composition-changed, and
+//            BOTH ways in WM_NCACTIVATE (apply on TRUE, DWMWA_COLOR_DEFAULT
+//            on FALSE -- the accent is the focused state's exclusively).
+//            The bytes did not move: the gray at all times (0x802B2B2B),
+//            the key focused (0x00000000); the accent over the key now
+//            comes from the app. Machinery in customWindow.h
+//            (cwApplyAccentBorder/cwResetAccentBorder/cwReadRegistryAccent).
+//            Version steps to 7.5.10.
 //    v7.5.9 THE TRAILING FLUSH (the design, locked). Field, after the
 //            v7.5.8 flight: "the glass's color disappears while in the
 //            minimizing/collapsing animation" -- then the spec: the
@@ -33,12 +57,14 @@
 //            top bar to the inactive state. THE MAPPING: the bytes were
 //            already exactly that (g_sheetRowActive 0x00000000;
 //            g_sheetRowInactive == g_sheetRowMinimize == 0x802B2B2B) --
-//            the new machinery is the ordered present's TRAILING
-//            DwmFlush: the inactive row + face land first, GdiFlushed,
-//            then the flush blocks until a composition has completed
-//            against them -- the release gray is SAMPLED before the
-//            handler returns and DefWindowProc flips the placement. The
-//            leading flush (v7.3.0) stays as the belt. The latch, the
+//            the new machinery is customWindow.h's cwSheetOrderedPresent
+//            (re-cut there on the field's word -- "make sure the trailing
+//            flush is specifically in customWindow.h"): the whole present
+//            -- the latch pre-flip, the gate, the v7.3.0 leading flush,
+//            the row-first commit, the face, and the TRAILING DwmFlush,
+//            which blocks until a composition has completed against the
+//            new bytes -- the release gray is SAMPLED before the handler
+//            returns and DefWindowProc flips the placement. The latch, the
 //            gate, the press frame, the train's ride: all stay. Version
 //            steps to 7.5.9.
 //    v7.5.8 THE SHRINK TRACKS THE FADE (the release glass is gone for
@@ -7605,6 +7631,13 @@ static bool guiCreateRealWindow() {
                               &darkOn, sizeof(darkOn)))) {
                 dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
             }
+            // v7.5.10 THE ACCENT, SELF-FED: the focused state's border color
+            // is the DWM's own border renderer fed by the APP -- DWMWA_BORDER_
+            // COLOR = the registry AccentColor (RGB(255,0,0) when the registry
+            // is silent) -- so the glass key's accent shows whether or not
+            // Windows' "show accent color" material does. WM_NCACTIVATE owns
+            // the flip of it, both directions; the machinery is the header's.
+            cwApplyAccentBorder(g_hwnd);
             // v7.3.0: DwmFlush blocks until the compose in flight has
             // retired; WM_NCACTIVATE calls it before the pre-flip present
             // so every compose that can carry the activation flip starts
@@ -7992,9 +8025,9 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.9 |  %s",  // v7.5.9 the trailing flush -- the release gray is sampled
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // before the flip (the design locked: the glass key on
-                                                                   // active, the field's gray on every other state)
+    snprintf(vbuf, sizeof(vbuf), "v7.5.10 |  %s",  // v7.5.10 the accent, self-fed -- the focused key's accent comes
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // from DWMWA_BORDER_COLOR (the registry accent, red silent);
+                                                                   // the gray at all times, the key focused -- exclusively
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8095,6 +8128,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // (TRUE) or an ordinary unfocus may latch 0, so the release present
         // owns its row until the placement flips.
         cwSheetRowLatch(wp ? 1 : (cwSheetRowLatchValue() == 2 ? 2 : 0));
+        // v7.5.10 THE ACCENT, SELF-FED, BOTH DIRECTIONS. An activation
+        // re-asserts the app-fed accent border (DWMWA_BORDER_COLOR -- the
+        // registry accent, RGB(255,0,0) when the registry is silent) so
+        // the focused state's key shows the accent glass whether or not
+        // Windows' own "show accent color" override is on; a deactivation
+        // hands the border back to DWMWA_COLOR_DEFAULT -- the accent is
+        // the FOCUSED state's alone, exclusively (the field's spec: the
+        // gray at all times, the key + the accent focused). Attribute-
+        // only calls: no surface work, no flush, no ordering -- they sit
+        // safely beside the latch, before the present below.
+        if (wp) cwApplyAccentBorder(w);
+        else    cwResetAccentBorder(w);
         // v7.2.3 THE NC-FLIP PRESENT, v7.3.0 THE CHROME CONTRACT, TRACKED,
         // v7.3.1 ROW-FIRST + THE lParam -1 ANSWER.
         // The bar -- the face AND row 0 -- is painted in the state wParam
@@ -8223,6 +8268,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
                 }
             }
+            // v7.5.10: the accent border rides the same re-commit -- the
+            // DWM that came back knows nothing of the attribute we fed it.
+            cwApplyAccentBorder(g_hwnd);
             guiPaintBar(w);
             cwSheetRowKick();
         }
@@ -8404,29 +8452,25 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // fallback, any presenter tick, the pre-flip
             // WM_NCACTIVATE(FALSE)) to one state, and the key cannot come
             // back before the placement flips.
-            cwSheetRowLatch(2);
-            cwSheetRowGate(true);
-            if (g_dwmFlush) g_dwmFlush();
-            cwCommitSheetRowState(w, 2);       // the row lands first -- the field's half-alpha
-                                               // gray (the inactive bar's byte); the shrink rides it
             g_forceActiveFace   = false;
             g_forceInactiveFace = true;
-            guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
+            // v7.5.9 THE ORDERED PRESENT IS THE HEADER'S (the field: "make
+            // sure the trailing flush is specifically in customWindow.h").
+            // The whole sequence -- the latch pre-flip to 2, the gate, the
+            // v7.3.0 leading flush, the row-first commit (the field's
+            // half-alpha gray, the inactive bar's byte -- the shrink rides
+            // it), the INACTIVE face + row 0 + GdiFlush, the v7.5.9
+            // TRAILING flush (a composition has completed against the new
+            // bytes before it returns: the release gray is SAMPLED, not
+            // merely written, and DefWindowProc's placement flip cannot
+            // start ahead of a compose that carried it) and the gate --
+            // lives in customWindow.h (cwSheetOrderedPresent). The header
+            // resolves DwmFlush itself; this host passes only the face
+            // painter. No kick here (the v7.5.5 contract): the
+            // WM_NCACTIVATE(FALSE) tail owns the next kick, and with the
+            // latch at 2 even that burst lands the release gray.
+            cwSheetOrderedPresent(w, 2, guiPaintBar);
             g_forceInactiveFace = false;
-            // v7.5.9 THE TRAILING FLUSH (the field's ordering): the inactive
-            // state is now ON the surface -- the row-first commit, the face,
-            // GdiFlush -- so a DwmFlush HERE blocks until a composition has
-            // completed against those bytes: the release gray is SAMPLED,
-            // not merely written, before this handler returns and
-            // DefWindowProc flips the placement. The v7.3.0 leading flush
-            // above stays (it retires the compose IN FLIGHT, so no stale
-            // carrier exists); this trailing flush closes the other half --
-            // the compose that carries the gray is forced to have run. Cost:
-            // one wait bounded by a refresh cycle, once per release. The
-            // gate holds through it -- no presenter tick can interleave
-            // inside the ordered present.
-            if (g_dwmFlush) g_dwmFlush();
-            cwSheetRowGate(false);
             // v7.5.5: NO kick here. Kicking re-armed the train INSIDE the
             // release-to-flip window (the race above). With the latch
             // pre-flipped its ticks would land the gray anyway -- but the
@@ -8455,8 +8499,17 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             // 43), byte for byte (g_sheetRowInactive ==
             // g_sheetRowMinimize == 0x802B2B2B, the v7.5.7 landing). The
             // three-state latch stays as the release-to-flip guard; the
-            // trailing flush above is the only machinery change. No byte
-            // changed in v7.5.9.
+            // ordered present -- trailing flush included -- is the header's
+            // (cwSheetOrderedPresent). No byte changed in v7.5.9.
+            // v7.5.10: the release itself is untouched -- the ordered
+            // present lands the gray, the trailing flush samples it, the
+            // train rides the shrink -- and the accent cannot tint the
+            // row anymore either way: the app FED it (DWMWA_BORDER_COLOR,
+            // v7.5.10) and the WM_NCACTIVATE(FALSE) leg of this same flip
+            // hands the border back to DWMWA_COLOR_DEFAULT, so the
+            // shrink's strips ride the vanilla muted border while the row
+            // settles on the field's gray. On the restore,
+            // WM_NCACTIVATE(TRUE) re-asserts the accent.
         }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
