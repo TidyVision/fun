@@ -23,6 +23,41 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.2 THE MINIMIZE PRESENT + THE ONE-WRITE BUTTONS. Field, after
+//            v7.5.1: "I actually see that fake top border bar turns
+//            transparent glass the moment the minimize button is
+//            pressed", with the earlier spec: "the frame the minimize
+//            button is pressed that the fabricated top title bar is
+//            changed to be something like 60,60,60. Right now, there's
+//            no dwmflush on the frame the minimize button is pressed."
+//            THE WHY: DefWindowProc(SC_MINIMIZE) flips the placement
+//            iconic immediately and WM_NCACTIVATE(FALSE)'s present is
+//            guarded !IsIconic -- when the flip wins the race, nothing
+//            ever presents the inactive style, and the bar rides the
+//            whole shrink with its ACTIVE bytes, whose sheet row IS the
+//            alpha-0 glass key (the transparent glass over a light
+//            backdrop). The press frame now gets the full ordered
+//            present INSIDE WM_SYSCOMMAND, before the flip: DwmFlush,
+//            the row-first INACTIVE commit, the INACTIVE face, GdiFlush
+//            -- the same bytes and order an ordinary unfocus lands. The
+//            row is the half-alpha RGB(43,43,43) (the field's gray, the
+//            closest real byte to "60,60,60": the proposed alpha-0
+//            recolor cannot deliver a color at all -- the RGB under an
+//            alpha-0 row is invisible, the DWM's own glass shows
+//            regardless; proved in v7.4.0, retired in v7.4.3). The
+//            animation rides the inactive bar; the v7.5.1 iconic guards
+//            hold every other painter off until restore. Second field
+//            item: "the 'start engine', 'apply+restart', 'save ini',
+//            '120 bpm tick test', or the theme button flicker on either
+//            tab menu select or deactivate." Both events swept every
+//            button through a full repaint of TWO screen writes -- the
+//            control's erase fill, then the buffered face blit -- and
+//            the DWM composed the erase-only frame (bare background: no
+//            border, no label, no fill) on each button. WM_CTLCOLORBTN
+//            now answers NULL_BRUSH: the erase paints nothing, the
+//            buffered face (its own background included) lands as the
+//            ONLY write, and the intermediate frame ceases to exist.
+//            Version steps to 7.5.2.
 //    v7.5.1 THE MINIMIZE FREEZE + THE HONEST BORDER. Field, after v7.5.0:
 //            "a split second after pressing the minimize titlebar button,
 //            the top bar turns transparent while the rest of the bars stay
@@ -7990,7 +8025,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.1 |  %s",  // v7.5.1 the minimize freeze + the honest border
+    snprintf(vbuf, sizeof(vbuf), "v7.5.2 |  %s",  // v7.5.2 the minimize present + the one-write buttons
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8305,6 +8340,47 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // minimize button, and the taskbar's restore click rides SC_RESTORE.
         const int sc = (int)(wp & 0xFFF0);
         if (sc == SC_MAXIMIZE || sc == SC_SIZE) return 0;
+        // v7.5.2 THE MINIMIZE PRESENT. The field, after the v7.5.1 freeze:
+        // "I actually see that fake top border bar turns transparent glass
+        // the moment the minimize button is pressed" -- with the spec from
+        // the earlier report: "the frame the minimize button is pressed
+        // that the fabricated top title bar is changed to be something
+        // like 60,60,60. Right now, there's no dwmflush on the frame the
+        // minimize button is pressed." THE WHY: DefWindowProc(SC_MINIMIZE)
+        // flips the placement iconic immediately, and WM_NCACTIVATE(FALSE)'s
+        // synchronous present is guarded !IsIconic -- when the flip wins
+        // that race (it usually does), NOTHING ever presents the inactive
+        // style, and the bar rides the whole shrink with its ACTIVE bytes,
+        // whose sheet row IS the alpha-0 glass key -- the transparent
+        // glass the field sees over a light backdrop. (The v7.5.1 freeze
+        // correctly silenced the OTHER painters mid-animation; it never
+        // gave the press frame a draw of its own.) THE PRESENT: the press
+        // frame gets the full ordered recipe BEFORE DefWindowProc flips
+        // anything -- DwmFlush (retire the compose in flight), the
+        // row-first INACTIVE commit, the INACTIVE face, GdiFlush -- the
+        // same bytes and the same order the WM_NCACTIVATE(FALSE) present
+        // lands on an ordinary unfocus. The row is the half-alpha
+        // RGB(43,43,43) (v7.4.3, the field's gray): the closest real byte
+        // to "60,60,60", because the field's own recolor proposal
+        // (BGRA(43,43,43,0) for active) cannot deliver a color at all --
+        // the alpha IS the delivery, the RGB under an alpha-0 row is
+        // invisible and the DWM's own glass shows regardless (proved in
+        // v7.4.0, retired in v7.4.3). The flip then moves a surface that
+        // ALREADY carries the inactive bar, the shrink animation rides it,
+        // and the v7.5.1 iconic guards hold every other painter off the
+        // surface until restore. The WM_NCACTIVATE(FALSE) that follows
+        // either re-presents byte-identical bytes or skips; both stand.
+        if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            g_guiRowCommit.store(true, std::memory_order_release);
+            if (g_dwmFlush) g_dwmFlush();
+            guiCommitSheetRowFast(w, false);   // the INACTIVE row lands first
+            g_forceActiveFace   = false;
+            g_forceInactiveFace = true;
+            guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
+            g_forceInactiveFace = false;
+            g_guiRowCommit.store(false, std::memory_order_release);
+            guiFadeKick();
+        }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
             if (g_engState.load() != 0) guiStopEngine();
@@ -8371,28 +8447,30 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // frame (the watermark flicker).
         return 1;
     case WM_CTLCOLORBTN: {
-        // v6.6.7: DefWindowProc answers WM_CTLCOLORBTN with WHITE, and the
-        // white pass under the corner AA was the ghost arcs. Answer DARK so
-        // no pass can ever put white under the AA.
-        // v7.2.15 THE ERASE MATCHES THE FACE. The BUTTON control erases its
-        // whole rect with THIS brush before it sends WM_DRAWITEM -- two
-        // screen writes, and the DWM can compose the first alone. The
-        // drawitem erase paints g_brPanel under the on-page faces and
-        // g_brBg under the bottom bar, but the answer here was ALWAYS
-        // g_brBg -- so every on-page toggle, pill and slot selector flashed
-        // the app background between its own pixels on each press, toggle
-        // and preset repaint (the "some buttons still flicker" report;
-        // the bottom-bar buttons sat on the answer's own color and could
-        // not flicker). The brush now mirrors WM_DRAWITEM's erase map per
-        // id, so the erase pass is pixel-identical to the face's own
-        // background and the intermediate frame ceases to exist. The
-        // v6.6.7 contract holds on both surfaces: both brushes are dark.
-        const int id = GetDlgCtrlID((HWND)lp);
-        const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 4) ||
-                              id == IDC_START  || id == IDC_APPLY ||
-                              id == IDC_SAVE   || id == IDC_TICK  ||
-                              id == IDC_THEME);
-        return (LRESULT)(onPage ? g_brPanel : g_brBg); }
+        // v7.5.2 THE ERASE IS NOTHING (the tab-switch/deactivate flicker).
+        // The field: "the 'start engine', 'apply+restart', 'save ini',
+        // '120 bpm tick test', or the theme button flicker on either tab
+        // menu select or deactivate." Both events sweep every button with
+        // a full repaint -- guiShowPage's RDW_ALLCHILDREN | RDW_UPDATENOW,
+        // WM_ACTIVATE(WA_INACTIVE)'s RDW_FRAME | RDW_INVALIDATE |
+        // RDW_UPDATENOW -- and each button repaint was TWO screen writes:
+        // the BUTTON CONTROL erased its whole rect with the WM_CTLCOLORBTN
+        // brush, THEN WM_DRAWITEM blitted the buffered face. The DWM can
+        // compose the first alone: one compose of bare background -- no
+        // border, no label, no fill -- per button, per tab click, per
+        // unfocus. v7.2.15 matched the erase brush to the face's own
+        // background, which hid the seam for the TRANSPARENT faces but
+        // never restored the border+text the erase lacks (and never
+        // covered the filled START accent or the ON pills). THE CONTRACT
+        // IS NOW ONE WRITE: the erase answers NULL_BRUSH -- the control's
+        // erase pass paints NOTHING, the previous bytes stand untouched --
+        // and the buffered face (its own background fill included, the
+        // corners AA'd inside the buffer per v7.0.6's spare column) lands
+        // as the ONLY write. No intermediate frame exists to compose. The
+        // v6.6.7 white-ghost worry dies with the erase itself: nothing at
+        // all can sit under the AA -- not white, not a mismatched dark;
+        // all GDI+ happens in the buffer, never on the item DC.
+        return (LRESULT)GetStockObject(NULL_BRUSH); }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         const int id = GetDlgCtrlID((HWND)lp);

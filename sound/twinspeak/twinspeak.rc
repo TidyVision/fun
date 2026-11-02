@@ -1,4 +1,4 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.1: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.2: version bump
 // (the one-file window: customWindow.h arrives -- the whole Windows chrome
 // (WM_NCCALCSIZE insets, WM_NCHITTEST, the caption button stack, the hover,
 // the sysmenu, the face/title/icon/button painting, the built-in fallback
@@ -170,12 +170,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.5.1.0"
+            VALUE "FileVersion",      "7.5.2.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.5.1.0"
+            VALUE "ProductVersion",   "7.5.2.0"
         END
     END
     BLOCK "VarFileInfo"
