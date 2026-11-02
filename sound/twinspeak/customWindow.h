@@ -642,6 +642,14 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {
     GdiFlush();                                 // the row is in the redirection surface
 }
 
+// v7.5.5: the host may pre-flip the latch AHEAD of the messages -- the
+// SC_MINIMIZE ordered present writes 0 before its present (the release
+// lands while the frame is still active; without the pre-flip, a kicked
+// presenter tick inside the release-to-flip window re-lands the ACTIVE
+// row byte -- the glass key -- over the ordered gray, and the shrink
+// bakes it). The latch is the ONE state every row writer reads;
+// flipping it first makes the impending state the frame's truth for
+// all of them.
 inline void cwSheetRowLatch(int state) {       // the frame's own truth (WM_NCACTIVATE writes FIRST)
     g_ncActive.store(state);                   // seq_cst: the presenter reads relaxed, the kick orders
 }

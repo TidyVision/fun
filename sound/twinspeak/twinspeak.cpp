@@ -23,6 +23,34 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.5 THE LATCH FLIPS FIRST (the last glass frame). Field, after
+//            v7.5.4: "I still see a transparent glass the moment I release
+//            the mouse from the minimize button. I think that's like the
+//            most important issue here to fix now, and it's the last one.
+//            What state is the top bar visible in though? Because this is
+//            strange." THE ANSWER: a hybrid frame no steady state can
+//            produce -- the INACTIVE face (the ordered present landed it
+//            correctly) with the ACTIVE border row (the glass key)
+//            re-landed on top in the last microseconds before the flip.
+//            THE RACE (buried since v7.5.2, masked by v7.5.3's uniform
+//            row, re-exposed by v7.5.4's split): the ordered present
+//            ended with cwSheetRowGate(false) + cwSheetRowKick() -- the
+//            kick re-armed the fade presenter train while the NC latch
+//            STILL READS ACTIVE (WM_NCACTIVATE(FALSE) has not run yet),
+//            and the train's first tick -- outside the queue, gate down,
+//            window not yet iconic -- presented cwSheetRowBytes(true),
+//            the glass key, right over the ordered gray commit; the DWM
+//            bakes the shrink from that poisoned surface. THE FIX: the
+//            SC_MINIMIZE present writes cwSheetRowLatch(0) FIRST -- the
+//            frame's own truth flips to INACTIVE at the release, before
+//            the gate, the flush, the commit and the face -- so the
+//            latch, latchedActive, the row patch, the commit and every
+//            presenter tick answer INACTIVE from the release onward; the
+//            block no longer kicks at all (the WM_NCACTIVATE(FALSE) tail
+//            owns the next kick). No writer can re-land the key in the
+//            release-to-flip window. The press frame keeps the key;
+//            restore re-latches 1 and the key returns with the fade.
+//            Version steps to 7.5.5.
 //    v7.5.4 THE SPLIT RETURNS: the key on active, the gray on minimize.
 //            Field, after running v7.5.3's uniform row: "I see it now.
 //            The problem is though, it contradicts the active window
@@ -7826,7 +7854,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.4 |  %s",  // v7.5.4 the split returns: key on active, gray on minimize
+    snprintf(vbuf, sizeof(vbuf), "v7.5.5 |  %s",  // v7.5.5 the latch flips first: no writer re-lands the key
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -8177,16 +8205,52 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // that follows lands the same gray bytes again or skips, both
         // stand.
         if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            // v7.5.5 THE LATCH FLIPS FIRST. The release lands here while the
+            // frame is still ACTIVE: the NC latch reads 1, GetActiveWindow
+            // still answers this window, and WM_NCACTIVATE(FALSE) will not
+            // run until AFTER DefWindowProc flips the placement. Every row
+            // writer that can fire between this instant and the flip reads
+            // the latch -- guiPaintBar's latchedActive, and the fade
+            // presenter's ticks (cwSheetRowBytes(nc != 0)) from OUTSIDE the
+            // queue. v7.5.4's buried race: this block ENDED with
+            // cwSheetRowKick() -- it re-armed the twenty-tick train while
+            // the latch still read ACTIVE, and the train's first tick
+            // (gate already down, window not yet iconic) re-landed the
+            // ACTIVE row byte -- the glass key -- right over the ordered
+            // gray commit. The DWM bakes the shrink from the surface it
+            // finds at the flip, so that one HYBRID frame -- the INACTIVE
+            // face the ordered present had just landed, with the ACTIVE
+            // border row back on top -- rode the whole animation (the
+            // field: "I still see a transparent glass the moment I release
+            // the mouse from the minimize button ... What state is the top
+            // bar visible in though? Because this is strange."). v7.5.2
+            // shipped the same race; v7.5.3's uniform row masked it (one
+            // byte in both states -- the re-land was invisible); v7.5.4's
+            // split exposed it. THE FIX: the frame's own truth flips to
+            // INACTIVE FIRST -- before the gate, the flush, the commit,
+            // the face -- so the latch, latchedActive, the row commit, the
+            // face present and any live or kicked presenter tick ALL
+            // answer INACTIVE from the release onward. No writer can
+            // re-land the key in the release-to-flip window. The press
+            // frame (mouse down, not released) keeps the key: SC_MINIMIZE
+            // only fires on the release.
+            cwSheetRowLatch(0);
             cwSheetRowGate(true);
             if (g_dwmFlush) g_dwmFlush();
-            cwCommitSheetRowFast(w, false);    // the row lands first (v7.5.4: the gray MINIMIZE
+            cwCommitSheetRowFast(w, false);    // the row lands first (the gray MINIMIZE
                                                // byte -- the shrink rides it, never the key)
             g_forceActiveFace   = false;
             g_forceInactiveFace = true;
             guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush
             g_forceInactiveFace = false;
             cwSheetRowGate(false);
-            cwSheetRowKick();
+            // v7.5.5: NO kick here. Kicking re-armed the train INSIDE the
+            // release-to-flip window (the race above). With the latch
+            // pre-flipped its ticks would land the gray anyway -- but the
+            // face was presented synchronously, the shrink needs no train,
+            // and the WM_NCACTIVATE(FALSE) tail owns the next kick; with
+            // the latch at 0 even that burst lands gray or is
+            // IsIconic-skipped.
         }
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();

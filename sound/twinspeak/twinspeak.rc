@@ -1,4 +1,4 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.4: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.5: version bump
 // (the uniform sheet row: the ACTIVE row joins the INACTIVE byte --
 // Gdiplus::Color(128,43,43,43), the field's pick -- so no alpha-0 row exists
 // anywhere and the minimize glass flash is impossible by construction; and
@@ -179,12 +179,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.5.4.0"
+            VALUE "FileVersion",      "7.5.5.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.5.4.0"
+            VALUE "ProductVersion",   "7.5.5.0"
         END
     END
     BLOCK "VarFileInfo"
