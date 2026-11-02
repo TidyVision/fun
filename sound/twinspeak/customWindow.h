@@ -64,17 +64,22 @@
 //         never starts, where it used to "end where it started". Default:
 //         false.
 //
-//     The button hover (v7.5.3d..f): no longer a color knob. The minimize
+//     The button hover (v7.5.3d..v7.5.4): no longer a color knob. The minimize
 //     and maximize buttons show a 10% black tint (measured off the real
-//     thing) that fades in over 100 ms and out over 150 ms, LINEAR, painted
+//     thing) that fades in over 100 ms and out over 150 ms, LINEAR -- at
+//     TWICE the speed while the window is unfocused (v7.5.4: 50/75 ms, the
+//     real caption's inactive behavior; file explorer shows it) -- painted
 //     over everything in the button, in a band of its own (v7.5.3f): ONE
 //     real px of daylight at the top (row 0 -- the border row -- is never
 //     covered; the v7.5.3e top pin is retired) and the whole band THREE real
 //     px shorter than the bar (two px of daylight at the bottom), with crisp
 //     whole-pixel seams between neighbouring buttons (the anti-aliased
-//     sub-pixel seams smeared the edges; integer renders the hairline). The
-//     close button fades its vanilla red the same way and the X whitens
-//     with it.
+//     sub-pixel seams smeared the edges; integer renders the hairline); the
+//     glyphs ride the band, two real px higher to stay centered in it, and
+//     while the window is UNFOCUSED the glyphs are half transparent -- a
+//     hovered button's glyph rides its fade back to full (v7.5.4, the
+//     task-manager behavior). The close button fades its vanilla red the
+//     same way and the X whitens with it.
 //     changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are retired.
 //
 //     putWindowinTray(bool hide)
@@ -201,10 +206,13 @@ inline int  g_textGrad    = 0xFF6C868C;   // title text gradient bottom
 inline int  g_textUn      = 0xFF7E888E;   // title text, unfocused (solid...
 inline int  g_textUnGrad  = -1;           // ...or gradient bottom when >= 0)
 inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_textCol)
-// v7.5.3d..f: the hover is no longer a solid face color. The min/max hover
-// is a black TINT -- 10% alpha (0x1A = 26, measured off a real Windows 10
-// caption button) -- that fades in over 100 ms and out over 150 ms, LINEAR,
-// painted OVER everything in the button (the glyph included), in a band of
+// v7.5.3d..v7.5.4: the hover is no longer a solid face color. The min/max
+// hover is a black TINT -- 10% alpha (0x1A = 26, measured off a real
+// Windows 10 caption button) -- that fades in over 100 ms and out over
+// 150 ms, LINEAR (HALF those durations while the window is unfocused,
+// v7.5.4: the real thing fades its caption buttons at twice the speed
+// while inactive -- the field watches file explorer do it), painted OVER
+// everything in the button (the glyph included), in a band of
 // its own (v7.5.3f): ONE real px of daylight at the top -- row 0, the
 // border row, is never covered (the v7.5.3e top pin lived one build) -- and
 // THREE real px shorter than the bar, two px of daylight at the bottom. The
@@ -214,8 +222,26 @@ inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_text
 // field's "blurred"). The close button fades its vanilla red the same way;
 // the X lerps to white with the fill.
 inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
-inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp (v7.5.3e: was 150)
-inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp (v7.5.3f: e had 100, d had 300)
+inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp, focused (v7.5.3e: was 150)
+inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f: e had 100, d had 300)
+// v7.5.4: the unfocused window's hover runs at TWICE the speed -- both
+// ramps divide by this while the window is inactive (50/75 ms), so the
+// highlight snaps on and off the way the real caption's does when the
+// window does not have focus. g_hovInactive is latched in the WM_NCACTIVATE
+// case, next to the sheet-row latch (the frame's own truth, hover's view).
+inline constexpr int kHovInactiveSpeed = 2;
+inline bool g_hovInactive = false;
+// v7.5.4: the glyphs ride the band -- the band took its three px off the
+// bottom of the bar, so a glyph centered on the FULL button rect hangs
+// below the highlight's visual center. Every caption glyph (min line, max
+// squares, close X) sits this many REAL px higher; unscaled, like the band
+// itself. The window icon and the title text do not ride.
+inline constexpr int kHovGlyphRide = 2;
+// v7.5.4: the UNFOCUSED caption's glyphs are HALF there -- the field's
+// task-manager observation: the real buttons dim to ~50% opacity while
+// their window is inactive. A hovered button's glyph rides its own fade
+// ramp (g_hovA[i]) back to full opacity; focused windows never dim.
+inline constexpr int kGlyphInactiveAlpha = 128;   // ~50% of 255
 inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation timer
 inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
 inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
@@ -313,7 +339,8 @@ inline void cwRepaint() {
 }
 
 // ---- v7.5.3d: the hover fade train ------------------------------------------
-// Linear 100/150 ms ramps per button (min, max, close), driven by a private
+// Linear 100/150 ms ramps per button (min, max, close) -- halved while the
+// window is unfocused (kHovInactiveSpeed, v7.5.4) -- driven by a private
 // 16 ms WM_TIMER on the host window; every tick repaints the bar through the
 // host's synchronous painter, which reads g_hovA. The timer lives only while
 // a ramp is in flight, then it is gone again.
@@ -335,11 +362,15 @@ inline void cwHovAnimTick() {
     g_hovLast = now;
     if (dt > 1000) dt = 1000;                       // a stalled queue must not jump the ramp
     bool busy = false;
+    // v7.5.4: the ramps' tempo follows the activation state -- twice the
+    // speed (half the durations) while the window is unfocused.
+    const int inMs  = g_hovInactive ? kHovFadeInMs  / kHovInactiveSpeed : kHovFadeInMs;
+    const int outMs = g_hovInactive ? kHovFadeOutMs / kHovInactiveSpeed : kHovFadeOutMs;
     for (int i = 0; i < 3; ++i) {
         const bool held = (g_hover == i + 1);
         int a = g_hovA[i];
-        if (held) a += (int)(dt * 255 / kHovFadeInMs);
-        else      a -= (int)(dt * 255 / kHovFadeOutMs);
+        if (held) a += (int)(dt * 255 / inMs);
+        else      a -= (int)(dt * 255 / outMs);
         if (a > 255) a = 255;
         if (a < 0) a = 0;
         if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
@@ -501,6 +532,15 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     const CwButtonRects br = cwButtonRects(ww);
     const int buttonW = br.close.right - br.close.left;
     const int item = active ? (g_glyph < 0 ? g_textCol : g_glyph) : g_textUn;
+    // v7.5.4: the inactive glyphs are HALF there (task manager shows it) --
+    // each button's glyph fades back to full opacity riding the same ramp
+    // that drives its tint (pa = g_hovA[i]); focused windows pass through.
+    auto glyphCol = [&](int base, int pa) -> int {
+        int a = cwChannel(base, 24);
+        if (!active) a = kGlyphInactiveAlpha
+                       + ((255 - kGlyphInactiveAlpha) * pa + 127) / 255;
+        return (a << 24) | (base & 0xFFFFFF);
+    };
     auto fillARGB = [&g](int col, int x, int y, int w2, int h2) {
         Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
                                              cwChannel(col, 8), cwChannel(col, 0)));
@@ -529,16 +569,19 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     if (g_btnMin) {
         const int lineW = cwS(10);
         const int cx = br.minimize.left + buttonW / 2;
-        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2;
-        fillARGB(item, cx - lineW / 2, cy, lineW, 1);
+        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        fillARGB(glyphCol(item, g_hovA[0]), cx - lineW / 2, cy, lineW, 1);
     }
     // maximize (square outline; double square while maximized)
     if (g_btnMax) {
         const int cx = br.maximize.left + buttonW / 2;
-        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2;
+        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
         const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
-        Gdiplus::Pen p(Gdiplus::Color(cwChannel(item, 24), cwChannel(item, 16),
-                                      cwChannel(item, 8), cwChannel(item, 0)), penW);
+        const int mi = glyphCol(item, g_hovA[1]);   // v7.5.4: dimmed while inactive
+        Gdiplus::Pen p(Gdiplus::Color(cwChannel(mi, 24), cwChannel(mi, 16),
+                                      cwChannel(mi, 8), cwChannel(mi, 0)), penW);
         if (w && cwIsMaximized(w)) {
             // v7.5.3d: the front sheet OCCLUDES the back one -- the real
             // restore glyph layers the squares, the back square's edges stop
@@ -561,13 +604,15 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         const int pa = g_hovA[2];
         if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0);
         const int cx = br.close.left + buttonW / 2;
-        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
-        int xc = item;
-        if (pa > 0) {                       // the X whitens with the red
+        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        int xc = glyphCol(item, pa);        // v7.5.4: half there while inactive, pa restores it
+        if (pa > 0) {                       // the X whitens with the red (alpha rides glyphCol)
+            const int a = cwChannel(xc, 24);
             const int r  = cwChannel(item, 16) + ((255 - cwChannel(item, 16)) * pa + 127) / 255;
             const int gr = cwChannel(item,  8) + ((255 - cwChannel(item,  8)) * pa + 127) / 255;
             const int b  = cwChannel(item,  0) + ((255 - cwChannel(item,  0)) * pa + 127) / 255;
-            xc = (int)(0xFF000000u | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
+            xc = (int)(((unsigned)a << 24) | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
         }
         Gdiplus::Pen xp(Gdiplus::Color(cwChannel(xc, 24), cwChannel(xc, 16),
                                        cwChannel(xc, 8), cwChannel(xc, 0)),
@@ -1044,6 +1089,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // activation transaction. The message itself keeps flowing to the
         // host's own case and DefWindowProc.
         if (!wp && g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        g_hovInactive = (wp == 0);    // v7.5.4: the hover ramps run twice the speed while inactive
         cwSheetRowLatch(wp ? 1 : 0);
         return false;
     case WM_DWMCOMPOSITIONCHANGED:

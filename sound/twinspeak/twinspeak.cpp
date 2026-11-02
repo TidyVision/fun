@@ -7838,7 +7838,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.3 |  %s",  // v7.5.3 the uniform sheet row + the bar lives in customWindow.h
+    snprintf(vbuf, sizeof(vbuf), "v7.5.4 |  %s",  // v7.5.4 the version bump (the v7.5.3 letter line ends; the bar lives in customWindow.h
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
