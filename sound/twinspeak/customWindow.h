@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.1)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.3)
 // =====================================================================
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
@@ -97,6 +97,19 @@
 //     cwPaintChrome(g, w, ww, active)     both, one call (fresh consumers)
 //     cwWndProc(w, msg, wp, lp, &result)  FORWARD FIRST in the host wndproc
 //
+// The fake top border bar (the sheet row -- the window's REAL top border,
+// row 0 of the caption bar) is the header's too, since v7.5.3:
+//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults
+//                                           = the field's half-alpha gray)
+//     cwPatchSheetRow(bits, cw, active)     row 0 of the host's 32bpp buffer
+//     cwCommitSheetRowFast(w, active)       the row-first 1 px commit
+//                                           (private DIB + GdiFlush)
+//     cwSheetRowGate(bool)                  presenter stand-down gate
+//     cwSheetRowKick()                      restart the fade train
+//     cwSheetRowLatch(int) / cwSheetRowLatchValue()   the NC activation
+//                                           latch (-1/0/1, the frame's truth)
+//     cwSheetPresenterStart(w) / cwSheetPresenterStop()   the fade train
+//
 // Host contract (twinspeak already meets all of it):
 //   * GDI+ started (GdiplusStartup) before the first paint.
 //   * The window class carries the icon (hIcon/hIconSm) for enableWinIcon
@@ -105,7 +118,10 @@
 //     the host's own cases and DefWindowProc.
 //   * The chrome draws face + icon + title + buttons; the host may draw its
 //     own border/edge rows around those calls (twinspeak sandwiches them:
-//     background, its glass-sheet row, its 1px bottom edge, foreground).
+//     background, its glass-sheet row fill, its 1px bottom edge, foreground).
+//     The BYTE-DIRECT sheet row (the fake top border) is the header's now:
+//     the host patches its buffer with cwPatchSheetRow inside the bar paint
+//     and orders the flip frames with cwCommitSheetRowFast.
 //   * The repaint callback is invoked on every state change (hover, theme,
 //     layout); it should repaint the bar synchronously.
 //
@@ -127,6 +143,7 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <gdiplus.h>
+#include <atomic>
 
 #ifndef GET_X_PARAM
 #define GET_X_PARAM(lp) ((int)(short)LOWORD(lp))
@@ -454,6 +471,250 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
     cwPaintBarForeground(g, w, ww, active);
 }
 
+// ---- THE FAKE TOP BORDER BAR (the sheet row; the header's since v7.5.3) -----
+// Row 0 of the caption bar is the window's REAL top border. The host extends
+// the DWM glass sheet exactly 1 px into the client ({0,0,1,0}), and this row
+// is written BYTE-DIRECT into a 32bpp top-down DIB -- GDI+ on an HDC-backed
+// surface cannot be trusted with the alpha byte, and the sheet recipe lives
+// or dies on that byte (the recipe: "the colors needed to be pre-multiplied").
+// The DWM composites the row with the sheet BY THE ALPHA, in the same compose
+// that blends the left/right/bottom NC strips, so the fake row tracks the
+// real frame exactly.
+//
+// THE BYTES (BGRA little-endian u32; the high byte is the alpha):
+//   v7.1.27..v7.5.2  active    BGRA(0,0,0,0)       the glass key: the DWM's
+//                                                   own border showed through.
+//   v7.4.3..         inactive  BGRA(43,43,43,0x80) half-alpha RGB(43,43,43):
+//                                                   the recipe's own source
+//                                                   gray (85 at 50%), the
+//                                                   field's byte -- "43, 43,
+//                                                   43 and that's just it."
+//   v7.5.3           active    BGRA(43,43,43,0x80) THE FIELD'S PICK: the
+//                                                   active row joins the
+//                                                   inactive byte -- the
+//                                                   field: "Gdiplus::Color
+//                                                   (128, 43, 43, 43) would
+//                                                   do it", since the DWM's
+//                                                   border color (the registry
+//                                                   colorization) owns the
+//                                                   frame tint anyway and a
+//                                                   bare glass key delivered
+//                                                   nothing the registry
+//                                                   border did not.
+// With no alpha-0 row anywhere, the transparent-glass flash the field taped
+// on minimize (v7.5.1/v7.5.2) is impossible BY CONSTRUCTION: every frame of
+// every animation -- the press frame, the shrink, the restore -- carries the
+// same composited gray. (The v7.4.0 receipt stands: an alpha-0 row cannot
+// carry a color at all -- the RGB under alpha 0 is invisible and the DWM's
+// own glass shows regardless -- so any recolor fix had to be alpha > 0;
+// this one is the field's own byte.) Both rows being one constant, the
+// activation flip no longer changes row 0 -- only the FACE (dim text, dim
+// glyphs) still flips, which is why the ordered presents stay: their row
+// commit is byte-idempotent now, their face present is not.
+//
+// THE THREE WRITERS (all land the same constant; none ever measures):
+//   * cwPatchSheetRow      -- row 0 of the HOST's bar buffer, inside the
+//                             host's bar paint (before its one blit).
+//   * cwCommitSheetRowFast -- the ROW-FIRST commit (v7.3.1): one row write
+//                             into a PRIVATE 1 px DIB (the host's buffer is
+//                             not touched, so the header is self-contained),
+//                             ONE 1 px blit, GdiFlush -- microseconds -- so
+//                             a flip-carrying compose can no longer sample
+//                             the pre-flip row while the multi-ms face
+//                             render is still running.
+//   * cwFadePresenter      -- the v7.2.15 fade train, a thread. WM_TIMER is
+//                             the queue's lowest-priority message; with the
+//                             engine running the queue is regularly fed and
+//                             timer ticks landed late, freezing the DWM's
+//                             presentation-time sheet blend mid-fade (the
+//                             intermittent deactivation redraw delay). The
+//                             thread re-presents the row from OUTSIDE the
+//                             queue: idling on the kick event, twenty 20 ms
+//                             ticks per kick, each tick a 1 px blit from its
+//                             own private DIB. A kick landing mid-run
+//                             restarts the train, so the LAST activation
+//                             state wins on rapid toggles.
+//
+// Threading: the latch (cwSheetRowLatch, written by the host's WM_NCACTIVATE
+// FIRST, before anything else in the handler) is the frame's own truth,
+// readable INSIDE the activation transaction -- unlike GetActiveWindow,
+// which only catches up when WM_ACTIVATE runs after the transaction closes.
+// The gate (cwSheetRowGate) stands the presenter down while the GUI thread
+// is inside an ordered present (v7.3.1: a tick racing the handler would
+// otherwise re-land the row into the commit window; byte-idempotent now,
+// the gate is the belt it always was). The kick (cwSheetRowKick) restarts
+// the train; the SetEvent still orders the GUI writes before the thread's
+// reads.
+inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplus::Color(128,43,43,43)
+inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
+inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
+inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
+inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
+inline HANDLE g_fadeThread = nullptr;        // created with the window, joined at stop
+inline std::atomic<bool> g_fadeQuit{false};
+// the fast commit's PRIVATE 1 px row DIB (GUI-thread only; the presenter
+// thread keeps its own -- no GDI object is ever shared)
+inline HDC     g_rowDc   = nullptr;
+inline HBITMAP g_rowBm   = nullptr;
+inline void*   g_rowBits = nullptr;
+inline int     g_rowW    = 0;
+
+inline unsigned cwSheetRowBytes(bool active) {
+    return active ? g_sheetRowActive : g_sheetRowInactive;
+}
+
+// row 0 of a top-down 32bpp buffer (the host's bar DIB), one constant
+inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+    if (!bits32 || cw <= 0) return;
+    const unsigned px = cwSheetRowBytes(active);
+    unsigned* row = (unsigned*)bits32;          // top-down: row 0 first
+    for (int x = 0; x < cw; ++x) row[x] = px;
+}
+
+// the ROW-FIRST COMMIT (v7.3.1): fill the private row DIB, blit 1 px,
+// GdiFlush. Buffer missing (the first frames): grown here -- the private
+// DIB makes the commit self-contained, the host's buffer is not required.
+inline void cwCommitSheetRowFast(HWND w, bool active) {
+    if (!w || !IsWindow(w)) return;
+    RECT cr;
+    if (!GetClientRect(w, &cr) || cr.right <= 0) return;
+    if (cr.right > g_rowW) {                    // (re)grow the private row DIB
+        if (g_rowBm) DeleteObject(g_rowBm);
+        if (g_rowDc) { DeleteDC(g_rowDc); g_rowDc = nullptr; }
+        g_rowBm = nullptr; g_rowBits = nullptr; g_rowW = 0;
+        HDC sdc = GetDC(w);
+        if (sdc) {
+            BITMAPINFO bi;
+            ZeroMemory(&bi, sizeof(bi));
+            bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biPlanes      = 1;
+            bi.bmiHeader.biBitCount    = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            bi.bmiHeader.biHeight      = -1;    // top-down, like the bar DIB
+            bi.bmiHeader.biWidth       = cr.right;
+            g_rowBm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &g_rowBits, nullptr, 0);
+            if (g_rowBm) {
+                g_rowDc = CreateCompatibleDC(sdc);
+                if (g_rowDc) SelectObject(g_rowDc, g_rowBm);
+            }
+            ReleaseDC(w, sdc);
+        }
+        if (!g_rowDc) {
+            if (g_rowBm) { DeleteObject(g_rowBm); g_rowBm = nullptr; }
+            g_rowBits = nullptr;
+            return;
+        }
+        g_rowW = cr.right;
+    }
+    const unsigned px = cwSheetRowBytes(active);
+    unsigned* row = (unsigned*)g_rowBits;
+    for (int x = 0; x < cr.right; ++x) row[x] = px;
+    HDC wdc = GetDC(w);
+    if (wdc) {
+        BitBlt(wdc, 0, 0, cr.right, 1, g_rowDc, 0, 0, SRCCOPY);
+        ReleaseDC(w, wdc);
+    }
+    GdiFlush();                                 // the row is in the redirection surface
+}
+
+inline void cwSheetRowLatch(int state) {       // the frame's own truth (WM_NCACTIVATE writes FIRST)
+    g_ncActive.store(state);                   // seq_cst: the presenter reads relaxed, the kick orders
+}
+inline int cwSheetRowLatchValue() {
+    return g_ncActive.load(std::memory_order_relaxed);
+}
+inline void cwSheetRowGate(bool on) {          // TRUE while the GUI thread is inside an ordered present
+    g_guiRowCommit.store(on, std::memory_order_release);
+}
+inline void cwSheetRowKick() {                 // non-blocking; safe from any message
+    if (g_fadeKick) SetEvent(g_fadeKick);
+}
+
+// the fade train (v7.2.15, moved here v7.5.3): re-presents row 0 from
+// OUTSIDE the message queue -- the DWM bakes the sheet blend at presentation
+// time (v7.1.30), and a starved repaint freezes it mid-fade.
+inline DWORD WINAPI cwFadePresenter(LPVOID) {
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bi.bmiHeader.biHeight      = -1;          // top-down, like the bar DIB
+    HDC     dc   = nullptr;
+    HBITMAP bm   = nullptr;
+    void*   bits = nullptr;
+    int     rowW = 0, ticks = 0;
+    for (;;) {
+        const bool kicked =
+            WaitForSingleObject(g_fadeKick, ticks ? 20 : 250) == WAIT_OBJECT_0;
+        if (kicked) ticks = 20;               // every kick restarts the train
+        else if (ticks) --ticks;
+        if (!ticks) continue;                 // idle: the event owns the wait
+        if (g_fadeQuit.load(std::memory_order_acquire)) break;
+        if (g_guiRowCommit.load(std::memory_order_acquire)) {
+            --ticks; continue;                // the GUI commit owns the row this tick
+        }
+        const int nc = g_ncActive.load(std::memory_order_relaxed);
+        if (nc < 0) continue;                 // no activation state latched yet
+        HWND w = g_host;
+        if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+        RECT cr;
+        if (!GetClientRect(w, &cr) || cr.right <= 0) continue;
+        if (cr.right > rowW) {                // (re)grow the private row DIB
+            if (bm) DeleteObject(bm);
+            if (dc) { DeleteDC(dc); dc = nullptr; }
+            bm = nullptr; bits = nullptr; rowW = 0;
+            HDC sdc = GetDC(w);
+            if (sdc) {
+                bi.bmiHeader.biWidth = cr.right;
+                bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (bm) {
+                    dc = CreateCompatibleDC(sdc);
+                    if (dc) SelectObject(dc, bm);
+                }
+                ReleaseDC(w, sdc);
+            }
+            if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
+            rowW = cr.right;
+        }
+        const unsigned px = cwSheetRowBytes(nc != 0);   // one constant, both states, since v7.5.3
+        unsigned* row = (unsigned*)bits;
+        for (int x = 0; x < cr.right; ++x) row[x] = px;
+        HDC wdc = GetDC(w);
+        if (wdc) {
+            BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);
+            ReleaseDC(w, wdc);
+        }
+        GdiFlush();                           // the strip is presented before the next tick
+        --ticks;
+    }
+    if (bm) DeleteObject(bm);
+    if (dc) DeleteDC(dc);
+    return 0;
+}
+inline void cwSheetPresenterStart(HWND w) {    // once, with the window (after cwAttach)
+    if (g_fadeThread) return;
+    g_fadeQuit.store(false, std::memory_order_release);
+    (void)w;                                   // the train reads g_host (cwAttach) every tick
+    g_fadeKick  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_fadeThread = g_fadeKick ? CreateThread(nullptr, 0, cwFadePresenter,
+                                             nullptr, 0, nullptr) : nullptr;
+}
+inline void cwSheetPresenterStop() {           // signal, wake, join (bounded), dispose
+    g_fadeQuit.store(true, std::memory_order_release);
+    if (g_fadeKick) SetEvent(g_fadeKick);
+    if (g_fadeThread) {
+        WaitForSingleObject(g_fadeThread, 2000);
+        CloseHandle(g_fadeThread);
+        g_fadeThread = nullptr;
+    }
+    if (g_fadeKick) { CloseHandle(g_fadeKick); g_fadeKick = nullptr; }
+    if (g_rowBm) DeleteObject(g_rowBm);
+    if (g_rowDc) DeleteDC(g_rowDc);
+    g_rowBm = nullptr; g_rowDc = nullptr; g_rowBits = nullptr; g_rowW = 0;
+}
+
 // ---- the built-in fallback tray --------------------------------------------
 inline void cwTrayEnsure() {
     if (g_trayUp || !g_host) return;
@@ -748,6 +1009,24 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 inline bool cwIsMaximized(HWND w) { return cwd::cwIsMaximized(w); }
 inline DWORD cwArgbOf(COLORREF c) { return cwd::cwArgbOf(c); }   // COLORREF -> ARGB
 
+// ---- the fake top border bar (the sheet row; see the essay above) ----------
+inline void cwSeedSheetRow(unsigned activeBgra, unsigned inactiveBgra) {
+    cwd::g_sheetRowActive   = activeBgra;      // BGRA u32, premultiplied
+    cwd::g_sheetRowInactive = inactiveBgra;
+}
+inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+    cwd::cwPatchSheetRow(bits32, cw, active);
+}
+inline void cwCommitSheetRowFast(HWND w, bool active) {
+    cwd::cwCommitSheetRowFast(w, active);
+}
+inline void cwSheetRowGate(bool on)    { cwd::cwSheetRowGate(on); }
+inline void cwSheetRowKick()           { cwd::cwSheetRowKick(); }
+inline void cwSheetRowLatch(int state) { cwd::cwSheetRowLatch(state); }
+inline int  cwSheetRowLatchValue()     { return cwd::cwSheetRowLatchValue(); }
+inline void cwSheetPresenterStart(HWND w) { cwd::cwSheetPresenterStart(w); }
+inline void cwSheetPresenterStop()        { cwd::cwSheetPresenterStop(); }
+
 #else  /* !_WIN32 -- the stub target: the API exists, does nothing ---------- */
 
 inline void enableCustomWin(bool)                                      {}
@@ -766,6 +1045,15 @@ inline void changeWinMinimizeHoverColor(int, int)                      {}
 inline void changeWinMaximizeHoverColor(int)                           {}
 inline void changeWinMaximizeHoverColor(int, int)                      {}
 inline void putWindowinTray(bool)                                      {}
+inline void cwSeedSheetRow(unsigned, unsigned)                         {}
+inline void cwPatchSheetRow(void*, int, bool)                          {}
+inline void cwCommitSheetRowFast(void*, bool)                          {}
+inline void cwSheetRowGate(bool)                                       {}
+inline void cwSheetRowKick()                                           {}
+inline void cwSheetRowLatch(int)                                       {}
+inline int  cwSheetRowLatchValue()                                     { return -1; }
+inline void cwSheetPresenterStart(void*)                               {}
+inline void cwSheetPresenterStop()                                     {}
 
 #endif /* _WIN32 */
 
