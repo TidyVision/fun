@@ -64,16 +64,17 @@
 //         never starts, where it used to "end where it started". Default:
 //         false.
 //
-//     The button hover (v7.5.3d + e): no longer a color knob. The minimize
+//     The button hover (v7.5.3d..f): no longer a color knob. The minimize
 //     and maximize buttons show a 10% black tint (measured off the real
-//     thing) that fades in and out over 100 ms, LINEAR, painted over
-//     everything in the button and pinned to the TOP of the titlebar -- the
-//     patch reaches the window's top edge (row 0 composites the tint through
-//     the byte-direct sheet-row writers, the way the real highlight runs
-//     behind the border line), with crisp whole-pixel seams between
-//     neighbouring buttons (the anti-aliased sub-pixel seams smeared the
-//     edges; integer renders the hairline). The close button fades its
-//     vanilla red the same way and the X whitens with it.
+//     thing) that fades in over 100 ms and out over 150 ms, LINEAR, painted
+//     over everything in the button, in a band of its own (v7.5.3f): ONE
+//     real px of daylight at the top (row 0 -- the border row -- is never
+//     covered; the v7.5.3e top pin is retired) and the whole band THREE real
+//     px shorter than the bar (two px of daylight at the bottom), with crisp
+//     whole-pixel seams between neighbouring buttons (the anti-aliased
+//     sub-pixel seams smeared the edges; integer renders the hairline). The
+//     close button fades its vanilla red the same way and the X whitens
+//     with it.
 //     changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are retired.
 //
 //     putWindowinTray(bool hide)
@@ -200,22 +201,21 @@ inline int  g_textGrad    = 0xFF6C868C;   // title text gradient bottom
 inline int  g_textUn      = 0xFF7E888E;   // title text, unfocused (solid...
 inline int  g_textUnGrad  = -1;           // ...or gradient bottom when >= 0)
 inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_textCol)
-// v7.5.3d + e: the hover is no longer a solid face color. The min/max hover
+// v7.5.3d..f: the hover is no longer a solid face color. The min/max hover
 // is a black TINT -- 10% alpha (0x1A = 26, measured off a real Windows 10
-// caption button) -- that fades in and out over 100 ms, LINEAR, painted
-// OVER everything in the button (the glyph included), the bar's FULL height
-// -- pinned to the TOP: the GDI+ patch owns rows 1.., and row 0 composites
-// the tint through the byte-direct sheet-row writers (cwSheetRowFillTinted),
-// so the patch reaches the window's top edge exactly like the real DWM's
-// highlight behind the border line. The seams between neighbouring buttons
-// are WHOLE pixels now (the real thing's 0.5 design px hairline snapped to
-// physical pixels -- the old anti-aliased sub-pixel insets smeared the
-// edges into a two-column gradient, the field's "blurred"). The close
-// button fades its vanilla red the same way; the X lerps to white with the
-// fill.
+// caption button) -- that fades in over 100 ms and out over 150 ms, LINEAR,
+// painted OVER everything in the button (the glyph included), in a band of
+// its own (v7.5.3f): ONE real px of daylight at the top -- row 0, the
+// border row, is never covered (the v7.5.3e top pin lived one build) -- and
+// THREE real px shorter than the bar, two px of daylight at the bottom. The
+// seams between neighbouring buttons are WHOLE pixels (the real thing's 0.5
+// design px hairline snapped to physical pixels -- the old anti-aliased
+// sub-pixel insets smeared the edges into a two-column gradient, the
+// field's "blurred"). The close button fades its vanilla red the same way;
+// the X lerps to white with the fill.
 inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
 inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp (v7.5.3e: was 150)
-inline constexpr int kHovFadeOutMs = 100;   // post-hover ramp (v7.5.3e: was 300)
+inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp (v7.5.3f: e had 100, d had 300)
 inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation timer
 inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
 inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
@@ -313,7 +313,7 @@ inline void cwRepaint() {
 }
 
 // ---- v7.5.3d: the hover fade train ------------------------------------------
-// Linear 100/100 ms ramps per button (min, max, close), driven by a private
+// Linear 100/150 ms ramps per button (min, max, close), driven by a private
 // 16 ms WM_TIMER on the host window; every tick repaints the bar through the
 // host's synchronous painter, which reads g_hovA. The timer lives only while
 // a ramp is in flight, then it is gone again.
@@ -506,15 +506,19 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
                                              cwChannel(col, 8), cwChannel(col, 0)));
         g.FillRectangle(&b, x, y, w2, h2);
     };
-    // v7.5.3e: the hover patch -- a translucent fill on WHOLE pixels. The
+    // v7.5.3e + f: the hover patch -- a translucent fill on WHOLE pixels. The
     // sub-pixel seams are gone: the 0.25 px anti-aliased insets smeared the
     // patch edges into a two-column gradient (the field: "blurred"). The
     // seam rides in whole physical pixels off the left neighbour's right
     // edge; the outer edges stay flush (close rides the window edge).
     // SmoothingMode stays None and every coordinate is an integer, so every
-    // edge renders crisp. Row 0 is NOT painted here -- GDI+ cannot be
-    // trusted with the alpha byte there; the byte-direct sheet-row writers
-    // composite the patch onto the border row (cwSheetRowFillTinted).
+    // edge renders crisp.
+    // v7.5.3f THE BAND: the patch is ONE real px down from the top (the
+    // button rects already start on row 1, under the border row -- the
+    // v7.5.3e top pin is retired) and THREE real px shorter than the bar:
+    // two px of daylight above the bar's bottom edge. hoverBand() is the one
+    // geometry; every hover fill goes through it.
+    auto hoverBand = [](const RECT& r) { RECT h = r; h.bottom -= 2; return h; };
     auto fillPatch = [&](const RECT& r, int col, int insetR) {
         Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
                                              cwChannel(col, 8), cwChannel(col, 0)));
@@ -551,11 +555,11 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         }
     }
     // close (always; vanilla red hover, white X -- both ride the same linear
-    // 100 ms fades; the X stroke is the real thing's 1 design px, the old
-    // 1.25 rendered half again too thick)
+    // fades, 100 ms in / 150 ms out; the X stroke is the real thing's
+    // 1 design px, the old 1.25 rendered half again too thick)
     {
         const int pa = g_hovA[2];
-        if (pa > 0) fillPatch(br.close, (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0);
+        if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0);
         const int cx = br.close.left + buttonW / 2;
         const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
         int xc = item;
@@ -631,19 +635,17 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             }
         }
     }
-    // v7.5.3d + e: the min/max hover tints land LAST -- they overlay
-    // everything in the button (the glyph included) and run the bar's FULL
-    // height, pinned to the top: this GDI+ patch owns rows 1.., and row 0 --
-    // the border row -- composites the same tint through the byte-direct
-    // sheet-row writers (cwSheetRowFillTinted), so the patch reaches the
-    // window's top edge exactly like the real DWM's highlight behind the
-    // border line. The seams against the right-hand neighbours are whole
-    // pixels now (the outer edges stay flush).
+    // v7.5.3d..f: the min/max hover tints land LAST -- they overlay
+    // everything in the button (the glyph included), in the v7.5.3f band:
+    // one real px of daylight at the top (the border row is never covered)
+    // and three real px shorter than the bar (two at the bottom). The seams
+    // against the right-hand neighbours are whole pixels (the outer edges
+    // stay flush).
     {
         const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
         const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
-        if (g_btnMin && aMin > 0) fillPatch(br.minimize, aMin << 24, cwHovSeamPx());
-        if (g_btnMax && aMax > 0) fillPatch(br.maximize, aMax << 24, cwHovSeamPx());
+        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), aMin << 24, cwHovSeamPx());
+        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), aMax << 24, cwHovSeamPx());
     }
 }
 
@@ -833,59 +835,24 @@ inline unsigned cwSheetRowBytes(bool active) {
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
 
-// v7.5.3e: THE TOP-PINNED PATCHES ON ROW 0. The hover tint (and the close
-// red) must reach the window's top edge -- the real DWM's highlight runs
-// BEHIND the border line -- and row 0 belongs to the byte-direct writers
-// (GDI+ cannot be trusted with the alpha byte there). So every row-0 writer
-// fills through this: the sheet byte first, then the patches composite over
-// the SAME columns the GDI+ patch paints below (seams included).
-// Premultiplied src-over, one rounding per channel:
-//   out.rgb = (dst.rgb*(255-a) + col.rgb*a + 127) / 255
-//   out.a   =  dst.a *(255-a) / 255 (rounded) + a
-// The glass key (focused & idle) tints to BGRA(0,0,0,a): the DWM's accent
-// border shows through at ~90% under the 10% black -- the patch visibly
-// touches the top. The gray (inactive / animating) darkens by the same
-// tint; the close red rides its own alpha (opaque at rest 255).
-inline void cwSheetRowFillTinted(unsigned* row, int cw2, bool active) {
+// v7.5.3f: THE TOP PIN IS RETIRED -- row 0 is the plain sheet byte again.
+// v7.5.3e composited the hover tint (and the close red) over this row so the
+// highlight reached the window's top edge the way the real DWM's runs behind
+// the border line; the field called the highlight back DOWN one real px
+// ("1px vertical"), so the border row is never covered now and the byte-
+// direct writers carry no patch state at all (no g_hovA reads on the row
+// path). The name keeps its v7.5.3e shape minus the tint: the sheet bytes,
+// top-down, every column.
+inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
     const unsigned px = cwSheetRowBytes(active);
     for (int x = 0; x < cw2; ++x) row[x] = px;
-    if (cw2 <= 0 || !g_enabled) return;
-    if (!(g_hovA[0] | g_hovA[1] | g_hovA[2])) return;
-    const CwButtonRects br = cwButtonRects(cw2);
-    const int seam = cwHovSeamPx();
-    struct Seg { bool on; int l, r, a; unsigned rgb; };
-    const Seg segs[3] = {
-        { g_btnMin && g_hovA[0] > 0, br.minimize.left, br.minimize.right - seam,
-          (g_hovA[0] * kHovTintAlpha + 127) / 255, 0u },
-        { g_btnMax && g_hovA[1] > 0, br.maximize.left, br.maximize.right - seam,
-          (g_hovA[1] * kHovTintAlpha + 127) / 255, 0u },
-        { g_hovA[2] > 0, br.close.left, br.close.right, g_hovA[2],
-          kCloseHover & 0xFFFFFFu },
-    };
-    for (const Seg& s : segs) {
-        if (!s.on) continue;
-        const int l = s.l > 0 ? s.l : 0;
-        const int r = s.r < cw2 ? s.r : cw2;
-        for (int x = l; x < r; ++x) {
-            const unsigned d   = row[x];
-            const unsigned inv = 255u - (unsigned)s.a;
-            const unsigned sr  = (s.rgb >> 16) & 0xFFu;
-            const unsigned sg  = (s.rgb >>  8) & 0xFFu;
-            const unsigned sb  =  s.rgb        & 0xFFu;
-            const unsigned a  = (((d >> 24) & 0xFFu) * inv + 127) / 255 + (unsigned)s.a;
-            const unsigned rr = (((d >> 16) & 0xFFu) * inv + sr * (unsigned)s.a + 127) / 255;
-            const unsigned gg = (((d >>  8) & 0xFFu) * inv + sg * (unsigned)s.a + 127) / 255;
-            const unsigned bb = (( d         & 0xFFu) * inv + sb * (unsigned)s.a + 127) / 255;
-            row[x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
-        }
-    }
 }
 
-// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte,
-// with the hover patches composited over the button columns (v7.5.3e)
+// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte
+// (v7.5.3f: the hover patch no longer touches the border row)
 inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
     if (!bits32 || cw <= 0) return;
-    cwSheetRowFillTinted((unsigned*)bits32, cw, active);   // top-down: row 0 first
+    cwSheetRowFill((unsigned*)bits32, cw, active);   // top-down: row 0 first
 }
 
 // the ROW-FIRST COMMIT (v7.3.1): fill the private row DIB, blit 1 px,
@@ -924,7 +891,7 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {
         g_rowW = cr.right;
     }
     unsigned* row = (unsigned*)g_rowBits;
-    cwSheetRowFillTinted(row, cr.right, active);   // v7.5.3e: the top-pinned patches ride every writer
+    cwSheetRowFill(row, cr.right, active);         // the plain sheet bytes (v7.5.3f: no patches on the row)
     HDC wdc = GetDC(w);
     if (wdc) {
         BitBlt(wdc, 0, 0, cr.right, 1, g_rowDc, 0, 0, SRCCOPY);
@@ -998,7 +965,7 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             rowW = cr.right;
         }
         unsigned* row = (unsigned*)bits;
-        cwSheetRowFillTinted(row, cr.right, nc != 0);  // v7.5.3e: the patches ride the train too
+        cwSheetRowFill(row, cr.right, nc != 0);        // the plain sheet bytes (v7.5.3f: no patches on the row)
         HDC wdc = GetDC(w);
         if (wdc) {
             BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);

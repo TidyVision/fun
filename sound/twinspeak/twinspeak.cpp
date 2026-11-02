@@ -6521,9 +6521,9 @@ static void guiBuildPages(HWND w) {
          "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
     tglRow(w, COLA_X, 316, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
     header(w, COLB_X, KHDR_Y, "CHIME/KEEPALIVE");
-    tglRow(w, COLB_X, KROW0, "volume_follow (Line 1 slider = master)", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
+    tglRow(w, COLB_X, KROW0, "volume_follow", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
-    tglRow(w, COLB_X, 188, "chimes (startup / reopen blip)", IDC_TGL_CHIMES, g_cfg.chimes);
+    tglRow(w, COLB_X, 188, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
     note(w, COLB_X, 226,
          "The keep-alive tone is BUILT IN (40 Hz @ 0.5%): out2 never sees\n"
          "digital silence, so the center speaker stays awake. POST-MIX: the\n"
