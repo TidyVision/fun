@@ -23,12 +23,15 @@
 //         top->bottom gradient col -> gradColor. Colors are ARGB ints
 //         (0xAARRGGBB). Default: dark slate (the twinspeak seed).
 //
-//     changeWinTextColor(int col) / (int col, int gradColor)
-//         The title text while the window is FOCUSED. One argument: solid;
-//         two: vertical gradient. Default: the cyan-gray gradient.
-//
-//     changeWinTextUnfocusedColor(int col) / (int col, int gradColor)
-//         The title text while the window is NOT focused. Default: gray.
+//     setWinTitleTextColor(int color, int gradientCol,
+//                          int inactiveColor = color,
+//                          int gradientInactiveCol = gradientCol)
+//         The title text, BOTH states in one call. Focused: color ->
+//         gradientCol (a vertical top->bottom gradient; pass the same color
+//         twice for solid). Inactive: inactiveColor ->
+//         gradientInactiveCol, which default to the focused pair -- the
+//         text only dims with focus when told to. Colors are ARGB ints
+//         (0xAARRGGBB). Default: the cyan-gray gradient.
 //
 //     changeWinTextFont(const std::string& font = "Segoe UI")
 //         The title text face. Accepts a font FAMILY name ("Segoe UI") or a
@@ -1072,11 +1075,27 @@ inline void cwApplyFace(bool active, int col, int grad) {
 inline void changeWinTitlebarColor(int col)                      { cwd::g_faceCol = col; cwd::g_faceGrad = col; cwd::g_faceColIn = -1; cwd::g_faceGradIn = -1; cwd::cwRepaint(); }
 inline void changeWinTitlebarColor(int col, int gradColor)       { cwd::g_faceCol = col; cwd::g_faceGrad = gradColor; cwd::cwRepaint(); }
 
-inline void changeWinTextColor(int col)                          { cwd::g_textCol = col; cwd::g_textGrad = col; cwd::cwRepaint(); }
-inline void changeWinTextColor(int col, int gradColor)           { cwd::g_textCol = col; cwd::g_textGrad = gradColor; cwd::cwRepaint(); }
-
-inline void changeWinTextUnfocusedColor(int col)                 { cwd::g_textUn = col; cwd::g_textUnGrad = -1; cwd::cwRepaint(); }
-inline void changeWinTextUnfocusedColor(int col, int gradColor)  { cwd::g_textUn = col; cwd::g_textUnGrad = gradColor; cwd::cwRepaint(); }
+inline void setWinTitleTextColor(int color, int gradientCol,
+                                 int inactiveColor, int gradientInactiveCol) {
+    // v7.5.3c: ONE setter for both states (the changeWinTextColor /
+    // changeWinTextUnfocusedColor pair retired). The requested defaults --
+    // inactiveColor = color, gradientInactiveCol = gradientCol -- are
+    // spelled as overloads below (C++ function default arguments may not
+    // reference the parameters to their left; template defaults may, and
+    // the first draft leaned on that -- clang threw it right back).
+    // A gradientInactiveCol >= 0 paints the inactive gradient, < 0 paints
+    // inactiveColor solid (the painter's rule -- pass -1 for solid).
+    cwd::g_textCol = color;  cwd::g_textGrad = gradientCol;
+    cwd::g_textUn  = inactiveColor;
+    cwd::g_textUnGrad = gradientInactiveCol;
+    cwd::cwRepaint();
+}
+inline void setWinTitleTextColor(int color, int gradientCol, int inactiveColor) {
+    setWinTitleTextColor(color, gradientCol, inactiveColor, gradientCol);
+}
+inline void setWinTitleTextColor(int color, int gradientCol) {
+    setWinTitleTextColor(color, gradientCol, color, gradientCol);
+}
 
 inline void changeWinMinimizeHoverColor(int col)                 { cwd::g_minHover = col; cwd::g_minHoverGrad = -1; cwd::cwRepaint(); }
 inline void changeWinMinimizeHoverColor(int col, int gradColor)  { cwd::g_minHover = col; cwd::g_minHoverGrad = gradColor; cwd::cwRepaint(); }
@@ -1186,10 +1205,9 @@ inline void cwSheetGlass(bool on)         { cwd::cwSheetGlass(on); }
 inline void enableCustomWin(bool)                                      {}
 inline void changeWinTitlebarColor(int)                                {}
 inline void changeWinTitlebarColor(int, int)                           {}
-inline void changeWinTextColor(int)                                    {}
-inline void changeWinTextColor(int, int)                               {}
-inline void changeWinTextUnfocusedColor(int)                           {}
-inline void changeWinTextUnfocusedColor(int, int)                      {}
+inline void setWinTitleTextColor(int, int, int, int)                   {}
+inline void setWinTitleTextColor(int, int, int)                        {}
+inline void setWinTitleTextColor(int, int)                             {}
 inline void changeWinTextFont(const std::string& = "Segoe UI")         {}
 inline void enableWinIcon(bool)                                        {}
 inline void setWinTitlebarButtonLayout(bool, bool)                     {}

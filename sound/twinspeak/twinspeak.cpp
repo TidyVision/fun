@@ -153,7 +153,7 @@
 //            icon, and putWindowinTray(true/false) which delegates to
 //            twinspeak's own hide-to-tray / guiRestoreWindow paths. The
 //            API: enableCustomWin, changeWinTitlebarColor,
-//            changeWinTextColor, changeWinTextUnfocusedColor,
+//            setWinTitleTextColor,
 //            changeWinTextFont (a family name or a C:/Windows/Fonts file),
 //            enableWinIcon, setWinTitlebarButtonLayout, setCanWinResize,
 //            changeWinMinimizeHoverColor, changeWinMaximizeHoverColor,
@@ -5435,9 +5435,15 @@ static void guiMakeGdi() {
     // launch-constant policy seeds ride here too; applyTheme owns colors.
     cwSeedTitleFont("Segoe UI", 14, FW_SEMIBOLD);
     changeWinTextFont("Segoe UI");
-    setWinTitlebarButtonLayout(true, false);   // minimize + close, no maximize --
-                                               // the v7.1.24 size-lock layout
-    setCanWinResize(false);                    // the window is fixed-size
+    // v7.5.3c THE RESIZE TEST BUILD: the v7.1.24 size-lock layout stands
+    // down so the header's maximize/resize paths can be verified -- the
+    // maximize button returns, the resize policy opens (the header's
+    // NCHITTEST sizing edges, its maximize toggle, its maximized
+    // NCCALCSIZE top inset). Revert these two lines plus the three belts
+    // below (WM_WINDOWPOSCHANGING, WM_SYSCOMMAND, WM_GETMINMAXINFO) to
+    // call it quits.
+    setWinTitlebarButtonLayout(true, true);    // minimize + maximize + close
+    setCanWinResize(true);                     // edges, snap, maximize -- the header's paths
     enableWinIcon(false);                      // no bar icon (the v7.4.11 look)
     enableCustomWin(true);
     applyTheme(g_themeSaved);   // v7.0.0: the theme owns the brushes now; v7.0.4: the ini's gui_theme wins (default 0 = DARK CYAN)
@@ -8087,31 +8093,22 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                          RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
         break;
-    case WM_WINDOWPOSCHANGING: {
-        // v7.1.20 THE SIZE LOCK, belt two: WS_THICKFRAME invites Aero snap
-        // (Win+arrow, drag-to-edge) and any SetWindowPos resize; those paths
-        // are not bound by WM_GETMINMAXINFO's min==max. Pin the window to
-        // the designed size in every sizing pass so the fixed layout cannot
-        // be stretched by the shell. (WM_SYSCOMMAND refuses SC_SIZE and
-        // SC_MAXIMIZE on top; WM_GETMINMAXINFO stays as the third belt.)
-        // v7.1.24: the designed size is now the CLIENT plus the frame
-        // insets WM_NCCALCSIZE takes back out.
-        WINDOWPOS* p = (WINDOWPOS*)lp;
-        if (p && !(p->flags & SWP_NOSIZE)) {
-            p->cx = KCLI_W + 2 * g_frmInsX;
-            p->cy = KCLI_H + kCapH + g_frmInsY;
-        }
-        break; }
+    // v7.5.3c: WM_WINDOWPOSCHANGING (the size lock's second belt -- it
+    // pinned every sizing pass to the designed 880x620+insets) stands down
+    // for the resize test. The shell may size the window freely now; the
+    // header's WM_NCCALCSIZE owns the insets and WM_PAINT regrows the
+    // frame + bar buffers at whatever client size results.
     case WM_SYSCOMMAND: {
-        // v7.1.20: the fixed layout cannot survive a resize or a maximize,
-        // so refuse those commands outright (keyboard Win+arrows included);
-        // IDM_TRAY_EXIT from the appended system-menu item is the real quit.
-        // NOTE: the 0xFFF0 mask is only for the built-in SC_* values -- the
-        // custom menu id must compare against the full wParam.
+        // v7.1.20: the fixed layout refused SC_SIZE/SC_MAXIMIZE outright
+        // (keyboard Win+arrows included) -- v7.5.3c: that refusal stands
+        // down for the resize test; the header's own WM_SYSCOMMAND case
+        // answers the built-in SC_ values FIRST and refuses them itself
+        // while setCanWinResize(false) is in force. IDM_TRAY_EXIT from the
+        // appended system-menu item is the real quit; the custom menu id is
+        // compared against the FULL wParam (the 0xFFF0 mask is only for the
+        // built-in SC_ values).
         // v7.1.24: SC_RESTORE passes again -- the main.c caption brings the
         // minimize button, and the taskbar's restore click rides SC_RESTORE.
-        const int sc = (int)(wp & 0xFFF0);
-        if (sc == SC_MAXIMIZE || sc == SC_SIZE) return 0;
         // v7.5.3b: THE MINIMIZE PRESENT moved into customWindow.h -- the
         // header's own WM_SYSCOMMAND case answers this message first
         // (cwWndProc runs before this switch) with the whole ordered
@@ -8510,14 +8507,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break; }
-    case WM_GETMINMAXINFO: {
-        // v6.6.3 polish, v6.6.5 size; v7.1.24: the WINDOW is the designed
-        // 880x620 client + the 31 px bar + the frame insets (WM_NCCALCSIZE
-        // takes the insets back out). min == max == no resizing at all.
-        MINMAXINFO* mmi = (MINMAXINFO*)lp;
-        mmi->ptMinTrackSize.x = mmi->ptMaxTrackSize.x = KCLI_W + 2 * g_frmInsX;
-        mmi->ptMinTrackSize.y = mmi->ptMaxTrackSize.y = KCLI_H + kCapH + g_frmInsY;
-        return 0; }
+    case WM_GETMINMAXINFO:
+        // v7.5.3c: the min==max track (v6.6.3..v7.1.24 -- the size lock's
+        // third belt) stands down for the resize test; DefWindowProc's
+        // defaults own the tracking now.
+        break;
     case WM_TIMER: {
         // v7.4.10: the second activation -- the unfocus + refocus replay
         // (tsReplayActivation above), armed two ticks (~500 ms) after the
