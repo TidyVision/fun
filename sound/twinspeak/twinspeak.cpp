@@ -23,6 +23,31 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.5.4 THE SPLIT RETURNS: the key on active, the gray on minimize.
+//            Field, after running v7.5.3's uniform row: "I see it now.
+//            The problem is though, it contradicts the active window
+//            state, so make it so if you've pressed the minimize button
+//            but have released the mouse click that the top bar color
+//            switches to Gdiplus::Color(128,43,43,43) while the active
+//            condition remains having Gdiplus::Color(255,0,0,0)."
+//            Adopted verbatim. ACTIVE is the glass key again: the
+//            buffered byte 0x00000000 (the v7.1.27..v7.5.2 byte -- an
+//            alpha-0 row carries nothing, so the DWM's own
+//            registry-colorized border material shows through, "the
+//            focused window remains accurate") and the GDI+ fallback
+//            Gdiplus::Color(255,0,0,0) (alpha > 0 so GDI+ delivers the
+//            paint at all; the RGB black keys the glass on the window
+//            DC). The half-alpha gray Gdiplus::Color(128,43,43,43)
+//            becomes the INACTIVE byte AND the MINIMIZE byte: the
+//            v7.5.2 press-frame ordered present is load-bearing again --
+//            WM_SYSCOMMAND(SC_MINIMIZE) (the click released, before
+//            DefWindowProc flips the placement) commits the gray row
+//            and lands the inactive face, DwmFlush-ordered, so the
+//            shrink animation rides the gray and never the key; the
+//            press frame (mouse down, not released) keeps the key,
+//            because SC_MINIMIZE only fires on the release. Restore
+//            reverses it: WM_NCACTIVATE(TRUE) commits the key back.
+//            Version steps to 7.5.4.
 //    v7.5.3 THE UNIFORM SHEET ROW + THE BAR MOVES INTO THE HEADER. Field,
 //            on the active sheet row: "Actually, I think this color on
 //            active Gdiplus::Color(128, 43, 43, 43) would do it" -- after
@@ -5247,11 +5272,13 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     // carries the real alpha into the redirection surface, and the DWM
     // composites the row 50/50 with the sheet -- the same semi-transparent
     // border the left/right/bottom NC strips carry, tracking the desktop
-    // behind the window exactly like theirs. v7.5.3: ACTIVE carries the
-    // SAME half-alpha gray (the field's pick, Gdiplus::Color(128,43,43,43)
-    // -- the DWM's registry-driven border colorization owns the frame
-    // tint, and with no alpha-0 row anywhere the minimize glass flash is
-    // impossible by construction). NO sheet (the extend
+    // behind the window exactly like theirs. v7.5.4: ACTIVE is the glass
+    // key again -- Gdiplus::Color(255,0,0,0), the field: "the active
+    // condition remains having Gdiplus::Color(255,0,0,0)" (v7.5.3's
+    // uniform gray contradicted the active state itself). Opaque black
+    // RGB on the window DC IS the key -- the DWM's own colorized border
+    // material shows through, the v7.1.27..v7.5.2 look. INACTIVE keeps
+    // the half-alpha gray. NO sheet (the extend
     // call failed): the v7.1.26 fake-shadow recipe stays as the fallback
     // -- a failed extend can never paint a dead black line. v7.1.30: the
     // DWM bakes this blend when the window PRESENTS pixels, and the
@@ -5266,12 +5293,17 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     // belongs to the border alone.
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
-        // v7.5.3: BOTH states carry the field's half-alpha gray -- the
-        // active row joined the inactive byte (the field's pick,
-        // Gdiplus::Color(128,43,43,43)). This GDI+ fill is the
-        // straight-to-screen FALLBACK only: the buffered path overwrites
-        // row 0 byte-direct through cwPatchSheetRow after the GDI+ pass.
-        rowCol = Gdiplus::Color(128, 43, 43, 43);
+        // v7.5.4: the ACTIVE row is the glass key again -- the field,
+        // "the active condition remains having Gdiplus::Color(255,0,0,0)".
+        // GDI+ needs alpha > 0 to deliver a paint at all, and the fill's
+        // RGB black is what keys the glass on the window DC: opaque black
+        // paint, the DWM's own border material showing through -- the
+        // v7.1.27..v7.5.2 look. INACTIVE keeps the half-alpha gray (the
+        // v7.4.3 field byte). This GDI+ fill is the straight-to-screen
+        // FALLBACK only: the buffered path overwrites row 0 byte-direct
+        // through cwPatchSheetRow after the GDI+ pass.
+        rowCol = active ? Gdiplus::Color(255, 0, 0, 0)
+                        : Gdiplus::Color(128, 43, 43, 43);
     } else {
         const COLORREF shTop = RGB(100, 100, 100);           // main.c verbatim
         const COLORREF li   = guiLerpRGB(bgTop, shTop, 0.5);
@@ -5304,19 +5336,23 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
 // alpha-0-both-states trial is the standing receipt that an alpha-0 row
 // cannot carry a color at all (over a (252,252,252) backdrop the DWM's
 // inactive sheet material landed BLACK -- the field's tape).
-// v7.5.3 THE FIELD'S UNIFORM ROW: the active row joins the inactive byte
-// -- Gdiplus::Color(128,43,43,43), the field's pick, "especially since
-// there's a dwm border color gotten from registry that's overriding that
-// color" (the DWM's colorization owns the frame tint; a bare glass key
-// delivered nothing extra). With NO alpha-0 row anywhere, the
-// transparent-glass flash the minimize animation rode (v7.5.1/v7.5.2) is
-// impossible BY CONSTRUCTION: every frame of every animation carries the
-// same composited gray. The v7.5.2 press-frame ordered present stays --
-// its row commit is byte-idempotent now, its face present is not. The
-// face's own row-0 GDI+ fill above is the straight-to-screen FALLBACK
-// only; the buffered path overwrites row 0 byte-direct through
-// cwPatchSheetRow after the GDI+ pass.
-//
+// v7.5.4 THE SPLIT RETURNS: the field ran the uniform row and saw it --
+// "I see it now. The problem is though, it contradicts the active window
+// state." The ACTIVE row is the alpha-0 glass key again (0x00000000, the
+// v7.1.27..v7.5.2 byte: the DWM's own registry-colorized border shows
+// through -- "the focused window remains accurate"), the GDI+ fallback
+// paints Color(255,0,0,0) again, and the gray becomes the INACTIVE byte
+// AND the MINIMIZE byte: "make it so if you've pressed the minimize
+// button but have released the mouse click that the top bar color
+// switches to Gdiplus::Color(128,43,43,43) while the active condition
+// remains having Gdiplus::Color(255,0,0,0)." The switch is the v7.5.2
+// press-frame ordered present, load-bearing again: WM_SYSCOMMAND
+// (SC_MINIMIZE) commits the gray row and lands the inactive face BEFORE
+// DefWindowProc flips the placement, DwmFlush-ordered, so the shrink
+// animation rides the gray and the press frame (mouse down, not
+// released) keeps the key. The face's own row-0 GDI+ fill above is the
+// straight-to-screen FALLBACK only; the buffered path overwrites row 0
+// byte-direct through cwPatchSheetRow after the GDI+ pass.
 // v7.3.0: DwmFlush blocks until the compose in flight has retired; the
 // ordered presents (WM_NCACTIVATE, WM_SYSCOMMAND(SC_MINIMIZE)) call it
 // before their pre-flip present so every compose that can carry the flip
@@ -7790,7 +7826,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.3 |  %s",  // v7.5.3 the uniform sheet row + the bar lives in customWindow.h
+    snprintf(vbuf, sizeof(vbuf), "v7.5.4 |  %s",  // v7.5.4 the split returns: key on active, gray on minimize
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7923,8 +7959,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         //       them (over a (252,252,252) backdrop the DWM's inactive
         //       sheet material landed BLACK -- the field's tape;
         //       Discord's custom-frame build carries the same hole).
-        // On activation the row rides the SAME half-alpha gray now
-        // (v7.5.3): the activation flip lives in the FACE alone.
+        // On activation the glass key goes down again (v7.5.4 restored
+        // the v7.1.27 split): the row commits the key's byte,
+        // 0x00000000 -- the DWM's own colorized border shows through.
         if (IsWindowVisible(w) && !IsIconic(w)) {
             if (g_dwmFlush) g_dwmFlush();  // wait out the compose in flight (v7.3.0, both directions)
             // v7.4.1: nothing to measure, nothing to stamp, nothing to
@@ -8127,21 +8164,23 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // row-first INACTIVE commit, the INACTIVE face, GdiFlush -- the
         // same bytes and the same order the WM_NCACTIVATE(FALSE) present
         // lands on an ordinary unfocus. The row is the half-alpha
-        // RGB(43,43,43) (v7.4.3, the field's gray) -- and v7.5.3 makes it
-        // the ACTIVE row's byte too (the field's pick,
-        // Gdiplus::Color(128,43,43,43)): the row commit here is
-        // byte-idempotent now and the glass flash is impossible by
-        // construction (no alpha-0 row exists anywhere); this present is
-        // ordered for the FACE, which still flips.
-        // ALREADY carries the inactive bar, the shrink animation rides it,
-        // and the v7.5.1 iconic guards hold every other painter off the
-        // surface until restore. The WM_NCACTIVATE(FALSE) that follows
-        // either re-presents byte-identical bytes or skips; both stand.
+        // RGB(43,43,43) (v7.4.3, the field's gray) -- and v7.5.4 makes it
+        // THE MINIMIZE BYTE: "if you've pressed the minimize button but
+        // have released the mouse click that the top bar color switches
+        // to Gdiplus::Color(128,43,43,43)". The active row is the glass
+        // key again (v7.5.4), so this commit is load-bearing exactly as
+        // in v7.5.2: the gray row lands before the flip and the shrink
+        // animation rides it, never the key. The press frame -- mouse
+        // down, not released -- keeps the active key: SC_MINIMIZE only
+        // fires on the release. The v7.5.1 iconic guards hold every other
+        // painter off the surface until restore; the WM_NCACTIVATE(FALSE)
+        // that follows lands the same gray bytes again or skips, both
+        // stand.
         if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
             cwSheetRowGate(true);
             if (g_dwmFlush) g_dwmFlush();
-            cwCommitSheetRowFast(w, false);    // the row lands first (v7.5.3: byte-idempotent --
-                                               // the FACE is what this present still orders)
+            cwCommitSheetRowFast(w, false);    // the row lands first (v7.5.4: the gray MINIMIZE
+                                               // byte -- the shrink rides it, never the key)
             g_forceActiveFace   = false;
             g_forceInactiveFace = true;
             guiPaintBar(w);                    // the INACTIVE face + row 0 + GdiFlush

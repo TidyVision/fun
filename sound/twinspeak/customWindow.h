@@ -1,5 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.3)
-// =====================================================================
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.4)
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
 // real NC strips via WM_NCCALCSIZE insets, HTCAPTION drag/snap/Alt+Space,
@@ -98,9 +97,12 @@
 //     cwWndProc(w, msg, wp, lp, &result)  FORWARD FIRST in the host wndproc
 //
 // The fake top border bar (the sheet row -- the window's REAL top border,
-// row 0 of the caption bar) is the header's too, since v7.5.3:
-//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults
-//                                           = the field's half-alpha gray)
+// row 0 of the caption bar) is the header's too, since v7.5.3. v7.5.4: the
+// ACTIVE row is the glass key again -- the gray covers the INACTIVE state
+// and the MINIMIZE frame only:
+//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults:
+//                                           ACTIVE the alpha-0 glass key,
+//                                           INACTIVE the half-alpha gray)
 //     cwPatchSheetRow(bits, cw, active)     row 0 of the host's 32bpp buffer
 //     cwCommitSheetRowFast(w, active)       the row-first 1 px commit
 //                                           (private DIB + GdiFlush)
@@ -489,29 +491,47 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 //                                                   gray (85 at 50%), the
 //                                                   field's byte -- "43, 43,
 //                                                   43 and that's just it."
-//   v7.5.3           active    BGRA(43,43,43,0x80) THE FIELD'S PICK: the
-//                                                   active row joins the
-//                                                   inactive byte -- the
-//                                                   field: "Gdiplus::Color
-//                                                   (128, 43, 43, 43) would
-//                                                   do it", since the DWM's
-//                                                   border color (the registry
-//                                                   colorization) owns the
-//                                                   frame tint anyway and a
-//                                                   bare glass key delivered
-//                                                   nothing the registry
-//                                                   border did not.
-// With no alpha-0 row anywhere, the transparent-glass flash the field taped
-// on minimize (v7.5.1/v7.5.2) is impossible BY CONSTRUCTION: every frame of
-// every animation -- the press frame, the shrink, the restore -- carries the
-// same composited gray. (The v7.4.0 receipt stands: an alpha-0 row cannot
-// carry a color at all -- the RGB under alpha 0 is invisible and the DWM's
-// own glass shows regardless -- so any recolor fix had to be alpha > 0;
-// this one is the field's own byte.) Both rows being one constant, the
-// activation flip no longer changes row 0 -- only the FACE (dim text, dim
-// glyphs) still flips, which is why the ordered presents stay: their row
-// commit is byte-idempotent now, their face present is not.
+//   v7.5.3           active    BGRA(43,43,43,0x80) ONE VERSION ONLY: the
+//                                                   field's pick made the row
+//                                                   uniform -- and the field
+//                                                   then saw it from the
+//                                                   outside: "The problem is
+//                                                   though, it contradicts
+//                                                   the active window
+//                                                   state."
+//   v7.5.4           active    BGRA(0,0,0,0)       THE KEY RETURNS: the
+//                                                   field: "make it so if
+//                                                   you've pressed the
+//                                                   minimize button but have
+//                                                   released the mouse click
+//                                                   that the top bar color
+//                                                   switches to
+//                                                   Gdiplus::Color(128,43,43,
+//                                                   43) while the active
+//                                                   condition remains having
+//                                                   Gdiplus::Color(255,0,0,0)."
+//                                                   The gray is the INACTIVE
+//                                                   byte and the MINIMIZE
+//                                                   byte; the key is the
+//                                                   active byte again (the
+//                                                   GDI+ fallback paints
+//                                                   Color(255,0,0,0) on the
+//                                                   window DC -- opaque black
+//                                                   RGB, the key itself).
+// The transparent-glass flash therefore has its old ONE window back: the
+// frames between the placement flip and the first gray present. The v7.5.2
+// ordered present owns it, load-bearing again: inside WM_SYSCOMMAND
+// (SC_MINIMIZE), before DefWindowProc flips anything -- DwmFlush retires
+// the compose in flight, the row-first gray commit lands, the inactive
+// face renders, GdiFlush -- the shrink animation rides the gray, never the
+// key. The press frame (mouse down, not released) keeps the key:
+// SC_MINIMIZE only fires on the release. (The v7.4.0 receipt still bounds
+// the design: an alpha-0 row cannot CARRY a color -- exactly what the
+// active state wants -- carry nothing, show the DWM's own border -- and
+// exactly what the inactive and minimize states must never do -- they need
+// a delivered gray.)
 //
+// THE THREE WRITERS (each lands the state's own constant; none ever measures):
 // THE THREE WRITERS (all land the same constant; none ever measures):
 //   * cwPatchSheetRow      -- row 0 of the HOST's bar buffer, inside the
 //                             host's bar paint (before its one blit).
@@ -541,12 +561,17 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 // which only catches up when WM_ACTIVATE runs after the transaction closes.
 // The gate (cwSheetRowGate) stands the presenter down while the GUI thread
 // is inside an ordered present (v7.3.1: a tick racing the handler would
-// otherwise re-land the row into the commit window; byte-idempotent now,
-// the gate is the belt it always was). The kick (cwSheetRowKick) restarts
+// otherwise re-land the row into the commit window; v7.5.4's split makes
+// the commits state-carrying again, the gate is the belt it always was).
+// The kick (cwSheetRowKick) restarts
 // the train; the SetEvent still orders the GUI writes before the thread's
 // reads.
-inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplus::Color(128,43,43,43)
-inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
+inline unsigned g_sheetRowActive   = 0x00000000u; // BGRA(0,0,0,0): the glass key, v7.5.4 restored -- the
+                                                  // DWM's own registry-colorized border shows through
+                                                  // (the GDI+ fallback paints Color(255,0,0,0))
+inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3) --
+                                                  // also the MINIMIZE byte: the SC_MINIMIZE ordered
+                                                  // present commits it before the placement flip
 inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
 inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
 inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
@@ -563,7 +588,7 @@ inline unsigned cwSheetRowBytes(bool active) {
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
 
-// row 0 of a top-down 32bpp buffer (the host's bar DIB), one constant
+// row 0 of a top-down 32bpp buffer (the host's bar DIB), the state's constant
 inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
     if (!bits32 || cw <= 0) return;
     const unsigned px = cwSheetRowBytes(active);
@@ -678,7 +703,7 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
             rowW = cr.right;
         }
-        const unsigned px = cwSheetRowBytes(nc != 0);   // one constant, both states, since v7.5.3
+        const unsigned px = cwSheetRowBytes(nc != 0);   // the split is back (v7.5.4): key on active, gray otherwise
         unsigned* row = (unsigned*)bits;
         for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
