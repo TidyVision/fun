@@ -7390,6 +7390,7 @@ static bool guiCreateRealWindow() {
             if (dwmExtend) {
                 const TS_MARGINS sheet = { 0, 0, 1, 0 };
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+                cwSheetGlass(g_glassSheet);   // v7.5.3a: the header's writers read the mirror
             }
             // v7.1.27 part two: DWMWA_USE_IMMERSIVE_DARK_MODE, always on.
             // Without it the DWM paints the extended sheet WHITE in light
@@ -7706,6 +7707,7 @@ static void guiRestoreWindow() {
         const TS_MARGINS sheet = { 0, 0, 1, 0 };
         dwmExtend(g_hwnd, &off);
         g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+        cwSheetGlass(g_glassSheet);           // v7.5.3a: the header's writers read the mirror
     }
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
 }
@@ -7991,6 +7993,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (dwmExtend) {
                 const TS_MARGINS sheet = { 0, 0, 1, 0 };
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
+                cwSheetGlass(g_glassSheet);   // v7.5.3a: the header's writers read the mirror
             }
             typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
             const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
@@ -8138,6 +8141,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // surface until restore. The WM_NCACTIVATE(FALSE) that follows
         // either re-presents byte-identical bytes or skips; both stand.
         if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            // v7.5.3a THE ANIMATION HOLD arms here (the caption button's
+            // click rides this message now, so EVERY minimize source --
+            // button, taskbar, system menu, keyboard -- presents through
+            // this ordered recipe). Until the fade train releases it after
+            // the restore, cwSheetRowBytes lands the field's gray for BOTH
+            // states: the shrink and the restore fly with the composited
+            // gray row (v7.5.3's construction -- no transparent glass), and
+            // the focused glass key (the accent) returns only once no
+            // animation is playing.
+            cwSheetRowAnimHold(true);
             cwSheetRowGate(true);
             if (g_dwmFlush) g_dwmFlush();
             cwCommitSheetRowFast(w, false);    // the row lands first (v7.5.3: byte-idempotent --

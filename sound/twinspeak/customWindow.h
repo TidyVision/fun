@@ -549,6 +549,32 @@ inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplu
 inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
 inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
 inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
+// v7.5.3a THE ANIMATION HOLD -- the focused state's timing gate. The host
+// arms it in the WM_SYSCOMMAND(SC_MINIMIZE) ordered present (the caption
+// button's click rides that message now); the fade train releases it ~280 ms
+// into a presenting run -- the restore animation is over by then. While it
+// stands, cwSheetRowBytes lands the field's gray for BOTH states: every
+// frame of the shrink and the restore carries the same composited gray (the
+// v7.5.3 construction -- the transparent-glass flash is impossible), and
+// the gray never shows on a focused window that has no animation playing.
+inline std::atomic<bool> g_sheetRowAnim{false};
+// THE FOCUSED & IDLE ROW: the alpha-0 glass key (the v7.1.27..v7.5.2 active
+// byte) -- the DWM's own border, accent-colorized by the registry, shows
+// through untouched. Note the byte is Gdiplus::Color(0,0,0,0), NOT the
+// field's "Color(255,0,0,0)": a literal (255,0,0,0) is an OPAQUE black row
+// that covers the accent exactly like the gray does -- an alpha-0 row is
+// the only way the accent shows (the v7.4.0 receipt).
+inline unsigned g_sheetRowFocusIdle = 0x00000000u;
+// mirror of the host's g_glassSheet: the header's own writers (the commit
+// and the train) must never land the glass key when no sheet is behind row 0
+inline std::atomic<bool> g_sheetHasGlass{false};
+
+inline void cwSheetRowAnimHold(bool on) {      // armed at the minimize present; the train releases it
+    g_sheetRowAnim.store(on, std::memory_order_release);
+}
+inline void cwSheetGlass(bool on) {            // the host mirrors g_glassSheet here (3 sites)
+    g_sheetHasGlass.store(on, std::memory_order_release);
+}
 inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
 inline HANDLE g_fadeThread = nullptr;        // created with the window, joined at stop
 inline std::atomic<bool> g_fadeQuit{false};
@@ -560,6 +586,12 @@ inline void*   g_rowBits = nullptr;
 inline int     g_rowW    = 0;
 
 inline unsigned cwSheetRowBytes(bool active) {
+    // v7.5.3a: the gray shows when INACTIVE or while an animation holds the
+    // row; focused & idle (and sheeted) the alpha-0 glass key lands and the
+    // DWM's accent border shows through.
+    if (active && !g_sheetRowAnim.load(std::memory_order_relaxed)
+               && g_sheetHasGlass.load(std::memory_order_relaxed))
+        return g_sheetRowFocusIdle;
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
 
@@ -687,6 +719,13 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             ReleaseDC(w, wdc);
         }
         GdiFlush();                           // the strip is presented before the next tick
+        // v7.5.3a THE HOLD RELEASE: after ~280 ms of presenting ticks the
+        // restore animation is over -- drop the hold and re-kick so a fresh
+        // train bakes the focused glass key (the accent). The iconic guard
+        // above skips the shrink's ticks without presenting, so a minimize
+        // alone can never reach this line and release the hold early.
+        if (ticks <= 7 && g_sheetRowAnim.exchange(false, std::memory_order_acq_rel))
+            cwSheetRowKick();
         --ticks;
     }
     if (bm) DeleteObject(bm);
@@ -826,7 +865,13 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // destroy), minimize minimizes, maximize toggles (refused while
         // setCanWinResize(false) -- a dead button for a host that asked)
         if (g_hover == cwHovClose)      { PostMessageW(w, WM_CLOSE, 0, 0); *out = 0; return true; }
-        if (g_hover == cwHovMin)        { ShowWindow(w, SW_MINIMIZE);      *out = 0; return true; }
+        // v7.5.3a: the click rides WM_SYSCOMMAND(SC_MINIMIZE) now, not a
+        // raw ShowWindow -- the host's ordered present (DwmFlush, the
+        // row-first gray commit, the face, the kick) and the animation hold
+        // arm BEFORE DefWindowProc flips anything. A raw ShowWindow skipped
+        // all of it: the surface kept the focused glass key and the shrink
+        // flew transparent (the v7.5.4..v7.5.10 flash).
+        if (g_hover == cwHovMin)        { PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0); *out = 0; return true; }
         if (g_hover == cwHovMax && g_btnMax) {
             if (g_resizable) ShowWindow(w, cwIsMaximized(w) ? SW_RESTORE : SW_MAXIMIZE);
             *out = 0; return true;
@@ -1026,6 +1071,9 @@ inline void cwSheetRowLatch(int state) { cwd::cwSheetRowLatch(state); }
 inline int  cwSheetRowLatchValue()     { return cwd::cwSheetRowLatchValue(); }
 inline void cwSheetPresenterStart(HWND w) { cwd::cwSheetPresenterStart(w); }
 inline void cwSheetPresenterStop()        { cwd::cwSheetPresenterStop(); }
+// v7.5.3a: the animation hold + the sheet mirror (see the essay above)
+inline void cwSheetRowAnimHold(bool on)   { cwd::cwSheetRowAnimHold(on); }
+inline void cwSheetGlass(bool on)         { cwd::cwSheetGlass(on); }
 
 #else  /* !_WIN32 -- the stub target: the API exists, does nothing ---------- */
 
@@ -1054,6 +1102,8 @@ inline void cwSheetRowLatch(int)                                       {}
 inline int  cwSheetRowLatchValue()                                     { return -1; }
 inline void cwSheetPresenterStart(void*)                               {}
 inline void cwSheetPresenterStop()                                     {}
+inline void cwSheetRowAnimHold(bool)                                   {}
+inline void cwSheetGlass(bool)                                         {}
 
 #endif /* _WIN32 */
 
