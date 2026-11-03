@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.4)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.5)
 // =====================================================================
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
@@ -22,6 +22,14 @@
 //         The caption bar's background. One argument: solid. Two: a vertical
 //         top->bottom gradient col -> gradColor. Colors are ARGB ints
 //         (0xAARRGGBB). Default: dark slate (the twinspeak seed).
+//
+//     setWinInactiveColor(int col) / (int col, int gradColor)     v7.5.5
+//         The caption bar's background while the window is INACTIVE. One
+//         argument: solid. Two: a vertical top->bottom gradient. -1 restores
+//         the default: mirror the focused color. The field's reason: the
+//         real Windows 10 dark mode turns the bar GRAY on inactive and
+//         keeps it black on focused -- a distinct inactive face is exactly
+//         that. Colors are ARGB ints (0xAARRGGBB).
 //
 //     setWinTitleTextColor(int color, int gradientCol,
 //                          int inactiveColor = color,
@@ -222,6 +230,15 @@ inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_text
 // field's "blurred"). The close button fades its vanilla red the same way;
 // the X lerps to white with the fill.
 inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
+// v7.5.5: the tint's CHANNEL follows the face being painted -- the field's
+// rule: HSL lightness < 128 (kHovDarkFaceL) reads as a dark face, and the
+// real caption's hover LIGHTENS a dark face: the UWP dark resources put the
+// button hover a step lighter than the face (#343434 over #171717, which
+// reads as a ~12.5% white overlay -- the field considered 12.5% for both
+// modes and kept the measured 10%). A light face keeps the measured black
+// step. The alpha never changes, only the channel; the close red is
+// untouched -- the real close hover is red in both modes.
+inline constexpr int kHovDarkFaceL = 128;   // the field's dark-face line
 inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp, focused (v7.5.3e: was 150)
 inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f: e had 100, d had 300)
 // v7.5.4: the unfocused window's hover runs at TWICE the speed -- both
@@ -325,6 +342,15 @@ inline DWORD cwArgbOf(COLORREF c) {
                        | ((DWORD)GetGValue(c) << 8) | (DWORD)GetBValue(c);
 }
 inline int cwChannel(int argb, int shift) { return (argb >> shift) & 0xFF; }
+
+// v7.5.5: HSL lightness of an ARGB color, 0..255 -- L = (max + min) / 2 on
+// the RGB channels. The hover's dark-face rule reads this (kHovDarkFaceL).
+inline int cwHslLightness(int argb) {
+    const int r = cwChannel(argb, 16), g2 = cwChannel(argb, 8), b = cwChannel(argb, 0);
+    const int mx = r > g2 ? (r > b ? r : b) : (g2 > b ? g2 : b);
+    const int mn = r < g2 ? (r < b ? r : b) : (g2 < b ? g2 : b);
+    return (mx + mn) / 2;
+}
 inline bool cwIsMaximized(HWND w) {          // main.c verbatim
     WINDOWPLACEMENT placement = {0};
     placement.length = sizeof(WINDOWPLACEMENT);
@@ -687,10 +713,17 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // against the right-hand neighbours are whole pixels (the outer edges
     // stay flush).
     {
+        // v7.5.5: the tint follows the face BEING PAINTED -- the same face
+        // expression cwPaintBarBackground answers, so the hover reads the
+        // mode actually on screen: dark face -> the white overlay, light
+        // face -> the measured black, kHovTintAlpha either way.
+        const int faceNow = active ? g_faceCol
+                                   : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+        const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
         const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
         const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
-        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), aMin << 24, cwHovSeamPx());
-        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), aMax << 24, cwHovSeamPx());
+        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), (aMin << 24) | tintCol, cwHovSeamPx());
+        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), (aMax << 24) | tintCol, cwHovSeamPx());
     }
 }
 
@@ -1364,6 +1397,13 @@ inline void cwApplyFace(bool active, int col, int grad) {
 
 inline void changeWinTitlebarColor(int col)                      { cwd::g_faceCol = col; cwd::g_faceGrad = col; cwd::g_faceColIn = -1; cwd::g_faceGradIn = -1; cwd::cwRepaint(); }
 inline void changeWinTitlebarColor(int col, int gradColor)       { cwd::g_faceCol = col; cwd::g_faceGrad = gradColor; cwd::cwRepaint(); }
+// v7.5.5: the inactive face, the field's call -- the real Windows 10 dark
+// mode turns the bar GRAY on inactive and keeps it black on focused, and
+// that needs a distinct inactive face. One argument: solid (a gradient
+// between equal colors is exact). Two: the inactive gradient. -1 restores
+// the default: mirror the focused color (cwPaintBarBackground's rule).
+inline void setWinInactiveColor(int col)                         { cwd::g_faceColIn = col; cwd::g_faceGradIn = col; cwd::cwRepaint(); }
+inline void setWinInactiveColor(int col, int gradColor)          { cwd::g_faceColIn = col; cwd::g_faceGradIn = gradColor; cwd::cwRepaint(); }
 
 inline void setWinTitleTextColor(int color, int gradientCol,
                                  int inactiveColor, int gradientInactiveCol) {
@@ -1388,8 +1428,9 @@ inline void setWinTitleTextColor(int color, int gradientCol) {
 }
 
 // v7.5.3d: changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are
-// retired -- the hover is the fixed 10% black tint now (the real thing's
-// look is not a color knob).
+// retired -- the hover is the fixed 10% tint now (the real thing's look is
+// not a color knob); v7.5.5: the tint's channel follows the face's HSL
+// lightness (white on a dark face, black on a light one) -- still no knob.
 
 inline void changeWinTextFont(const std::string& font = "Segoe UI") {
     std::wstring wide(font.begin(), font.end());
@@ -1505,6 +1546,8 @@ inline void cwSheetGlass(bool on)         { cwd::cwSheetGlass(on); }
 inline void enableCustomWin(bool)                                      {}
 inline void changeWinTitlebarColor(int)                                {}
 inline void changeWinTitlebarColor(int, int)                           {}
+inline void setWinInactiveColor(int)                                   {}
+inline void setWinInactiveColor(int, int)                              {}
 inline void setWinTitleTextColor(int, int, int, int)                   {}
 inline void setWinTitleTextColor(int, int, int)                        {}
 inline void setWinTitleTextColor(int, int)                             {}

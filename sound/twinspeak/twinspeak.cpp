@@ -5516,6 +5516,17 @@ static void applyTheme(int i) {
                      dark ? cwArgbOf(RGB(108, 134, 140)) : cwArgbOf(guic::cText),
                      cwArgbOf(guic::cDim),
                      cwArgbOf(guic::cText));   // v7.5.3d: the hover pair is gone -- the header's tint owns it
+        // v7.5.5: the dark themes' inactive bar does what the real Windows
+        // 10 dark mode does -- GRAY on inactive, black on focused (the
+        // field's find, wired through the header's new setWinInactiveColor).
+        // #323232: the system's own dark-mode inactive titlebar gray (the
+        // UWP default-title-bar inactive dark; the XAML dark ladder
+        // #171717/#343434/#4C4C4C brackets it, and the hover-tint research
+        // read the same ladder). Light themes keep the v7.1.20 3% lift
+        // mirror -- the real light-mode inactive bar barely differs from
+        // focused. The hover follows: the gray is still dark, so the white
+        // overlay rides the inactive bar too.
+        if (dark) setWinInactiveColor(cwArgbOf(RGB(50, 50, 50)));
     }
     #define TSREBR(b, c) do { if (b) DeleteObject(b); (b) = CreateSolidBrush(c); } while (0)
     TSREBR(g_brBg,     guic::cBg);
@@ -7838,8 +7849,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.4 |  %s",  // v7.5.4 the version bump (the v7.5.3 letter line ends; the bar lives in customWindow.h
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // (the 11-function API); v7.4.11's forced replay stays
+    snprintf(vbuf, sizeof(vbuf), "v7.5.5 |  %s",  // v7.5.5 the version bump (every build bumps now, the field's rule; v7.5.4
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // ended the v7.5.3 letter line; the bar lives in customWindow.h
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
