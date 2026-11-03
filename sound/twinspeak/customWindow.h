@@ -1,4 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.3)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.4)
 // =====================================================================
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
@@ -1275,12 +1275,38 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // releases the hold and the focused glass key -- the DWM's accent
         // border -- bakes once no animation is playing.
         if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            // v7.5.4 THE RELEASE PRESENT DROPS THE HOVER -- the strip's half
+            // of the recipe. The field: "do the same type of thing as the
+            // window border's top bar where the moment you release the
+            // minimize button and have pressed it the titlebar's buttons go
+            // half-transparent for that period." The release IS this
+            // message: the WM_NCLBUTTONUP dispatch posts it (the caption
+            // button since v7.5.3a), and the taskbar, the system menu and
+            // the keyboard land here too. At this instant the cursor is
+            // still ON the button -- the hover is armed and its ramp sits
+            // at 255 -- so the untouched present would land that glyph FULL
+            // (glyphCol lifts it, the tint band on it), and nothing could
+            // ever correct the flight: the shrink shows whatever THIS
+            // present lands (the iconic freeze), and the hover fade-out the
+            // WM_NCACTIVATE clear starts dies on the same freeze. Zeroed
+            // before the repaint, every glyph lands the inactive half
+            // (glyphCol at pa = 0 = kGlyphInactiveAlpha), the band and the
+            // red go with it, and the ride down shows the settled inactive
+            // caption -- the exact frames the top bar's gray has ridden
+            // since v7.5.3, now with the strip on it. Every OTHER
+            // deactivation keeps its animated fade-out (WM_NCACTIVATE's
+            // clear, the doubled inactive speed); only the minimize handoff
+            // drops instantly, because only this present is the last paint
+            // the animation will ever sample. The restore's activation
+            // lands the active face and the full strip as before.
+            g_hover = cwHovNone;
+            g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;
             cwSheetRowAnimHold(true);
             cwSheetRowGate(true);
             cwSheetRowLatch(0);
             cwDwmFlush();
             cwCommitSheetRowFast(w, false);
-            cwRepaint();                   // the inactive face, through the latch answer
+            cwRepaint();                   // the inactive face + the half strip, through the latch answer
             cwSheetRowGate(false);
             cwSheetRowKick();
         }
