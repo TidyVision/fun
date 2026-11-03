@@ -608,77 +608,44 @@ inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 // minus the field's two pixels plus the half one.
 struct CwButtonRects { RECT close, maximize, minimize; };
 inline CwButtonRects cwButtonRects(int ww) {
-    // v7.6.2: the rects stay whole pixels -- every edge rounds off the
-    // CUMULATIVE fractional run from the right edge (never the per-button
-    // width, which would drop the half pixel three times over). At 96 dpi
-    // the edges land at 46/91/137: 46/45/46, the stack total carrying the
-    // .5 in its rounding, the close button matching the real thing's own
-    // 46. At 150% they land at 68/137/205 off a 68.25 stride.
-    // v7.6.3 THE MAXIMIZED STYLE (the real thing's): the bar runs 24 design
-    // px, there is no border row above the buttons (the sheet is withdrawn
-    // -- the buttons start at row 0), and the buttons end one design px
-    // above the bar's bottom edge.
-    // v7.6.4 THE SMALLER MAXIMIZE BUTTON tried narrowing the MAXIMIZE
-    // button two design px in the maximized state -- withdrawn in v7.6.5:
-    // the field, again: "the freed 2px would not widen the maximize button
-    // at all, since you will leave it as is." The maximize button is LEFT
-    // AS IS -- its slot never moves and its width never changes; only the
-    // CLOSE button is special.
-    // v7.6.5 THE CLOSE BUTTON'S OWN STYLE (maximized) -- the field: "the
-    // close button being 2px thinner and 2px more to the left (keeping the
-    // anchor of the titlebar buttons in total)." Two moves, one button:
-    //   * 2px THINNER: the maximized close runs edge1 - cwS(2) (46 -> 44 at
-    //     96 dpi), the v7.6.3 width kept;
-    //   * 2px MORE TO THE LEFT: its right edge pulls two design px OFF the
-    //     window's right edge (close.right = ww - cwS(2)) -- the real
-    //     thing's maximized close does not touch the frame edge (the
-    //     reference shot shows two px of face to the red's right), and the
-    //     button's left edge lands exactly where the RESTORED close's left
-    //     edge sits (ww - 46). So the minimize/maximize pair keeps the
-    //     cumulative edges 46/91/137 on both sides of the state flip -- THE
-    //     ANCHOR OF THE STACK IS KEPT IN TOTAL (137 at 96 dpi, gap
-    //     included), the maximize button left as is (46/45/46 restored ->
-    //     46/45/44 + the 2 px gap maximized, the pair byte-identical), and
-    //     the titlebar buttons left of the close are the 2 px wider the
-    //     field counted against v7.6.4's 89 (91 now, in total).
-    //   The restored stack is untouched (46/45/46, flush right).
-    // v7.6.6 THE QUARTER PIXEL + THE WIDER MAXIMIZED STACK -- two field
-    // moves:
-    //   * THE METRIC: "the total titlebar button width is instead 45.75px
-    //     and the gap 0.25px, because I think that's how windows does it?
-    //     I don't know." Same 46 design px stride (the stack total is
-    //     untouched), the quarter pixel moves from the gap into the
-    //     button. Cumulative rounding re-splits the stack: 46/46/45 at
-    //     96 dpi (the half pixel rides the MAXIMIZE button now),
-    //     69/68/69 at 150% off the 68.625 run -- the field's "slight
-    //     diversion on 150% scale" gone.
-    //   * THE MAXIMIZED STACK: "on the maximized state, have the titlebar
-    //     buttons be 1px wider" -- every button runs cwS(1) wider there
-    //     (the close keeps its own 2px-off-the-edge anchor, the growth
-    //     runs leftward), on top of the v7.6.5 close rules. The restore
-    //     stack carries no +1.
+    // v7.6.8 THE REFERENCE LAYOUT -- the field shipped the two maximized
+    // titlebars side by side (the native one and ours) and the pixels
+    // answered. Measured off the native shot at 1920 px wide: close
+    // 1873..1917 (45), gap 1872, max 1827..1871 (45), gap 1826, min
+    // 1781..1825 (45), inset 1918..1919 (2) -- buttons rows 0..20 on a
+    // 23-row bar. The native maximized stack is 45/45/45 with REAL 1 px
+    // gaps and the close ending 2 px inside the window edge.
+    //   v7.6.6's reading ("+1 wide maximized, close -2") produced
+    // 46/47/45 with no daylight -- every button one px wider than the
+    // reference, the stack drifting leftward, the seams cut only while a
+    // patch stood. The 45 + 1 gap split keeps the SAME 46 design px
+    // stride the field's 45.75 + 0.25 metric rode (the stack total is
+    // untouched) -- the extra pixel now lives in the GAP, where the
+    // reference puts it, in BOTH states. Restored stays flush right
+    // (close.right = ww); maximized keeps the v7.6.5 2 px inset.
+    //   v7.6.8 THE RESTORED RAISE IS GONE -- the field: "on the normal
+    // state (not maximized) I see that the titlebar buttons are raised
+    // again, like I don't want (0px vs 1px and height reduced by 1px)."
+    // The buttons run 0..g_barH in BOTH states -- no WIN32_FAKE_SHADOW
+    // offset, no shortened band. The maximized band keeps its
+    // v7.6.3 one-design-px floor (rows 0..bh-2; the hover's two px of
+    // daylight land the band on the reference's 21 rows exactly).
     const bool  maxed  = g_host && cwIsMaximized(g_host);
-    const float bwf      = cwSf(45.75f);
-    const int   edge1    = (int)(bwf + 0.5f);
-    const int   edge2    = (int)(bwf * 2.0f + 0.5f);
-    const int   edge3    = (int)(bwf * 3.0f + 0.5f);
-    const int   wide     = maxed ? cwS(1) : 0;             // v7.6.6: +1 design px maximized
-    const int   closeW   = edge1 - (maxed ? cwS(2) : 0) + wide;   // v7.6.3: -2 maximized; v7.6.6: +1
-    const int   closeR   = ww - (maxed ? cwS(2) : 0);      // v7.6.5: -2 design px off the window edge maximized
-    const int   maxW     = edge2 - edge1 + wide;           // v7.6.5: NEVER narrowed; v7.6.6: +1 maximized
-    const int   minW     = edge3 - edge2 + wide;           // v7.6.6: +1 maximized
+    const float bwf      = cwSf(45.0f);
+    const float gapf     = cwSf(1.0f);
+    const int   bw       = (int)(bwf + 0.5f);                     // 45 at 96 dpi
+    const int   gap      = gapf < 1.0f ? 1 : (int)(gapf + 0.5f);  // 1 at 96 dpi, never 0
+    const int   closeR   = ww - (maxed ? cwS(2) : 0);             // v7.6.5: the maximized 2 px inset
     const int   bh       = maxed ? cwS(kBarHMaxDesign) : g_barH;
-    RECT close = { 0, 0, ww, bh };
-    if (maxed) close.bottom -= cwS(1);    // v7.6.3: the buttons run one design px shorter
-    else       close.top   += WIN32_FAKE_SHADOW_HEIGHT;
-    close.right = closeR;                 // v7.6.5: the close's own right edge
-    close.left = close.right - closeW;
+    RECT close = { 0, 0, closeR, bh };
+    if (maxed) close.bottom -= cwS(1);    // v7.6.3: the maximized band ends one design px up
+    close.left = close.right - bw;
     RECT maximize = close;
-    maximize.right = close.left;
-    maximize.left  = close.left - maxW;
+    maximize.right = close.left - gap;
+    maximize.left  = maximize.right - bw;
     RECT minimize = maximize;
-    minimize.right = maximize.left;
-    minimize.left  = maximize.left - minW;
+    minimize.right = maximize.left - gap;
+    minimize.left  = minimize.right - bw;
     if (!g_btnMax) minimize = maximize;   // the empty slot collapses
     return { close, maximize, minimize };
 }
@@ -856,21 +823,30 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     };
     // minimize
     if (g_btnMin) {
-        // v7.6.6: the maximized line runs one design px smaller (cwS(9),
-        // was cwS(10)) -- the close X and the maximize sheets already
-        // shrink maximized, this completes the set.
-        const int lineW = cwS(maxedW ? 9 : 10);
-        const int cx = br.minimize.left
-                     + (br.minimize.right - br.minimize.left) / 2;   // v7.6.2: its own width
-        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
-        fillARGB(glyphCol(item, g_hovA[0], 0), cx - lineW / 2, cy, lineW, 1);
+        // v7.6.8: the dash is the reference's own 10 design px in BOTH
+        // states (the maximized shot's dash runs 1799..1808 -- v7.6.6's
+        // "one px smaller" line drew 9 and sat a row high), and it centers
+        // on the TRUE middle of its slot: (mw - lineW + 1) / 2 rounds the
+        // half pixel INTO the button the way the reference does. The
+        // v7.6.8 cy (the +1 rounding below) drops the maximized glyphs a
+        // row to the reference's own rows (dash row 10, pair 5..14).
+        const int lineW = cwS(10);
+        const int mw    = br.minimize.right - br.minimize.left;
+        const int dx    = br.minimize.left + (mw - lineW + 1) / 2;
+        const int cy    = br.minimize.top + (br.minimize.bottom - br.minimize.top + 1) / 2
+                        - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        fillARGB(glyphCol(item, g_hovA[0], 0), dx, cy, lineW, 1);
     }
     // maximize (square outline; double square while maximized)
     if (g_btnMax) {
+        // v7.6.8 cy: the +1 in the rounding centers on the band the way
+        // the reference does -- the maximized glyphs land on the native
+        // rows exactly (pair 5..14, dash row 10, X tips 5..14); the
+        // restored glyphs keep the row they always sat on (the old rect
+        // ran 1..g_barH, whose center this same rounding answers).
         const int cx = br.maximize.left
                      + (br.maximize.right - br.maximize.left) / 2;   // v7.6.2: its own width
-        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2
+        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top + 1) / 2
                      - kHovGlyphRide;   // v7.5.4: the glyph rides the band
         const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
         const int mi = glyphCol(item, g_hovA[1], 1);   // v7.5.4: dimmed while inactive
@@ -888,12 +864,18 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             // icon draws 9x9 design inside the same slot (was 10x10), one
             // design px smaller on every side that counts. The restored
             // square keeps its 10 -- only the maximized icon shrinks.
-            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(7), cwS(7));
+            // v7.6.8 REVERTED TO cwS(8) -- the maximized reference shot
+            // measures the restore pair at 8 px a sheet (back square top
+            // edge row 5 x 1846..1853, front square top edge row 7 x
+            // 1844..1851): the v7.6.5 shrink was the field's own guess, and
+            // the reference out-answers it. With the v7.6.8 cy the pair
+            // lands on the native rows EXACTLY (back 5..12, front 7..14).
+            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));
             Gdiplus::Region frontRegion(front);
             g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
-            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(7), cwS(7));   // the back sheet, occluded
+            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet, occluded
             g.ResetClip();
-            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(7), cwS(7));   // the front sheet, full
+            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
         } else {
             // v7.6.3 THE CRISP SQUARE: the pen path at half-pixel
             // coordinates grew a mitre-joint speck off the top-left corner
@@ -924,8 +906,8 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(g_closeHover & 0xFFFFFF), 0);
         const int cx = br.close.left
                      + (br.close.right - br.close.left) / 2;   // v7.6.2: its own width
-        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        const int cy = br.close.top + (br.close.bottom - br.close.top + 1) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.8: the +1 centers like the reference
         int xc = glyphCol(item, pa, 2);     // v7.5.4: half there while inactive, pa restores it
         if (pa > 0) {                       // the X whitens with the red (alpha rides glyphCol)
             const int a = cwChannel(xc, 24);
@@ -1020,8 +1002,14 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
         const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
         const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
-        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), (aMin << 24) | tintCol, cwHovSeamPx());
-        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), (aMax << 24) | tintCol, cwHovSeamPx());
+        // v7.6.8: the seam insets are GONE -- the gaps are REAL now, they
+        // live in the button rects themselves (cwButtonRects), so the
+        // patches fill their rects flush and the 1 px of daylight between
+        // neighbours shows the face exactly like the reference's own
+        // button gaps. cwHovSeamPx() stays for hosts that run abutting
+        // rects of their own.
+        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), (aMin << 24) | tintCol, 0);
+        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), (aMax << 24) | tintCol, 0);
     }
 }
 
@@ -1218,8 +1206,20 @@ inline unsigned cwFaceRowBytes(bool active) {
     const int face = active ? g_faceCol
                             : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
     const int r = cwChannel(face, 16), g2 = cwChannel(face, 8), b = cwChannel(face, 0);
-    return 0xFF000000u | ((unsigned)b << 16)
-         | ((unsigned)g2 << 8) | (unsigned)r;
+    // v7.6.8 THE BLUE LINE -- FOUND. This row byte landed as 0xAABBGGRR
+    // (b<<16|r) while the 32bpp top-down DIB speaks 0xAARRGGBB (r<<16|b,
+    // the same packing cwRGB above has always used). Every byte this path
+    // wrote to row 0 had R and B SWAPPED. The gray (43,43,43) and the
+    // glass key (0,0,0,0) are R/B-symmetric -- invisible. The near-white
+    // face swap read (240,247,242) instead of (242,247,240) -- invisible.
+    // The close hover red did not survive it: 232,17,35 delivered as
+    // 35,17,232 -- the field's "blue line at the 0px row", captured live
+    // in the field's own screenshot (row 0 = 35,17,232, rows 1..20 =
+    // 232,17,35). v7.6.6's opaque-always and v7.6.7's face-base were both
+    // real fixes of real problems -- over the WRONG bytes. Packed
+    // 0xAARRGGBB now; the row agrees with the GDI+ rows under it.
+    return 0xFF000000u | ((unsigned)r << 16)
+         | ((unsigned)g2 << 8) | (unsigned)b;
 }
 
 inline unsigned cwSheetRowBytes(bool active) {
@@ -1281,14 +1281,19 @@ inline unsigned cwRowPatchOver(unsigned base, int pa, int col) {
     const int pr = ((col >> 16) & 0xFF) * pa / 255;
     const int pg = ((col >>  8) & 0xFF) * pa / 255;
     const int pb = ( col        & 0xFF) * pa / 255;
-    const int bA = (int)((base >> 24) & 0xFF), bB = (int)((base >> 16) & 0xFF);
-    const int bG = (int)((base >>  8) & 0xFF), bR = (int)( base        & 0xFF);
+    // v7.6.8: the base byte is 0xAARRGGBB (DIB order) -- R at bits 16..23,
+    // B at bits 0..7. This compositor read it 0xAABBGGRR, so the patch
+    // landed R/B-swapped on row 0 exactly when a hover was standing (the
+    // red read blue -- the field's line). Same packing fix as
+    // cwFaceRowBytes; premultiply unchanged.
+    const int bA = (int)((base >> 24) & 0xFF), bR = (int)((base >> 16) & 0xFF);
+    const int bG = (int)((base >>  8) & 0xFF), bB = (int)( base        & 0xFF);
     const int oA = pa + bA * ia / 255;
-    const int oB = pb + bB * ia / 255;
-    const int oG = pg + bG * ia / 255;
     const int oR = pr + bR * ia / 255;
-    return ((unsigned)oA << 24) | ((unsigned)oB << 16)
-         | ((unsigned)oG << 8)  | (unsigned)oR;
+    const int oG = pg + bG * ia / 255;
+    const int oB = pb + bB * ia / 255;
+    return ((unsigned)oA << 24) | ((unsigned)oR << 16)
+         | ((unsigned)oG << 8)  | (unsigned)oB;
 }
 inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
     const unsigned px = cwSheetRowBytes(active);
@@ -1305,7 +1310,7 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
     // field's "when I hover the close button that blue line appears"),
     // the bottom two real px short.
     const CwButtonRects br = cwButtonRects(cw2);
-    const int seam = cwHovSeamPx();
+    // v7.6.8: no seam cuts -- the gaps live in the rects (see cwButtonRects)
     const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
     const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
     const int aClose = g_hovA[2];
@@ -1332,9 +1337,9 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
         if (rowInBand) {
             if      (aClose > 0 && x >= br.close.left    && x < br.close.right)
                 { pa = aClose; col = closeCol; }
-            else if (aMax  > 0 && x >= br.maximize.left  && x < br.maximize.right  - seam)
+            else if (aMax  > 0 && x >= br.maximize.left  && x < br.maximize.right)
                 { pa = aMax;  col = tintCol;  }
-            else if (aMin  > 0 && x >= br.minimize.left  && x < br.minimize.right  - seam)
+            else if (aMin  > 0 && x >= br.minimize.left  && x < br.minimize.right)
                 { pa = aMin;  col = tintCol;  }
         }
         row[x] = (pa > 0) ? cwRowPatchOver(facePx, pa, col) : px;

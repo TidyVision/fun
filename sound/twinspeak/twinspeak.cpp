@@ -7919,7 +7919,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.7 |  %s",  // v7.6.7 the decompile comparison: the native hover fills the whole button rect (group rect top 0, uDWM 0x6a90) while the native buttons sit at margins.top+1 (0x21bc0) -- v7.6.6 read "y=1" as the band's top too, leaving the glass key (the accent) shining above the red; now the band owns row 0 in BOTH states and every patch composites over the opaque face row (cwFaceRowBytes), never over the glass key
+    snprintf(vbuf, sizeof(vbuf), "v7.6.8 |  %s",  // v7.6.8 the blue line SOLVED + the reference layout: cwFaceRowBytes/cwRowPatchOver packed 0xAABBGGRR into a 0xAARRGGBB DIB -- every byte-path row-0 pixel was R/B swapped (the near-white face hid it; the hover red read 35,17,232, the field's "blue line"); the button rects now carry the reference's own 45/45/45 with real 1px gaps (measured off the field's maximized shots: close 1873..1917, gap 1872, max 1827..1871, gap 1826, min 1781..1825, inset 1918..1919), the restored raise is gone (0px, full height), and the maximized glyphs sit on the native rows (dash row 10, pair 5..14)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
