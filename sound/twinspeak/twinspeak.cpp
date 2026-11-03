@@ -2183,6 +2183,32 @@ static IAudioEndpointVolume* endpointVolFromIdString(LPCWSTR idStr) {
     return out;
 }
 
+// v7.6.3: is this endpoint (by its id string) the CURRENT Windows default
+// playback (render) device? The pin layer must never write a volume to the
+// endpoint the user is LISTENING on: when a leg's device IS the default
+// render endpoint (the yield_default case), its volume slider belongs to
+// the user -- engine start and reopen must leave it exactly where it is.
+// Exact id-string compare: friendly names can collide, endpoint ids cannot.
+static bool isDefaultRenderEndpointId(const wchar_t* idStr) {
+    if (!idStr || !idStr[0]) return false;
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return false;
+    bool mine = false;
+    IMMDevice* def = nullptr;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &def)) && def) {
+        LPWSTR defId = nullptr;
+        if (SUCCEEDED(def->GetId(&defId)) && defId) {
+            mine = wcscmp(defId, idStr) == 0;
+            CoTaskMemFree(defId);
+        }
+        def->Release();
+    }
+    en->Release();
+    return mine;
+}
+
 // the render (playback) side of the VAC cable, matched by name against
 // input_device -- its IAudioEndpointVolume IS "VAC's volume".
 static IAudioEndpointVolume* findRenderEndpointVolume(const std::string& nameNeedle,
@@ -3976,7 +4002,9 @@ static void writeTemplate(const char* path) {
         "volume_follow = on\n"
         "volume_endpoint =\n"
         "; v7.0.0: pin_outputs is part of the engine now -- ALWAYS ON: both\n"
-        "; endpoint volumes are pinned 100%% / unmuted while the engine runs.\n"
+        "; endpoint volumes are pinned 100%% / unmuted while the engine runs,\n"
+        "; EXCEPT a leg whose device IS the current default playback device:\n"
+        "; that slider belongs to the user and is never written (v7.6.3).\n"
         "out2_first = on\n"
         "\n"
         "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI): out2 sums a sine on\n"
@@ -4605,11 +4633,20 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
         if (g_pin[idx].vol) { g_pin[idx].vol->Release(); g_pin[idx].vol = nullptr; }
         g_pin[idx].id = L.id.wasapi;
         if (L.id.wasapi[0]) {
-            g_pin[idx].vol = endpointVolFromIdString(L.id.wasapi);
-            if (g_pin[idx].vol) {
-                g_pin[idx].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
-                g_pin[idx].vol->SetMute(FALSE, nullptr);
-                tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- pinned 100%%\n", idx + 1);
+            // v7.6.3: THE DEFAULT-DEVICE GUARD -- a reopen that lands on the
+            // current default playback endpoint must not write 100% to it
+            // (the slider belongs to the user; yield_default re-yields the
+            // leg within a tick). The pin stays UNRESOLVED -- the watcher
+            // enforces nothing on an endpoint we do not hold.
+            if (isDefaultRenderEndpointId(L.id.wasapi)) {
+                tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- IS the default playback device, volume left alone\n", idx + 1);
+            } else {
+                g_pin[idx].vol = endpointVolFromIdString(L.id.wasapi);
+                if (g_pin[idx].vol) {
+                    g_pin[idx].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
+                    g_pin[idx].vol->SetMute(FALSE, nullptr);
+                    tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- pinned 100%%\n", idx + 1);
+                }
             }
         }
     }
@@ -5227,9 +5264,13 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     cwPaintBarBackground(g, ww, active);
     const COLORREF bgTop = guiLerpRGB(guic::cBg, RGB(255, 255, 255), active ? 0.07 : 0.03);
     // 1px bottom edge: chrome, not dead space (same cPanel2 as v7.0.9).
+    // v7.6.3: it rides the EFFECTIVE caption height -- maximized, the bar is
+    // 24 design px and the edge closes it there (kCapH stays the NORMAL
+    // baseline for the buffer and the creation geometry).
+    const int barNow = cwBarHeightNow();
     Gdiplus::SolidBrush edge(Gdiplus::Color(255, GetRValue(guic::cPanel2),
                                              GetGValue(guic::cPanel2), GetBValue(guic::cPanel2)));
-    g.FillRectangle(&edge, 0, kCapH - 1, ww, 1);
+    g.FillRectangle(&edge, 0, barNow - 1, ww, 1);
     // v7.1.28 THE INACTIVE ROW -- the recipe's exact RGBA. The field:
     // unfocused, the top border still read "not proper like the left,
     // right and bottom" -- v7.1.27 painted an OPAQUE lerp toward
@@ -5268,6 +5309,13 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     // frame -- inactive the moment the fade lands, nothing snaps. The
     // v7.1.26 gradient offset stays: the face starts 1px down, so this row
     // belongs to the border alone.
+    // v7.6.3: MAXIMIZED -- the fake top border row does not exist. The
+    // sheet is withdrawn ({0,0,0,0}, the header's WM_SIZE flip) and row 0
+    // is plain face: cwPaintBarBackground painted it above and the byte-
+    // direct patch (maximize-aware through cwSheetRowBytes) lands the same
+    // face byte. The gray row brush below is SKIPPED there -- landing it
+    // would be the top border coming back through the GDI+ fallback.
+    if (!cwIsMaximized(w)) {
     Gdiplus::Color rowCol;
     if (g_glassSheet) {
         // v7.5.3: BOTH states carry the field's half-alpha gray -- the
@@ -5286,6 +5334,7 @@ static void guiRenderBar(HDC dc, HWND w, int ww, bool active) {
     }
     Gdiplus::SolidBrush rowBrush(rowCol);
     g.FillRectangle(&rowBrush, 0, 0, ww, WIN32_FAKE_SHADOW_HEIGHT);
+    }   // v7.6.3: the maximized skip
     // v7.5.0: the buttons, the icon and the title text are customWindow.h's
     // (layout, hover faces, glyphs, the title = the WINDOW TITLE, every
     // color = the API state seeded from the theme). Painted AFTER the edge
@@ -5395,10 +5444,14 @@ static void guiPaintBar(HWND w) {
     if (cw <= 0) return;
     HDC wdc = GetDC(w);
     if (!wdc) return;
+    // v7.6.3: the buffer stays the NORMAL 33-design ceiling (a maximize
+    // never needs a regrow); the BLIT lands the EFFECTIVE row count --
+    // maximized, only the 24-design rows the bar now owns.
+    const int barNow = cwBarHeightNow();
     if (guiBarBufEnsure(cw, kCapH)) {
         guiRenderBar(g_barDc, w, cw, active);
         if (g_glassSheet) cwPatchSheetRow(g_barBits, cw, active);   // v7.1.29: the alpha IS the delivery (v7.5.3: the header's writer)
-        BitBlt(wdc, 0, 0, cw, kCapH, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker
+        BitBlt(wdc, 0, 0, cw, barNow, g_barDc, 0, 0, SRCCOPY);   // ONE blit, no flicker (eff rows v7.6.3)
     } else {
         guiRenderBar(wdc, w, cw, active);   // no buffer: draw straight
     }
@@ -6492,7 +6545,9 @@ static void guiBuildPages(HWND w) {
     row(w, COLB_X, 154, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 188, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
     // v7.0.0: the pin_outputs pill is gone -- output pinning is part of the
-    // engine now (always on): both endpoint volumes are pinned 100% / unmuted.
+    // engine now (always on): both endpoint volumes are pinned 100% / unmuted,
+    // except a leg that IS the current default playback device (v7.6.3 --
+    // its slider stays the user's; yield_default releases the DAC anyway).
     note(w, COLB_X, 262,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
          "EARLY leg. The banner prints both est paths; the health line's 'drift'\n"
@@ -7761,9 +7816,20 @@ static void guiRestoreWindow() {
     const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
         LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
     if (dwmExtend) {
-        const TS_MARGINS off   = { 0, 0, 0, 0 };
-        const TS_MARGINS sheet = { 0, 0, 1, 0 };
-        dwmExtend(g_hwnd, &off);
+        // v7.6.3: MAXIMIZE-AWARE -- a maximized window's settled sheet is
+        // NONE ({0,0,0,0}; the fake top border does not exist there). The
+        // two real changes still both happen, only in the maximized order
+        // ({0,0,1,0} first, then {0,0,0,0}), so the DWM cannot filter the
+        // unchanged margins and must rebuild frame + shadow either way.
+        // g_glassSheet stays "the extend machinery is alive" -- the row
+        // BYTES are maximize-aware through cwSheetRowBytes (the patch lands
+        // the face byte on a maximized window, the recipe bytes otherwise).
+        const bool maxed = cwIsMaximized(g_hwnd);
+        const TS_MARGINS first = maxed ? TS_MARGINS{ 0, 0, 1, 0 }
+                                       : TS_MARGINS{ 0, 0, 0, 0 };
+        const TS_MARGINS sheet = maxed ? TS_MARGINS{ 0, 0, 0, 0 }
+                                       : TS_MARGINS{ 0, 0, 1, 0 };
+        dwmExtend(g_hwnd, &first);
         g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
     }
     SetTimer(g_hwnd, 1, 250, nullptr);       // v7.1.20: the tick slept while hidden
@@ -7836,9 +7902,13 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // every frame-paint coordinate below shifts by kCapH -- the layout
     // literals keep their content-space meaning. v7.1.20: the literals go
     // through the DPI scale; kCapH / KPANEL_* / KLOG_BOTTOM are already real.
+    // v7.6.3: the shift rides the EFFECTIVE caption height -- maximized,
+    // the bar is 24 design px and every band below moves up with it
+    // (kCapH stays the NORMAL baseline for buffers and creation).
+    const int capNow = cwBarHeightNow();
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
-    const RECT panel = { S(12), KPANEL_T + kCapH, S(866), KPANEL_B + kCapH };
+    const RECT panel = { S(12), KPANEL_T + capNow, S(866), KPANEL_B + capNow };
     FillRect(dc, &panel, g_brPanel);
     FrameRect(dc, &panel, g_brPanel2);
     Gdiplus::Graphics g(dc);
@@ -7846,23 +7916,23 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
     g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(13) + 0.5f,
-                                        (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
+                                        (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.0 |  %s",  // v7.6.0 the base line returns -- the narrower buttons (cwS(45)),
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // the square's true center, the inactive lapse (12.5%, 100 ms)
-    const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
+    snprintf(vbuf, sizeof(vbuf), "v7.6.3 |  %s",  // v7.6.3 the unhover flash starts at 0; the maximize square is crisp; maximized: 24px bar, -1px buttons, -2px close, no top border + {0,0,0,0}; the default playback device's volume is never pinned
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // to 100% at engine start
+    const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
     // inside the frame buffer -- the STATIC child (hidden) only stores the
     // string. One blit, no flicker while the health line updates.
     char stb[512] = "";
     if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
-    const RECT stc = { S(14), S(458) + kCapH, S(866), S(476) + kCapH };
+    const RECT stc = { S(14), S(458) + capNow, S(866), S(476) + capNow };
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    const RECT kbr = { S(14), KLOG_BOTTOM + kCapH, S(552), KCLI_H + kCapH };
+    const RECT kbr = { S(14), KLOG_BOTTOM + capNow, S(552), KCLI_H + capNow };
     guiAAString(g, dc, kbr,
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
@@ -9658,6 +9728,20 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 // endpoint volume to pin. volume_follow still governs this
                 // leg from the pump side.
                 tlog("[twinspeak] out%d: WDM-KS pin -- endpoint pinning not applicable (KS bypasses endpoint volume)\n", i + 1);
+                continue;
+            }
+            // v7.6.3 THE DEFAULT-DEVICE GUARD: when a leg's endpoint IS the
+            // current default playback device, its volume slider belongs to
+            // the user -- engine start must never slam it to 100%/unmuted
+            // (the field: "if the default playback device is either the
+            // first output leg or second output leg, their volume must not
+            // just get set to 100 once the engine starts"). The pin stays
+            // UNRESOLVED -- the watcher has nothing to enforce on it -- and
+            // yield_default releases this leg's DAC within a health tick;
+            // the yield-release reopen re-pins once the default has moved
+            // away, and the pin then writes like any other.
+            if (isDefaultRenderEndpointId(g_leg[i].id.wasapi)) {
+                tlog("[twinspeak] out%d: endpoint IS the default playback device -- volume left alone (no 100%% pin)\n", i + 1);
                 continue;
             }
             g_pin[i].id = g_leg[i].id.wasapi;
