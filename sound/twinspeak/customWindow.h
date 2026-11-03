@@ -298,6 +298,15 @@ inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is runn
 // the tint. Inactive only -- the focused bar never lapses -- and every
 // activation change and hide takes the live flashes with it.
 inline constexpr int  kCwLapseAlpha = 0;    // the flash floor: FULLY transparent (v7.6.3, was 32)
+// v7.6.5 THE SLOW-LEAVE CAP -- the field: "if the titlebar button unhover
+// threshold is too slow (more than 250ms) then the fade thing is not done
+// at all." The leave's tempo (cwHovTempoMs, captured into
+// kHovInactiveOutMs at every leave site) answers for the threshold: past
+// 250 ms the lapse is SKIPPED OUTRIGHT -- the glyph never drops to zero
+// and simply rests at its half-there value. The fade-back only exists
+// inside [100, 250] ms; a 2 px/ms flick (the 300 ms ceiling) gets no flash
+// at all.
+inline constexpr int  kCwLapseMaxMs = 250;
 inline bool  g_lapseOn[3] = { false, false, false };  // min, max, close: a flash is live
 inline int   g_lapseA[3] = { 0, 0, 0 };               // the flash's glyph alpha, 0..128
 inline DWORD g_lapseT0[3] = { 0, 0, 0 };              // the unhover tick each flash started
@@ -528,6 +537,11 @@ inline void cwHovAnimTick() {
 // the ramps.
 inline void cwHovLapse(int i) {
     if (i < 0 || i > 2) return;
+    // v7.6.5: the slow-leave cap -- kHovInactiveOutMs was JUST captured off
+    // the leave's tempo at every leave site (WM_NCMOUSEMOVE's change,
+    // WM_NCMOUSELEAVE, the WM_MOUSEMOVE walk into the client); past 250 ms
+    // the flash does not exist. The glyph rests where the ramps put it.
+    if (kHovInactiveOutMs > kCwLapseMaxMs) return;
     g_lapseOn[i] = true;                 // the flash is live
     g_lapseT0[i] = GetTickCount();       // its life starts now
     g_lapseA[i]  = kCwLapseAlpha;        // the transparency set to ZERO, this very frame
@@ -595,37 +609,53 @@ inline CwButtonRects cwButtonRects(int ww) {
     // 46. At 150% they land at 68/137/205 off a 68.25 stride.
     // v7.6.3 THE MAXIMIZED STYLE (the real thing's): the bar runs 24 design
     // px, there is no border row above the buttons (the sheet is withdrawn
-    // -- the buttons start at row 0), the buttons end one design px above
-    // the bar's bottom edge, and the CLOSE button runs two design px
-    // narrower.
-    // v7.6.4 THE SMALLER MAXIMIZE BUTTON -- the field, again: "make the
-    // window's titlebar buttons actually look like this, with the smaller
-    // maximize button and the maximize button keeping its same position
-    // but removing 2px off the width." The MAXIMIZE button gives up two
-    // design px in the maximized state too, its right edge still glued to
-    // the close button's left edge (the stack stays flush -- no gap can
-    // open where two hover patches meet), and it keeps its slot: the
-    // MINIMIZE button keeps the cumulative edge and rides the new
-    // boundary. At 96 dpi the maximized stack reads 46/43/44 (was
-    // 46/45/44); at 150%: 68/66/65 off the 68.25 stride.
+    // -- the buttons start at row 0), and the buttons end one design px
+    // above the bar's bottom edge.
+    // v7.6.4 THE SMALLER MAXIMIZE BUTTON tried narrowing the MAXIMIZE
+    // button two design px in the maximized state -- withdrawn in v7.6.5:
+    // the field, again: "the freed 2px would not widen the maximize button
+    // at all, since you will leave it as is." The maximize button is LEFT
+    // AS IS -- its slot never moves and its width never changes; only the
+    // CLOSE button is special.
+    // v7.6.5 THE CLOSE BUTTON'S OWN STYLE (maximized) -- the field: "the
+    // close button being 2px thinner and 2px more to the left (keeping the
+    // anchor of the titlebar buttons in total)." Two moves, one button:
+    //   * 2px THINNER: the maximized close runs edge1 - cwS(2) (46 -> 44 at
+    //     96 dpi), the v7.6.3 width kept;
+    //   * 2px MORE TO THE LEFT: its right edge pulls two design px OFF the
+    //     window's right edge (close.right = ww - cwS(2)) -- the real
+    //     thing's maximized close does not touch the frame edge (the
+    //     reference shot shows two px of face to the red's right), and the
+    //     button's left edge lands exactly where the RESTORED close's left
+    //     edge sits (ww - 46). So the minimize/maximize pair keeps the
+    //     cumulative edges 46/91/137 on both sides of the state flip -- THE
+    //     ANCHOR OF THE STACK IS KEPT IN TOTAL (137 at 96 dpi, gap
+    //     included), the maximize button left as is (46/45/46 restored ->
+    //     46/45/44 + the 2 px gap maximized, the pair byte-identical), and
+    //     the titlebar buttons left of the close are the 2 px wider the
+    //     field counted against v7.6.4's 89 (91 now, in total).
+    //   The restored stack is untouched (46/45/46, flush right).
     const bool  maxed  = g_host && cwIsMaximized(g_host);
     const float bwf      = cwSf(45.5f);
     const int   edge1    = (int)(bwf + 0.5f);
     const int   edge2    = (int)(bwf * 2.0f + 0.5f);
     const int   edge3    = (int)(bwf * 3.0f + 0.5f);
-    const int   closeW   = edge1 - (maxed ? cwS(2) : 0);   // v7.6.3: the close runs -2 design px
-    const int   maxW     = (edge2 - edge1) - (maxed ? cwS(2) : 0);   // v7.6.4: the maximize runs -2 design px too
+    const int   closeW   = edge1 - (maxed ? cwS(2) : 0);   // v7.6.3: -2 design px maximized
+    const int   closeR   = ww - (maxed ? cwS(2) : 0);      // v7.6.5: -2 design px off the window edge maximized
+    const int   maxW     = edge2 - edge1;                  // v7.6.5: the maximize button is NEVER narrowed
+    const int   minW     = edge3 - edge2;
     const int   bh       = maxed ? cwS(kBarHMaxDesign) : g_barH;
     RECT close = { 0, 0, ww, bh };
     if (maxed) close.bottom -= cwS(1);    // v7.6.3: the buttons run one design px shorter
     else       close.top   += WIN32_FAKE_SHADOW_HEIGHT;
+    close.right = closeR;                 // v7.6.5: the close's own right edge
     close.left = close.right - closeW;
     RECT maximize = close;
     maximize.right = close.left;
     maximize.left  = close.left - maxW;
     RECT minimize = maximize;
     minimize.right = maximize.left;
-    minimize.left  = maximize.left - (edge3 - edge2);
+    minimize.left  = maximize.left - minW;
     if (!g_btnMax) minimize = maximize;   // the empty slot collapses
     return { close, maximize, minimize };
 }
@@ -758,12 +788,19 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // edge; the outer edges stay flush (close rides the window edge).
     // SmoothingMode stays None and every coordinate is an integer, so every
     // edge renders crisp.
-    // v7.5.3f THE BAND: the patch is ONE real px down from the top (the
-    // button rects already start on row 1, under the border row -- the
-    // v7.5.3e top pin is retired) and THREE real px shorter than the bar:
-    // two px of daylight above the bar's bottom edge. hoverBand() is the one
-    // geometry; every hover fill goes through it.
-    auto hoverBand = [](const RECT& r) { RECT h = r; h.bottom -= 2; return h; };
+    // v7.5.3f THE BAND: the patch ran ONE real px down from the top (the
+    // button rects start on row 1, under the border row) and THREE real px
+    // shorter than the bar: two px of daylight above the bar's bottom edge.
+    // v7.6.5 THE HOVER AT 0PX -- the field: "I still don't see the titlebar
+    // button hovers being at 0px." The real thing's highlight runs to the
+    // VERY TOP of the frame -- the border row is covered the moment a
+    // button lights. hoverBand pins the patch's top to ROW 0 (restored:
+    // the sheet row is painted over; maximized: row 0 was already the
+    // patch's first row) and keeps the two px of daylight at the bottom.
+    // The byte-direct row writers composite the same bands over row 0
+    // (cwSheetRowFill), so every path -- buffered blit, pre-flip commit,
+    // fade train -- agrees with this one.
+    auto hoverBand = [](const RECT& r) { RECT h = r; h.top = 0; h.bottom -= 2; return h; };
     auto fillPatch = [&](const RECT& r, int col, int insetR) {
         Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
                                              cwChannel(col, 8), cwChannel(col, 0)));
@@ -794,12 +831,19 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             // restore glyph layers the squares, the back square's edges stop
             // at the front square instead of showing through its interior
             // (the maximized button used to read as see-through wireframe).
-            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));
+            // v7.6.5 ONE PX SMALLER -- the field: "doesn't the maximized
+            // state's maximize button icon need to be 1px smaller?" Both
+            // sheets run cwS(7) now (was cwS(8)), each keeping its top-left
+            // anchor and the cwS(2) diagonal offset between them: the whole
+            // icon draws 9x9 design inside the same slot (was 10x10), one
+            // design px smaller on every side that counts. The restored
+            // square keeps its 10 -- only the maximized icon shrinks.
+            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(7), cwS(7));
             Gdiplus::Region frontRegion(front);
             g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
-            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet, occluded
+            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(7), cwS(7));   // the back sheet, occluded
             g.ResetClip();
-            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
+            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(7), cwS(7));   // the front sheet, full
         } else {
             // v7.6.3 THE CRISP SQUARE: the pen path at half-pixel
             // coordinates grew a mitre-joint speck off the top-left corner
@@ -907,11 +951,11 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         }
     }
     // v7.5.3d..f: the min/max hover tints land LAST -- they overlay
-    // everything in the button (the glyph included), in the v7.5.3f band:
-    // one real px of daylight at the top (the border row is never covered)
-    // and three real px shorter than the bar (two at the bottom). The seams
-    // against the right-hand neighbours are whole pixels (the outer edges
-    // stay flush).
+    // everything in the button (the glyph included), in the band: since
+    // v7.6.5 the band starts at ROW 0 (the hover covers the border row,
+    // like the real thing) and keeps the two real px of daylight at the
+    // bottom. The seams against the right-hand neighbours are whole pixels
+    // (the outer edges stay flush).
     {
         // v7.5.5: the tint follows the face BEING PAINTED -- the same face
         // expression cwPaintBarBackground answers, so the hover reads the
@@ -1136,21 +1180,80 @@ inline unsigned cwSheetRowBytes(bool active) {
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
 
-// v7.5.3f: THE TOP PIN IS RETIRED -- row 0 is the plain sheet byte again.
-// v7.5.3e composited the hover tint (and the close red) over this row so the
+// v7.6.5: THE HOVER REACHES ROW 0 -- the byte-direct twin of the GDI+ patch.
+// v7.5.3e composited the hover tint (and the close red) over row 0 so the
 // highlight reached the window's top edge the way the real DWM's runs behind
-// the border line; the field called the highlight back DOWN one real px
-// ("1px vertical"), so the border row is never covered now and the byte-
-// direct writers carry no patch state at all (no g_hovA reads on the row
-// path). The name keeps its v7.5.3e shape minus the tint: the sheet bytes,
-// top-down, every column.
+// the border line; v7.5.3f pushed the highlight DOWN one real px (the field's
+// "1px vertical") and the writers carried no patch state at all. The field,
+// now: "I still don't see the titlebar button hovers being at 0px" -- the
+// real thing's highlight covers the border row outright, so the compositing
+// is BACK, rebuilt to match the v7.6.5 painter exactly: the same bands
+// (hoverBand: top pinned to row 0, two real px of daylight at the bottom),
+// the same colors (the white/black face tint for min/max, the red knob for
+// close), the same alphas (kHovTintAlpha * the min/max ramps, the close's
+// own ramp) and the same seams (cwHovSeamPx off the left neighbour's right
+// edge). Every byte-direct writer goes through here -- the host's buffered
+// blit (cwPatchSheetRow after the GDI+ pass), the pre-flip row commit and
+// the fade train -- so row 0 agrees with rows 1+ on every path, hover or
+// not. (The fade train reads the hover alphas from its own thread: plain
+// int reads of GUI-thread state, the same shape as its g_host read -- a
+// stale alpha costs one 20 ms tick of one row, never a crash.)
+// Premultiplied-over of a patch (straight ARGB int) onto a row byte
+// (premultiplied BGRA): out = patch*pa + base*(1-pa), alpha delivered the
+// v7.1.29 way (the alpha IS the delivery -- a semi-transparent row over the
+// focused glass key stays semi-transparent, exactly like the GDI+ fill).
+inline unsigned cwRowPatchOver(unsigned base, int pa, int col) {
+    if (pa <= 0) return base;
+    if (pa > 255) pa = 255;
+    const int ia = 255 - pa;
+    const int pr = ((col >> 16) & 0xFF) * pa / 255;
+    const int pg = ((col >>  8) & 0xFF) * pa / 255;
+    const int pb = ( col        & 0xFF) * pa / 255;
+    const int bA = (int)((base >> 24) & 0xFF), bB = (int)((base >> 16) & 0xFF);
+    const int bG = (int)((base >>  8) & 0xFF), bR = (int)( base        & 0xFF);
+    const int oA = pa + bA * ia / 255;
+    const int oB = pb + bB * ia / 255;
+    const int oG = pg + bG * ia / 255;
+    const int oR = pr + bR * ia / 255;
+    return ((unsigned)oA << 24) | ((unsigned)oB << 16)
+         | ((unsigned)oG << 8)  | (unsigned)oR;
+}
 inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
     const unsigned px = cwSheetRowBytes(active);
-    for (int x = 0; x < cw2; ++x) row[x] = px;
+    // fast path: no hover anywhere -- the plain sheet bytes, as always
+    if (!g_hovA[0] && !g_hovA[1] && !g_hovA[2]) {
+        for (int x = 0; x < cw2; ++x) row[x] = px;
+        return;
+    }
+    // the bands, straight off the painter's geometry: the rects of THIS
+    // width, the band top pinned to row 0, the bottom two real px short
+    // (row 0 is inside the band whenever the band's bottom is past it).
+    const CwButtonRects br = cwButtonRects(cw2);
+    const int seam = cwHovSeamPx();
+    const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
+    const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
+    const int aClose = g_hovA[2];
+    const int faceNow = active ? g_faceCol
+                               : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
+    const int closeCol = (int)(g_closeHover & 0xFFFFFF);
+    const bool rowInBand = (br.close.bottom - 2) > 0;   // band top is row 0
+    for (int x = 0; x < cw2; ++x) {
+        int pa = 0, col = 0;
+        if (rowInBand) {
+            if      (aClose > 0 && x >= br.close.left    && x < br.close.right)
+                { pa = aClose; col = closeCol; }
+            else if (aMax  > 0 && x >= br.maximize.left  && x < br.maximize.right  - seam)
+                { pa = aMax;  col = tintCol;  }
+            else if (aMin  > 0 && x >= br.minimize.left  && x < br.minimize.right  - seam)
+                { pa = aMin;  col = tintCol;  }
+        }
+        row[x] = (pa > 0) ? cwRowPatchOver(px, pa, col) : px;
+    }
 }
 
-// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte
-// (v7.5.3f: the hover patch no longer touches the border row)
+// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte,
+// hover patches composited (v7.6.5: the hover reaches row 0)
 inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
     if (!bits32 || cw <= 0) return;
     cwSheetRowFill((unsigned*)bits32, cw, active);   // top-down: row 0 first
@@ -1192,7 +1295,7 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {
         g_rowW = cr.right;
     }
     unsigned* row = (unsigned*)g_rowBits;
-    cwSheetRowFill(row, cr.right, active);         // the plain sheet bytes (v7.5.3f: no patches on the row)
+    cwSheetRowFill(row, cr.right, active);         // sheet bytes + hover patches (v7.6.5: row 0 joins the hover)
     HDC wdc = GetDC(w);
     if (wdc) {
         BitBlt(wdc, 0, 0, cr.right, 1, g_rowDc, 0, 0, SRCCOPY);
@@ -1266,7 +1369,7 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             rowW = cr.right;
         }
         unsigned* row = (unsigned*)bits;
-        cwSheetRowFill(row, cr.right, nc != 0);        // the plain sheet bytes (v7.5.3f: no patches on the row)
+        cwSheetRowFill(row, cr.right, nc != 0);        // sheet bytes + hover patches (v7.6.5: row 0 joins the hover)
         HDC wdc = GetDC(w);
         if (wdc) {
             BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);

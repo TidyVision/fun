@@ -7919,7 +7919,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.4 |  %s",  // v7.6.4 the unhover fade runs 100-300ms; maximized, the maximize button gives up 2px too (46/43/44 at 96dpi); the maximize flip and the DPI reaction repaint the whole frame in one synchronous write (no split-second corruption); the composition-changed re-commit is maximize-aware
+    snprintf(vbuf, sizeof(vbuf), "v7.6.5 |  %s",  // v7.6.5 maximized, the close runs 2px thinner AND 2px off the window edge (44 + a 2px face gap at 96dpi) with the min/max pair and the stack anchor kept (46/45/44+2); the hovers reach row 0 on every path; the maximized restore icon is 1px smaller; an unhover slower than 250ms gets no fade at all
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);

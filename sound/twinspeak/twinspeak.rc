@@ -1,10 +1,12 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump; v7.5.4: version bump; v7.5.5: version bump; v7.6.0: version bump; v7.6.1: version bump; v7.6.2: version bump; v7.6.3: version bump; v7.6.4: version bump
-// (the unhover fade's tempo bracket moves to [100, 300] ms -- "have the
-// fade be 100ms to 300ms instead"; maximized, the MAXIMIZE button runs
-// two design px narrower too, the stack flush 46/43/44 at 96 dpi; and the
-// maximize flip + the WM_DPICHANGED reaction repaint the whole frame in
-// one synchronous write -- no split-second corruption -- with the host's
-// WM_DWMCOMPOSITIONCHANGED re-commit maximize-aware)
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump; v7.5.4: version bump; v7.5.5: version bump; v7.6.0: version bump; v7.6.1: version bump; v7.6.2: version bump; v7.6.3: version bump; v7.6.4: version bump; v7.6.5: version bump
+// (maximized, the CLOSE button runs 2px thinner AND 2px more to the left --
+// its right edge two design px off the window edge, the min/max pair and
+// the stack's total anchor kept: 46/45/44 + the 2px gap at 96 dpi, the
+// maximize button left as is; the HOVERS reach row 0 on every path -- the
+// GDI+ band pins its top to row 0 and the byte-direct row writers
+// composite the same patches over the sheet byte; the maximized restore
+// icon runs one design px smaller (cwS(7) sheets, was cwS(8)); and an
+// unhover slower than 250 ms gets no fade-back flash at all)
 // (the hover tint reads the face's HSL lightness -- white on a dark face,
 // the measured 10% black on a light one -- and setWinInactiveColor arrives;
 // twinspeak's dark themes take the real Win10 dark-mode inactive gray
@@ -177,8 +179,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,6,4,0
-PRODUCTVERSION  7,6,4,0
+FILEVERSION     7,6,5,0
+PRODUCTVERSION  7,6,5,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -189,12 +191,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.6.4.0"
+            VALUE "FileVersion",      "7.6.5.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.6.4.0"
+            VALUE "ProductVersion",   "7.6.5.0"
         END
     END
     BLOCK "VarFileInfo"
