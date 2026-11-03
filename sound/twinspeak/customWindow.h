@@ -359,9 +359,6 @@ inline constexpr int kBarHDesign = 33;
 // height; every painter, rect and hit-test reads it.
 inline constexpr int kBarHMaxDesign = 24;
 inline bool   g_wasMax    = false;        // the WM_SIZE maximize-flip latch
-inline bool   g_dpiRelayout = false;      // v7.6.11: a DPI change under a zoomed
-                                          // window defers the child re-seat to
-                                          // the system's own WM_SIZE
 inline int    g_barH      = 33;           // caption bar height, REAL px (the NORMAL baseline)
 inline void (*g_repaint)(HWND) = nullptr;  // the host's synchronous bar repaint
 inline void (*g_trayHide)(HWND) = nullptr; // putWindowinTray(true)  -> host path
@@ -601,44 +598,37 @@ inline void cwRelayoutChildren() {
 inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
-// v7.6.11 THE TWO-PIXEL GAP -- the field, after the v7.6.10 half-px stack:
-// "Even then, it's still not it. Do 2px." The maximized seams widen to TWO
-// FIXED PHYSICAL px of face and the min/max fills give back the 1.5 px each
-// so NOTHING ELSE moves -- the stack total (3*stride + 1), every fill's
-// LEFT edge and every glyph anchor survive intact:
-//     stride   = w_max = round(glyph * 48/22)   (46 @96, 70 @144)
-//     min/max  = stride - 2    whole px         (44 / 68)
-//     close    = stride - 0.5  the half px stay (45.5 / 69.5)
-//     gap      = 2 px, FIXED physical           (two whole dark columns)
-//     inset    = 1.5 px, FIXED physical         (close.right = ww - 1.5)
-// The arithmetic closes on the field's own measurements at BOTH scales:
-// @96  close 1873..1917 (+ the half tail at 1918), gap 1871..1872,
-//      max 1827..1870, gap 1825..1826, min 1781..1824 -- stack 139;
-// @144 close 1849..1917 (+ half tail 1918), gap 1847..1848,
-//      max 1779..1846, gap 1777..1778, min 1709..1776 -- stack 211
-// (the v7.6.8-era read "min 1781..1825 / gap 1872" and the v7.6.9-era
-// reads "close 1849..1917, gap 1847..1848, max 1779..1847, min 1709..1777"
-// are these same columns seen through whole-pixel thresholds). The glyph
-// anchors ride the FLOORED int view and are UNCHANGED: max w 44 int-divs
-// to the same cx 1849/1813 (44/2 = 45/2 = 22/34), the close rect did not
-// move, and the dash keeps its half-px round-INTO-the-button via the +2
-// (see the painter) -- 1799..1808 @96, 1736..1750 @144, both native. The
-// close keeps the ONLY half pixel now (its 1.5 px inset tail, v7.6.10's
-// verified find); the min/max fills and both gaps are whole.
+// v7.6.10 THE HALF-PIXEL MAXIMIZED STACK -- the field's own sub-pixel read
+// of the native strip: "the gap was actually 0.5px and also that the close
+// button's right reduction is 1.5px and not 2px. Pretty weird if you think
+// about it." The decompile agrees once halves are allowed: there is NO
+// 47/22 maximized ratio in 0x222a8 (the out-of-line tails 0x670d3/0x670e6
+// only ever pick 48/22 and 49/22, and the flag-2 tail is the TOOL WINDOW's
+// SM_CYSMSIZE path) -- the maximized buttons ride the SAME 48/22 chain
+// width as restored, on the SAME stride, with the last HALF px of every
+// button left to the face:
+//     stride = w_max = round(glyph * 48/22)   (46 @96, 70 @144)
+//     fill   = stride - 0.5                   (45.5 / 69.5 -- the halves)
+//     gap    = 0.5 px, FIXED physical         (the half-dark column)
+//     inset  = 1.5 px, FIXED physical         (close.right = ww - 1.5)
+// The stack total (3*stride + 1) equals the restored stack (2*w_max +
+// w_close, w_close = w_max + 1) at every dpi -- 139 @96, 211 @144 -- and
+// every glyph anchor off the FLOORED int view lands on the measured native
+// pixels (96: X 1890..1899, front 1844, back 1846, dash 1799..1808; 144:
+// X 1876..1890, front 1805, back 1808, dash 1736..1750 -- all four, both
+// scales, exact). The half px are REAL pixels: each fill's tail column
+// renders at HALF the patch alpha (fillPatch here, the cwSheetRowFill byte
+// path on row 0) -- exactly the 50% coverage the native compositor leaves.
+// The v7.6.9 round-up (45/68 fills, 1-2 px gap, 2-3 px inset -- MulDiv
+// halves) and the 47/22 ratio are RETIRED.
 // RESTORED: unchanged -- the CONTIGUOUS flush-right stack (46/46/47 @96,
 // 70/70/71 @144; 0x21bc0's cursor += width, no gap, the group rect flush)
 // with the field's raise ("fix the unmaximized state having titlebar
 // buttons at 0px instead of 1px and reduce their height by 1px"): rows
-// 1..g_barH-1. v7.6.11 RESTORED BAND: the field re-asserts the raise for
-// the HOVER too -- "I still see that when the window is not maximized that
-// the titlebar's buttons are at 0px vertical instead of 1px vertical. 0px
-// vertical is reserved for the fake top bar." The band rides the rect's
-// own top now (row 1 restored, row 0 maximized) and cwSheetRowFill gates
-// its row-0 patch to the maximized state: the fake top border bar keeps
-// row 0 in the restored state, hover or not (v7.6.7's both-states rule is
-// retired by the field's own call). MAXIMIZED keeps its rows (top 0,
-// bottom bh-1 -- the one REAL px floor; the +1 glyph ride lands native's
-// (cysize-1)/2 at 96/120/144/168 alike).
+// 1..g_barH-1. The hover still owns row 0 in both states (v7.6.7's split
+// stands -- the rect is the button's, the band is the hover's). MAXIMIZED
+// keeps its rows (top 0, bottom bh-1 -- the one REAL px floor; the +1
+// glyph ride lands native's (cysize-1)/2 at 96/120/144/168 alike).
 struct CwButtonRects { RECT close, maximize, minimize; };
 struct CwBtnRectF { float left, top, right, bottom; };
 struct CwButtonRectsF { CwBtnRectF close, maximize, minimize; };
@@ -651,8 +641,7 @@ inline CwButtonRectsF cwButtonRectsF(int ww) {
     const int   glyph  = (cysize * 21 + 11) / 22;   // round(cysize*21/22)
     const int   wMax   = (glyph  * 48 + 11) / 22;   // round(glyph*48/22) -- the stride in BOTH states
     const int   wClose = (glyph  * 49 + 11) / 22;   // round(glyph*49/22) -- restored close only
-    const float wFill  = (float)wMax - 0.5f;        // the maximized CLOSE fill: the native half px
-    const float wFill2 = (float)wMax - 2.0f;        // v7.6.11: the min/max fills -- stride - 2, whole px
+    const float wFill  = (float)wMax - 0.5f;        // the maximized fill: the native half px
     const int   bh     = maxed ? cwS(kBarHMaxDesign) : g_barH;
     CwBtnRectF close;
     if (maxed) {
@@ -668,16 +657,16 @@ inline CwButtonRectsF cwButtonRectsF(int ww) {
     }
     CwBtnRectF maximize = close;
     if (maxed) {
-        maximize.right = close.left - 2.0f;         // v7.6.11: the 2 px gap (fixed physical)
-        maximize.left  = maximize.right - wFill2;
+        maximize.right = close.left - 0.5f;         // the 0.5 px gap (fixed physical)
+        maximize.left  = maximize.right - wFill;
     } else {
         maximize.right = close.left;
         maximize.left  = maximize.right - (float)wMax;
     }
     CwBtnRectF minimize = maximize;
     if (maxed) {
-        minimize.right = maximize.left - 2.0f;      // v7.6.11: the 2 px gap (fixed physical)
-        minimize.left  = minimize.right - wFill2;
+        minimize.right = maximize.left - 0.5f;
+        minimize.left  = minimize.right - wFill;
     } else {
         minimize.right = maximize.left;
         minimize.left  = minimize.right - (float)wMax;
@@ -869,24 +858,17 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // alpha is standing (the idle border line, the native look).
     auto hoverBand = [](const CwBtnRectF& r) {
         CwBtnRectF h = r;
-        // v7.6.11: the band rides the RECT'S OWN TOP -- row 1 restored (the
-        // field: "the titlebar's buttons are at 0px vertical instead of 1px
-        // vertical. 0px vertical is reserved for the fake top bar"), row 0
-        // maximized (no fake bar exists there; the native red runs y 0..20).
-        // v7.6.7's both-states row 0 is retired by the field's own call.
-        h.top    = r.top;
+        h.top    = 0.0f;             // v7.6.7: row 0 in both states
         h.bottom -= 2.0f;
         return h;
     };
-    // v7.6.10 + 11 THE HALF-PIXEL TAIL -- the CLOSE fill's right edge sits
-    // on a HALF pixel (the native compositor leaves that column at 50%
-    // coverage; the field's "right reduction 1.5px"). The patch is the full
+    // v7.6.10 THE HALF-PIXEL TAIL -- a maximized fill's right edge sits on a
+    // HALF pixel (the native compositor leaves that column at 50% coverage;
+    // the field's "gap 0.5px, right reduction 1.5px"). The patch is the full
     // columns at the patch alpha PLUS the tail column at HALF the alpha --
     // integer fills only, no AA, no smear, byte-identical to the
-    // cwSheetRowFill path on row 0. The min/max maximized fills are whole
-    // again since v7.6.11 (stride - 2) and the gaps are two whole face
-    // columns, so the tail fires for the close only. Restored fills carry
-    // whole-rect integer right edges and render exactly as before.
+    // cwSheetRowFill path on row 0. Restored fills carry whole-rect integer
+    // right edges and render exactly as before.
     auto fillPatch = [&](const CwBtnRectF& r, int col) {
         const int x0 = (int)r.left, x1 = (int)r.right;   // [x0, x1): the full columns
         const int y0 = (int)r.top,  yb = (int)r.bottom;
@@ -913,13 +895,7 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         // row to the reference's own rows (dash row 10, pair 5..14).
         const int lineW = cwS(10);
         const int mw    = br.minimize.right - br.minimize.left;
-        // v7.6.11: the maximized fill went whole (stride - 2), so the half
-        // px of the center rounding moves the dash a column LEFT unless the
-        // round-INTO-the-button bias follows it: mw 44 @96 -> (44-10+2)/2 =
-        // 18 -> dash 1799..1808, mw 68 @144 -> (68-15+2)/2 = 27 -> dash
-        // 1736..1750 -- the native anchors, unchanged. Restored keeps +1
-        // (mw 46/70) and the column it always sat on.
-        const int dx    = br.minimize.left + (mw - lineW + (maxedW ? 2 : 1)) / 2;
+        const int dx    = br.minimize.left + (mw - lineW + 1) / 2;
         const int cy    = br.minimize.top
                         + (br.minimize.bottom - br.minimize.top + (maxedW ? 1 : 0)) / 2
                         - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 is the MAXIMIZED fit (native's (cysize-1)/2), restored keeps the v7.6.6-era row at every scale
@@ -1430,11 +1406,12 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
         return;
     }
     // the bands, straight off the painter's geometry: the rects of THIS
-    // width, the band riding the rects' own top (v7.6.11 -- the field's
-    // call: restored row 0 is the FAKE TOP BAR's, the buttons sit at 1px;
-    // v7.6.7's both-states row 0 is retired. Row 0 joins the band only on
-    // a MAXIMIZED host, where the native red runs y 0..20 and no fake bar
-    // exists), the bottom two real px short.
+    // width, the band top pinned to ROW 0 in BOTH states (v7.6.7 -- the
+    // native group rect's top is 0 and the real thing's hover fills the
+    // whole button rect: the reference shot's red runs y 0..20; v7.6.6's
+    // restored row-1 band left the glass key shining above the red -- the
+    // field's "when I hover the close button that blue line appears"),
+    // the bottom two real px short.
     const CwButtonRectsF bf = cwButtonRectsF(cw2);
     // v7.6.10: the float rects -- the maximized fills' half-px tails ride
     // here too (the tail column at half the patch alpha), so row 0 agrees
@@ -1447,10 +1424,10 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
                                : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
     const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
     const int closeCol = (int)(g_closeHover & 0xFFFFFF);
-    // v7.6.11: MAXIMIZED ONLY -- the restored row 0 is the fake top bar's
-    // (the field: "0px vertical is reserved for the fake top bar"); the
-    // sheet byte stays there idle, hovered and mid-fade alike.
-    const bool rowInBand = g_host && cwIsMaximized(g_host);
+    // v7.6.7: BOTH STATES -- row 0 is inside the band whenever the band's
+    // bottom is past it (it always is: the rects' own bottom runs to the
+    // bar's floor).
+    const bool rowInBand = g_host && ((int)bf.close.bottom - 2) > 0;
     // v7.6.7: THE PATCH BASE IS THE OPAQUE FACE ROW -- the native hover
     // visual replaces the border line, it does not blend with the glass
     // behind it. Over the alpha-0 glass key (restored, focused idle) a
@@ -1733,24 +1710,6 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
                     cwSheetRowKick();
                 }
             }
-            // v7.6.11 THE DEFERRED DPI RE-SEAT -- a WM_DPICHANGED that fired
-            // on a ZOOMED (or iconic) host left its flag here (the client
-            // rect was still the old scale's there; this one is the system's
-            // own post-refit truth). Re-seat the children, then land the
-            // whole frame in one synchronous write -- the same recipe as the
-            // flip above, so the new scale's pixels win the compose.
-            if (g_dpiRelayout) {
-                g_dpiRelayout = false;
-                cwRelayoutChildren();
-                if (IsWindowVisible(w)) {
-                    RECT cr; GetClientRect(w, &cr);
-                    RedrawWindow(w, &cr, nullptr,
-                                 RDW_INVALIDATE | RDW_ERASE
-                                 | RDW_ALLCHILDREN | RDW_UPDATENOW);
-                    cwRepaint();
-                    cwSheetRowKick();
-                }
-            }
         }
         return false; }
     case WM_NCCALCSIZE: {
@@ -1941,40 +1900,29 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // rect, hands the host its hook (constants + fonts), then re-seats
         // the tracked children at the new scale. Handled HERE -- the host's
         // switch never sees it.
-        // v7.6.11 THE ZOOMED GUARD -- the field: "when I trigger the dpi
-        // response on a maximized window, it corrupts its object positioning
-        // until you unmaximize said window." Two halves, both here: (1) the
-        // suggested rect is the DWM's guess for a RESTORED frame -- feeding
-        // it to a zoomed window tears the maximized frame off the monitor
-        // (and every object laid out inside it with it) until the next
-        // restore re-fits; a zoomed window re-fits ITSELF -- the system
-        // sends the WM_SIZE -- so the suggested rect is SKIPPED when
-        // IsZoomed. (2) the child re-seat ran HERE, on the OLD scale's
-        // client rect, and the WM_SIZE that followed re-seated nobody (the
-        // flip latch does not move without a maximize/restore) -- so for a
-        // zoomed host the re-seat is DEFERRED into that WM_SIZE via
-        // g_dpiRelayout, where the client rect is the new scale's truth.
-        // Iconic windows skip both the same way; the restore's WM_SIZE
-        // lands them.
         const UINT nd = HIWORD(wp);
         if (nd && nd != cwDpi()) {
-            const bool zoomed = IsZoomed(w) || IsIconic(w);
             cwDpiChanged(nd);
             g_barH = cwS(kBarHDesign);
             const LPRECT r = (LPRECT)lp;
-            if (r && !zoomed) SetWindowPos(w, nullptr, r->left, r->top,
+            if (r) SetWindowPos(w, nullptr, r->left, r->top,
                                 r->right - r->left, r->bottom - r->top,
                                 SWP_NOZORDER | SWP_NOACTIVATE);
             if (g_dpiHook) g_dpiHook();
-            if (zoomed) g_dpiRelayout = true;   // the WM_SIZE re-seats + repaints
-            else        cwRelayoutChildren();
-            if (!zoomed && IsWindowVisible(w) && !IsIconic(w)) {
-                // v7.6.4 THE WHOLE-FRAME DPI REPAINT (unzoomed hosts): one
-                // synchronous full-window repaint at the new scale, after
-                // the hook and the re-seat, so the DWM never composes the
-                // resized window with the old scale's pixels. A zoomed host
-                // lands the same recipe from its WM_SIZE (above) once the
-                // system has re-fit it.
+            cwRelayoutChildren();
+            if (IsWindowVisible(w) && !IsIconic(w)) {
+                // v7.6.4 THE WHOLE-FRAME DPI REPAINT -- the field's "have it
+                // so ... DPI reaction doesn't corrupt the window render for
+                // a split second." The reaction used to re-land the BAR
+                // alone (cwRepaint) and leave the host's own full repaint
+                // ASYNC (RDW_INVALIDATE without RDW_UPDATENOW): between the
+                // suggested-rect SetWindowPos and the queue's paint, the DWM
+                // could compose the resized window with the OLD scale's
+                // pixels -- the split-second garbage on every scale change.
+                // One synchronous full-window repaint at the new scale,
+                // AFTER the hook re-derived the constants and the children
+                // are re-seated, lands the whole frame in a single write;
+                // the bar re-lands with it and the sheet train re-kicks.
                 RECT cr; GetClientRect(w, &cr);
                 RedrawWindow(w, &cr, nullptr,
                              RDW_INVALIDATE | RDW_ERASE
