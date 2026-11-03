@@ -4850,9 +4850,12 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr;   // (g_fTitle retired v7.5.0:
-                                    // the title font is customWindow.h's, seeded
-                                    // in guiMakeGdi below)
+                 g_fSml = nullptr, g_fMono = nullptr;
+// v7.6.14: g_fTitle is BACK -- the caption strip is the app's own pixels
+// again (v7.5.0 had retired the slot in favor of customWindow.h's seeded
+// font; v7.6.12/13's native caption could not carry any custom font at all;
+// the strip draws the title itself, so the slot comes home).
+static HFONT     g_fTitle = nullptr;
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -5001,6 +5004,16 @@ static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
 static int KLOG_BOTTOM= 594;                            // log pane bottom
 static int kTabW[5]   = { 166, 166, 166, 166, 166 };   // tab face widths
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
+// v7.6.14: THE CAPTION STRIP -- 33 design px, customWindow.h's kBarHDesign
+// (the house-measured caption height; the old 31 was two px short). Real px
+// re-derived in guiApplyDpi; the children shift down by kCapHDesign design
+// px (their ledger coords ride the same number, so cwRelayoutChildren lands
+// them identically at every DPI), and guiPaintFrame paints the strip in
+// rows 0..g_capH-1. The caption strip's own names are kCapHDesign/g_capH
+// (the house's pre-7.6.12 caption names, revived); the tab strip's GPU
+// buffer keeps its own g_stripW/g_stripH -- unrelated surfaces.
+static const int kCapHDesign = 33;   // the caption strip, design px
+static int       g_capH      = 33;   // real px, guiApplyDpi re-derives
 // guiInitDpi runs FIRST in guiMain -- before guiMakeGdi (fonts) and before
 // any window exists. v7.5.3d: the manifest is PerMonitorV2 now and the
 // WM_DPICHANGED hook re-runs the derivation at the new scale -- the
@@ -5016,6 +5029,7 @@ static void guiApplyDpi() {
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
     KSTRIP_FACE_Y = S(6);
+    g_capH    = S(kCapHDesign);   // v7.6.14: the caption strip rides the scale
 }
 static void guiInitDpi() {
     HDC sdc = GetDC(nullptr);
@@ -5074,6 +5088,17 @@ static void guiMakeFonts() {
     g_fMono = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+    // v7.6.14 THE CUSTOM TITLEBAR FONT, AGAIN -- the cwSeedTitleFont seed
+    // verbatim (customWindow.h's defaults: face "Segoe UI", 14 px, semibold,
+    // the negative height = em height exactly as the seed's lfHeight built
+    // it). This is the font Windows 10 could never carry on a native
+    // caption: no attribute, no message, nothing -- so the strip draws the
+    // title itself and the seed is honored on every Windows back to the
+    // palette era.
+    if (g_fTitle) { DeleteObject(g_fTitle); g_fTitle = nullptr; }
+    g_fTitle = CreateFontW(-S(14), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
 static void guiMakeGdi() {
@@ -5095,34 +5120,14 @@ static void guiStripGpuRelease();   // v7.0.7 (defined with the tab strip)
 // (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
 // itself -- v7.0.9 paints the bar from the live guic:: colors instead.)
 
-// v7.6.13 THE CAPTION WEARS THE THEME AGAIN. The field, after v7.6.12: "I
-// just see a black window without the custom color and custom titlebar
-// font." The native restart retired the custom bar -- and with it the
-// theme-seeded caption color; the native caption rendered in the system's
-// own gray-black and the whole window read as a system rectangle. Windows
-// 11 answers the color half natively: DWMWA_CAPTION_COLOR (35) and
-// DWMWA_TEXT_COLOR (36) paint the REAL caption with the app's colors while
-// every button, glyph, hover, snap layout and resize edge stays Windows'
-// own -- no custom window involved, the v7.6.12 contract stands. The colors
-// are the bar's own: the face melts to cBg (the client's background, so
-// caption and client read as one surface), and the text takes the exact
-// pair the custom bar drew -- dark themes: the cyan-gray title gradient's
-// top stop (160,200,205); light themes: cText (the v7.5.0 seed's luma
-// branch). Windows 10 has no such attributes: the calls fail and the
-// caption stays system-colored. The FONT half has no native answer at all
-// -- see the changelog's second section.
-static void guiApplyDwmCaption() {
-    typedef HRESULT (WINAPI *TS_DWMSA13)(HWND, DWORD, LPCVOID, DWORD);
-    const TS_DWMSA13 dwmSet = (TS_DWMSA13)GetProcAddress(
-        LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
-    if (!dwmSet || !g_hwnd || !IsWindow(g_hwnd)) return;
-    const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
-                        GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma (the v7.5.0 branch)
-    const COLORREF face = guic::cBg;
-    const COLORREF text = dark ? RGB(160, 200, 205) : guic::cText;
-    dwmSet(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &face, sizeof(face));
-    dwmSet(g_hwnd, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof(text));
-}
+// v7.6.14: guiApplyDwmCaption is RETIRED -- there is no native caption left
+// to tint. Its two calls were Windows 11-only: on the field's Windows 10
+// ("I'm on Windows 10 btw. That's the whole reason in why I'm here.")
+// DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR fail silently and the caption stays
+// the system's own gray, and no font API exists on ANY Windows. The strip
+// (guiPaintStrip, in the frame section) is the app's own pixels now: it
+// reads guic:: live, so a theme switch needs no re-seed call at all -- the
+// RDW below repaints it like any other client pixel.
 
 // v7.0.0: live theme switch -- commit colors + brushes, then ONE synchronous
 // repaint of the whole tree, bar included, so nothing can show old colors.
@@ -5143,7 +5148,8 @@ static void applyTheme(int i) {
     TSREBR(g_brPanel2, guic::cPanel2);
     TSREBR(g_brLog,    guic::cLogBg);
     #undef TSREBR
-    guiApplyDwmCaption();   // v7.6.13: the native caption re-seeds with the theme (Win 11)
+    // v7.6.14: no caption re-seed call -- the strip IS client pixels and
+    // reads guic:: live; the RDW repaint below lands the new colors on it.
     if (g_hwnd) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
         // v7.6.12: no bar to recolor synchronously -- the native caption
@@ -5237,6 +5243,11 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     if (wt.empty() || !g_hwnd) return;
     RECT crc = { 0, 0, 880, 620 };
     GetClientRect(g_hwnd, &crc);
+    crc.bottom -= g_capH;   // v7.6.14: the paint runs in CONTENT space (the
+                              // viewport origin rides the strip) -- the band
+                              // between the log pane and the CONTENT bottom,
+                              // not the window bottom, or the watermark lands
+                              // one strip too low and clips off the glass
     Gdiplus::FontFamily ff(L"Arial");
     Gdiplus::Font f(&ff, (Gdiplus::REAL)S(13), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::StringFormat sf;
@@ -5329,26 +5340,32 @@ static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
 }
 
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
-    // v7.1.20: design px in, real px out (DPI scale; kCapH is already real).
-    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d: design px for the dpi ledger
-    x = S(x); y = S(y); cw = S(cw); ch = S(ch);
+    // v7.1.20: design px in, real px out (DPI scale).
+    // v7.6.14: the caption strip leads -- every child shifts down
+    // kCapHDesign design px, in BOTH the creation coords and the ledger
+    // coords (the ledger re-derives S(dy + kCapHDesign) identically, so
+    // creation and relayout land the same pixel at every DPI). The first
+    // child pixel sits directly below the strip: the field's "draw something
+    // just below the titlebar buttons" is the layout contract now.
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
-    cwTrackChild(h, dx, dy, dw2, dh, false, (f == g_fUIb) ? &g_fUIb : &g_fUI);   // v7.6.12: plain design px
+    cwTrackChild(h, dx, dy, dw2, dh, false, (f == g_fUIb) ? &g_fUIb : &g_fUI);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
 
 static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
-    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d
-    x = S(x); y = S(y); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale (v7.6.12: no bar offset)
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "EDIT", val,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     guiDarkCtl(h);
-    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUI);   // v7.6.12: plain design px
+    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUI);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
@@ -5357,19 +5374,19 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
     // NOTE: deliberately NOT regPage()d here -- the tab strip and the
     // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
     // presets, REFRESH) are registered by their builders (v6.6.2).
-    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.5.3d
-    x = S(x); y = S(y); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale (v7.6.12: no bar offset)
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUIb, TRUE);
-    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUIb);   // v7.6.12: plain design px
+    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUIb);   // v7.6.14: design px + the strip lead
     return h;
 }
 
 static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
-    const int dx = x, dy = y;   // v7.5.3d
-    x = S(x); y = S(y);   // v7.1.20: DPI scale (v7.6.12: no bar offset)
+    const int dx = x, dy = y + kCapHDesign;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
         (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
@@ -5377,7 +5394,7 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, S(16));
     guiDarkCtl(h);
-    cwTrackChild(h, dx, dy, CTL_W, 220, false, &g_fUI, 16);   // v7.6.12: plain design px
+    cwTrackChild(h, dx, dy, CTL_W, 220, false, &g_fUI, 16);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
@@ -5517,8 +5534,8 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
-    const int dx = x, dy = y, dw2 = cw;   // v7.5.3d
-    x = S(x); y = S(y); cw = S(cw);   // v7.1.20: DPI scale (v7.6.12: no bar offset)
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw);   // v7.1.20: DPI scale
     static bool sldClass = false;      // registered once
     if (!sldClass) {
         WNDCLASSA wc = {};
@@ -5530,7 +5547,7 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
     }
     HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP,   // v7.1.4: a tab stop
                              x, y, cw, S(28), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
-    cwTrackChild(h, dx, dy, dw2, 28, false);   // v7.6.12: the dpi ledger (no font, no bar)
+    cwTrackChild(h, dx, dy, dw2, 28, false);   // v7.6.14: the dpi ledger (no font; the strip lead rides dy)
     g_sld[h] = { lo, hi, lo, false };
     InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
     regPage(h);
@@ -5969,7 +5986,9 @@ static void guiAppendLog(const std::string& s) {
 static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
     // v7.1.20: MUST mirror guiPaintFrame's scaled status band exactly.
-    const RECT sr = { S(14), S(458), S(866), S(476) };
+    // v7.6.14: the band renders below the caption strip -- the invalidate
+    // rect rides the same strip offset the paint's viewport shift applies.
+    const RECT sr = { S(14), S(458) + g_capH, S(866), S(476) + g_capH };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -6673,10 +6692,12 @@ static void guiMakeTabStrip(HWND w) {
         reg = true;
     }
     // v7.1.20: the design-px strip constants scale at the creation site.
+    // v7.6.14: the caption strip leads -- the tab strip lands one strip below
+    // the buttons (S(y + kCapHDesign), the ledger rides the same number).
     HWND ts = CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
-                    S(KSTRIP_X), S(KSTRIP_Y), S(KSTRIP_W), S(KSTRIP_H), w,
+                    S(KSTRIP_X), S(KSTRIP_Y + kCapHDesign), S(KSTRIP_W), S(KSTRIP_H), w,
                     (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
-    cwTrackChild(ts, KSTRIP_X, KSTRIP_Y, KSTRIP_W, KSTRIP_H, false);   // v7.6.12: plain design px
+    cwTrackChild(ts, KSTRIP_X, KSTRIP_Y + kCapHDesign, KSTRIP_W, KSTRIP_H, false);   // v7.6.14: design px + the strip lead
 }
 
 static void guiBuildControls(HWND w) {
@@ -6695,17 +6716,17 @@ static void guiBuildControls(HWND w) {
     // v7.1.20: the direct creations scale too (the factories do it for the
     // rest).
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              S(14), S(458), S(852), S(16),
+                              S(14), S(458 + kCapHDesign), S(852), S(16),
                               w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    cwTrackChild(st, 14, 458, 852, 16, false, &g_fMono);   // v7.6.12: plain design px
+    cwTrackChild(st, 14, 458 + kCapHDesign, 852, 16, false, &g_fMono);   // v7.6.14: design px + the strip lead
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        S(14), S(480), S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), S(480 + kCapHDesign), S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    cwTrackChild(log, 14, 480, 852, 114, false, &g_fMono);   // v7.6.12: plain design px
+    cwTrackChild(log, 14, 480 + kCapHDesign, 852, 114, false, &g_fMono);   // v7.6.14: design px + the strip lead
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -6981,8 +7002,11 @@ static bool guiCreateRealWindow() {
     // v7.1.26 THE WINDOW IS UNICODE, END TO END: CreateWindowExW +
     // DefWindowProcW -- the title is the full brand the taskbar, Alt-Tab
     // and Task Manager's app entry read.
-    RECT fr = { 0, 0, KCLI_W, KCLI_H };
-    AdjustWindowRectEx(&fr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    RECT fr = { 0, 0, KCLI_W, KCLI_H + g_capH };
+    // v7.6.14: the strip is client again -- WM_NCCALCSIZE answers 0, so the
+    // window IS the client and AdjustWindowRectEx's caption reservation
+    // would only inflate the frame. The outer size is the designed 880x620
+    // content plus the 33-design-px strip.
     const int kww = fr.right - fr.left, kwh = fr.bottom - fr.top;
     g_hwnd = CreateWindowExW(0, L"twinspeak.control",
                              L"TidyVision TwinSpeak",     // v7.2.1: the brand the taskbar,
@@ -7029,10 +7053,10 @@ static bool guiCreateRealWindow() {
                 dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
             }
         }
-        // v7.6.13: the caption is BORN in the theme's colors -- the boot
-        // applyTheme ran before this window existed (and this seed is what
-        // colors it if the theme is never switched).
-        guiApplyDwmCaption();
+        // v7.6.14: guiApplyDwmCaption is retired with the native caption --
+        // there is nothing left for DWMWA_CAPTION_COLOR to tint (no NC area
+        // exists); the strip is born in the live guic:: colors because it is
+        // painted from them on every frame.
     }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
     tsAddSysExit(g_hwnd);
@@ -7354,7 +7378,7 @@ static bool guiFrameBufEnsure(int w, int h) {
     g_frmW = w; g_frmH = h;
     return true;
 }
-// v7.1.20: long ini paths used to run off the version line and clip mid-glyph.
+// v7.5.3a: long ini paths used to run off the version line and clip mid-glyph.
 // Middle-truncate so BOTH ends stay visible (the drive and the file name).
 static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
     if (s.size() <= maxChars) return s;
@@ -7362,14 +7386,230 @@ static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
     return s.substr(0, keep) + "..." + s.substr(s.size() - keep, keep);
 }
 
+// ---- v7.6.14 THE STRIP COMES HOME ------------------------------------------
+// The field: "I'm on Windows 10 btw. That's the whole reason in why I'm here."
+// One sentence, whole verdict. The native restart's caption color rode
+// DWMWA_CAPTION_COLOR / DWMWA_TEXT_COLOR -- Windows 11 attributes. On
+// Windows 10 both calls fail and the caption stays the system's own gray,
+// and the native caption has no font API on ANY Windows. On Win10 the custom
+// color AND the custom titlebar font exist only if the app draws the caption
+// itself. So the window keeps the native restart's plain shell
+// (WS_OVERLAPPEDWINDOW: Windows' own shadow, animations, snap, resize
+// metrics, sysmenu) and takes back exactly ONE band: the caption strip, 33
+// design px -- customWindow.h's kBarHDesign, the house-measured caption
+// height -- painted INSIDE guiPaintFrame's buffered face (one blit; the
+// never-black erase belt covers it). Restored from the v7.6.12 restart:
+//   * the face is the theme's own cBg (caption and client read as one
+//     surface -- v7.6.13's choice, now actually visible on Win10), with a
+//     1 px cLine separator as the strip's one own edge,
+//   * the title is the CUSTOM FONT again -- Segoe UI -14 semibold, the
+//     cwSeedTitleFont seed verbatim -- at the pseudocode's 12 px padding,
+//   * the title color is v7.6.13's exact pair: dark themes the cyan-gray
+//     (160,200,205), light themes cText; inactive: cDim,
+//   * the three buttons are ours: TWO PHYSICAL px seams and a 2 px right
+//     inset (the field's "Do 2px"), 1 design px of daylight on top (the
+//     field's y = 1 -- "0px vertical is reserved for the fake top bar" is a
+//     rule with no fake bar left to serve; the buttons ride the native y = 1),
+//   * the glyphs are the proven native recipes, 1 physical px strokes:
+//     dash S(10) x 1, square outer S(9)+1, restore pair sheets S(8) /
+//     diagonal S(2) in a S(10) span, X span S(10),
+//   * the close hover is the native red (196,43,28; pressed 154,33,22).
+// And the field's experiment is literal now: the first content pixel sits
+// DIRECTLY below the strip -- every child shifts down kCapHDesign design
+// px (creation AND ledger) and guiPaintFrame's content body renders from the
+// strip's bottom row. If the restored-state 0px-versus-1px question ever
+// bites again, it can only bite INSIDE this one strip, and the answer is a
+// constant (top = S(1)) -- not a chase across the whole layout.
+// What stays WINDOWS' OWN: the drag (HTCAPTION on the strip -> Aero snap,
+// double-click maximize, Win+arrows), the resize edges (native frame
+// thickness via the DPI-correct metrics), minimize/maximize/close
+// animations, the shadow, the sysmenu, Alt+F4. The maximized window insets
+// the client by the frame on all four sides (Win10 inflates a maximized rect
+// past the monitor) so the strip lands whole on the work area. DPI rides the
+// standard WM_DPICHANGED handler -- g_capH re-derives in guiApplyDpi, the
+// font remakes in guiMakeFonts, the children re-seat in cwRelayoutChildren;
+// no guards, no deferrals ("forget about the dpi issue entirely").
+#ifndef GET_X_LPARAM
+#define GET_X_LPARAM(lp)   ((int)(short)LOWORD(lp))
+#endif
+#ifndef GET_Y_LPARAM
+#define GET_Y_LPARAM(lp)   ((int)(short)HIWORD(lp))
+#endif
+enum { kStripNone = 0, kStripMin = 1, kStripMax = 2, kStripClose = 3 };
+static int  g_btnHover    = kStripNone;
+static int  g_btnPress    = kStripNone;
+static bool g_stripActive = true;   // WM_NCACTIVATE
+static bool g_stripTrack  = false;  // TrackMouseEvent armed
+
+static COLORREF stripBlend(COLORREF a, COLORREF b, int t) {   // t: 0..255 toward b
+    return RGB(GetRValue(a) + ((GetRValue(b) - GetRValue(a)) * t + 127) / 255,
+               GetGValue(a) + ((GetGValue(b) - GetGValue(a)) * t + 127) / 255,
+               GetBValue(a) + ((GetBValue(b) - GetBValue(a)) * t + 127) / 255);
+}
+static bool stripIsDark() {   // the v7.5.0 seed's Rec.601-ish luma branch
+    return ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
+             GetBValue(guic::cBg) * 29) >> 8) < 128;
+}
+static COLORREF stripTextColor() {
+    if (!g_stripActive) return guic::cDim;
+    return stripIsDark() ? RGB(160, 200, 205) : guic::cText;   // v7.6.13's exact pair
+}
+
+// the three button rects, right to left: 2 FIXED PHYSICAL px seams + 2 px
+// right inset ("Do 2px"), 1 design px of daylight on top (the field's y = 1),
+// the bottom row left free for the separator.
+static void stripBtnRects(int ww, RECT* mn, RECT* mx, RECT* cl) {
+    const int gap = 2, inset = 2;                  // FIXED PHYSICAL px
+    const int bW = S(44), cW = S(46);              // min/max, close (design px)
+    const int top = S(1);                          // the field's y = 1
+    const int bh = g_capH - top - 1;             // stops above the separator row
+    cl->left = ww - inset - cW; cl->right = ww - inset;
+    mx->left = cl->left - gap - bW; mx->right = cl->left - gap;
+    mn->left = mx->left - gap - bW; mn->right = mx->left - gap;
+    mn->top = mx->top = cl->top = top;
+    mn->bottom = mx->bottom = cl->bottom = top + bh;
+}
+static int stripBtnAt(int x, int y, int ww) {
+    if (y < 0 || y >= g_capH) return kStripNone;
+    RECT mn, mx, cl;
+    stripBtnRects(ww, &mn, &mx, &cl);
+    const POINT p = { x, y };
+    if (PtInRect(&cl, p)) return kStripClose;
+    if (PtInRect(&mx, p)) return kStripMax;
+    if (PtInRect(&mn, p)) return kStripMin;
+    return kStripNone;
+}
+static void stripInvalidate(HWND w) {
+    RECT crc; GetClientRect(w, &crc);
+    const RECT sr = { 0, 0, crc.right, g_capH };
+    InvalidateRect(w, &sr, FALSE);
+}
+static void stripHoverUpdate(HWND w, LPARAM lp) {
+    RECT crc; GetClientRect(w, &crc);
+    const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+    const int hit = (y < g_capH) ? stripBtnAt(x, y, crc.right) : kStripNone;
+    if (hit != g_btnHover) {
+        g_btnHover = hit;
+        stripInvalidate(w);
+    }
+    if (hit != kStripNone && !g_stripTrack) {
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, w, 0 };
+        if (TrackMouseEvent(&tme)) g_stripTrack = true;
+    }
+}
+
+// the strip painter: face, separator, hover/pressed bands, glyphs, title --
+// into the frame buffer (rows 0..g_capH-1, device space, BEFORE the
+// content body's viewport shift). Integer fills, crisp; the title rides
+// GDI+ AA through guiAAString like every other string in the app.
+static void guiPaintStrip(Gdiplus::Graphics& g, HDC dc, int ww) {
+    g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+    const int sh = g_capH;
+    const RECT sr = { 0, 0, ww, sh };
+    if (g_brBg) {
+        FillRect(dc, &sr, g_brBg);
+    } else {   // the belt-and-braces path (g_brBg exists from guiMakeGdi on)
+        const Gdiplus::SolidBrush fb(GCol(guic::cBg));
+        g.FillRectangle(&fb, 0, 0, ww, sh);
+    }
+    {   // the separator row -- the strip's one own edge
+        const Gdiplus::SolidBrush line(GCol(guic::cLine));
+        g.FillRectangle(&line, 0, sh - 1, ww, 1);
+    }
+    RECT mn, mx, cl;
+    stripBtnRects(ww, &mn, &mx, &cl);
+    // hover / pressed faces -- the native band shape: the button rect minus
+    // 2 px of daylight at the bottom; the close wears the native red.
+    auto band = [&](RECT r, int which) {
+        r.bottom -= 2;
+        COLORREF f = 0;
+        if (g_btnPress == which)      f = (which == kStripClose) ? RGB(154, 33, 22) : stripBlend(guic::cBg, guic::cText, 70);
+        else if (g_btnHover == which && g_stripActive)
+                                      f = (which == kStripClose) ? RGB(196, 43, 28) : stripBlend(guic::cBg, guic::cText, 36);
+        else return;
+        const Gdiplus::SolidBrush b(GCol(f));
+        g.FillRectangle(&b, (int)r.left, (int)r.top,
+                        (int)(r.right - r.left), (int)(r.bottom - r.top));
+    };
+    band(mn, kStripMin); band(mx, kStripMax); band(cl, kStripClose);
+    // glyphs -- the proven native recipes, 1 physical px strokes
+    const COLORREF gc = (g_btnHover == kStripClose) ? RGB(255, 255, 255) : stripTextColor();
+    auto fill = [&](int x, int y, int w2, int h2) {
+        const Gdiplus::SolidBrush b(GCol(gc));
+        g.FillRectangle(&b, x, y, w2, h2);
+    };
+    {   // minimize: the dash, S(10) x 1, round-INTO-the-button centering
+        const int w2 = S(10);
+        const int dx = mn.left + (mn.right - mn.left - w2 + 1) / 2;
+        const int cy = mn.top + (mn.bottom - mn.top) / 2;
+        fill(dx, cy, w2, 1);
+    }
+    {   // maximize: the square; the restore pair while maximized (the front
+        // sheet occludes the back one -- the proven clip recipe)
+        const int cx = mx.left + (mx.right - mx.left) / 2;
+        const int cy = mx.top + (mx.bottom - mx.top) / 2;
+        if (g_hwnd && IsZoomed(g_hwnd)) {
+            const int span = S(10), sheet = S(8), diag = S(2);
+            const int fl = cx - (span + 1) / 2, bt = cy - span / 2;
+            const Gdiplus::Rect frontRect(fl, bt + diag, sheet, sheet);
+            Gdiplus::Region frontRegion(frontRect);
+            g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
+            {   // the back sheet, occluded
+                const int bx = fl + diag, by = bt;
+                fill(bx, by, sheet, 1); fill(bx, by + sheet - 1, sheet, 1);
+                fill(bx, by + 1, 1, sheet - 2); fill(bx + sheet - 1, by + 1, 1, sheet - 2);
+            }
+            g.ResetClip();
+            {   // the front sheet, full
+                const int fy = bt + diag;
+                fill(fl, fy, sheet, 1); fill(fl, fy + sheet - 1, sheet, 1);
+                fill(fl, fy + 1, 1, sheet - 2); fill(fl + sheet - 1, fy + 1, 1, sheet - 2);
+            }
+        } else {
+            const int outer = S(9) + 1;
+            const int x0 = cx - outer / 2, y0 = cy - outer / 2;
+            fill(x0, y0, outer, 1); fill(x0, y0 + outer - 1, outer, 1);
+            fill(x0, y0 + 1, 1, outer - 2); fill(x0 + outer - 1, y0 + 1, 1, outer - 2);
+        }
+    }
+    {   // close: the X, span S(10), 1 px strokes (15x15 at 150% -- the
+        // measured native footprint)
+        const int cx = cl.left + (cl.right - cl.left) / 2;
+        const int cy = cl.top + (cl.bottom - cl.top) / 2;
+        const int span = S(10);
+        const int x0 = cx - span / 2, y0 = cy - span / 2;
+        for (int i = 0; i < span; ++i) {
+            fill(x0 + i, y0 + i, 1, 1);
+            fill(x0 + span - 1 - i, y0 + i, 1, 1);
+        }
+    }
+    // the title -- the CUSTOM FONT, the v7.6.13 color pair, 12 px padding
+    if (g_fTitle && g_hwnd) {
+        char title[192] = "";
+        GetWindowTextA(g_hwnd, title, (int)sizeof(title));
+        const RECT tr = { S(12), 0, mn.left - S(8), sh };
+        guiAAString(g, dc, tr, title, stripTextColor(), g_fTitle, 1);
+    }
+}
+
 // The complete frame face -- background, page panel, log frame, version line,
 // watermark -- into ANY dc (the memory buffer normally, the screen directly
 // as the no-buffer fallback).
-// v7.6.12: the custom titlebar is retired -- the native caption sits ABOVE
-// the client now, so every frame coordinate is plain client space: no
-// caption offset, no maximized band shift. The first custom pixel is the
-// app's own content, drawn just below the native titlebar buttons.
+// v7.6.12: the custom titlebar was retired -- v7.6.14 brings the caption
+// strip back as the app's own pixels (guiPaintStrip above), so the frame
+// paints the strip in device rows 0..g_capH-1 FIRST, then drops the
+// viewport origin by g_capH and renders the whole content body in its
+// plain design space (0 = the first row under the titlebar buttons -- the
+// field's "draw something just below the titlebar buttons"). Every existing
+// coordinate keeps its meaning; nothing below the strip moved a pixel
+// relative to the content grid.
 static void guiPaintFrame(HDC dc, int cw, int ch) {
+    {   // v7.6.14: the caption strip -- device space, before the shift
+        Gdiplus::Graphics gs(dc);
+        gs.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        guiPaintStrip(gs, dc, cw);
+    }
+    SetViewportOrgEx(dc, 0, g_capH, nullptr);   // v7.6.14: the content leads the strip
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
     const RECT panel = { S(12), KPANEL_T, S(866), KPANEL_B };
@@ -7383,7 +7623,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(479) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.13 |  %s",   // v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption takes the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" is back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window is a plain WS_OVERLAPPEDWINDOW now: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story are Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome is not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay); the client begins just below the native caption and every child coordinate is plain design px -- the kCapH offsets, the bar buffers, the sheet row, the fade presenter, the WM_NCACTIVATE/WM_NCPAINT present machinery and the v7.6.11 dpi guards are all retired
+    snprintf(vbuf, sizeof(vbuf), "v7.6.14 |  %s",   // v7.6.14 THE STRIP COMES HOME (WINDOWS 10 FIRST): "I'm on Windows 10 btw. That's the whole reason in why I'm here." -- the v7.6.13 caption color rode DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11 only: on Win10 both fail and the caption stays system gray, and no font API exists on any Windows), so the window keeps the native restart's plain WS_OVERLAPPEDWINDOW shell and takes back ONE band: the caption strip, 33 design px (kBarHDesign), painted inside the buffered face -- theme cBg face + 1px cLine separator, the CUSTOM TITLEBAR FONT again (Segoe UI -14 semibold, the cwSeedTitleFont seed) at the pseudocode's 12px padding, the v7.6.13 color pair (dark: 160,200,205 / light: cText; inactive cDim), and OUR buttons: 2 FIXED PHYSICAL px seams + 2px right inset ("Do 2px"), 1 design px of daylight on top (the field's y=1), the proven native glyphs (dash S(10)x1, square S(9)+1, restore pair S(8)/S(2) in a S(10) span, X span S(10), 1px strokes), close hover the native red (196,43,28); HTCAPTION on the strip keeps drag/Aero snap/double-click maximize Windows' own, the resize edges answer the DPI-correct frame metrics, the maximized client insets by the frame on all four sides, and the first content pixel sits DIRECTLY below the strip (every child + the content body shift kCapHDesign design px -- "draw something just below the titlebar buttons" is the layout contract) -- DPI rides the standard WM_DPICHANGED path, no guards, "forget about the dpi issue entirely" -- v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption took the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" was back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window became a plain WS_OVERLAPPEDWINDOW: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story were Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome was not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7401,6 +7641,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
     guiWatermark(g);
+    SetViewportOrgEx(dc, 0, 0, nullptr);   // v7.6.14: hand the DC back unshifted
 }
 
 // ---- the window procedure ---------------------------------------------------
@@ -7470,6 +7711,78 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         RedrawWindow(w, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         return 0; }
+    // ---- v7.6.14 THE STRIP: the window answers its own frame again ----------
+    // The plain WS_OVERLAPPEDWINDOW shell stays; only the caption band is
+    // taken back. WM_NCCALCSIZE makes the client the whole window (the strip
+    // paints row 0), WM_NCHITTEST hands the resize edges and the drag to the
+    // system, the buttons answer HTCLIENT and live as client messages.
+    case WM_NCCALCSIZE: {
+        // wParam TRUE: the client IS the window -- the strip paints row 0.
+        // wParam FALSE rides DefWindowProc (the creation pass).
+        // Maximized: Windows inflates the rect past the monitor by the frame
+        // thickness -- give it back or the strip lands off-screen.
+        if (!wp) break;
+        if (IsZoomed(w)) {
+            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            NCCALCSIZE_PARAMS* ncp = (NCCALCSIZE_PARAMS*)lp;
+            ncp->rgrc[0].left   += fx;   ncp->rgrc[0].top    += fy;
+            ncp->rgrc[0].right  -= fx;   ncp->rgrc[0].bottom -= fy;
+        }
+        return 0; }
+    case WM_NCHITTEST: {
+        // Native resize edges first (Windows' own thickness, DPI-correct via
+        // GetSystemMetricsForDpi), then the strip: the buttons answer
+        // HTCLIENT (their clicks are client messages), the rest of the strip
+        // answers HTCAPTION -- drag, Aero snap, double-click maximize and
+        // Win+arrows stay the system's own. The buttons win over the top
+        // edge band (the native order: rows 1..8 over a button are the
+        // button's, exactly like the real caption).
+        const POINT spt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT wrc; GetWindowRect(w, &wrc);
+        const int ww = wrc.right - wrc.left, wh = wrc.bottom - wrc.top;
+        const int x = spt.x - wrc.left, y = spt.y - wrc.top;
+        if (stripBtnAt(x, y, ww)) return HTCLIENT;
+        if (!IsZoomed(w)) {
+            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            if (y < fy)       return (x < fx) ? HTTOPLEFT : (x >= ww - fx) ? HTTOPRIGHT : HTTOP;
+            if (x < fx)       return HTLEFT;
+            if (x >= ww - fx) return HTRIGHT;
+            if (y >= wh - fy) return HTBOTTOM;
+        }
+        return (y < g_capH) ? HTCAPTION : HTCLIENT; }
+    case WM_NCACTIVATE:
+        // No NC area exists -- the strip repaints its active face instead
+        // (the title and glyphs step down to cDim; the face never changes).
+        g_stripActive = (wp != 0);
+        stripInvalidate(w);
+        return TRUE;
+    case WM_MOUSEMOVE:
+        stripHoverUpdate(w, lp);
+        break;
+    case WM_MOUSELEAVE:
+        g_stripTrack = false;
+        if (g_btnHover) { g_btnHover = kStripNone; stripInvalidate(w); }
+        break;
+    case WM_LBUTTONDOWN: {
+        RECT crc; GetClientRect(w, &crc);
+        const int hit = stripBtnAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), crc.right);
+        if (hit) { g_btnPress = hit; stripInvalidate(w); }
+        break; }
+    case WM_LBUTTONUP: {
+        RECT crc; GetClientRect(w, &crc);
+        const int hit = stripBtnAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), crc.right);
+        if (hit && hit == g_btnPress) {
+            // SC_CLOSE lands in WM_CLOSE (hide to tray, engine keeps running)
+            // -- the same gesture the native close button delivered.
+            if (hit == kStripMin)        PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+            else if (hit == kStripMax)   PostMessageW(w, WM_SYSCOMMAND,
+                                                      IsZoomed(w) ? SC_RESTORE : SC_MAXIMIZE, 0);
+            else if (hit == kStripClose) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
+        }
+        if (g_btnPress) { g_btnPress = kStripNone; stripInvalidate(w); }
+        break; }
     // v7.5.3c: WM_WINDOWPOSCHANGING (the size lock's second belt -- it
     // pinned every sizing pass to the designed 880x620+insets) stands down
     // for the resize test. The shell may size the window freely now; the
