@@ -255,15 +255,18 @@ inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f
 // case, next to the sheet-row latch (the frame's own truth, hover's view).
 // v7.6.1: the field's call -- 75 ms pre AND post (the resting values).
 // v7.6.2: they went DYNAMIC -- the pointer's tempo over the caption
-// steers them inside the field's bracket: kHovInactiveMinMs 50 (a slow,
-// deliberate pull-off, the flash barely lingers) to kHovInactiveMaxMs 200
-// (a fast flick -- "have that flashing effect be slowed down based on how
-// fast you've unhovered the thing"). The flash's fade-back rides the OUT
-// value; the focused bar keeps its flat 100/150.
+// steers them inside the field's bracket (a fast flick -- "have that
+// flashing effect be slowed down based on how fast you've unhovered the
+// thing"). The flash's fade-back rides the OUT value; the focused bar
+// keeps its flat 100/150.
+// v7.6.4: THE BRACKET ITSELF MOVES -- the field: "have the fade be 100ms
+// to 300ms instead." The floor is 100 (a slow, deliberate pull-off burns
+// it fast at 100, the flash barely lingers) and the ceiling 300 (a fast
+// flick stretches the fade-back toward 300).
 inline int kHovInactiveInMs  = 75;   // pre-hover ramp, unfocused (dynamic)
 inline int kHovInactiveOutMs = 75;   // post-hover ramp, unfocused (dynamic)
-inline constexpr int kHovInactiveMinMs = 50;   // the bracket's floor
-inline constexpr int kHovInactiveMaxMs = 200;  // the bracket's ceiling
+inline constexpr int kHovInactiveMinMs = 100;   // the bracket's floor (v7.6.4: was 50)
+inline constexpr int kHovInactiveMaxMs = 300;   // the bracket's ceiling (v7.6.4: was 200)
 inline bool g_hovInactive = false;
 // v7.5.4: the glyphs ride the band -- the band took its three px off the
 // bottom of the bar, so a glyph centered on the FULL button rect hangs
@@ -485,9 +488,10 @@ inline void cwHovAnimTick() {
             else {
                 const DWORD el = now - g_lapseT0[i];
                 // v7.6.2: the flash lives on the LEAVE's tempo --
-                // g_lapseMs[i], captured at trigger, inside the [50, 200]
-                // bracket; a fast flick stretches it toward 200, a slow
-                // pull-off burns it fast at 50.
+                // g_lapseMs[i], captured at trigger, inside the bracket
+                // (v7.6.4: [100, 300] -- "have the fade be 100ms to 300ms
+                // instead"); a fast flick stretches it toward 300, a slow
+                // pull-off burns it fast at 100.
                 if (el >= (DWORD)g_lapseMs[i]) g_lapseOn[i] = false;
                 else {
                     g_lapseA[i] = kCwLapseAlpha
@@ -513,8 +517,9 @@ inline void cwHovAnimTick() {
 // -- right away, not on the next tick -- and eases back to its half-there
 // rest (kGlyphInactiveAlpha,
 // 128 = the "50% transparency") across g_lapseMs[i], the LEAVE's tempo
-// (v7.6.2: inside the [50, 200] bracket -- a fast flick stretches the flash
-// toward 200, a slow pull-off burns it fast at 50). v7.6.0 read the old
+// (v7.6.2: inside the tempo bracket; v7.6.4: [100, 300] -- a fast flick
+// stretches the flash toward 300, a slow pull-off burns it fast at 100).
+// v7.6.0 read the old
 // 12.5% floor into the shared hover ramp instead -- g_hovA = 32 lands the
 // tint at 3/255 and the glyph at 144 vs the 128 rest, both under the eye,
 // which is why the field saw nothing. Inactive only; every activation
@@ -592,14 +597,24 @@ inline CwButtonRects cwButtonRects(int ww) {
     // px, there is no border row above the buttons (the sheet is withdrawn
     // -- the buttons start at row 0), the buttons end one design px above
     // the bar's bottom edge, and the CLOSE button runs two design px
-    // narrower. The min/max widths keep the cumulative edges -- only the
-    // close gives up the two pixels.
+    // narrower.
+    // v7.6.4 THE SMALLER MAXIMIZE BUTTON -- the field, again: "make the
+    // window's titlebar buttons actually look like this, with the smaller
+    // maximize button and the maximize button keeping its same position
+    // but removing 2px off the width." The MAXIMIZE button gives up two
+    // design px in the maximized state too, its right edge still glued to
+    // the close button's left edge (the stack stays flush -- no gap can
+    // open where two hover patches meet), and it keeps its slot: the
+    // MINIMIZE button keeps the cumulative edge and rides the new
+    // boundary. At 96 dpi the maximized stack reads 46/43/44 (was
+    // 46/45/44); at 150%: 68/66/65 off the 68.25 stride.
     const bool  maxed  = g_host && cwIsMaximized(g_host);
     const float bwf      = cwSf(45.5f);
     const int   edge1    = (int)(bwf + 0.5f);
     const int   edge2    = (int)(bwf * 2.0f + 0.5f);
     const int   edge3    = (int)(bwf * 3.0f + 0.5f);
     const int   closeW   = edge1 - (maxed ? cwS(2) : 0);   // v7.6.3: the close runs -2 design px
+    const int   maxW     = (edge2 - edge1) - (maxed ? cwS(2) : 0);   // v7.6.4: the maximize runs -2 design px too
     const int   bh       = maxed ? cwS(kBarHMaxDesign) : g_barH;
     RECT close = { 0, 0, ww, bh };
     if (maxed) close.bottom -= cwS(1);    // v7.6.3: the buttons run one design px shorter
@@ -607,7 +622,7 @@ inline CwButtonRects cwButtonRects(int ww) {
     close.left = close.right - closeW;
     RECT maximize = close;
     maximize.right = close.left;
-    maximize.left  = close.left - (edge2 - edge1);
+    maximize.left  = close.left - maxW;
     RECT minimize = maximize;
     minimize.right = maximize.left;
     minimize.left  = maximize.left - (edge3 - edge2);
@@ -1364,7 +1379,27 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
                 g_wasMax = maxed;
                 cwSheetSetup(w);          // {0,0,0,0} maximized / {0,0,1,0} restored
                 cwRelayoutChildren();     // the children ride the bar height
-                if (IsWindowVisible(w)) { cwRepaint(); cwSheetRowKick(); }
+                if (IsWindowVisible(w)) {
+                    // v7.6.4 THE WHOLE-FRAME FLIP REPAINT -- the field's
+                    // "have it so maximizing ... doesn't corrupt the window
+                    // render for a split second." The flip used to re-land
+                    // the BAR alone (cwRepaint), so every band of the panel
+                    // below -- just moved by the 9 design px the bar gave
+                    // up -- kept its PRE-flip pixels until the queue's async
+                    // WM_PAINT wandered by: one to two composes of stale,
+                    // misplaced content on every maximize/unmaximize. One
+                    // synchronous full-window repaint (RDW_UPDATENOW) lands
+                    // the buffered frame at the new geometry in a single
+                    // write BEFORE the flip's compose can sample anything
+                    // stale; the bar re-lands with it and the sheet train
+                    // re-kicks after.
+                    RECT cr; GetClientRect(w, &cr);
+                    RedrawWindow(w, &cr, nullptr,
+                                 RDW_INVALIDATE | RDW_ERASE
+                                 | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                    cwRepaint();          // the bar re-lands with it (belt)
+                    cwSheetRowKick();
+                }
             }
         }
         return false; }
@@ -1461,8 +1496,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
             // button's glyph to 12.5% for its fade-back -- moving onto
             // a neighbouring button unhovered the first one all the same.
             // v7.6.2: the leave's tempo steers the out ramp AND the flash
-            // (cwHovTempoMs, inside [50, 200]); the arrival's tempo steers
-            // the IN ramp, and re-hover cancels that button's flash.
+            // (cwHovTempoMs, inside the bracket -- v7.6.4: [100, 300]); the
+            // arrival's tempo steers the IN ramp, and re-hover cancels
+            // that button's flash.
             if (was != cwHovNone && g_hovInactive) {
                 kHovInactiveOutMs = cwHovTempoMs();
                 cwHovLapse(was - 1);
@@ -1560,7 +1596,26 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
                                 SWP_NOZORDER | SWP_NOACTIVATE);
             if (g_dpiHook) g_dpiHook();
             cwRelayoutChildren();
-            if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
+            if (IsWindowVisible(w) && !IsIconic(w)) {
+                // v7.6.4 THE WHOLE-FRAME DPI REPAINT -- the field's "have it
+                // so ... DPI reaction doesn't corrupt the window render for
+                // a split second." The reaction used to re-land the BAR
+                // alone (cwRepaint) and leave the host's own full repaint
+                // ASYNC (RDW_INVALIDATE without RDW_UPDATENOW): between the
+                // suggested-rect SetWindowPos and the queue's paint, the DWM
+                // could compose the resized window with the OLD scale's
+                // pixels -- the split-second garbage on every scale change.
+                // One synchronous full-window repaint at the new scale,
+                // AFTER the hook re-derived the constants and the children
+                // are re-seated, lands the whole frame in a single write;
+                // the bar re-lands with it and the sheet train re-kicks.
+                RECT cr; GetClientRect(w, &cr);
+                RedrawWindow(w, &cr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE
+                             | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                cwRepaint();              // the bar re-lands with it (belt)
+                cwSheetRowKick();
+            }
         }
         *out = 0; return true; }
     case WM_SYSCOMMAND: {

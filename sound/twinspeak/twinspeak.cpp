@@ -7919,8 +7919,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.3 |  %s",  // v7.6.3 the unhover flash starts at 0; the maximize square is crisp; maximized: 24px bar, -1px buttons, -2px close, no top border + {0,0,0,0}; the default playback device's volume is never pinned
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // to 100% at engine start
+    snprintf(vbuf, sizeof(vbuf), "v7.6.4 |  %s",  // v7.6.4 the unhover fade runs 100-300ms; maximized, the maximize button gives up 2px too (46/43/44 at 96dpi); the maximize flip and the DPI reaction repaint the whole frame in one synchronous write (no split-second corruption); the composition-changed re-commit is maximize-aware
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
@@ -8123,7 +8123,23 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             const TS_DWMEA dwmExtend = (TS_DWMEA)GetProcAddress(
                 LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
             if (dwmExtend) {
-                const TS_MARGINS sheet = { 0, 0, 1, 0 };
+                // v7.6.4: MAXIMIZE-AWARE -- the host's copy of the re-commit
+                // still landed the {0,0,1,0} sheet UNCONDITIONALLY, so a
+                // composition restart under a MAXIMIZED window brought the
+                // fake top border straight back (the header's own case
+                // re-runs maximize-aware, then this one undid it -- the
+                // field's corruption had a second door). The two real
+                // changes, in the maximized order ({0,0,1,0} first, then
+                // {0,0,0,0}) so the DWM cannot filter the unchanged margins
+                // and must rebuild frame + shadow either way -- the same
+                // shape guiCreateRealWindow and the tray-reopen re-commit
+                // already run.
+                const bool maxed = cwIsMaximized(g_hwnd);
+                const TS_MARGINS first = maxed ? TS_MARGINS{ 0, 0, 1, 0 }
+                                               : TS_MARGINS{ 0, 0, 0, 0 };
+                const TS_MARGINS sheet = maxed ? TS_MARGINS{ 0, 0, 0, 0 }
+                                               : TS_MARGINS{ 0, 0, 1, 0 };
+                dwmExtend(g_hwnd, &first);
                 g_glassSheet = SUCCEEDED(dwmExtend(g_hwnd, &sheet));
             }
             typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
