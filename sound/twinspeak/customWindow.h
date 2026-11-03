@@ -1,5 +1,4 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.5.5)
-// =====================================================================
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.9)
 // A single-header custom window-chrome API for Windows 10/11: a borderless
 // window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
 // real NC strips via WM_NCCALCSIZE insets, HTCAPTION drag/snap/Alt+Space,
@@ -23,23 +22,12 @@
 //         top->bottom gradient col -> gradColor. Colors are ARGB ints
 //         (0xAARRGGBB). Default: dark slate (the twinspeak seed).
 //
-//     setWinInactiveColor(int col) / (int col, int gradColor)     v7.5.5
-//         The caption bar's background while the window is INACTIVE. One
-//         argument: solid. Two: a vertical top->bottom gradient. -1 restores
-//         the default: mirror the focused color. The field's reason: the
-//         real Windows 10 dark mode turns the bar GRAY on inactive and
-//         keeps it black on focused -- a distinct inactive face is exactly
-//         that. Colors are ARGB ints (0xAARRGGBB).
+//     changeWinTextColor(int col) / (int col, int gradColor)
+//         The title text while the window is FOCUSED. One argument: solid;
+//         two: vertical gradient. Default: the cyan-gray gradient.
 //
-//     setWinTitleTextColor(int color, int gradientCol,
-//                          int inactiveColor = color,
-//                          int gradientInactiveCol = gradientCol)
-//         The title text, BOTH states in one call. Focused: color ->
-//         gradientCol (a vertical top->bottom gradient; pass the same color
-//         twice for solid). Inactive: inactiveColor ->
-//         gradientInactiveCol, which default to the focused pair -- the
-//         text only dims with focus when told to. Colors are ARGB ints
-//         (0xAARRGGBB). Default: the cyan-gray gradient.
+//     changeWinTextUnfocusedColor(int col) / (int col, int gradColor)
+//         The title text while the window is NOT focused. Default: gray.
 //
 //     changeWinTextFont(const std::string& font = "Segoe UI")
 //         The title text face. Accepts a font FAMILY name ("Segoe UI") or a
@@ -58,7 +46,8 @@
 //         Which caption buttons exist besides CLOSE (close is always kept,
 //         always rightmost; maximize sits between minimize and close; with
 //         maximize off, minimize sits directly beside close -- the twinspeak
-//         layout). Buttons are 47 design-px wide each, the sample's widths.
+//         layout). Buttons are 45 design-px wide each (v7.5.11: two
+//         narrower than the sample's 47 -- the field's call).
 //         Default: minimize on, maximize off.
 //
 //     setCanWinResize(bool resize)
@@ -72,23 +61,21 @@
 //         never starts, where it used to "end where it started". Default:
 //         false.
 //
-//     The button hover (v7.5.3d..v7.5.4): no longer a color knob. The minimize
-//     and maximize buttons show a 10% black tint (measured off the real
-//     thing) that fades in over 100 ms and out over 150 ms, LINEAR -- at
-//     TWICE the speed while the window is unfocused (v7.5.4: 50/75 ms, the
-//     real caption's inactive behavior; file explorer shows it) -- painted
-//     over everything in the button, in a band of its own (v7.5.3f): ONE
-//     real px of daylight at the top (row 0 -- the border row -- is never
-//     covered; the v7.5.3e top pin is retired) and the whole band THREE real
-//     px shorter than the bar (two px of daylight at the bottom), with crisp
-//     whole-pixel seams between neighbouring buttons (the anti-aliased
-//     sub-pixel seams smeared the edges; integer renders the hairline); the
-//     glyphs ride the band, two real px higher to stay centered in it, and
-//     while the window is UNFOCUSED the glyphs are half transparent -- a
-//     hovered button's glyph rides its fade back to full (v7.5.4, the
-//     task-manager behavior). The close button fades its vanilla red the
-//     same way and the X whitens with it.
-//     changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are retired.
+//     changeWinMinimizeHoverColor(int col) / (int col, int gradColor)
+//         The minimize button's hover face. Default: the panel gray.
+//
+//     changeWinMaximizeHoverColor(int col) / (int gradColor)
+//         The maximize button's hover face. Default: the panel gray.
+//         (The CLOSE hover face is deliberately not configurable -- it stays
+//         the vanilla red with the white X, like every normal window.)
+//
+//     v7.5.11, the inactive hover-end lapse (the minimize button): on an
+//     INACTIVE window, when the minimize button's hover ends, its face is
+//     re-landed at 12.5% opacity (the alpha-32 byte) and fades out over
+//     100 ms -- the unmodified Windows 10 bar's own lapse, measured by the
+//     field (minimize only; not Chrome, not the active window, which keeps
+//     the instant clear). The fade rides whichever face
+//     changeWinMinimizeHoverColor / cwSeedChrome seeded.
 //
 //     putWindowinTray(bool hide)
 //         hide=true: hide the window to the tray NOW, SILENTLY -- the
@@ -111,17 +98,6 @@
 //     cwIsMaximized(HWND)          the sample's maximized test (WPL)
 //     cwAttach(HWND, void(*)(HWND))   the chrome window + the bar repaint fn
 //     cwSetBarHeight(int)          the caption bar height in REAL pixels
-//     cwBarHeight()                v7.5.3d: the header's own caption height
-//                                  (33 design px, dpi-scaled) -- the number
-//                                  a host adopts as its caption contract;
-//                                  cwSetBarHeight stays for hosts that keep
-//                                  their own
-//     cwTrackChild / cwRelayoutChildren / cwSetDpiHook
-//                                  v7.5.3d: the WM_DPICHANGED story. The
-//                                  header re-derives itself (dpi, bar height,
-//                                  title font), applies the suggested rect,
-//                                  calls the host's hook (constants + fonts),
-//                                  then re-seats the tracked children.
 //     cwSeedTitleFont(face, px, weight)   size/weight behind changeWinTextFont
 //     cwSeedChrome(...)            per-theme seed of every chrome color
 //     cwSetTrayHost(hideFn, showFn)   putWindowinTray delegates to these
@@ -130,9 +106,12 @@
 //     cwWndProc(w, msg, wp, lp, &result)  FORWARD FIRST in the host wndproc
 //
 // The fake top border bar (the sheet row -- the window's REAL top border,
-// row 0 of the caption bar) is the header's too, since v7.5.3:
-//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults
-//                                           = the field's half-alpha gray)
+// row 0 of the caption bar) is the header's too, since v7.5.3. v7.5.4: the
+// ACTIVE row is the glass key again -- the gray covers the INACTIVE state
+// and the MINIMIZE frame only:
+//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults:
+//                                           ACTIVE the alpha-0 glass key,
+//                                           INACTIVE the half-alpha gray)
 //     cwPatchSheetRow(bits, cw, active)     row 0 of the host's 32bpp buffer
 //     cwCommitSheetRowFast(w, active)       the row-first 1 px commit
 //                                           (private DIB + GdiFlush)
@@ -141,11 +120,6 @@
 //     cwSheetRowLatch(int) / cwSheetRowLatchValue()   the NC activation
 //                                           latch (-1/0/1, the frame's truth)
 //     cwSheetPresenterStart(w) / cwSheetPresenterStop()   the fade train
-//
-//     (v7.5.3b: the sheet itself is the header's too -- cwAttach runs
-//      cwSheetSetup, the {0,0,1,0} extend + the immersive dark mode
-//      border, and the WM_SYSCOMMAND(SC_MINIMIZE) ordered present lives
-//      in cwWndProc. A fresh consumer needs NO host DWM code at all.)
 //
 // Host contract (twinspeak already meets all of it):
 //   * GDI+ started (GdiplusStartup) before the first paint.
@@ -181,7 +155,6 @@
 #include <objbase.h>
 #include <gdiplus.h>
 #include <atomic>
-#include <vector>
 
 #ifndef GET_X_PARAM
 #define GET_X_PARAM(lp) ((int)(short)LOWORD(lp))
@@ -214,55 +187,10 @@ inline int  g_textGrad    = 0xFF6C868C;   // title text gradient bottom
 inline int  g_textUn      = 0xFF7E888E;   // title text, unfocused (solid...
 inline int  g_textUnGrad  = -1;           // ...or gradient bottom when >= 0)
 inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_textCol)
-// v7.5.3d..v7.5.4: the hover is no longer a solid face color. The min/max
-// hover is a black TINT -- 10% alpha (0x1A = 26, measured off a real
-// Windows 10 caption button) -- that fades in over 100 ms and out over
-// 150 ms, LINEAR (HALF those durations while the window is unfocused,
-// v7.5.4: the real thing fades its caption buttons at twice the speed
-// while inactive -- the field watches file explorer do it), painted OVER
-// everything in the button (the glyph included), in a band of
-// its own (v7.5.3f): ONE real px of daylight at the top -- row 0, the
-// border row, is never covered (the v7.5.3e top pin lived one build) -- and
-// THREE real px shorter than the bar, two px of daylight at the bottom. The
-// seams between neighbouring buttons are WHOLE pixels (the real thing's 0.5
-// design px hairline snapped to physical pixels -- the old anti-aliased
-// sub-pixel insets smeared the edges into a two-column gradient, the
-// field's "blurred"). The close button fades its vanilla red the same way;
-// the X lerps to white with the fill.
-inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
-// v7.5.5: the tint's CHANNEL follows the face being painted -- the field's
-// rule: HSL lightness < 128 (kHovDarkFaceL) reads as a dark face, and the
-// real caption's hover LIGHTENS a dark face: the UWP dark resources put the
-// button hover a step lighter than the face (#343434 over #171717, which
-// reads as a ~12.5% white overlay -- the field considered 12.5% for both
-// modes and kept the measured 10%). A light face keeps the measured black
-// step. The alpha never changes, only the channel; the close red is
-// untouched -- the real close hover is red in both modes.
-inline constexpr int kHovDarkFaceL = 128;   // the field's dark-face line
-inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp, focused (v7.5.3e: was 150)
-inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f: e had 100, d had 300)
-// v7.5.4: the unfocused window's hover runs at TWICE the speed -- both
-// ramps divide by this while the window is inactive (50/75 ms), so the
-// highlight snaps on and off the way the real caption's does when the
-// window does not have focus. g_hovInactive is latched in the WM_NCACTIVATE
-// case, next to the sheet-row latch (the frame's own truth, hover's view).
-inline constexpr int kHovInactiveSpeed = 2;
-inline bool g_hovInactive = false;
-// v7.5.4: the glyphs ride the band -- the band took its three px off the
-// bottom of the bar, so a glyph centered on the FULL button rect hangs
-// below the highlight's visual center. Every caption glyph (min line, max
-// squares, close X) sits this many REAL px higher; unscaled, like the band
-// itself. The window icon and the title text do not ride.
-inline constexpr int kHovGlyphRide = 2;
-// v7.5.4: the UNFOCUSED caption's glyphs are HALF there -- the field's
-// task-manager observation: the real buttons dim to ~50% opacity while
-// their window is inactive. A hovered button's glyph rides its own fade
-// ramp (g_hovA[i]) back to full opacity; focused windows never dim.
-inline constexpr int kGlyphInactiveAlpha = 128;   // ~50% of 255
-inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation timer
-inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
-inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
-inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is running
+inline int  g_minHover    = 0xFF181B1F;   // minimize hover face
+inline int  g_minHoverGrad= -1;           // hover gradient bottom (-1 = solid)
+inline int  g_maxHover    = 0xFF181B1F;   // maximize hover face
+inline int  g_maxHoverGrad= -1;
 inline const DWORD kCloseHover = 0xFFCC0000;   // vanilla red, not configurable
 inline std::wstring g_fontFace = L"Segoe UI";
 inline int  g_fontPx      = 14;
@@ -274,25 +202,35 @@ inline bool g_resizable   = false;
 
 // ---- host plumbing state ---------------------------------------------------
 inline HWND   g_host      = nullptr;      // the chrome window
-// v7.5.3d: the bar height is the header's own truth now -- 33 design px
-// (the real DWM caption height; the old 31 was two px short), scaled by the
-// header's DPI and re-derived on WM_DPICHANGED. A host adopts it through
-// cwBarHeight() (twinspeak) or keeps seeding cwSetBarHeight() (others).
-inline constexpr int kBarHDesign = 33;
-inline int    g_barH      = 33;           // caption bar height, REAL px
+inline int    g_barH      = 31;           // caption bar height, REAL px
 inline void (*g_repaint)(HWND) = nullptr;  // the host's synchronous bar repaint
 inline void (*g_trayHide)(HWND) = nullptr; // putWindowinTray(true)  -> host path
 inline void (*g_trayShow)(HWND) = nullptr; // putWindowinTray(false) -> host path
-// v7.5.3d: the DPI hook -- the one thing the header cannot do for a host is
-// re-derive ITS constants and fonts. On WM_DPICHANGED the header updates
-// itself (dpi, bar height, title font) and calls this AFTER the suggested
-// rect has been applied; the host re-scales and then cwRelayoutChildren()
-// moves the tracked children. Registered once, next to cwAttach.
-inline void (*g_dpiHook)() = nullptr;
 
 // hover: 0 none, 1 minimize, 2 maximize, 3 close (replaces GWLP_USERDATA)
 enum { cwHovNone = 0, cwHovMin = 1, cwHovMax = 2, cwHovClose = 3 };
 inline int g_hover = cwHovNone;
+
+// v7.5.11 THE INACTIVE LAPSE. The field, on the unmodified Windows 10 bar:
+// "When an inactive titlebar button hover ends, it also sets the
+// transparency to be 12.5% fading back half-transparent after 100ms. Yes,
+// this only happens with the minimize button on the unmodified windows 10
+// window style. Not google chrome." The parse, stated so it can be
+// corrected: on an INACTIVE window, when the MINIMIZE button's hover ends,
+// the face is re-landed at 12.5% opacity -- the alpha-32 byte, 32/255 --
+// and that remnant fades to nothing over the next 100 ms, the button back
+// at its resting half-transparent look when it lands. Minimize only,
+// inactive only; the active window's hover end stays the instant clear it
+// always was here.
+inline const int      kCwMinRemnantAlpha  = 32;     // 12.5% of the face
+inline const DWORD    kCwMinRemnantMs     = 100;    // the fade's whole life
+inline const UINT_PTR kCwMinRemnantTimer  = 0xC011; // the header's own WM_TIMER slot
+inline int   g_minRemnant   = 0;                // the remnant's alpha, 0 = idle
+inline DWORD g_minRemnantT0 = 0;                // GetTickCount() at the hover's end
+// ARGB with the A byte replaced (the lapse scales the SEEDED face, no new color)
+inline int cwArgbAlpha(int col, int a) {
+    return (int)(((unsigned)col & 0x00FFFFFFu) | ((unsigned)(a & 0xFF) << 24));
+}
 
 // the built-in fallback tray (only when no tray host is registered)
 inline NOTIFYICONDATAW g_nid   = {};
@@ -300,40 +238,16 @@ inline bool g_trayUp           = false;
 inline UINT g_trayMsg          = 0;          // WM_APP+n, registered on first use
 inline UINT g_taskbarCreated   = 0;
 
-// ---- the title font (family name or C:\Windows\Fonts file) -----------------
-inline Gdiplus::Font* g_font = nullptr;
-inline std::wstring g_fontKey;             // face|px|weight|dpi of the cached font
-inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
-
 // ---- small helpers ---------------------------------------------------------
-inline UINT g_dpi = 0;                    // 0 = seed on the first cwDpi()
 inline UINT cwDpi() {
-    if (!g_dpi) {
+    static UINT dpi = 0;
+    if (!dpi) {
         HDC dc = GetDC(nullptr);
         int d = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
         if (dc) ReleaseDC(nullptr, dc);
-        g_dpi = (d > 0) ? (UINT)d : 96;
+        dpi = (d > 0) ? (UINT)d : 96;
     }
-    return g_dpi;
-}
-// v7.5.3d: WM_DPICHANGED -- the scale moved under the window. The header's
-// whole geometry derives from this (cwS/cwSf, the bar height, the title
-// font's pixel height), so one store re-derives everything lazily; the
-// title font's cache key carries the DPI and rebuilds on the next paint.
-inline void cwDpiChanged(UINT dpi) {
-    if (dpi && dpi != g_dpi) { g_dpi = dpi; g_fontKey.clear(); }
-}
-// system metrics at the window's DPI (per-monitor-v2 correct; the plain
-// GetSystemMetrics answers the primary's sign-in scale). Loaded loose so
-// pre-1607 Windows keeps working.
-inline int cwMetric(int idx) {
-    typedef int (WINAPI *CwMetricForDpiFn)(int, UINT);
-    static CwMetricForDpiFn fn = []() -> CwMetricForDpiFn {
-        HMODULE u = GetModuleHandleW(L"user32.dll");
-        return u ? (CwMetricForDpiFn)(void*)GetProcAddress(u, "GetSystemMetricsForDpi") : nullptr;
-    }();
-    if (fn) { const int v = fn(idx, cwDpi()); if (v) return v; }
-    return GetSystemMetrics(idx);
+    return dpi;
 }
 inline int cwS(int v) { return MulDiv(v, (int)cwd::cwDpi(), 96); }        // design px -> real px (twinspeak's S())
 inline float cwSf(float v) { return v * (float)cwd::cwDpi() / 96.0f; }
@@ -342,15 +256,6 @@ inline DWORD cwArgbOf(COLORREF c) {
                        | ((DWORD)GetGValue(c) << 8) | (DWORD)GetBValue(c);
 }
 inline int cwChannel(int argb, int shift) { return (argb >> shift) & 0xFF; }
-
-// v7.5.5: HSL lightness of an ARGB color, 0..255 -- L = (max + min) / 2 on
-// the RGB channels. The hover's dark-face rule reads this (kHovDarkFaceL).
-inline int cwHslLightness(int argb) {
-    const int r = cwChannel(argb, 16), g2 = cwChannel(argb, 8), b = cwChannel(argb, 0);
-    const int mx = r > g2 ? (r > b ? r : b) : (g2 > b ? g2 : b);
-    const int mn = r < g2 ? (r < b ? r : b) : (g2 < b ? g2 : b);
-    return (mx + mn) / 2;
-}
 inline bool cwIsMaximized(HWND w) {          // main.c verbatim
     WINDOWPLACEMENT placement = {0};
     placement.length = sizeof(WINDOWPLACEMENT);
@@ -364,95 +269,40 @@ inline void cwRepaint() {
     }
 }
 
-// ---- v7.5.3d: the hover fade train ------------------------------------------
-// Linear 100/150 ms ramps per button (min, max, close) -- halved while the
-// window is unfocused (kHovInactiveSpeed, v7.5.4) -- driven by a private
-// 16 ms WM_TIMER on the host window; every tick repaints the bar through the
-// host's synchronous painter, which reads g_hovA. The timer lives only while
-// a ramp is in flight, then it is gone again.
-inline void cwHovAnimEnsure() {
-    if (g_hovTimerOn || !g_host || !IsWindow(g_host)) return;
-    g_hovLast = GetTickCount();
-    if (SetTimer(g_host, kHovTimerId, 16, nullptr)) g_hovTimerOn = true;
+// ---- the v7.5.11 inactive lapse machinery (the minimize button) ------------
+inline void cwMinRemnantCancel() {
+    if (!g_minRemnant) return;
+    g_minRemnant = 0;
+    if (g_host) KillTimer(g_host, kCwMinRemnantTimer);
 }
-inline void cwHovAnimTick() {
-    if (!g_hovTimerOn) return;
-    const HWND w = g_host;
-    if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w)) {
-        g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;      // nothing visible: rest
-        KillTimer(w, kHovTimerId); g_hovTimerOn = false;
-        return;
+inline void cwMinRemnantBegin(HWND w) {
+    g_minRemnant   = kCwMinRemnantAlpha;      // the first post-hover frame: 12.5%
+    g_minRemnantT0 = GetTickCount();
+    if (w) SetTimer(w, kCwMinRemnantTimer, 15, nullptr);
+    // the caller's repaint lands the 12.5% frame; the ticks fade it out
+}
+inline void cwMinRemnantTick(HWND w) {
+    if (!g_minRemnant) { if (w) KillTimer(w, kCwMinRemnantTimer); return; }
+    const DWORD el = GetTickCount() - g_minRemnantT0;
+    if (el >= kCwMinRemnantMs) {
+        g_minRemnant = 0;                     // the resting look: the face gone
+        if (w) KillTimer(w, kCwMinRemnantTimer);
+    } else {
+        g_minRemnant = kCwMinRemnantAlpha
+                     - (int)((DWORD)kCwMinRemnantAlpha * el / kCwMinRemnantMs);
     }
-    const DWORD now = GetTickCount();
-    DWORD dt = now - g_hovLast;
-    g_hovLast = now;
-    if (dt > 1000) dt = 1000;                       // a stalled queue must not jump the ramp
-    bool busy = false;
-    // v7.5.4: the ramps' tempo follows the activation state -- twice the
-    // speed (half the durations) while the window is unfocused.
-    const int inMs  = g_hovInactive ? kHovFadeInMs  / kHovInactiveSpeed : kHovFadeInMs;
-    const int outMs = g_hovInactive ? kHovFadeOutMs / kHovInactiveSpeed : kHovFadeOutMs;
-    for (int i = 0; i < 3; ++i) {
-        const bool held = (g_hover == i + 1);
-        int a = g_hovA[i];
-        if (held) a += (int)(dt * 255 / inMs);
-        else      a -= (int)(dt * 255 / outMs);
-        if (a > 255) a = 255;
-        if (a < 0) a = 0;
-        if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
-        if ((held && a < 255) || (!held && a > 0)) busy = true;
-    }
-    cwRepaint();                                    // the painter reads g_hovA
-    if (!busy) { KillTimer(w, kHovTimerId); g_hovTimerOn = false; }
+    cwRepaint();
 }
-
-// ---- v7.5.3d: the DPI-responsive child ledger --------------------------------
-// Children that ride below the bar (design px in, real px out) register here;
-// on WM_DPICHANGED the header re-positions every tracked child at the new
-// scale, re-seats its font (a pointer into the host's HFONT slot -- the host
-// re-creates the font in its dpi hook) and runs its per-child fixup
-// (combobox item heights).
-struct CwTrackedChild {
-    HWND    h;
-    int     x, y, w, ht;        // design px
-    bool    underBar;           // the y rides the header's bar height
-    HFONT*  font;               // the host's font slot, re-sent after a move
-    int     comboItemH;         // > 0: CB_SETITEMHEIGHT(-1) after the move
-};
-inline std::vector<CwTrackedChild> g_kids;
-inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
-                         bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0) {
-    for (auto& k : g_kids)
-        if (k.h == h) { k.x = x; k.y = y; k.w = w; k.ht = ht;
-                        k.underBar = underBar; k.font = font;
-                        k.comboItemH = comboItemH; return; }
-    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH });
-}
-inline void cwRelayoutChildren() {
-    for (auto& k : g_kids) {
-        if (!k.h || !IsWindow(k.h)) continue;
-        SetWindowPos(k.h, nullptr,
-                     cwS(k.x), cwS(k.y) + (k.underBar ? g_barH : 0),
-                     cwS(k.w), cwS(k.ht),
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        if (k.font && *k.font) SendMessageW(k.h, WM_SETFONT, (WPARAM)*k.font, TRUE);
-        if (k.comboItemH > 0) {
-            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwS(k.comboItemH));
-            InvalidateRect(k.h, nullptr, FALSE);
-        }
-    }
-}
-inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
-// Client coordinates over a bar 0..g_barH tall, buttons 47 design-px wide,
+// Client coordinates over a bar 0..g_barH tall, buttons 45 design-px wide
+// (v7.5.11: two narrower than the sample's 47 -- the field's call),
 // stacked from the right edge: close always; then maximize (if present);
 // then minimize. With maximize off, minimize sits beside close -- the
-// twinspeak geometry, byte for byte.
+// twinspeak geometry, minus the field's two pixels.
 struct CwButtonRects { RECT close, maximize, minimize; };
 inline CwButtonRects cwButtonRects(int ww) {
-    const int bw = cwS(47);
+    const int bw = cwS(45);
     RECT close = { 0, 0, ww, g_barH };
     close.top += WIN32_FAKE_SHADOW_HEIGHT;
     close.left = close.right - bw;
@@ -466,14 +316,10 @@ inline CwButtonRects cwButtonRects(int ww) {
     return { close, maximize, minimize };
 }
 
-// v7.5.3e: the seam between neighbouring hover patches, in REAL px -- the
-// real DWM's half-a-design-px hairline snapped to whole physical pixels
-// (never 0: a sub-pixel seam is what smeared the patches before). Taken off
-// the LEFT neighbour's right edge, so the right-hand patch stays flush.
-inline int cwHovSeamPx() {
-    const float s = cwSf(0.5f);
-    return s < 1.0f ? 1 : (int)(s + 0.5f);
-}
+// ---- the title font (family name or C:\Windows\Fonts file) -----------------
+inline Gdiplus::Font* g_font = nullptr;
+inline std::wstring g_fontKey;             // face|px|weight of the cached font
+inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
 
 inline bool cwFileExists(const std::wstring& p) {
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -506,8 +352,7 @@ inline bool cwResolveFont(const std::wstring& in) {
 
 inline Gdiplus::Font* cwFont() {
     const std::wstring key = g_fontFamily + L"|" + std::to_wstring(g_fontPx)
-                           + L"|" + std::to_wstring(g_fontWeight)
-                           + L"|" + std::to_wstring(cwDpi());   // v7.5.3d: the dpi rides the key
+                           + L"|" + std::to_wstring(g_fontWeight);
     if (g_font && key == g_fontKey) return g_font;
     delete g_font; g_font = nullptr;
     LOGFONTW lf = {0};
@@ -558,91 +403,74 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     const CwButtonRects br = cwButtonRects(ww);
     const int buttonW = br.close.right - br.close.left;
     const int item = active ? (g_glyph < 0 ? g_textCol : g_glyph) : g_textUn;
-    // v7.5.4: the inactive glyphs are HALF there (task manager shows it) --
-    // each button's glyph fades back to full opacity riding the same ramp
-    // that drives its tint (pa = g_hovA[i]); focused windows pass through.
-    auto glyphCol = [&](int base, int pa) -> int {
-        int a = cwChannel(base, 24);
-        if (!active) a = kGlyphInactiveAlpha
-                       + ((255 - kGlyphInactiveAlpha) * pa + 127) / 255;
-        return (a << 24) | (base & 0xFFFFFF);
-    };
     auto fillARGB = [&g](int col, int x, int y, int w2, int h2) {
         Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
                                              cwChannel(col, 8), cwChannel(col, 0)));
         g.FillRectangle(&b, x, y, w2, h2);
     };
-    // v7.5.3e + f: the hover patch -- a translucent fill on WHOLE pixels. The
-    // sub-pixel seams are gone: the 0.25 px anti-aliased insets smeared the
-    // patch edges into a two-column gradient (the field: "blurred"). The
-    // seam rides in whole physical pixels off the left neighbour's right
-    // edge; the outer edges stay flush (close rides the window edge).
-    // SmoothingMode stays None and every coordinate is an integer, so every
-    // edge renders crisp.
-    // v7.5.3f THE BAND: the patch is ONE real px down from the top (the
-    // button rects already start on row 1, under the border row -- the
-    // v7.5.3e top pin is retired) and THREE real px shorter than the bar:
-    // two px of daylight above the bar's bottom edge. hoverBand() is the one
-    // geometry; every hover fill goes through it.
-    auto hoverBand = [](const RECT& r) { RECT h = r; h.bottom -= 2; return h; };
-    auto fillPatch = [&](const RECT& r, int col, int insetR) {
-        Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
-                                             cwChannel(col, 8), cwChannel(col, 0)));
-        g.FillRectangle(&b, (INT)r.left, (INT)r.top,
-                        (INT)((r.right - r.left) - insetR), (INT)(r.bottom - r.top));
+    // hover faces: flat or vertical gradient over the button rect
+    auto fillHover = [&](int col, int grad, const RECT& r) {
+        if (grad < 0) { fillARGB(col, r.left, r.top, r.right - r.left, r.bottom - r.top); return; }
+        Gdiplus::LinearGradientBrush hb(
+            Gdiplus::Rect((INT)r.left, (INT)r.top,
+                          (INT)(r.right - r.left), (INT)(r.bottom - r.top)),
+            Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
+                           cwChannel(col, 8), cwChannel(col, 0)),
+            Gdiplus::Color(cwChannel(grad, 24), cwChannel(grad, 16),
+                           cwChannel(grad, 8), cwChannel(grad, 0)),
+            Gdiplus::LinearGradientModeVertical);
+        g.FillRectangle(&hb, (INT)r.left, (INT)r.top,
+                        (INT)(r.right - r.left), (INT)(r.bottom - r.top));
     };
     // minimize
     if (g_btnMin) {
+        if (g_hover == cwHovMin) {
+            fillHover(g_minHover, g_minHoverGrad, br.minimize);
+        } else if (g_minRemnant > 0) {
+            // v7.5.11 the inactive lapse: the face at 12.5%, fading out
+            fillHover(cwArgbAlpha(g_minHover, g_minRemnant),
+                      g_minHoverGrad < 0 ? -1 : cwArgbAlpha(g_minHoverGrad, g_minRemnant),
+                      br.minimize);
+        }
         const int lineW = cwS(10);
         const int cx = br.minimize.left + buttonW / 2;
-        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
-        fillARGB(glyphCol(item, g_hovA[0]), cx - lineW / 2, cy, lineW, 1);
+        const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2;
+        fillARGB(item, cx - lineW / 2, cy, lineW, 1);
     }
     // maximize (square outline; double square while maximized)
     if (g_btnMax) {
+        if (g_hover == cwHovMax) fillHover(g_maxHover, g_maxHoverGrad, br.maximize);
         const int cx = br.maximize.left + buttonW / 2;
-        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2;
         const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
-        const int mi = glyphCol(item, g_hovA[1]);   // v7.5.4: dimmed while inactive
-        Gdiplus::Pen p(Gdiplus::Color(cwChannel(mi, 24), cwChannel(mi, 16),
-                                      cwChannel(mi, 8), cwChannel(mi, 0)), penW);
+        Gdiplus::Pen p(Gdiplus::Color(cwChannel(item, 24), cwChannel(item, 16),
+                                      cwChannel(item, 8), cwChannel(item, 0)), penW);
         if (w && cwIsMaximized(w)) {
-            // v7.5.3d: the front sheet OCCLUDES the back one -- the real
-            // restore glyph layers the squares, the back square's edges stop
-            // at the front square instead of showing through its interior
-            // (the maximized button used to read as see-through wireframe).
-            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));
-            Gdiplus::Region frontRegion(front);
-            g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
-            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet, occluded
-            g.ResetClip();
-            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
+            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet
+            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet
         } else {
-            g.DrawRectangle(&p, cx - cwS(4), cy - cwS(4), cwS(9), cwS(9));
+            // v7.5.11 the square's true center: a 9px path from an integer
+            // origin centers its pen strokes on cx+0.5 (x = cx-4, path to
+            // cx+5 -- half a pixel right AND low of the X's and the line's
+            // center); the REAL overload draws the same 9px square at
+            // cx-4.5/cy-4.5, strokes on cx+/-4.5, midpoint (cx, cy) exact.
+            g.DrawRectangle(&p, (Gdiplus::REAL)(cx - cwSf(4.5f)),
+                                (Gdiplus::REAL)(cy - cwSf(4.5f)),
+                                cwSf(9.0f), cwSf(9.0f));
         }
     }
-    // close (always; vanilla red hover, white X -- both ride the same linear
-    // fades, 100 ms in / 150 ms out; the X stroke is the real thing's
-    // 1 design px, the old 1.25 rendered half again too thick)
+    // close (always; vanilla red hover, white X)
     {
-        const int pa = g_hovA[2];
-        if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0);
-        const int cx = br.close.left + buttonW / 2;
-        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
-        int xc = glyphCol(item, pa);        // v7.5.4: half there while inactive, pa restores it
-        if (pa > 0) {                       // the X whitens with the red (alpha rides glyphCol)
-            const int a = cwChannel(xc, 24);
-            const int r  = cwChannel(item, 16) + ((255 - cwChannel(item, 16)) * pa + 127) / 255;
-            const int gr = cwChannel(item,  8) + ((255 - cwChannel(item,  8)) * pa + 127) / 255;
-            const int b  = cwChannel(item,  0) + ((255 - cwChannel(item,  0)) * pa + 127) / 255;
-            xc = (int)(((unsigned)a << 24) | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
+        if (g_hover == cwHovClose) {
+            fillARGB((int)kCloseHover, br.close.left, br.close.top, buttonW,
+                     br.close.bottom - br.close.top);
         }
+        const int cx = br.close.left + buttonW / 2;
+        const int cy = br.close.top + (br.close.bottom - br.close.top) / 2;
+        const int xc = (g_hover == cwHovClose) ? 0xFFFFFFFF : item;
         Gdiplus::Pen xp(Gdiplus::Color(cwChannel(xc, 24), cwChannel(xc, 16),
                                        cwChannel(xc, 8), cwChannel(xc, 0)),
-                        cwSf(1.0f) < 1.0f ? 1.0f : cwSf(1.0f));
+                        cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f));
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.DrawLine(&xp, cx - cwS(5), cy - cwS(5), cx + cwS(5), cy + cwS(5));
         g.DrawLine(&xp, cx + cwS(5), cy - cwS(5), cx - cwS(5), cy + cwS(5));
@@ -706,25 +534,6 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             }
         }
     }
-    // v7.5.3d..f: the min/max hover tints land LAST -- they overlay
-    // everything in the button (the glyph included), in the v7.5.3f band:
-    // one real px of daylight at the top (the border row is never covered)
-    // and three real px shorter than the bar (two at the bottom). The seams
-    // against the right-hand neighbours are whole pixels (the outer edges
-    // stay flush).
-    {
-        // v7.5.5: the tint follows the face BEING PAINTED -- the same face
-        // expression cwPaintBarBackground answers, so the hover reads the
-        // mode actually on screen: dark face -> the white overlay, light
-        // face -> the measured black, kHovTintAlpha either way.
-        const int faceNow = active ? g_faceCol
-                                   : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
-        const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
-        const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
-        const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
-        if (g_btnMin && aMin > 0) fillPatch(hoverBand(br.minimize), (aMin << 24) | tintCol, cwHovSeamPx());
-        if (g_btnMax && aMax > 0) fillPatch(hoverBand(br.maximize), (aMax << 24) | tintCol, cwHovSeamPx());
-    }
 }
 
 // one-call chrome for fresh consumers (twinspeak sandwiches its own border
@@ -752,29 +561,164 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 //                                                   gray (85 at 50%), the
 //                                                   field's byte -- "43, 43,
 //                                                   43 and that's just it."
-//   v7.5.3           active    BGRA(43,43,43,0x80) THE FIELD'S PICK: the
-//                                                   active row joins the
-//                                                   inactive byte -- the
-//                                                   field: "Gdiplus::Color
-//                                                   (128, 43, 43, 43) would
-//                                                   do it", since the DWM's
-//                                                   border color (the registry
-//                                                   colorization) owns the
-//                                                   frame tint anyway and a
-//                                                   bare glass key delivered
-//                                                   nothing the registry
-//                                                   border did not.
-// With no alpha-0 row anywhere, the transparent-glass flash the field taped
-// on minimize (v7.5.1/v7.5.2) is impossible BY CONSTRUCTION: every frame of
-// every animation -- the press frame, the shrink, the restore -- carries the
-// same composited gray. (The v7.4.0 receipt stands: an alpha-0 row cannot
-// carry a color at all -- the RGB under alpha 0 is invisible and the DWM's
-// own glass shows regardless -- so any recolor fix had to be alpha > 0;
-// this one is the field's own byte.) Both rows being one constant, the
-// activation flip no longer changes row 0 -- only the FACE (dim text, dim
-// glyphs) still flips, which is why the ordered presents stay: their row
-// commit is byte-idempotent now, their face present is not.
+//   v7.5.3           active    BGRA(43,43,43,0x80) ONE VERSION ONLY: the
+//                                                   field's pick made the row
+//                                                   uniform -- and the field
+//                                                   then saw it from the
+//                                                   outside: "The problem is
+//                                                   though, it contradicts
+//                                                   the active window
+//                                                   state."
+//   v7.5.4           active    BGRA(0,0,0,0)       THE KEY RETURNS: the
+//                                                   field: "make it so if
+//                                                   you've pressed the
+//                                                   minimize button but have
+//                                                   released the mouse click
+//                                                   that the top bar color
+//                                                   switches to
+//                                                   Gdiplus::Color(128,43,43,
+//                                                   43) while the active
+//                                                   condition remains having
+//                                                   Gdiplus::Color(255,0,0,0)."
+//                                                   The gray is the INACTIVE
+//                                                   byte and the MINIMIZE
+//                                                   byte; the key is the
+//                                                   active byte again (the
+//                                                   GDI+ fallback paints
+//                                                   Color(255,0,0,0) on the
+//                                                   window DC -- opaque black
+//                                                   RGB, the key itself).
+//   v7.5.6           minimize  BGRA(43,43,43,0xFF) ONE VERSION ONLY: the
+//                                                   opaque release byte -- and
+//                                                   the field saw the row's
+//                                                   color itself vanish: "the
+//                                                   frame you release the
+//                                                   mouse for the minimize
+//                                                   button, the top bar's
+//                                                   color simply disappears."
+//   v7.5.7           minimize  BGRA(43,43,43,0x80) THE GRAY RETURNS: the
+//                                                   release frame carries the
+//                                                   field's Gdiplus::Color(
+//                                                   128,43,43,43) again --
+//                                                   byte for byte the INACTIVE
+//                                                   bar's row. The three-state
+//                                                   latch STAYS: state 2 is
+//                                                   what keeps the alpha-0 key
+//                                                   from re-landing inside the
+//                                                   release-to-flip window (the
+//                                                   v7.5.5 race); only the byte
+//                                                   it lands is the field's
+//                                                   gray again.
+//   v7.5.8           (byte unchanged)         THE SHRINK TRACKS THE FADE.
+//                                                   Three byte changes in a row
+//                                                   (v7.5.5 latch, v7.5.6
+//                                                   opaque, v7.5.7 gray) could
+//                                                   not kill the release glass,
+//                                                   and the field caught it a
+//                                                   fourth time: "I still see a
+//                                                   transparent glass being a
+//                                                   255,0,0 the moment I
+//                                                   release the mouse's left
+//                                                   button for minimizing."
+//                                                   THE VERDICT: the byte was
+//                                                   never the bug -- the RIDE
+//                                                   was. The v7.5.2 ordered
+//                                                   present lands the gray ONCE,
+//                                                   and at that instant the
+//                                                   sheet under the row is
+//                                                   still the ACTIVE material
+//                                                   (the registry accent -- the
+//                                                   field's red): the bake is
+//                                                   half gray + half accent
+//                                                   glass. Then the placement
+//                                                   flips and the DWM starts
+//                                                   its ~200 ms activation
+//                                                   fade -- the left/right/
+//                                                   bottom strips ride it --
+//                                                   but every painter is
+//                                                   IsIconic-frozen for the
+//                                                   whole shrink (v7.5.1), the
+//                                                   fade presenter train
+//                                                   included, so the row is
+//                                                   NEVER re-presented: the one
+//                                                   red-glass blend rides the
+//                                                   entire animation while the
+//                                                   strips fade without it.
+//                                                   THE FIX is the train: its
+//                                                   IsIconic skip retires and
+//                                                   the row re-presents every
+//                                                   20 ms through the fade,
+//                                                   in lockstep with the
+//                                                   strips -- the ordinary-
+//                                                   unfocus behavior the field
+//                                                   already accepts -- and it
+//                                                   settles on THIS byte, the
+//                                                   inactive bar's own.
+// The transparent-glass flash therefore has NO window left. The v7.5.2
+// ordered present still owns the FIRST bake (inside WM_SYSCOMMAND
+// (SC_MINIMIZE), before DefWindowProc flips anything -- DwmFlush retires
+// the compose in flight, the row-first gray commit lands, the inactive
+// face renders, GdiFlush), and from v7.5.8 the fade presenter train owns
+// every frame after it: kicked by the WM_NCACTIVATE(FALSE) tail as the
+// flip lands, it re-presents the gray through the DWM's fade while the
+// window shrinks, the row and the strips dimming as one, and the settled
+// state is the field's gray -- Gdiplus::Color(128,43,43,43), the inactive
+// bar's row, byte for byte. The press frame (mouse down, not released)
+// keeps the key: SC_MINIMIZE only fires on the release. (The v7.4.0
+// receipt still bounds the design: an alpha-0 row cannot CARRY a color --
+// exactly what the active state wants -- carry nothing, show the DWM's
+// own border -- and exactly what the inactive and minimize states must
+// never do -- they need a delivered gray.)
 //
+// v7.5.9 THE TRAILING FLUSH, THE DESIGN LOCKED. The field's final spec,
+// verbatim: the active state "overlaps the current glass color with the
+// accent color (255,0,0,0 by default)" -- the glass key it has always
+// been -- and "any other state (especially minimizing which would
+// immediately do dwmflush after changing the top bar color to the
+// inactive state) is 128,43,43,43". The bytes already matched that spec
+// (g_sheetRowActive 0x00000000; g_sheetRowInactive ==
+// g_sheetRowMinimize == 0x802B2B2B); the machinery is the HEADER's now:
+// cwSheetOrderedPresent (below, after the kick) owns the WHOLE ordered
+// present -- the latch pre-flip, the gate, the v7.3.0 leading flush, the
+// row-first commit, the host's face, and the TRAILING DwmFlush INSIDE
+// the gate, before the handler returns and DefWindowProc flips the
+// placement -- the trailing flush blocks until a composition has
+// completed against the new bytes, so the landed state is SAMPLED, not
+// merely written. The header resolves DwmFlush itself (dwmapi.dll via
+// GetProcAddress -- the house trick), so a host carries no flush of its
+// own. The three-state latch stays as the release-to-flip guard. No byte
+// changed in v7.5.9.
+//
+// v7.5.10 THE ACCENT, SELF-FED. The field caught the DELIVERY, not the
+// bytes: focused at rest still read as a transparent glass (the v7.5.9
+// screenshot -- the sheet row cream, the edges default-gray, no red
+// anywhere). WHY: the accent was never the app's paint. The recipe lets
+// the DWM colorize row 0 from the REGISTRY ("show accent color on title
+// bars and window borders"), and that material only exists while Windows
+// itself draws it -- with the override off (or drifted away), the focused
+// key shows the BARE sheet: the transparent glass, again. THE FIX feeds
+// the DWM the accent directly: DWMWA_BORDER_COLOR (attribute 34, Win11
+// 21H2+) = the registry AccentColor (HKCU ...\Explorer\Accent, AABBGGRR
+// -- the alpha byte dropped), RGB(255,0,0) when the registry is silent --
+// the accent color "(255,0,0,0 by default)", the field's red. The DWM
+// renders that border on the FOCUSED window -- exactly where the glass
+// key waits -- and cwResetAccentBorder hands the border back to
+// DWMWA_COLOR_DEFAULT on every deactivation, so the accent is the
+// focused state's ALONE. The field's spec, verbatim: the top bar is the
+// half-alpha gray at all times, and the focused state EXCLUSIVELY uses
+// Color(255,0,0,0) -- the key -- with the accent glass over it. The
+// sheet-row bytes did not change (g_sheetRowActive 0x00000000;
+// g_sheetRowInactive == g_sheetRowMinimize 0x802B2B2B); what changed is
+// that the accent over the key no longer depends on a Windows toggle.
+// cwSeedAccentBorder / cwApplyAccentBorder / cwResetAccentBorder live in
+// the header (the house GetProcAddress trick -- no dwmapi.h, no import
+// lib, advapi32 loaded the same way for the registry read); the host
+// calls the apply at attach and on WM_DWMCOMPOSITIONCHANGED, and BOTH
+// directions inside WM_NCACTIVATE. Pre-Win11 the attribute call fails
+// harmlessly (g_cwAccentAttrLive 0) and the registry override -- when
+// the field turns it on -- colors the border the old way.
+//
+// THE THREE WRITERS (each lands the state's own constant; none ever measures):
 // THE THREE WRITERS (all land the same constant; none ever measures):
 //   * cwPatchSheetRow      -- row 0 of the HOST's bar buffer, inside the
 //                             host's bar paint (before its one blit).
@@ -804,95 +748,35 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 // which only catches up when WM_ACTIVATE runs after the transaction closes.
 // The gate (cwSheetRowGate) stands the presenter down while the GUI thread
 // is inside an ordered present (v7.3.1: a tick racing the handler would
-// otherwise re-land the row into the commit window; byte-idempotent now,
-// the gate is the belt it always was). The kick (cwSheetRowKick) restarts
+// otherwise re-land the row into the commit window; v7.5.4's split makes
+// the commits state-carrying again, the gate is the belt it always was).
+// The kick (cwSheetRowKick) restarts
 // the train; the SetEvent still orders the GUI writes before the thread's
 // reads.
-inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplus::Color(128,43,43,43)
-inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
+inline unsigned g_sheetRowActive   = 0x00000000u; // BGRA(0,0,0,0): the glass key, v7.5.4 restored -- the
+                                                  // DWM's own border shows through (the GDI+ fallback
+                                                  // paints Color(255,0,0,0)). v7.5.10: the accent over
+                                                  // the key is APP-FED now -- DWMWA_BORDER_COLOR = the
+                                                  // registry accent, RGB(255,0,0) silent -- the focused
+                                                  // state's exclusively (THE ACCENT, SELF-FED, above).
+inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3) --
+                                                  // the INACTIVE/DEFAULT byte (the GDI+ fallback paints
+                                                  // Gdiplus::Color(128,43,43,43) -- the field's default
+                                                  // state, v7.5.4 spec, unchanged)
+inline unsigned g_sheetRowMinimize = 0x802B2B2Bu; // v7.5.7 THE GRAY RETURNS: the release frame lands the
+                                                  // field's half-alpha gray -- Gdiplus::Color(128,43,43,
+                                                  // 43), byte for byte the INACTIVE bar's row. The opaque
+                                                  // v7.5.6 byte (0xFF2B2B2B) erased the row's color at the
+                                                  // release (the field: "the frame you release the mouse
+                                                  // for the minimize button, the top bar's color simply
+                                                  // disappears") -- the row must BLEND with the sheet the
+                                                  // way the inactive bar does, not occlude it. The
+                                                  // three-state latch STAYS: state 2 remains the
+                                                  // release-to-flip guard that keeps the alpha-0 glass key
+                                                  // from re-landing (the v7.5.5 race); only the byte it
+                                                  // lands changed.
 inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
 inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
-// v7.5.3a THE ANIMATION HOLD -- the focused state's timing gate. The header
-// arms it in its own WM_SYSCOMMAND(SC_MINIMIZE) ordered present (every
-// minimize source rides that message -- the caption button posts it since
-// v7.5.3a); the fade train releases it ~280 ms
-// into a presenting run -- the restore animation is over by then. While it
-// stands, cwSheetRowBytes lands the field's gray for BOTH states: every
-// frame of the shrink and the restore carries the same composited gray (the
-// v7.5.3 construction -- the transparent-glass flash is impossible), and
-// the gray never shows on a focused window that has no animation playing.
-inline std::atomic<bool> g_sheetRowAnim{false};
-// THE FOCUSED & IDLE ROW: the alpha-0 glass key (the v7.1.27..v7.5.2 active
-// byte) -- the DWM's own border, accent-colorized by the registry, shows
-// through untouched. Note the byte is Gdiplus::Color(0,0,0,0), NOT the
-// field's "Color(255,0,0,0)": a literal (255,0,0,0) is an OPAQUE black row
-// that covers the accent exactly like the gray does -- an alpha-0 row is
-// the only way the accent shows (the v7.4.0 receipt).
-inline unsigned g_sheetRowFocusIdle = 0x00000000u;
-// the sheet's own state now (v7.5.3b): the header extends the 1 px glass
-// sheet itself (cwSheetSetup, run from cwAttach and on
-// WM_DWMCOMPOSITIONCHANGED) and records whether row 0 has glass behind it
-// -- the header's writers (the commit and the train) must never land the
-// glass key over a bare row. Hosts that run their own sheet machinery can
-// still mirror theirs through the public cwSheetGlass().
-inline std::atomic<bool> g_sheetHasGlass{false};
-
-// v7.5.3b THE HEADER'S OWN DWMAPI SEAM -- the house trick (no dwmapi.h, no
-// link dependency): the three pointers are fetched once into function-local
-// statics, exactly how the host fetched its own. The sheet setup and
-// DwmFlush live in the header now, so a fresh consumer gets the exact
-// Windows 10 top edge from this file alone: the 1 px glass sheet under row
-// 0 (the DWM's colorized border shows through the focused alpha-0 key) and
-// the immersive dark mode attribute (without it the extended sheet paints
-// WHITE in light mode -- the documented light-mode border bug). Idempotent
-// with a host that runs its own copies (twinspeak does).
-typedef HRESULT (WINAPI *CwDwmFlushFn)();
-typedef HRESULT (WINAPI *CwDwmExtendFn)(HWND, const void*);
-typedef HRESULT (WINAPI *CwDwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
-typedef struct { int cxLeftWidth, cxRightWidth,
-                 cyTopHeight, cyBottomHeight; } CwMargins;
-inline CwDwmFlushFn cwDwmFlushPtr() {
-    static CwDwmFlushFn fn =
-        (CwDwmFlushFn)GetProcAddress(LoadLibraryA("dwmapi.dll"), "DwmFlush");
-    return fn;
-}
-inline CwDwmExtendFn cwDwmExtendPtr() {
-    static CwDwmExtendFn fn =
-        (CwDwmExtendFn)GetProcAddress(LoadLibraryA("dwmapi.dll"),
-                                      "DwmExtendFrameIntoClientArea");
-    return fn;
-}
-inline CwDwmSetAttrFn cwDwmSetAttrPtr() {
-    static CwDwmSetAttrFn fn =
-        (CwDwmSetAttrFn)GetProcAddress(LoadLibraryA("dwmapi.dll"),
-                                       "DwmSetWindowAttribute");
-    return fn;
-}
-inline void cwDwmFlush() {                     // retire the compose in flight (the v7.3.0 ordering)
-    if (CwDwmFlushFn fn = cwDwmFlushPtr()) fn();
-}
-inline bool cwSheetSetup(HWND w) {             // the sheet + the dark-mode border, one call
-    if (!w || !IsWindow(w)) return false;
-    if (CwDwmSetAttrFn set = cwDwmSetAttrPtr()) {
-        const int darkOn = 1;                  // attribute 20 since 1903, 19 on the early Insider builds
-        if (FAILED(set(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                       &darkOn, sizeof(darkOn))))
-            set(w, 19, &darkOn, sizeof(darkOn));
-    }
-    CwDwmExtendFn ext = cwDwmExtendPtr();
-    if (!ext) return false;
-    const CwMargins sheet = { 0, 0, 1, 0 };    // row 0 becomes the DWM's own top border
-    const bool on = SUCCEEDED(ext(w, &sheet));
-    g_sheetHasGlass.store(on, std::memory_order_release);
-    return on;
-}
-
-inline void cwSheetRowAnimHold(bool on) {      // armed at the minimize present; the train releases it
-    g_sheetRowAnim.store(on, std::memory_order_release);
-}
-inline void cwSheetGlass(bool on) {            // hosts that run their own sheet mirror it here
-    g_sheetHasGlass.store(on, std::memory_order_release);
-}
 inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
 inline HANDLE g_fadeThread = nullptr;        // created with the window, joined at stop
 inline std::atomic<bool> g_fadeQuit{false};
@@ -904,39 +788,48 @@ inline void*   g_rowBits = nullptr;
 inline int     g_rowW    = 0;
 
 inline unsigned cwSheetRowBytes(bool active) {
-    // v7.5.3a: the gray shows when INACTIVE or while an animation holds the
-    // row; focused & idle (and sheeted) the alpha-0 glass key lands and the
-    // DWM's accent border shows through.
-    if (active && !g_sheetRowAnim.load(std::memory_order_relaxed)
-               && g_sheetHasGlass.load(std::memory_order_relaxed))
-        return g_sheetRowFocusIdle;
     return active ? g_sheetRowActive : g_sheetRowInactive;
 }
-
-// v7.5.3f: THE TOP PIN IS RETIRED -- row 0 is the plain sheet byte again.
-// v7.5.3e composited the hover tint (and the close red) over this row so the
-// highlight reached the window's top edge the way the real DWM's runs behind
-// the border line; the field called the highlight back DOWN one real px
-// ("1px vertical"), so the border row is never covered now and the byte-
-// direct writers carry no patch state at all (no g_hovA reads on the row
-// path). The name keeps its v7.5.3e shape minus the tint: the sheet bytes,
-// top-down, every column.
-inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
-    const unsigned px = cwSheetRowBytes(active);
-    for (int x = 0; x < cw2; ++x) row[x] = px;
+// v7.5.6: the NC latch is a THREE-state: -1 never seen, 0 inactive /
+// default, 1 active (the glass key), 2 MINIMIZING -- the release-to-restore
+// transition. State 2 reads as INACTIVE for the face; v7.5.7: it lands the
+// HALF-ALPHA gray for the row -- byte for byte the inactive bar's row, the
+// field's Gdiplus::Color(128,43,43,43) (the opaque v7.5.6 byte vanished).
+// v7.5.8: state 2 is also what the fade presenter train lands while the
+// shrink runs -- the train is no longer IsIconic-skipped, so the row rides
+// the DWM's activation fade in lockstep with the strips and settles on
+// this byte (the essay above, THE SHRINK TRACKS THE FADE).
+inline unsigned cwSheetRowBytesState(int state) {
+    if (state == 1) return g_sheetRowActive;     // the glass key (focused, resting)
+    if (state == 2) return g_sheetRowMinimize;   // the release frame: the half-alpha gray,
+                                                 // the INACTIVE byte (v7.5.7)
+    return g_sheetRowInactive;                   // the half-alpha gray (inactive/default)
 }
 
-// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte
-// (v7.5.3f: the hover patch no longer touches the border row)
-inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+// v7.5.11: the inactive truth for the hover-end lapse. The host's
+// WM_NCACTIVATE writes the NC latch FIRST (0 inactive / 1 active / 2
+// minimizing -- the frame's own truth, readable inside the transaction);
+// a fresh consumer that never latches falls back to the foreground.
+inline bool cwWindowInactive(HWND w) {
+    const int latch = g_ncActive.load(std::memory_order_relaxed);
+    if (latch >= 0) return latch != 1;        // 0 and the minimizing 2: the inactive look
+    return GetForegroundWindow() != w;
+}
+
+// row 0 of a top-down 32bpp buffer (the host's bar DIB), the state's constant
+inline void cwPatchSheetRowPx(void* bits32, int cw, unsigned px) {
     if (!bits32 || cw <= 0) return;
-    cwSheetRowFill((unsigned*)bits32, cw, active);   // top-down: row 0 first
+    unsigned* row = (unsigned*)bits32;          // top-down: row 0 first
+    for (int x = 0; x < cw; ++x) row[x] = px;
+}
+inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+    cwPatchSheetRowPx(bits32, cw, cwSheetRowBytes(active));
 }
 
 // the ROW-FIRST COMMIT (v7.3.1): fill the private row DIB, blit 1 px,
 // GdiFlush. Buffer missing (the first frames): grown here -- the private
 // DIB makes the commit self-contained, the host's buffer is not required.
-inline void cwCommitSheetRowFast(HWND w, bool active) {
+inline void cwCommitSheetRowState(HWND w, int state) {
     if (!w || !IsWindow(w)) return;
     RECT cr;
     if (!GetClientRect(w, &cr) || cr.right <= 0) return;
@@ -968,8 +861,9 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {
         }
         g_rowW = cr.right;
     }
+    const unsigned px = cwSheetRowBytesState(state);
     unsigned* row = (unsigned*)g_rowBits;
-    cwSheetRowFill(row, cr.right, active);         // the plain sheet bytes (v7.5.3f: no patches on the row)
+    for (int x = 0; x < cr.right; ++x) row[x] = px;
     HDC wdc = GetDC(w);
     if (wdc) {
         BitBlt(wdc, 0, 0, cr.right, 1, g_rowDc, 0, 0, SRCCOPY);
@@ -977,7 +871,29 @@ inline void cwCommitSheetRowFast(HWND w, bool active) {
     }
     GdiFlush();                                 // the row is in the redirection surface
 }
+inline void cwCommitSheetRowFast(HWND w, bool active) {   // the v7.3.1 bool API
+    cwCommitSheetRowState(w, active ? 1 : 0);
+}
 
+// v7.5.5: the host may pre-flip the latch AHEAD of the messages -- the
+// SC_MINIMIZE ordered present writes its state before its present (the
+// release lands while the frame is still active; without the pre-flip, a
+// kicked presenter tick inside the release-to-flip window re-lands the
+// ACTIVE row byte -- the glass key -- over the ordered gray, and the
+// shrink bakes it). The latch is the ONE state every row writer reads;
+// flipping it first makes the impending state the frame's truth for
+// all of them.
+// v7.5.6: the pre-flip value is 2 (MINIMIZING), not 0. v7.5.5's latch(0)
+// stopped the key re-land and the field STILL saw the glass -- the
+// release-to-flip row was the HALF-ALPHA gray and the DWM blends it 50/50
+// with the sheet, whose material all through the shrink is the ACTIVE
+// registry accent. v7.5.7: state 2 routes every writer to the SAME
+// half-alpha gray as state 0 (the field's verdict -- the release frame is
+// the inactive bar's row, Gdiplus::Color(128,43,43,43)); the state stays
+// because the pre-flip -- not the byte -- is what keeps the alpha-0 key
+// off the surface. WM_NCACTIVATE(FALSE) must NOT downgrade a 2 (a
+// pre-flip FALSE re-commits state 2), and WM_NCACTIVATE(TRUE) (the
+// restore) re-latches 1 and the key returns with the fade.
 inline void cwSheetRowLatch(int state) {       // the frame's own truth (WM_NCACTIVATE writes FIRST)
     g_ncActive.store(state);                   // seq_cst: the presenter reads relaxed, the kick orders
 }
@@ -991,9 +907,163 @@ inline void cwSheetRowKick() {                 // non-blocking; safe from any me
     if (g_fadeKick) SetEvent(g_fadeKick);
 }
 
+// v7.5.9 THE ORDERED PRESENT, WHOLE, IN THE HEADER. The host's minimize
+// path used to assemble the present itself -- the latch pre-flip, the
+// gate, the leading flush, the row-first commit, the face -- and v7.5.9's
+// trailing flush sat in the host's SC_MINIMIZE block for exactly one
+// re-cut before the field moved it here ("make sure the trailing flush is
+// specifically in customWindow.h"). It is: the header resolves DwmFlush
+// ITSELF (dwmapi.dll, the house GetProcAddress trick -- same recipe as
+// the host's g_dwmFlush, self-contained, no dwmapi.h, no import lib) and
+// owns the whole sequence. state: the latch pre-flip (2 = the minimize
+// present; 0 = an ordinary unfocus present). face: the host's face
+// painter -- the multi-ms GDI+ bar render that ends in its own GdiFlush
+// -- or nullptr for a row-only present. The sequence, in order:
+//   cwSheetRowLatch(state)   the frame's truth flips FIRST (the v7.5.5
+//                            contract -- from this instant every row
+//                            writer answers the impending state);
+//   gate(true)               the presenter stands down for the present;
+//   DwmFlush                 the HEAD flush (v7.3.0): the compose in
+//                            flight retires, so no stale carrier exists;
+//   cwCommitSheetRowState    the row lands -- microseconds, before the
+//                            face render starts (v7.3.1);
+//   face(w)                  the host's face + row 0 + GdiFlush;
+//   DwmFlush                 v7.5.9 THE TRAILING FLUSH: the new bytes are
+//                            ON the surface (every commit path ends in
+//                            GdiFlush), so this blocks until a
+//                            composition has completed against them --
+//                            the landed state is SAMPLED, not merely
+//                            written, before the caller returns (the
+//                            SC_MINIMIZE handler returns into
+//                            DefWindowProc's placement flip);
+//   gate(false)              the presenter may resume. No kick here -- the
+//                            v7.5.5 no-kick contract holds: the kick
+//                            belongs to the caller's tail (the
+//                            WM_NCACTIVATE(FALSE) one) or to nobody.
+// The two flushes are no-ops when DwmFlush cannot be resolved or when
+// composition is unavailable (DwmFlush returns at once, non-blocking) --
+// the present degrades to the v7.5.2 ordering, never to disorder.
+inline HRESULT (WINAPI *g_cwDwmFlush)() = nullptr;   // resolved once, lazily (GUI thread)
+inline bool         g_cwDwmFlushTried   = false;
+
+inline void cwResolveDwmFlush() {
+    if (g_cwDwmFlushTried) return;
+    g_cwDwmFlushTried = true;
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    if (dwm) g_cwDwmFlush = (HRESULT (WINAPI*)())GetProcAddress(dwm, "DwmFlush");
+}
+
+inline void cwSheetOrderedPresent(HWND w, int state, void (*face)(HWND)) {
+    if (!w || !IsWindow(w)) return;
+    cwSheetRowLatch(state);
+    cwSheetRowGate(true);
+    cwResolveDwmFlush();
+    if (g_cwDwmFlush) g_cwDwmFlush();          // the head: retire the compose in flight (v7.3.0)
+    cwCommitSheetRowState(w, state);           // the row lands first -- the state's own byte
+    if (face) face(w);                         // the host's face + row 0 + GdiFlush
+    if (g_cwDwmFlush) g_cwDwmFlush();          // v7.5.9 THE TRAILING FLUSH: a composition has
+                                               // completed against the new bytes before this returns
+    cwSheetRowGate(false);
+}
+
+// v7.5.10 THE ACCENT, SELF-FED -- the machinery. The focused state's
+// border color, carried by the DWM's own border renderer so it composes
+// like every vanilla border on the machine (and rides the activation
+// fade with the strips), but FED BY THE APP so it cannot vanish with a
+// Windows toggle:
+//   * cwReadRegistryAccent -- HKCU\Software\Microsoft\Windows\Current-
+//     Version\Explorer\Accent : AccentColor (REG_DWORD, AABBGGRR; the
+//     alpha byte is the DWM's own business and is dropped), read ONCE
+//     through advapi32's RegGetValueA loaded the house way. Silent
+//     registry: the default stands -- RGB(255,0,0), the field's red,
+//     "the accent color (255,0,0,0 by default)".
+//   * cwSeedAccentBorder -- a host theme may pin the accent itself
+//     (skips the registry read forever).
+//   * cwApplyAccentBorder -- DWMWA_BORDER_COLOR (attribute 34) = the
+//     accent. Attribute-only, no surface work, safe inside the
+//     activation transaction. First failure pins g_cwAccentAttrLive 0
+//     (pre-Win11): every later call is a no-op and the registry
+//     override -- when on -- colors the border the old way.
+//   * cwResetAccentBorder -- DWMWA_COLOR_DEFAULT (0xFFFFFFFF): the DWM's
+//     own default again. The accent is the FOCUSED state's exclusively;
+//     no unfocused window ever carries it (the deactivation leg of
+//     WM_NCACTIVATE calls this -- the DWM mutes the border on its own,
+//     the reset is the belt).
+inline COLORREF g_cwAccentBorder   = 0x000000FFu; // COLORREF 0x00BBGGRR = RGB(255,0,0): the accent,
+                                                  // "(255,0,0,0 by default)" -- the field's red
+inline bool     g_cwAccentSeeded = false;        // the registry read ran once (GUI thread only)
+inline HRESULT (WINAPI *g_cwDwmSet)(HWND, DWORD, LPCVOID, DWORD) = nullptr; // DwmSetWindowAttribute,
+                                                                            // resolved once, lazily
+inline int      g_cwAccentAttrLive = -1;         // -1 untried, 1 attribute 34 works, 0 unsupported
+
+inline void cwResolveDwmSet() {
+    if (g_cwDwmSet) return;
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    if (dwm) g_cwDwmSet = (HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD))
+                          GetProcAddress(dwm, "DwmSetWindowAttribute");
+}
+
+inline void cwSeedAccentBorder(COLORREF c) {
+    g_cwAccentBorder = c;
+    g_cwAccentSeeded = true;
+}
+
+inline void cwReadRegistryAccent() {
+    if (g_cwAccentSeeded) return;
+    g_cwAccentSeeded = true;
+    typedef LSTATUS (WINAPI *TS_CW_REGVAL)(HKEY, LPCSTR, LPCSTR, DWORD,
+                                           LPDWORD, PVOID, LPDWORD);
+    HMODULE adv = LoadLibraryA("advapi32.dll");
+    if (!adv) return;
+    const TS_CW_REGVAL get = (TS_CW_REGVAL)GetProcAddress(adv, "RegGetValueA");
+    if (!get) return;
+    DWORD v = 0, sz = sizeof(v);
+    if (get(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent",
+            "AccentColor", 0x00000008u /* RRF_RT_REG_DWORD */, nullptr,
+            &v, &sz) == ERROR_SUCCESS && sz == sizeof(v)) {
+        // AABBGGRR -> COLORREF 0x00BBGGRR (the alpha byte is dropped)
+        g_cwAccentBorder = RGB((v >> 0) & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
+    }
+}
+
+inline void cwApplyAccentBorder(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    if (g_cwAccentAttrLive == 0) return;      // attribute 34 refused once -- the registry
+                                              // override (when on) carries the border
+    cwReadRegistryAccent();
+    cwResolveDwmSet();
+    if (!g_cwDwmSet) { g_cwAccentAttrLive = 0; return; }
+    const COLORREF col = g_cwAccentBorder;
+    g_cwAccentAttrLive = SUCCEEDED(g_cwDwmSet(w, 34 /* DWMWA_BORDER_COLOR */,
+                                             &col, sizeof(col))) ? 1 : 0;
+}
+
+inline void cwResetAccentBorder(HWND w) {
+    if (!w || !IsWindow(w) || g_cwAccentAttrLive != 1 || !g_cwDwmSet) return;
+    const DWORD def = 0xFFFFFFFFu;            // DWMWA_COLOR_DEFAULT
+    g_cwDwmSet(w, 34, &def, sizeof(def));
+}
+
 // the fade train (v7.2.15, moved here v7.5.3): re-presents row 0 from
 // OUTSIDE the message queue -- the DWM bakes the sheet blend at presentation
 // time (v7.1.30), and a starved repaint freezes it mid-fade.
+// v7.5.8 THE SHRINK TRACKS THE FADE: the train's IsIconic skip is RETIRED.
+// The v7.5.1 freeze silenced every FACE painter for the shrink (correct --
+// a re-landed face mid-animation is the taped flicker), but it took the ROW
+// presenter down with it, and the row is the one surface the DWM's
+// activation fade must see re-presented: the ordered present bakes the
+// gray ONCE over the sheet's still-ACTIVE material (the registry accent),
+// the flip starts the ~200 ms fade, the strips ride it -- and the frozen
+// train let that one red-tinted blend ride the ENTIRE shrink. The train now
+// ticks through the iconic state exactly as it ticks through an ordinary
+// unfocus: the row re-presents every 20 ms, blends with the sheet frame by
+// frame as the fade runs, dims in lockstep with the left/right/bottom
+// strips, and settles on the latch's byte -- the field's gray for the
+// minimize release (state 2), the key again on the restore (state 1).
+// IsWindowVisible STAYS: a HIDDEN window (the tray) has no surface worth
+// presenting to. The latch + the gate keep every tick state-carrying: no
+// tick can re-land a stale byte (the v7.5.5 race stays dead).
 inline DWORD WINAPI cwFadePresenter(LPVOID) {
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
@@ -1007,11 +1077,8 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
     void*   bits = nullptr;
     int     rowW = 0, ticks = 0;
     for (;;) {
-        // v7.5.3b PERF: the idle wait owns the thread until the next kick
-        // (the old 250 ms poll woke four times a second to present nothing;
-        // the presenting cadence itself is untouched -- 20 ms per tick).
         const bool kicked =
-            WaitForSingleObject(g_fadeKick, ticks ? 20 : INFINITE) == WAIT_OBJECT_0;
+            WaitForSingleObject(g_fadeKick, ticks ? 20 : 250) == WAIT_OBJECT_0;
         if (kicked) ticks = 20;               // every kick restarts the train
         else if (ticks) --ticks;
         if (!ticks) continue;                 // idle: the event owns the wait
@@ -1022,9 +1089,22 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
         const int nc = g_ncActive.load(std::memory_order_relaxed);
         if (nc < 0) continue;                 // no activation state latched yet
         HWND w = g_host;
-        if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+        // v7.5.8: no IsIconic here anymore -- the shrink tracks the fade
+        // (the block comment above). IsWindowVisible keeps the tray-hidden
+        // window out.
+        if (!w || !IsWindow(w) || !IsWindowVisible(w)) continue;
         RECT cr;
-        if (!GetClientRect(w, &cr) || cr.right <= 0) continue;
+        if (!GetClientRect(w, &cr) || cr.right <= 0) {
+            // v7.5.8: an iconic window can answer an EMPTY client rect, but
+            // the redirection surface keeps the pre-shrink width for the
+            // whole animation -- the cached DIB width is the truth there.
+            // (The grow branch below never fires from the cache: rowW is
+            // already the pre-shrink width by construction.) Resting-iconic
+            // ticks land the latch's byte on the hidden surface -- harmless,
+            // and the taskbar thumbnail shows the right border for it.
+            if (IsIconic(w) && rowW > 0) cr.right = rowW;
+            else continue;
+        }
         if (cr.right > rowW) {                // (re)grow the private row DIB
             if (bm) DeleteObject(bm);
             if (dc) { DeleteDC(dc); dc = nullptr; }
@@ -1042,21 +1122,18 @@ inline DWORD WINAPI cwFadePresenter(LPVOID) {
             if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
             rowW = cr.right;
         }
+        const unsigned px = cwSheetRowBytesState(nc);   // state bytes -- the key on 1, the field's
+                                                        // half-alpha gray on 2 (minimize, v7.5.7; the
+                                                        // shrink tracks the fade on it, v7.5.8) and
+                                                        // on 0 (inactive; the split itself is v7.5.4's)
         unsigned* row = (unsigned*)bits;
-        cwSheetRowFill(row, cr.right, nc != 0);        // the plain sheet bytes (v7.5.3f: no patches on the row)
+        for (int x = 0; x < cr.right; ++x) row[x] = px;
         HDC wdc = GetDC(w);
         if (wdc) {
             BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);
             ReleaseDC(w, wdc);
         }
         GdiFlush();                           // the strip is presented before the next tick
-        // v7.5.3a THE HOLD RELEASE: after ~280 ms of presenting ticks the
-        // restore animation is over -- drop the hold and re-kick so a fresh
-        // train bakes the focused glass key (the accent). The iconic guard
-        // above skips the shrink's ticks without presenting, so a minimize
-        // alone can never reach this line and release the hold early.
-        if (ticks <= 7 && g_sheetRowAnim.exchange(false, std::memory_order_acq_rel))
-            cwSheetRowKick();
         --ticks;
     }
     if (bm) DeleteObject(bm);
@@ -1115,26 +1192,6 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
     *out = 0;
     if (!g_enabled) return false;
     switch (msg) {
-    case WM_NCACTIVATE:
-        // v7.5.3b: the NC latch is latched HERE now, at the very top of
-        // the dispatch -- the frame's own truth (wParam carries the state
-        // the frame is flipping to), readable by every painter inside the
-        // activation transaction. The message itself keeps flowing to the
-        // host's own case and DefWindowProc.
-        if (!wp && g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
-        g_hovInactive = (wp == 0);    // v7.5.4: the hover ramps run twice the speed while inactive
-        cwSheetRowLatch(wp ? 1 : 0);
-        return false;
-    case WM_DWMCOMPOSITIONCHANGED:
-        // v7.5.3b: composition can restart under the window (driver reset,
-        // an RDP session) -- the {0,0,1,0} sheet is a geometry commitment
-        // to a DWM that no longer exists. The header re-runs its own sheet
-        // setup (re-extend + the dark-mode border; the glass flag follows
-        // the result), re-lands the bar and re-kicks the train. A host's
-        // own case, if it has one, still runs after this -- idempotent.
-        cwSheetSetup(w);
-        if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
-        return false;
     case WM_NCCALCSIZE: {
         // main.c verbatim: the client is the whole window MINUS the frame
         // insets on left/right/bottom (top only when maximized). The DWM
@@ -1143,9 +1200,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // caption OUTSIDE the window rect -- the real top border belongs to
         // the host's sheet/border row).
         if (!wp) return false;
-        const int frame_x = cwMetric(SM_CXFRAME);       // v7.5.3d: per-dpi metrics
-        const int frame_y = cwMetric(SM_CYFRAME);
-        const int padding = cwMetric(SM_CXPADDEDBORDER);
+        const int frame_x = GetSystemMetrics(SM_CXFRAME);
+        const int frame_y = GetSystemMetrics(SM_CYFRAME);
+        const int padding = GetSystemMetrics(SM_CXPADDEDBORDER);
         NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
         RECT* requested_client_rect = params->rgrc;
         requested_client_rect->right  -= frame_x + padding;
@@ -1187,7 +1244,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         cursor_point.y = GET_Y_PARAM(lp);
         ScreenToClient(w, &cursor_point);
         if (!cwIsMaximized(w) && cursor_point.y > 0 &&
-            cursor_point.y < cwMetric(SM_CYFRAME) + cwMetric(SM_CXPADDEDBORDER)) {
+            cursor_point.y < GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)) {
             *out = g_resizable ? HTTOP : HTBORDER;   // v7.5.1: the honest border
             return true;
         }
@@ -1205,9 +1262,18 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (PtInRect(&br.close, cursor_point)) nh = cwHovClose;
         else if (g_btnMax && PtInRect(&br.maximize, cursor_point)) nh = cwHovMax;
         else if (g_btnMin && PtInRect(&br.minimize, cursor_point)) nh = cwHovMin;
-        if (nh != g_hover) { g_hover = nh; cwHovAnimEnsure(); }   // the fade owns the repaints
-        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT, w, 0 };
-        TrackMouseEvent(&tme);          // the leave that starts the 100 ms fade-out
+        if (nh != g_hover) {
+            const int was = g_hover;
+            g_hover = nh;
+            // v7.5.11: leaving the minimize button on an INACTIVE window
+            // re-lands its face at 12.5% for a 100 ms fade; every other
+            // hover change clears clean
+            if (was == cwHovMin && nh == cwHovNone && cwWindowInactive(w))
+                cwMinRemnantBegin(w);
+            else
+                cwMinRemnantCancel();
+            cwRepaint();
+        }
         *out = DefWindowProcW(w, msg, wp, lp); return true; }
     case WM_NCLBUTTONDOWN:
         // the DOWN must not count as a drag start when a button is hovered
@@ -1218,13 +1284,7 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // destroy), minimize minimizes, maximize toggles (refused while
         // setCanWinResize(false) -- a dead button for a host that asked)
         if (g_hover == cwHovClose)      { PostMessageW(w, WM_CLOSE, 0, 0); *out = 0; return true; }
-        // v7.5.3a: the click rides WM_SYSCOMMAND(SC_MINIMIZE) now, not a
-        // raw ShowWindow -- the header's ordered present (the WM_SYSCOMMAND
-        // case below: the hold, DwmFlush, the row-first gray commit, the
-        // face, the kick) arms BEFORE DefWindowProc flips anything. A raw ShowWindow skipped
-        // all of it: the surface kept the focused glass key and the shrink
-        // flew transparent (the v7.5.4..v7.5.10 flash).
-        if (g_hover == cwHovMin)        { PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0); *out = 0; return true; }
+        if (g_hover == cwHovMin)        { ShowWindow(w, SW_MINIMIZE);      *out = 0; return true; }
         if (g_hover == cwHovMax && g_btnMax) {
             if (g_resizable) ShowWindow(w, cwIsMaximized(w) ? SW_RESTORE : SW_MAXIMIZE);
             *out = 0; return true;
@@ -1260,97 +1320,36 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
             *out = 0; return true;
         }
         return false;
-    case WM_NCMOUSELEAVE:
-        // the cursor left the window: the fade-out owns what is on screen now
-        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
-        return false;
-    case WM_TIMER:
-        // the hover fade train's own tick; every other timer is the host's
-        if (wp == kHovTimerId && g_hovTimerOn) { cwHovAnimTick(); *out = 0; return true; }
-        return false;
-    case WM_DPICHANGED: {
-        // v7.5.3d: the scale moved under the window (a system scale change, a
-        // dock, a drag across monitors). The header re-derives its own
-        // geometry (dpi, bar height, title font), applies the DWM's suggested
-        // rect, hands the host its hook (constants + fonts), then re-seats
-        // the tracked children at the new scale. Handled HERE -- the host's
-        // switch never sees it.
-        const UINT nd = HIWORD(wp);
-        if (nd && nd != cwDpi()) {
-            cwDpiChanged(nd);
-            g_barH = cwS(kBarHDesign);
-            const LPRECT r = (LPRECT)lp;
-            if (r) SetWindowPos(w, nullptr, r->left, r->top,
-                                r->right - r->left, r->bottom - r->top,
-                                SWP_NOZORDER | SWP_NOACTIVATE);
-            if (g_dpiHook) g_dpiHook();
-            cwRelayoutChildren();
-            if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
+    case WM_SYSCOMMAND:
+        if (!g_resizable) {
+            const UINT sc = (UINT)(wp & 0xFFF0);
+            if (sc == SC_MAXIMIZE || sc == SC_SIZE) { *out = 0; return true; }
         }
-        *out = 0; return true; }
-    case WM_SYSCOMMAND: {
-        const UINT sc = (UINT)(wp & 0xFFF0);
-        if (!g_resizable && (sc == SC_MAXIMIZE || sc == SC_SIZE)) { *out = 0; return true; }
-        // v7.5.3b THE ORDERED MINIMIZE PRESENT -- the header's now (the
-        // host's copy retired with the move). Every minimize source -- the
-        // caption button (posts this message since v7.5.3a), the taskbar,
-        // the system menu, the keyboard -- presents through this one
-        // recipe BEFORE DefWindowProc flips the placement iconic: the
-        // animation hold arms (the gray may show only while an animation
-        // plays), the gate stands the train down, the latch flips FIRST
-        // (the frame's own truth -- the repaint below answers through it
-        // and lands the INACTIVE face, the same bytes the
-        // WM_NCACTIVATE(FALSE) present would), DwmFlush retires the
-        // compose in flight, the row lands (the half-alpha gray,
-        // byte-idempotent -- the FACE is what this present orders), then
-        // the gate clears and the train kicks. The restore's own
-        // activation re-kicks; ~280 ms into that presenting run the train
-        // releases the hold and the focused glass key -- the DWM's accent
-        // border -- bakes once no animation is playing.
-        if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
-            // v7.5.4 THE RELEASE PRESENT DROPS THE HOVER -- the strip's half
-            // of the recipe. The field: "do the same type of thing as the
-            // window border's top bar where the moment you release the
-            // minimize button and have pressed it the titlebar's buttons go
-            // half-transparent for that period." The release IS this
-            // message: the WM_NCLBUTTONUP dispatch posts it (the caption
-            // button since v7.5.3a), and the taskbar, the system menu and
-            // the keyboard land here too. At this instant the cursor is
-            // still ON the button -- the hover is armed and its ramp sits
-            // at 255 -- so the untouched present would land that glyph FULL
-            // (glyphCol lifts it, the tint band on it), and nothing could
-            // ever correct the flight: the shrink shows whatever THIS
-            // present lands (the iconic freeze), and the hover fade-out the
-            // WM_NCACTIVATE clear starts dies on the same freeze. Zeroed
-            // before the repaint, every glyph lands the inactive half
-            // (glyphCol at pa = 0 = kGlyphInactiveAlpha), the band and the
-            // red go with it, and the ride down shows the settled inactive
-            // caption -- the exact frames the top bar's gray has ridden
-            // since v7.5.3, now with the strip on it. Every OTHER
-            // deactivation keeps its animated fade-out (WM_NCACTIVATE's
-            // clear, the doubled inactive speed); only the minimize handoff
-            // drops instantly, because only this present is the last paint
-            // the animation will ever sample. The restore's activation
-            // lands the active face and the full strip as before.
-            g_hover = cwHovNone;
-            g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;
-            cwSheetRowAnimHold(true);
-            cwSheetRowGate(true);
-            cwSheetRowLatch(0);
-            cwDwmFlush();
-            cwCommitSheetRowFast(w, false);
-            cwRepaint();                   // the inactive face + the half strip, through the latch answer
-            cwSheetRowGate(false);
-            cwSheetRowKick();
-        }
-        return false; }
+        return false;
     case WM_SETCURSOR:
         // the arrow instead of the busy cursor (main.c)
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return false;   // the host's DefWindowProc finishes the protocol
     case WM_MOUSEMOVE:
         // into the client = no caption button hovered
-        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        if (g_hover != cwHovNone) {
+            const int was = g_hover;
+            g_hover = cwHovNone;
+            if (was == cwHovMin && cwWindowInactive(w))
+                cwMinRemnantBegin(w);         // the v7.5.11 inactive lapse
+            else
+                cwMinRemnantCancel();
+            cwRepaint();
+        }
+        return false;
+    case WM_TIMER:
+        // v7.5.11: the inactive lapse's fade ticks -- the header's own
+        // slot only; the host's timers keep flowing to their owners
+        if (wp == kCwMinRemnantTimer) {
+            if (g_minRemnant) cwMinRemnantTick(w);
+            else if (w) KillTimer(w, kCwMinRemnantTimer);
+            *out = 0; return true;
+        }
         return false;
     default:
         if (g_trayUp && g_trayMsg && msg == g_trayMsg) {
@@ -1397,40 +1396,18 @@ inline void cwApplyFace(bool active, int col, int grad) {
 
 inline void changeWinTitlebarColor(int col)                      { cwd::g_faceCol = col; cwd::g_faceGrad = col; cwd::g_faceColIn = -1; cwd::g_faceGradIn = -1; cwd::cwRepaint(); }
 inline void changeWinTitlebarColor(int col, int gradColor)       { cwd::g_faceCol = col; cwd::g_faceGrad = gradColor; cwd::cwRepaint(); }
-// v7.5.5: the inactive face, the field's call -- the real Windows 10 dark
-// mode turns the bar GRAY on inactive and keeps it black on focused, and
-// that needs a distinct inactive face. One argument: solid (a gradient
-// between equal colors is exact). Two: the inactive gradient. -1 restores
-// the default: mirror the focused color (cwPaintBarBackground's rule).
-inline void setWinInactiveColor(int col)                         { cwd::g_faceColIn = col; cwd::g_faceGradIn = col; cwd::cwRepaint(); }
-inline void setWinInactiveColor(int col, int gradColor)          { cwd::g_faceColIn = col; cwd::g_faceGradIn = gradColor; cwd::cwRepaint(); }
 
-inline void setWinTitleTextColor(int color, int gradientCol,
-                                 int inactiveColor, int gradientInactiveCol) {
-    // v7.5.3c: ONE setter for both states (the changeWinTextColor /
-    // changeWinTextUnfocusedColor pair retired). The requested defaults --
-    // inactiveColor = color, gradientInactiveCol = gradientCol -- are
-    // spelled as overloads below (C++ function default arguments may not
-    // reference the parameters to their left; template defaults may, and
-    // the first draft leaned on that -- clang threw it right back).
-    // A gradientInactiveCol >= 0 paints the inactive gradient, < 0 paints
-    // inactiveColor solid (the painter's rule -- pass -1 for solid).
-    cwd::g_textCol = color;  cwd::g_textGrad = gradientCol;
-    cwd::g_textUn  = inactiveColor;
-    cwd::g_textUnGrad = gradientInactiveCol;
-    cwd::cwRepaint();
-}
-inline void setWinTitleTextColor(int color, int gradientCol, int inactiveColor) {
-    setWinTitleTextColor(color, gradientCol, inactiveColor, gradientCol);
-}
-inline void setWinTitleTextColor(int color, int gradientCol) {
-    setWinTitleTextColor(color, gradientCol, color, gradientCol);
-}
+inline void changeWinTextColor(int col)                          { cwd::g_textCol = col; cwd::g_textGrad = col; cwd::cwRepaint(); }
+inline void changeWinTextColor(int col, int gradColor)           { cwd::g_textCol = col; cwd::g_textGrad = gradColor; cwd::cwRepaint(); }
 
-// v7.5.3d: changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are
-// retired -- the hover is the fixed 10% tint now (the real thing's look is
-// not a color knob); v7.5.5: the tint's channel follows the face's HSL
-// lightness (white on a dark face, black on a light one) -- still no knob.
+inline void changeWinTextUnfocusedColor(int col)                 { cwd::g_textUn = col; cwd::g_textUnGrad = -1; cwd::cwRepaint(); }
+inline void changeWinTextUnfocusedColor(int col, int gradColor)  { cwd::g_textUn = col; cwd::g_textUnGrad = gradColor; cwd::cwRepaint(); }
+
+inline void changeWinMinimizeHoverColor(int col)                 { cwd::g_minHover = col; cwd::g_minHoverGrad = -1; cwd::cwRepaint(); }
+inline void changeWinMinimizeHoverColor(int col, int gradColor)  { cwd::g_minHover = col; cwd::g_minHoverGrad = gradColor; cwd::cwRepaint(); }
+
+inline void changeWinMaximizeHoverColor(int col)                 { cwd::g_maxHover = col; cwd::g_maxHoverGrad = -1; cwd::cwRepaint(); }
+inline void changeWinMaximizeHoverColor(int col, int gradColor)  { cwd::g_maxHover = col; cwd::g_maxHoverGrad = gradColor; cwd::cwRepaint(); }
 
 inline void changeWinTextFont(const std::string& font = "Segoe UI") {
     std::wstring wide(font.begin(), font.end());
@@ -1465,21 +1442,8 @@ inline void putWindowinTray(bool hide) {
 
 inline void cwAttach(HWND w, void (*repaint)(HWND)) {
     cwd::g_host = w; cwd::g_repaint = repaint;
-    cwd::cwSheetSetup(w);   // v7.5.3b: the sheet + the dark-mode border -- the header's own
 }
 inline void cwSetBarHeight(int px)                  { cwd::g_barH = px; }
-// v7.5.3d: the bar height is the header's own -- 33 design px at the header's
-// dpi. A host adopts this as its caption-height layout contract (the buffer
-// height, the content y offset) instead of deriving its own S(31).
-inline int  cwBarHeight()                           { return cwd::cwS(cwd::kBarHDesign); }
-inline UINT cwDpi()                                 { return cwd::cwDpi(); }   // v7.5.3d
-inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
-                         bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0) {   // v7.5.3d
-    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH);
-}
-inline void cwRelayoutChildren()                    { cwd::cwRelayoutChildren(); }
-inline void cwSetDpiHook(void (*hook)())            { cwd::cwSetDpiHook(hook); }
 inline void cwSetTrayHost(void (*hide)(HWND), void (*show)(HWND)) {
     cwd::g_trayHide = hide; cwd::g_trayShow = show;
 }
@@ -1490,16 +1454,16 @@ inline void cwSeedTitleFont(const std::string& face, int px, int weight) {
 }
 // per-theme seed of every chrome color (twinspeak's applyTheme re-seeds on
 // every theme switch). inactive face defaults to mirroring the active one.
-// v7.5.3d: the hover-color pair is gone from the seed -- the tint owns it.
 inline void cwSeedChrome(int faceCol, int faceGrad,
                          int faceColIn, int faceGradIn,
                          int textCol, int textGrad, int textUn,
-                         int glyphCol) {
+                         int glyphCol, int minHover, int maxHover) {
     cwd::g_faceCol = faceCol;   cwd::g_faceGrad = faceGrad;
     cwd::g_faceColIn = faceColIn < 0 ? faceCol  : faceColIn;
     cwd::g_faceGradIn = faceGradIn < 0 ? faceGrad : faceGradIn;
     cwd::g_textCol = textCol;   cwd::g_textGrad = textGrad;
     cwd::g_textUn = textUn;     cwd::g_glyph = glyphCol;
+    cwd::g_minHover = minHover; cwd::g_maxHover = maxHover;
     cwd::cwRepaint();
 }
 inline DWORD cwFrameStyle() {
@@ -1531,46 +1495,64 @@ inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
 inline void cwCommitSheetRowFast(HWND w, bool active) {
     cwd::cwCommitSheetRowFast(w, active);
 }
+inline void cwCommitSheetRowState(HWND w, int state) {
+    cwd::cwCommitSheetRowState(w, state);
+}
+inline void cwPatchSheetRowPx(void* bits32, int cw, unsigned px) {
+    cwd::cwPatchSheetRowPx(bits32, cw, px);
+}
+inline unsigned cwSheetRowBytesState(int state) {
+    return cwd::cwSheetRowBytesState(state);
+}
 inline void cwSheetRowGate(bool on)    { cwd::cwSheetRowGate(on); }
 inline void cwSheetRowKick()           { cwd::cwSheetRowKick(); }
+inline void cwSheetOrderedPresent(HWND w, int state, void (*face)(HWND)) {
+    cwd::cwSheetOrderedPresent(w, state, face);
+}
 inline void cwSheetRowLatch(int state) { cwd::cwSheetRowLatch(state); }
 inline int  cwSheetRowLatchValue()     { return cwd::cwSheetRowLatchValue(); }
 inline void cwSheetPresenterStart(HWND w) { cwd::cwSheetPresenterStart(w); }
 inline void cwSheetPresenterStop()        { cwd::cwSheetPresenterStop(); }
-// v7.5.3a: the animation hold + the sheet mirror (see the essay above)
-inline void cwSheetRowAnimHold(bool on)   { cwd::cwSheetRowAnimHold(on); }
-inline void cwSheetGlass(bool on)         { cwd::cwSheetGlass(on); }
+
+// v7.5.10: the accent border, self-fed (the focused state's exclusively)
+inline void cwSeedAccentBorder(COLORREF c) { cwd::cwSeedAccentBorder(c); }
+inline void cwApplyAccentBorder(HWND w)     { cwd::cwApplyAccentBorder(w); }
+inline void cwResetAccentBorder(HWND w)     { cwd::cwResetAccentBorder(w); }
 
 #else  /* !_WIN32 -- the stub target: the API exists, does nothing ---------- */
 
 inline void enableCustomWin(bool)                                      {}
 inline void changeWinTitlebarColor(int)                                {}
 inline void changeWinTitlebarColor(int, int)                           {}
-inline void setWinInactiveColor(int)                                   {}
-inline void setWinInactiveColor(int, int)                              {}
-inline void setWinTitleTextColor(int, int, int, int)                   {}
-inline void setWinTitleTextColor(int, int, int)                        {}
-inline void setWinTitleTextColor(int, int)                             {}
+inline void changeWinTextColor(int)                                    {}
+inline void changeWinTextColor(int, int)                               {}
+inline void changeWinTextUnfocusedColor(int)                           {}
+inline void changeWinTextUnfocusedColor(int, int)                      {}
 inline void changeWinTextFont(const std::string& = "Segoe UI")         {}
 inline void enableWinIcon(bool)                                        {}
 inline void setWinTitlebarButtonLayout(bool, bool)                     {}
 inline void setCanWinResize(bool)                                      {}
+inline void changeWinMinimizeHoverColor(int)                           {}
+inline void changeWinMinimizeHoverColor(int, int)                      {}
+inline void changeWinMaximizeHoverColor(int)                           {}
+inline void changeWinMaximizeHoverColor(int, int)                      {}
 inline void putWindowinTray(bool)                                      {}
-inline int  cwBarHeight()                                              { return 33; }
-inline void cwTrackChild(void*, int, int, int, int, bool, void*, int)  {}
-inline void cwRelayoutChildren()                                       {}
-inline void cwSetDpiHook(void (*)())                                   {}
 inline void cwSeedSheetRow(unsigned, unsigned)                         {}
 inline void cwPatchSheetRow(void*, int, bool)                          {}
+inline unsigned cwSheetRowBytesState(int)                              { return 0; }
+inline void cwPatchSheetRowPx(void*, int, unsigned)                    {}
 inline void cwCommitSheetRowFast(void*, bool)                          {}
+inline void cwCommitSheetRowState(void*, int)                          {}
 inline void cwSheetRowGate(bool)                                       {}
 inline void cwSheetRowKick()                                           {}
+inline void cwSheetOrderedPresent(void*, int, void (*)(void*))         {}
 inline void cwSheetRowLatch(int)                                       {}
 inline int  cwSheetRowLatchValue()                                     { return -1; }
 inline void cwSheetPresenterStart(void*)                               {}
 inline void cwSheetPresenterStop()                                     {}
-inline void cwSheetRowAnimHold(bool)                                   {}
-inline void cwSheetGlass(bool)                                         {}
+inline void cwSeedAccentBorder(COLORREF)                               {}
+inline void cwApplyAccentBorder(void*)                                 {}
+inline void cwResetAccentBorder(void*)                                 {}
 
 #endif /* _WIN32 */
 
