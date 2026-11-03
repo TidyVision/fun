@@ -7919,7 +7919,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.5 |  %s",  // v7.6.5 maximized, the close runs 2px thinner AND 2px off the window edge (44 + a 2px face gap at 96dpi) with the min/max pair and the stack anchor kept (46/45/44+2); the hovers reach row 0 on every path; the maximized restore icon is 1px smaller; an unhover slower than 250ms gets no fade at all
+    snprintf(vbuf, sizeof(vbuf), "v7.6.6 |  %s",  // v7.6.6 the quarter pixel (45.75 + 0.25, the same 46 stride), the maximized stack 1px wider (47/46/45+2), the lapse cap at 100ms, the restored band at row 1 (y=1, one px shorter), the row-0 blue blend gone, the maximized min line and close X one design px smaller; uDWM.dll decompiled -- the native stack is 46/46/47 contiguous, close 1px wider, right edge minus one
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
