@@ -7919,7 +7919,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + capNow) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.6 |  %s",  // v7.6.6 the quarter pixel (45.75 + 0.25, the same 46 stride), the maximized stack 1px wider (47/46/45+2), the lapse cap at 100ms, the restored band at row 1 (y=1, one px shorter), the row-0 blue blend gone, the maximized min line and close X one design px smaller; uDWM.dll decompiled -- the native stack is 46/46/47 contiguous, close 1px wider, right edge minus one
+    snprintf(vbuf, sizeof(vbuf), "v7.6.7 |  %s",  // v7.6.7 the decompile comparison: the native hover fills the whole button rect (group rect top 0, uDWM 0x6a90) while the native buttons sit at margins.top+1 (0x21bc0) -- v7.6.6 read "y=1" as the band's top too, leaving the glass key (the accent) shining above the red; now the band owns row 0 in BOTH states and every patch composites over the opaque face row (cwFaceRowBytes), never over the glass key
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8) + capNow, S(866), S(30) + capNow };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);

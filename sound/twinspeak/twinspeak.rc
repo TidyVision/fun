@@ -1,4 +1,4 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump; v7.5.4: version bump; v7.5.5: version bump; v7.6.0: version bump; v7.6.1: version bump; v7.6.2: version bump; v7.6.3: version bump; v7.6.4: version bump; v7.6.5: version bump; v7.6.6: version bump
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump; v7.5.4: version bump; v7.5.5: version bump; v7.6.0: version bump; v7.6.1: version bump; v7.6.2: version bump; v7.6.3: version bump; v7.6.4: version bump; v7.6.5: version bump; v7.6.6: version bump; v7.6.7: version bump
 // (maximized, the CLOSE button runs 2px thinner AND 2px more to the left --
 // its right edge two design px off the window edge, the min/max pair and
 // the stack's total anchor kept: 46/45/44 + the 2px gap at 96 dpi, the
@@ -179,8 +179,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,6,6,0
-PRODUCTVERSION  7,6,6,0
+FILEVERSION     7,6,7,0
+PRODUCTVERSION  7,6,7,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -191,12 +191,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.6.6.0"
+            VALUE "FileVersion",      "7.6.7.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.6.6.0"
+            VALUE "ProductVersion",   "7.6.7.0"
         END
     END
     BLOCK "VarFileInfo"

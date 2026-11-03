@@ -787,9 +787,9 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // v7.6.3: the icon and the title ride the EFFECTIVE bar height (the
     // button rects carry their own).
     const int bhEff = cwEffBarH();
-    // v7.6.6: the maximized-only rules live on ONE bool -- the hover band's
-    // top (row 0 maximized, row 1 restored) and the maximized glyphs' 1px
-    // shrink (below).
+    // v7.6.7: maxedW now drives the MAXIMIZED GLYPHS only (the 1px shrink
+    // below) -- the hover band is state-independent since v7.6.7 (the band
+    // owns row 0 in both states; the decompile split the two geometries).
     const bool maxedW = w && cwIsMaximized(w);
     const int item = active ? (g_glyph < 0 ? g_textCol : g_glyph) : g_textUn;
     // v7.5.4: the inactive glyphs are HALF there (task manager shows it) --
@@ -830,19 +830,21 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // The byte-direct row writers composite the same bands over row 0
     // (cwSheetRowFill), so every path -- buffered blit, pre-flip commit,
     // fade train -- agrees with this one.
-    // v7.6.6 THE RESTORED BAND DROPS TO ROW 1 -- the field: "on the normal
-    // unmaximized state, change the titlebar button y to be 1 because
-    // that's how I like it, and reduce the height by 1px in that state
-    // too." One shift, both halves: the restored band starts at ROW 1 (the
-    // button rects' own top, under the sheet row) and is one real px
-    // shorter for it. The MAXIMIZED band stays pinned to row 0 -- the real
-    // thing's maximized highlight still owns the very top edge. Row 0 on a
-    // restored window is never patched again (the byte-direct writers
-    // carry the same rule), so the red can never blend with the glass
-    // there either.
-    auto hoverBand = [maxedW](const RECT& r) {
+    // v7.6.6 asked the band to follow the field's "y = 1" restored button
+    // request and dropped the RESTORED band to row 1 -- that read the two
+    // geometries as one. The decompile splits them: the native BUTTONS sit
+    // at y = margins.top + 1 (0x21bc0 -- the field's y = 1, kept in the
+    // rects), while the native HOVER fills the whole button rect under the
+    // group rect whose top is 0 (0x6a90) -- the highlight owns the border
+    // row in BOTH states (the reference shot's red runs y 0..20).
+    // v7.6.7 THE BAND OWNS ROW 0, BOTH STATES -- and the byte-direct
+    // writers composite the same rule over the OPAQUE face row
+    // (cwFaceRowBytes), never over the glass key, so the accent can never
+    // blend into the patch. The glass key returns the moment no hover
+    // alpha is standing (the idle border line, the native look).
+    auto hoverBand = [](const RECT& r) {
         RECT h = r;
-        h.top    = maxedW ? 0 : 1;   // v7.6.6: row 0 maximized, row 1 restored
+        h.top    = 0;                // v7.6.7: row 0 in both states
         h.bottom -= 2;
         return h;
     };
@@ -1206,6 +1208,20 @@ inline HBITMAP g_rowBm   = nullptr;
 inline void*   g_rowBits = nullptr;
 inline int     g_rowW    = 0;
 
+// v7.6.7: THE OPAQUE FACE ROW -- the maximized row-0 byte, factored out so
+// every hover patch can base on it. Native receipt (uDWM.dll): the button
+// hover is its own DirectComposition visual sitting ON TOP of the frame
+// visuals -- when it lights, it REPLACES the border row, it never blends
+// with the glass under it. So any pixel a hover patch owns must be
+// delivered opaque, over the face, never over the alpha-0 glass key.
+inline unsigned cwFaceRowBytes(bool active) {
+    const int face = active ? g_faceCol
+                            : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int r = cwChannel(face, 16), g2 = cwChannel(face, 8), b = cwChannel(face, 0);
+    return 0xFF000000u | ((unsigned)b << 16)
+         | ((unsigned)g2 << 8) | (unsigned)r;
+}
+
 inline unsigned cwSheetRowBytes(bool active) {
     // v7.6.3: MAXIMIZED -- the fake top border does not exist on the real
     // thing's maximized frame. The sheet is withdrawn ({0,0,0,0}, the
@@ -1215,8 +1231,6 @@ inline unsigned cwSheetRowBytes(bool active) {
     // window. The byte is PREMULTIPLIED BGRA like its siblings (the face's
     // own alpha usually carries it at 255).
     if (g_host && cwIsMaximized(g_host)) {
-        const int face = active ? g_faceCol
-                                : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
         // v7.6.6: OPAQUE, ALWAYS -- the face's own alpha byte no longer
         // rides. A sub-255 face alpha made the row byte translucent, and
         // whatever the DWM keeps behind the client (the accent) blended
@@ -1224,10 +1238,10 @@ inline unsigned cwSheetRowBytes(bool active) {
         // see at the 0px row that appears when I hover the close button."
         // The premultiply collapses with a = 255, so row 0 on a maximized
         // window is the plain opaque face byte and can never blend with
-        // anything behind it again.
-        const int r = cwChannel(face, 16), g2 = cwChannel(face, 8), b = cwChannel(face, 0);
-        return 0xFF000000u | ((unsigned)b << 16)
-             | ((unsigned)g2 << 8) | (unsigned)r;
+        // anything behind it again. (v7.6.7: the expression lives in
+        // cwFaceRowBytes now -- the hover patch bases on it in BOTH
+        // states, see cwSheetRowFill.)
+        return cwFaceRowBytes(active);
     }
     // v7.5.3a: the gray shows when INACTIVE or while an animation holds the
     // row; focused & idle (and sheeted) the alpha-0 glass key lands and the
@@ -1284,10 +1298,12 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
         return;
     }
     // the bands, straight off the painter's geometry: the rects of THIS
-    // width, the band top pinned to row 0 MAXIMIZED only (v7.6.6: on a
-    // RESTORED window the band starts at row 1 -- row 0 is never patched,
-    // the sheet bytes stay plain), the bottom two real px short
-    // (row 0 is inside the band whenever the band's bottom is past it).
+    // width, the band top pinned to ROW 0 in BOTH states (v7.6.7 -- the
+    // native group rect's top is 0 and the real thing's hover fills the
+    // whole button rect: the reference shot's red runs y 0..20; v7.6.6's
+    // restored row-1 band left the glass key shining above the red -- the
+    // field's "when I hover the close button that blue line appears"),
+    // the bottom two real px short.
     const CwButtonRects br = cwButtonRects(cw2);
     const int seam = cwHovSeamPx();
     const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
@@ -1297,10 +1313,20 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
                                : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
     const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
     const int closeCol = (int)(g_closeHover & 0xFFFFFF);
-    // v7.6.6: MAXIMIZED ONLY -- the restored band starts at row 1, so row 0
-    // is never inside it (the sheet bytes stay plain there).
-    const bool rowInBand = g_host && cwIsMaximized(g_host)
-                        && (br.close.bottom - 2) > 0;
+    // v7.6.7: BOTH STATES -- row 0 is inside the band whenever the band's
+    // bottom is past it (it always is: the rects' own bottom runs to the
+    // bar's floor).
+    const bool rowInBand = g_host && (br.close.bottom - 2) > 0;
+    // v7.6.7: THE PATCH BASE IS THE OPAQUE FACE ROW -- the native hover
+    // visual replaces the border line, it does not blend with the glass
+    // behind it. Over the alpha-0 glass key (restored, focused idle) a
+    // patch delivered sub-255 alpha let the accent blend INTO the red --
+    // the blue line. Over the opaque face the premultiply collapses
+    // (oA = pa + 255*(255-pa)/255 = 255): the fade runs face -> red at a
+    // constant opaque alpha, row 0 ends pure red at full hover, and the
+    // glass key returns the moment the ramps rest at zero (the border
+    // line comes back for the idle look, exactly like the native frame).
+    const unsigned facePx = cwFaceRowBytes(active);
     for (int x = 0; x < cw2; ++x) {
         int pa = 0, col = 0;
         if (rowInBand) {
@@ -1311,7 +1337,7 @@ inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
             else if (aMin  > 0 && x >= br.minimize.left  && x < br.minimize.right  - seam)
                 { pa = aMin;  col = tintCol;  }
         }
-        row[x] = (pa > 0) ? cwRowPatchOver(px, pa, col) : px;
+        row[x] = (pa > 0) ? cwRowPatchOver(facePx, pa, col) : px;
     }
 }
 
