@@ -5095,6 +5095,35 @@ static void guiStripGpuRelease();   // v7.0.7 (defined with the tab strip)
 // (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
 // itself -- v7.0.9 paints the bar from the live guic:: colors instead.)
 
+// v7.6.13 THE CAPTION WEARS THE THEME AGAIN. The field, after v7.6.12: "I
+// just see a black window without the custom color and custom titlebar
+// font." The native restart retired the custom bar -- and with it the
+// theme-seeded caption color; the native caption rendered in the system's
+// own gray-black and the whole window read as a system rectangle. Windows
+// 11 answers the color half natively: DWMWA_CAPTION_COLOR (35) and
+// DWMWA_TEXT_COLOR (36) paint the REAL caption with the app's colors while
+// every button, glyph, hover, snap layout and resize edge stays Windows'
+// own -- no custom window involved, the v7.6.12 contract stands. The colors
+// are the bar's own: the face melts to cBg (the client's background, so
+// caption and client read as one surface), and the text takes the exact
+// pair the custom bar drew -- dark themes: the cyan-gray title gradient's
+// top stop (160,200,205); light themes: cText (the v7.5.0 seed's luma
+// branch). Windows 10 has no such attributes: the calls fail and the
+// caption stays system-colored. The FONT half has no native answer at all
+// -- see the changelog's second section.
+static void guiApplyDwmCaption() {
+    typedef HRESULT (WINAPI *TS_DWMSA13)(HWND, DWORD, LPCVOID, DWORD);
+    const TS_DWMSA13 dwmSet = (TS_DWMSA13)GetProcAddress(
+        LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+    if (!dwmSet || !g_hwnd || !IsWindow(g_hwnd)) return;
+    const bool dark = ((GetRValue(guic::cBg) * 77 + GetGValue(guic::cBg) * 150 +
+                        GetBValue(guic::cBg) * 29) >> 8) < 128;   // Rec.601-ish luma (the v7.5.0 branch)
+    const COLORREF face = guic::cBg;
+    const COLORREF text = dark ? RGB(160, 200, 205) : guic::cText;
+    dwmSet(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &face, sizeof(face));
+    dwmSet(g_hwnd, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof(text));
+}
+
 // v7.0.0: live theme switch -- commit colors + brushes, then ONE synchronous
 // repaint of the whole tree, bar included, so nothing can show old colors.
 static void applyTheme(int i) {
@@ -5114,6 +5143,7 @@ static void applyTheme(int i) {
     TSREBR(g_brPanel2, guic::cPanel2);
     TSREBR(g_brLog,    guic::cLogBg);
     #undef TSREBR
+    guiApplyDwmCaption();   // v7.6.13: the native caption re-seeds with the theme (Win 11)
     if (g_hwnd) {
         SetWindowTextA(GetDlgItem(g_hwnd, IDC_THEME), t.name);
         // v7.6.12: no bar to recolor synchronously -- the native caption
@@ -6999,6 +7029,10 @@ static bool guiCreateRealWindow() {
                 dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
             }
         }
+        // v7.6.13: the caption is BORN in the theme's colors -- the boot
+        // applyTheme ran before this window existed (and this seed is what
+        // colors it if the theme is never switched).
+        guiApplyDwmCaption();
     }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
     tsAddSysExit(g_hwnd);
@@ -7240,7 +7274,13 @@ static void guiRestoreWindow() {
     // v7.4.11: the arm is FORCED -- the tray owns the foreground after
     // the click and this process holds no grant; the plain replay would
     // exit at its guard every time (see tsReplayActivation).
-    if (wasHidden) { g_tbCycle = 2; g_tbForce = true; }
+    if (wasHidden) {
+        g_tbCycle = 2; g_tbForce = true;
+        // v7.6.13: the first-frame belt rides every show-from-hidden too
+        // (same reasoning as the plain-launch show in guiMain).
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+        UpdateWindow(g_hwnd);
+    }
     // v7.1.26: no ITaskbarList::AddTab anymore -- the native button arrives
     // with the show, full-size and fully labeled (see the taskbar note above).
     guiClampToWorkArea(g_hwnd);              // v7.1.20: survive dead monitors
@@ -7343,7 +7383,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(479) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.6.12 |  %s",   // v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window is a plain WS_OVERLAPPEDWINDOW now: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story are Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome is not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay); the client begins just below the native caption and every child coordinate is plain design px -- the kCapH offsets, the bar buffers, the sheet row, the fade presenter, the WM_NCACTIVATE/WM_NCPAINT present machinery and the v7.6.11 dpi guards are all retired
+    snprintf(vbuf, sizeof(vbuf), "v7.6.13 |  %s",   // v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption takes the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" is back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window is a plain WS_OVERLAPPEDWINDOW now: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story are Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome is not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay); the client begins just below the native caption and every child coordinate is plain design px -- the kCapH offsets, the bar buffers, the sheet row, the fade presenter, the WM_NCACTIVATE/WM_NCPAINT present machinery and the v7.6.11 dpi guards are all retired
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7484,6 +7524,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const int cw = crc.right, ch = crc.bottom;
         if (guiFrameBufEnsure(cw, ch)) {
             guiPaintFrame(g_frmDc, cw, ch);
+            // v7.6.13 THE FIRST-FRAME RECEIPT: once, the log pane gets the
+            // rendered buffer's own center pixel next to the theme color.
+            // A future "black window" report reads straight from it: buffer
+            // black + theme colored = the render failed; buffer colored +
+            // screen black = the present (the DWM side) lagged -- and the
+            // erase belt above makes even that state theme-colored.
+            static bool s_firstFrameLogged = false;
+            if (!s_firstFrameLogged) {
+                s_firstFrameLogged = true;
+                const COLORREF px = GetPixel(g_frmDc, cw / 2, ch / 2);
+                tlog("[twinspeak] gui           : first buffered frame -- center RGB %02x%02x%02x, theme bg RGB %02x%02x%02x\n",
+                     GetRValue(px), GetGValue(px), GetBValue(px),
+                     GetRValue(guic::cBg), GetGValue(guic::cBg), GetBValue(guic::cBg));
+            }
             BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                    g_frmDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
@@ -7493,13 +7547,31 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }   // v7.5.1: the not-iconic paint body
         EndPaint(w, &ps);
         return 0; }
-    case WM_ERASEBKGND:
+    case WM_ERASEBKGND: {
         // The class brush went stale after the first applyTheme (deleted +
         // recreated) -- that is why erase is answered here, not by the class.
-        // v7.0.9: it now does NOTHING: the buffered WM_PAINT covers every
-        // pixel, and a fill here would only hand DWM a blank intermediate
-        // frame (the watermark flicker).
-        return 1;
+        // v7.0.9: it did NOTHING: the buffered WM_PAINT covered every pixel,
+        // and a fill here would only hand DWM a blank intermediate frame
+        // (the watermark flicker).
+        // v7.6.13 THE NEVER-BLACK BELT: the field's v7.6.12 report ("I just
+        // see a black window") makes the no-erase contract too dangerous to
+        // keep -- with the class brush nullptr, any repaint cycle whose
+        // buffered blit fails or never runs leaves the client's bytes
+        // UNDEFINED and the DWM composites the surface's birth color: black.
+        // The erase now fills the update region with the THEME BACKGROUND
+        // itself. An intermediate frame can only ever be the theme's own
+        // flat color -- the exact first fill the buffered paint lays anyway
+        // -- so v7.0.9's blank intermediate no longer exists (nothing to
+        // flicker) and an unpainted client is structurally impossible.
+        HDC edc = (HDC)wp;
+        RECT er;
+        if (edc && GetClipBox(edc, &er) != ERROR) {
+            HBRUSH br = g_brBg;
+            if (!br) br = CreateSolidBrush(guic::cBg);
+            FillRect(edc, &er, br);
+            if (br != g_brBg) DeleteObject(br);
+        }
+        return 1; }
     case WM_CTLCOLORBTN: {
         // v7.5.2 THE ERASE IS NOTHING (the tab-switch/deactivate flicker).
         // The field: "the 'start engine', 'apply+restart', 'save ini',
@@ -8313,6 +8385,16 @@ static int guiMain(const std::string& iniPath, bool startTray) {
         // suppress ShowWindow activation; on an already-active window
         // they are no-ops.
         ShowWindow(g_hwnd, SW_SHOW);   // v7.4.7: activating show -- the taskbar button rides it
+        // v7.6.13 THE FIRST-FRAME BELT: the v6.6.5 pre-render validated the
+        // update region while the window was HIDDEN. If that hidden render
+        // ever fails, the shown window displays the failed surface with an
+        // EMPTY update region -- nothing would ever repaint it (the field's
+        // black window). One invalidate + synchronous repaint after the show
+        // re-runs WM_PAINT on the VISIBLE window: the same buffered bytes
+        // (a no-op visually when the pre-render worked, a corrected first
+        // frame when it did not).
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+        UpdateWindow(g_hwnd);
         // v7.1.20 THE FOCUS FIX: SW_SHOWNA alone left the first-open window
         // UNFOCUSED -- keyboard dead until the first click (the tray path
         // always foregrounded; the double-click path never did). The v6.6.5
