@@ -598,54 +598,61 @@ inline void cwRelayoutChildren() {
 inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
-// Client coordinates over a bar 0..g_barH tall, buttons 45.75 design px
-// wide with a 0.25 design px gap (v7.6.0: two narrower than the sample's
-// 47; v7.6.2: 45.5 + a 0.5 gap -- half a pixel back, the field's call;
-// v7.6.6: 45.75 + 0.25 -- the same 46 stride, the quarter pixel now in
-// the GAP, the field's Windows-does-it guess), stacked from the right
-// edge: close always; then maximize (if present); then minimize. With
-// maximize off, minimize sits beside close -- the twinspeak geometry,
-// minus the field's two pixels plus the half one.
+// v7.6.9 THE NATIVE CHAIN, DPI-AGNOSTIC -- the field: "Make the math DPI
+// agnostic, which is what I want. I want 100% accuracy of the objects'
+// alignment." Every width now derives from the decompile's own chain
+// (0x222a8) instead of design-px guesses, so the layout lands on the
+// native pixels at ANY scale by construction:
+//     cysize = MulDiv(22, dpi, 96)        -- SM_CYSIZE at the dpi
+//     glyph  = round(cysize * 21 / 22)
+//     w_max  = round(glyph * 48 / 22)     w_close = round(glyph * 49 / 22)
+//     w_maxed= round(glyph * 47 / 22)     -- maximized, all three buttons
+// RESTORED: the native stack is CONTIGUOUS and flush right (the
+// decompile: "no fractional gap") -- 46/46/47 @96, 70/70/71 @144, both
+// measured. The v7.6.6 "45.75 + 0.25" guess and v7.6.8's 45+1 split are
+// retired: the ratios ARE how windows does it. The field's raise is BACK
+// (v7.6.6, re-asserted: "fix the unmaximized state having titlebar
+// buttons at 0px instead of 1px and reduce their height by 1px, like
+// I've said"): rows 1..g_barH-1. The hover still owns row 0 in both
+// states (v7.6.7's split stands -- the rect is the button's, the band is
+// the hover's), so no accent line can shine above a lit close.
+// MAXIMIZED: w_maxed buttons with a real gap and the 2-design-px inset
+// (the reference's own split at every scale: 45+1+2 @96, 68+2+3 @144;
+// the stack total still equals the restored stack's). The band floor is
+// ONE REAL px now, not cwS(1): at 144 dpi that rounds to TWO and dropped
+// every glyph a row low (cy 15; native 16). With the floor at 1 the
+// glyph center lands bar/2 - 2, which equals native's own
+// (cysize-1)/2 at 96/120/144/168 alike.
 struct CwButtonRects { RECT close, maximize, minimize; };
 inline CwButtonRects cwButtonRects(int ww) {
-    // v7.6.8 THE REFERENCE LAYOUT -- the field shipped the two maximized
-    // titlebars side by side (the native one and ours) and the pixels
-    // answered. Measured off the native shot at 1920 px wide: close
-    // 1873..1917 (45), gap 1872, max 1827..1871 (45), gap 1826, min
-    // 1781..1825 (45), inset 1918..1919 (2) -- buttons rows 0..20 on a
-    // 23-row bar. The native maximized stack is 45/45/45 with REAL 1 px
-    // gaps and the close ending 2 px inside the window edge.
-    //   v7.6.6's reading ("+1 wide maximized, close -2") produced
-    // 46/47/45 with no daylight -- every button one px wider than the
-    // reference, the stack drifting leftward, the seams cut only while a
-    // patch stood. The 45 + 1 gap split keeps the SAME 46 design px
-    // stride the field's 45.75 + 0.25 metric rode (the stack total is
-    // untouched) -- the extra pixel now lives in the GAP, where the
-    // reference puts it, in BOTH states. Restored stays flush right
-    // (close.right = ww); maximized keeps the v7.6.5 2 px inset.
-    //   v7.6.8 THE RESTORED RAISE IS GONE -- the field: "on the normal
-    // state (not maximized) I see that the titlebar buttons are raised
-    // again, like I don't want (0px vs 1px and height reduced by 1px)."
-    // The buttons run 0..g_barH in BOTH states -- no WIN32_FAKE_SHADOW
-    // offset, no shortened band. The maximized band keeps its
-    // v7.6.3 one-design-px floor (rows 0..bh-2; the hover's two px of
-    // daylight land the band on the reference's 21 rows exactly).
     const bool  maxed  = g_host && cwIsMaximized(g_host);
-    const float bwf      = cwSf(45.0f);
-    const float gapf     = cwSf(1.0f);
-    const int   bw       = (int)(bwf + 0.5f);                     // 45 at 96 dpi
-    const int   gap      = gapf < 1.0f ? 1 : (int)(gapf + 0.5f);  // 1 at 96 dpi, never 0
-    const int   closeR   = ww - (maxed ? cwS(2) : 0);             // v7.6.5: the maximized 2 px inset
-    const int   bh       = maxed ? cwS(kBarHMaxDesign) : g_barH;
-    RECT close = { 0, 0, closeR, bh };
-    if (maxed) close.bottom -= cwS(1);    // v7.6.3: the maximized band ends one design px up
-    close.left = close.right - bw;
+    const int   dpi    = (int)cwd::cwDpi();
+    const int   cysize = MulDiv(22, dpi, 96);
+    const int   glyph  = (cysize * 21 + 11) / 22;   // round(cysize*21/22)
+    const int   wMax   = (glyph  * 48 + 11) / 22;   // round(glyph*48/22)
+    const int   wClose = (glyph  * 49 + 11) / 22;   // round(glyph*49/22)
+    const int   wMaxed = (glyph  * 47 + 11) / 22;   // round(glyph*47/22)
+    const int   gap    = MulDiv(1, dpi, 96);        // the maximized daylight
+    const int   inset  = MulDiv(2, dpi, 96);        // the maximized right inset
+    const int   bh     = maxed ? cwS(kBarHMaxDesign) : g_barH;
+    RECT close;
+    if (maxed) {
+        close.right  = ww - inset;
+        close.bottom = bh - 1;                      // v7.6.9: one REAL px floor
+        close.left   = close.right - wMaxed;
+        close.top    = 0;
+    } else {
+        close.right  = ww;
+        close.bottom = bh;                          // the field's raise: rows 1..g_barH-1
+        close.left   = close.right - wClose;
+        close.top    = 1;
+    }
     RECT maximize = close;
-    maximize.right = close.left - gap;
-    maximize.left  = maximize.right - bw;
+    maximize.right = close.left - (maxed ? gap : 0);
+    maximize.left  = maximize.right - (maxed ? wMaxed : wMax);
     RECT minimize = maximize;
-    minimize.right = maximize.left - gap;
-    minimize.left  = minimize.right - bw;
+    minimize.right = maximize.left - (maxed ? gap : 0);
+    minimize.left  = minimize.right - (maxed ? wMaxed : wMax);
     if (!g_btnMax) minimize = maximize;   // the empty slot collapses
     return { close, maximize, minimize };
 }
@@ -657,6 +664,9 @@ inline CwButtonRects cwButtonRects(int ww) {
 // v7.6.6: the hairline rides the NEW gap metric -- 0.25 design px (the
 // button went 45.5 -> 45.75, the gap 0.5 -> 0.25). Still never 0: at every
 // dpi here it clamps to the same 1 physical px as before.
+// v7.6.9: no active callers inside the bar painter (the gaps live in the
+// rects; restored is contiguous native). Kept for hosts that run abutting
+// patches of their own.
 inline int cwHovSeamPx() {
     const float s = cwSf(0.25f);
     return s < 1.0f ? 1 : (int)(s + 0.5f);
@@ -833,8 +843,9 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         const int lineW = cwS(10);
         const int mw    = br.minimize.right - br.minimize.left;
         const int dx    = br.minimize.left + (mw - lineW + 1) / 2;
-        const int cy    = br.minimize.top + (br.minimize.bottom - br.minimize.top + 1) / 2
-                        - kHovGlyphRide;   // v7.5.4: the glyph rides the band
+        const int cy    = br.minimize.top
+                        + (br.minimize.bottom - br.minimize.top + (maxedW ? 1 : 0)) / 2
+                        - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 is the MAXIMIZED fit (native's (cysize-1)/2), restored keeps the v7.6.6-era row at every scale
         fillARGB(glyphCol(item, g_hovA[0], 0), dx, cy, lineW, 1);
     }
     // maximize (square outline; double square while maximized)
@@ -846,13 +857,11 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         // ran 1..g_barH, whose center this same rounding answers).
         const int cx = br.maximize.left
                      + (br.maximize.right - br.maximize.left) / 2;   // v7.6.2: its own width
-        const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top + 1) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band
-        const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
+        const int cy = br.maximize.top
+                     + (br.maximize.bottom - br.maximize.top + (maxedW ? 1 : 0)) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 rides the MAXIMIZED band only
         const int mi = glyphCol(item, g_hovA[1], 1);   // v7.5.4: dimmed while inactive
-        Gdiplus::Pen p(Gdiplus::Color(cwChannel(mi, 24), cwChannel(mi, 16),
-                                      cwChannel(mi, 8), cwChannel(mi, 0)), penW);
-        if (w && cwIsMaximized(w)) {
+        if (maxedW) {
             // v7.5.3d: the front sheet OCCLUDES the back one -- the real
             // restore glyph layers the squares, the back square's edges stop
             // at the front square instead of showing through its interior
@@ -868,14 +877,47 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             // measures the restore pair at 8 px a sheet (back square top
             // edge row 5 x 1846..1853, front square top edge row 7 x
             // 1844..1851): the v7.6.5 shrink was the field's own guess, and
-            // the reference out-answers it. With the v7.6.8 cy the pair
-            // lands on the native rows EXACTLY (back 5..12, front 7..14).
-            Gdiplus::Rect front(cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));
-            Gdiplus::Region frontRegion(front);
+            // the reference out-answers it.
+            //   v7.6.9 THE NATIVE PAIR, CRISP AND DPI-AGNOSTIC -- the
+            // field's 150% shots measure the native sheets at 12 px a side
+            // (cwS(8) -- 12.0 exact at 144 dpi) while the pen path bled to
+            // 13 (the 1.875 px pen straddles the path); at 96 the same
+            // bleed made 9 of the native 8 -- the changelog's "lands on the
+            // reference" was the PATH, not the paint. The sheets are four
+            // integer 1-real-px fills each now (the restored square's own
+            // crisp recipe), so the painted footprint IS cwS(8). The
+            // anchors ride the 10-design-px pair span (cwS(10)):
+            // front.left = cx - (span+1)/2 puts the front sheet at 1805
+            // @144 / 1844 @96, back.top = cy - span/2 at row 9 @144 / row 5
+            // @96, the diagonal offset is cwS(2) (3 @144, 2 @96) -- the
+            // native anchors at every scale. The front sheet still
+            // OCCLUDES the back one (v7.5.3d): the back strokes draw under
+            // an exclude-clip of the front RECT (the native tail at row 20
+            // x 1817..1819 is exactly this), then the front strokes draw
+            // full.
+            const int pairSpan = cwS(10);
+            const int sheetSz  = cwS(8);
+            const int pairDiag = cwS(2);
+            const int fl = cx - (pairSpan + 1) / 2;      // the front sheet's left
+            const int bt = cy - pairSpan / 2;            // the back sheet's top
+            Gdiplus::Rect frontRect(fl, bt + pairDiag, sheetSz, sheetSz);
+            Gdiplus::Region frontRegion(frontRect);
             g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
-            g.DrawRectangle(&p, cx - cwS(3), cy - cwS(5), cwS(8), cwS(8));   // the back sheet, occluded
+            {   // the back sheet, occluded -- four integer fills
+                const int bx = fl + pairDiag, by = bt;
+                fillARGB(mi, bx, by, sheetSz, 1);
+                fillARGB(mi, bx, by + sheetSz - 1, sheetSz, 1);
+                fillARGB(mi, bx, by + 1, 1, sheetSz - 2);
+                fillARGB(mi, bx + sheetSz - 1, by + 1, 1, sheetSz - 2);
+            }
             g.ResetClip();
-            g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
+            {   // the front sheet, full
+                const int fy = bt + pairDiag;
+                fillARGB(mi, fl, fy, sheetSz, 1);
+                fillARGB(mi, fl, fy + sheetSz - 1, sheetSz, 1);
+                fillARGB(mi, fl, fy + 1, 1, sheetSz - 2);
+                fillARGB(mi, fl + sheetSz - 1, fy + 1, 1, sheetSz - 2);
+            }
         } else {
             // v7.6.3 THE CRISP SQUARE: the pen path at half-pixel
             // coordinates grew a mitre-joint speck off the top-left corner
@@ -906,8 +948,9 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
         if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(g_closeHover & 0xFFFFFF), 0);
         const int cx = br.close.left
                      + (br.close.right - br.close.left) / 2;   // v7.6.2: its own width
-        const int cy = br.close.top + (br.close.bottom - br.close.top + 1) / 2
-                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.8: the +1 centers like the reference
+        const int cy = br.close.top
+                     + (br.close.bottom - br.close.top + (maxedW ? 1 : 0)) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 rides the MAXIMIZED band only
         int xc = glyphCol(item, pa, 2);     // v7.5.4: half there while inactive, pa restores it
         if (pa > 0) {                       // the X whitens with the red (alpha rides glyphCol)
             const int a = cwChannel(xc, 24);
@@ -916,17 +959,21 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             const int b  = cwChannel(item,  0) + ((255 - cwChannel(item,  0)) * pa + 127) / 255;
             xc = (int)(((unsigned)a << 24) | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
         }
-        Gdiplus::Pen xp(Gdiplus::Color(cwChannel(xc, 24), cwChannel(xc, 16),
-                                       cwChannel(xc, 8), cwChannel(xc, 0)),
-                        cwSf(1.0f) < 1.0f ? 1.0f : cwSf(1.0f));
-        // v7.6.6: the maximized X runs one design px smaller -- half-px
-        // arm reach (cwSf(4.5), was cwS(5)), the v7.5.x square's REAL
-        // (float) overload trick; the restored X keeps its 10.
-        const float xh = maxedW ? cwSf(4.5f) : (float)cwS(5);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.DrawLine(&xp, cx - xh, cy - xh, cx + xh, cy + xh);
-        g.DrawLine(&xp, cx + xh, cy - xh, cx - xh, cy + xh);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+        // v7.6.9 THE NATIVE X, PIXEL-EXACT AT EVERY DPI -- the field's 150%
+        // shots measure the native X at 15x15 (rows 9..23, cols 1876..1890,
+        // tips ON the box) while the pen path painted 13x13 (cwSf(4.5)
+        // reach, AA'd); at 96 the same pen painted 9x9 of the native 10x10.
+        // The X is two 1-real-px staircases corner to corner of the cwS(10)
+        // span box (15 @144, 10 @96 -- the native span at every scale),
+        // drawn as integer 1x1 fills: no pen, no AA, no sub-pixel drift,
+        // the tips land ON the box exactly like the reference.
+        const int xSpan = cwS(10);
+        const int xL = cx - xSpan / 2, yT = cy - xSpan / 2;
+        const int xR = xL + xSpan - 1;
+        for (int k = 0; k < xSpan; ++k) {
+            fillARGB(xc, xL + k, yT + k, 1, 1);
+            fillARGB(xc, xR - k, yT + k, 1, 1);
+        }
     }
     // the icon: the window class icon -- the same one the taskbar shows
     if (g_icon && w) {
