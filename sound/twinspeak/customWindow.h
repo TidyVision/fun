@@ -58,9 +58,16 @@
 //         Which caption buttons exist besides CLOSE (close is always kept,
 //         always rightmost; maximize sits between minimize and close; with
 //         maximize off, minimize sits directly beside close -- the twinspeak
-//         layout). Buttons are 45 design-px wide each (v7.6.0: two
-//         narrower than the sample's 47 -- the field's call).
-//         Default: minimize on, maximize off.
+//         layout). Buttons are 45.5 design px wide each (v7.6.0: two
+//         narrower than the sample's 47; v7.6.2: half a pixel BACK -- the
+//         field's call, and yes, seriously). Default: minimize on,
+//         maximize off.
+//
+//     setWinCloseBtnColor(int col)                                v7.6.2
+//         The close button's hover red. One ARGB int (0xAARRGGBB); the
+//         alpha channel is ignored -- the hover ramp owns the fade, the
+//         color rides it. Default: RGB(232,17,35), the real thing's full
+//         red (#E81123) -- the old 0xCC0000 was a step dark.
 //
 //     setCanWinResize(bool resize)
 //         Whether the window accepts resize/maximize COMMANDS. With resize
@@ -246,11 +253,17 @@ inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f
 // highlight snaps on and off the way the real caption's does when the
 // window does not have focus. g_hovInactive is latched in the WM_NCACTIVATE
 // case, next to the sheet-row latch (the frame's own truth, hover's view).
-// v7.6.1: the field's call -- 75 ms pre AND post. The v7.5.4 TWICE-speed
-// divisor (100/150 halved to 50/75) is retired: the inactive durations are
-// their own constants now, and 75 does not fall out of halving 100.
-inline constexpr int kHovInactiveInMs  = 75;   // pre-hover ramp, unfocused
-inline constexpr int kHovInactiveOutMs = 75;   // post-hover ramp, unfocused
+// v7.6.1: the field's call -- 75 ms pre AND post (the resting values).
+// v7.6.2: they went DYNAMIC -- the pointer's tempo over the caption
+// steers them inside the field's bracket: kHovInactiveMinMs 50 (a slow,
+// deliberate pull-off, the flash barely lingers) to kHovInactiveMaxMs 200
+// (a fast flick -- "have that flashing effect be slowed down based on how
+// fast you've unhovered the thing"). The flash's fade-back rides the OUT
+// value; the focused bar keeps its flat 100/150.
+inline int kHovInactiveInMs  = 75;   // pre-hover ramp, unfocused (dynamic)
+inline int kHovInactiveOutMs = 75;   // post-hover ramp, unfocused (dynamic)
+inline constexpr int kHovInactiveMinMs = 50;   // the bracket's floor
+inline constexpr int kHovInactiveMaxMs = 200;  // the bracket's ceiling
 inline bool g_hovInactive = false;
 // v7.5.4: the glyphs ride the band -- the band took its three px off the
 // bottom of the bar, so a glyph centered on the FULL button rect hangs
@@ -270,7 +283,8 @@ inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is runn
 // v7.6.1: the inactive lapse, on EVERY caption button -- when a button's
 // hover ends on an INACTIVE window, that button's GLYPH is set to 12.5%
 // (kCwLapseAlpha = 32 of 255) and fades back to the half-there look it
-// rests at (kGlyphInactiveAlpha) over kCwLapseMs. v7.6.0's cut read the
+// rests at (kGlyphInactiveAlpha) over g_lapseMs[i], the leave's tempo
+// (v7.6.2). v7.6.0's cut read the
 // 12.5% into the shared hover ramp instead (g_hovA = 32): the tint landed
 // at 3/255 and the glyph at 144 vs the 128 rest -- both under the eye,
 // which is exactly why the field saw nothing. The flash owns the glyph's
@@ -278,11 +292,31 @@ inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is runn
 // the tint. Inactive only -- the focused bar never lapses -- and every
 // activation change and hide takes the live flashes with it.
 inline constexpr int  kCwLapseAlpha = 32;   // 12.5% of 255 -- the flash floor
-inline constexpr int  kCwLapseMs    = 100;  // the fade-back's whole life
 inline bool  g_lapseOn[3] = { false, false, false };  // min, max, close: a flash is live
 inline int   g_lapseA[3] = { 0, 0, 0 };               // the flash's glyph alpha, 32..128
 inline DWORD g_lapseT0[3] = { 0, 0, 0 };              // the unhover tick each flash started
-inline const DWORD kCloseHover = 0xFFCC0000;   // vanilla red, not configurable
+inline int   g_lapseMs[3] = { 100, 100, 100 };        // each flash's own fade-back life (v7.6.2: the leave's tempo)
+// v7.6.2: the pointer's tempo over the caption, feeding the durations --
+// an EMA of (px/ms)^2 sampled on every WM_NCMOUSEMOVE. Squared, so the
+// mapping needs no sqrt; a stale sample reads as stillness (the floor).
+inline DWORD g_hovMoveLast = 0;           // the last NCMOUSEMOVE tick
+inline POINT g_hovMovePt  = { 0, 0 };     // its position
+inline float g_hovSpeed2  = 0.0f;         // (px/ms)^2, EMA'd
+inline constexpr float kCwHovSpeedRef2 = 4.0f;  // a 2 px/ms flick pins the ceiling
+// The tempo -> a duration inside the bracket: the floor at rest, the
+// ceiling at (and past) the 2 px/ms reference, linear between.
+inline int cwHovTempoMs() {
+    float ratio = (GetTickCount() - g_hovMoveLast > 200) ? 0.0f
+                : g_hovSpeed2 / kCwHovSpeedRef2;
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+    return kHovInactiveMinMs
+         + (int)((float)(kHovInactiveMaxMs - kHovInactiveMinMs) * ratio + 0.5f);
+}
+// v7.6.2: the close hover is a knob now -- setWinCloseBtnColor(int col) --
+// and its default is the REAL full red, RGB(232,17,35) (the old 0xCC0000
+// was a step dark; the field's measure is the thing's own #E81123).
+inline DWORD g_closeHover = 0xFFE81123;   // ARGB; the alpha rides the hover ramp
 inline std::wstring g_fontFace = L"Segoe UI";
 inline int  g_fontPx      = 14;
 inline int  g_fontWeight  = FW_SEMIBOLD;
@@ -423,19 +457,22 @@ inline void cwHovAnimTick() {
         if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
         if ((held && a < 255) || (!held && a > 0)) busy = true;
         // v7.6.1: the lapse -- the flash's GLYPH alpha eases 32 -> 128
-        // across its own 100 ms, timed off the unhover tick (not the ramp:
-        // a full-range outMs would drain 32 alpha in ~12 ms; the flash
-        // spreads the whole 96-alpha ride across the whole 100 ms). It dies
-        // the tick it lands or the moment its button is re-hovered -- the
-        // normal ramp owns the glyph again from there.
+        // across its own life (g_lapseMs[i], the leave's tempo), timed off
+        // the unhover tick. It dies the tick it lands or the moment its
+        // button is re-hovered -- the normal ramp owns the glyph again from
+        // there.
         if (g_lapseOn[i]) {
             if (held) { g_lapseOn[i] = false; }
             else {
                 const DWORD el = now - g_lapseT0[i];
-                if (el >= (DWORD)kCwLapseMs) g_lapseOn[i] = false;
+                // v7.6.2: the flash lives on the LEAVE's tempo --
+                // g_lapseMs[i], captured at trigger, inside the [50, 200]
+                // bracket; a fast flick stretches it toward 200, a slow
+                // pull-off burns it fast at 50.
+                if (el >= (DWORD)g_lapseMs[i]) g_lapseOn[i] = false;
                 else {
                     g_lapseA[i] = kCwLapseAlpha
-                                + ((kGlyphInactiveAlpha - kCwLapseAlpha) * (int)el) / kCwLapseMs;
+                                + ((kGlyphInactiveAlpha - kCwLapseAlpha) * (int)el) / g_lapseMs[i];
                     busy = true;
                 }
             }
@@ -452,7 +489,9 @@ inline void cwHovAnimTick() {
 // The parse: on an INACTIVE window, when ANY button's hover ends, that
 // button's GLYPH alpha is SET to 32 of 255 (12.5%) -- right away, not on
 // the next tick -- and eases back to its half-there rest (kGlyphInactiveAlpha,
-// 128 = the "50% transparency") across kCwLapseMs. v7.6.0 read the 12.5%
+// 128 = the "50% transparency") across g_lapseMs[i], the LEAVE's tempo
+// (v7.6.2: inside the [50, 200] bracket -- a fast flick stretches the flash
+// toward 200, a slow pull-off burns it fast at 50). v7.6.0 read the 12.5%
 // into the shared hover ramp instead -- g_hovA = 32 lands the tint at 3/255
 // and the glyph at 144 vs the 128 rest, both under the eye, which is why
 // the field saw nothing. Inactive only; every activation change (the
@@ -461,8 +500,9 @@ inline void cwHovAnimTick() {
 inline void cwHovLapse(int i) {
     if (i < 0 || i > 2) return;
     g_lapseOn[i] = true;                 // the flash is live
-    g_lapseT0[i] = GetTickCount();       // its 100 ms starts now
+    g_lapseT0[i] = GetTickCount();       // its life starts now
     g_lapseA[i]  = kCwLapseAlpha;        // the transparency set to 12.5%, this very frame
+    g_lapseMs[i] = kHovInactiveOutMs;   // v7.6.2: the leave's tempo is the flash's life
     cwHovAnimEnsure();                   // the train owns the repaints, as always
 }
 inline void cwHovLapseClearAll() {       // activation changes and hides take every flash
@@ -509,23 +549,33 @@ inline void cwRelayoutChildren() {
 inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
-// Client coordinates over a bar 0..g_barH tall, buttons 45 design-px wide
-// (v7.6.0: two narrower than the sample's 47 -- the field's call),
-// stacked from the right edge: close always; then maximize (if present);
-// then minimize. With maximize off, minimize sits beside close -- the
-// twinspeak geometry, minus the field's two pixels.
+// Client coordinates over a bar 0..g_barH tall, buttons 45.5 design px wide
+// (v7.6.0: two narrower than the sample's 47; v7.6.2: half a pixel back --
+// the field's call, seriously), stacked from the right edge: close always;
+// then maximize (if present); then minimize. With maximize off, minimize
+// sits beside close -- the twinspeak geometry, minus the field's two
+// pixels plus the half one.
 struct CwButtonRects { RECT close, maximize, minimize; };
 inline CwButtonRects cwButtonRects(int ww) {
-    const int bw = cwS(45);
+    // v7.6.2: the rects stay whole pixels -- every edge rounds off the
+    // CUMULATIVE fractional run from the right edge (never the per-button
+    // width, which would drop the half pixel three times over). At 96 dpi
+    // the edges land at 46/91/137: 46/45/46, the stack total carrying the
+    // .5 in its rounding, the close button matching the real thing's own
+    // 46. At 150% they land at 68/137/205 off a 68.25 stride.
+    const float bwf      = cwSf(45.5f);
+    const int   edge1    = (int)(bwf + 0.5f);
+    const int   edge2    = (int)(bwf * 2.0f + 0.5f);
+    const int   edge3    = (int)(bwf * 3.0f + 0.5f);
     RECT close = { 0, 0, ww, g_barH };
     close.top += WIN32_FAKE_SHADOW_HEIGHT;
-    close.left = close.right - bw;
+    close.left = close.right - edge1;
     RECT maximize = close;
-    maximize.left  -= bw;
-    maximize.right -= bw;
+    maximize.right = close.left;
+    maximize.left  = close.left - (edge2 - edge1);
     RECT minimize = maximize;
-    minimize.left  -= bw;
-    minimize.right -= bw;
+    minimize.right = maximize.left;
+    minimize.left  = maximize.left - (edge3 - edge2);
     if (!g_btnMax) minimize = maximize;   // the empty slot collapses
     return { close, maximize, minimize };
 }
@@ -620,7 +670,6 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     if (!g_enabled) return;
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     const CwButtonRects br = cwButtonRects(ww);
-    const int buttonW = br.close.right - br.close.left;
     const int item = active ? (g_glyph < 0 ? g_textCol : g_glyph) : g_textUn;
     // v7.5.4: the inactive glyphs are HALF there (task manager shows it) --
     // each button's glyph fades back to full opacity riding the same ramp
@@ -663,14 +712,16 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
     // minimize
     if (g_btnMin) {
         const int lineW = cwS(10);
-        const int cx = br.minimize.left + buttonW / 2;
+        const int cx = br.minimize.left
+                     + (br.minimize.right - br.minimize.left) / 2;   // v7.6.2: its own width
         const int cy = br.minimize.top + (br.minimize.bottom - br.minimize.top) / 2
                      - kHovGlyphRide;   // v7.5.4: the glyph rides the band
         fillARGB(glyphCol(item, g_hovA[0], 0), cx - lineW / 2, cy, lineW, 1);
     }
     // maximize (square outline; double square while maximized)
     if (g_btnMax) {
-        const int cx = br.maximize.left + buttonW / 2;
+        const int cx = br.maximize.left
+                     + (br.maximize.right - br.maximize.left) / 2;   // v7.6.2: its own width
         const int cy = br.maximize.top + (br.maximize.bottom - br.maximize.top) / 2
                      - kHovGlyphRide;   // v7.5.4: the glyph rides the band
         const float penW = cwSf(1.25f) < 1.0f ? 1.0f : cwSf(1.25f);
@@ -699,13 +750,17 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
                                 cwSf(9.0f), cwSf(9.0f));
         }
     }
-    // close (always; vanilla red hover, white X -- both ride the same linear
-    // fades, 100 ms in / 150 ms out; the X stroke is the real thing's
-    // 1 design px, the old 1.25 rendered half again too thick)
+    // close (always; the close red -- g_closeHover since v7.6.2, the
+    // setWinCloseBtnColor knob, default the real full red RGB(232,17,35) --
+    // under the white X; both ride the same linear fades, 100 ms in / 150 ms
+    // out focused, the inactive pair tempo-steered v7.6.2; the X stroke is
+    // the real thing's 1 design px, the old 1.25 rendered half again too
+    // thick)
     {
         const int pa = g_hovA[2];
-        if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(kCloseHover & 0xFFFFFF), 0);
-        const int cx = br.close.left + buttonW / 2;
+        if (pa > 0) fillPatch(hoverBand(br.close), (pa << 24) | (int)(g_closeHover & 0xFFFFFF), 0);
+        const int cx = br.close.left
+                     + (br.close.right - br.close.left) / 2;   // v7.6.2: its own width
         const int cy = br.close.top + (br.close.bottom - br.close.top) / 2
                      - kHovGlyphRide;   // v7.5.4: the glyph rides the band
         int xc = glyphCol(item, pa, 2);     // v7.5.4: half there while inactive, pa restores it
@@ -1276,6 +1331,22 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         POINT cursor_point;
         GetCursorPos(&cursor_point);
         ScreenToClient(w, &cursor_point);
+        // v7.6.2: the tempo sample -- instantaneous (px/ms)^2, EMA 60/40.
+        // A pause longer than 200 ms reads as stillness (the next flash
+        // runs at the floor); a 2 px/ms flick pins the ceiling.
+        const DWORD mvNow = GetTickCount();
+        if (g_hovMoveLast && mvNow > g_hovMoveLast) {
+            const DWORD mdt = mvNow - g_hovMoveLast;
+            if (mdt >= 200) g_hovSpeed2 = 0.0f;
+            else {
+                const float dx = (float)(cursor_point.x - g_hovMovePt.x);
+                const float dy = (float)(cursor_point.y - g_hovMovePt.y);
+                const float inst2 = (dx * dx + dy * dy) / ((float)mdt * (float)mdt);
+                g_hovSpeed2 = g_hovSpeed2 * 0.6f + inst2 * 0.4f;
+            }
+        }
+        g_hovMoveLast = mvNow;
+        g_hovMovePt   = cursor_point;
         RECT cr; GetClientRect(w, &cr);
         const CwButtonRects br = cwButtonRects(cr.right);
         int nh = cwHovNone;
@@ -1286,16 +1357,23 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
             const int was = g_hover;
             g_hover = nh;
             // v7.6.1: leaving ANY button on an INACTIVE window sets that
-            // button's glyph to 12.5% for its 100 ms fade-back -- moving onto
+            // button's glyph to 12.5% for its fade-back -- moving onto
             // a neighbouring button unhovered the first one all the same.
-            // Arriving on a button cancels ITS flash: re-hover hands the
-            // glyph back to the normal ramps.
-            if (was != cwHovNone && g_hovInactive) cwHovLapse(was - 1);
-            if (nh != cwHovNone) g_lapseOn[nh - 1] = false;
+            // v7.6.2: the leave's tempo steers the out ramp AND the flash
+            // (cwHovTempoMs, inside [50, 200]); the arrival's tempo steers
+            // the IN ramp, and re-hover cancels that button's flash.
+            if (was != cwHovNone && g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();
+                cwHovLapse(was - 1);
+            }
+            if (nh != cwHovNone) {
+                g_lapseOn[nh - 1] = false;
+                if (g_hovInactive) kHovInactiveInMs = cwHovTempoMs();
+            }
             cwHovAnimEnsure();             // the fade owns the repaints
         }
         TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT, w, 0 };
-        TrackMouseEvent(&tme);          // the leave that starts the 100 ms fade-out
+        TrackMouseEvent(&tme);          // the leave that starts the tempo-steered fade-out
         *out = DefWindowProcW(w, msg, wp, lp); return true; }
     case WM_NCLBUTTONDOWN:
         // the DOWN must not count as a drag start when a button is hovered
@@ -1353,7 +1431,10 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (g_hover != cwHovNone) {
             const int was = g_hover;
             g_hover = cwHovNone;
-            if (g_hovInactive) cwHovLapse(was - 1);   // v7.6.1: every button lapses
+            if (g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();      // v7.6.2: the leave's tempo
+                cwHovLapse(was - 1);                      // v7.6.1: every button lapses
+            }
             cwHovAnimEnsure();                        // the fade owns the repaints
         }
         return false;
@@ -1447,7 +1528,10 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (g_hover != cwHovNone) {
             const int was = g_hover;
             g_hover = cwHovNone;
-            if (g_hovInactive) cwHovLapse(was - 1);   // v7.6.1: every button lapses
+            if (g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();      // v7.6.2: the leave's tempo
+                cwHovLapse(was - 1);                      // v7.6.1: every button lapses
+            }
             cwHovAnimEnsure();                        // the fade owns the repaints
         }
         return false;
@@ -1503,6 +1587,11 @@ inline void changeWinTitlebarColor(int col, int gradColor)       { cwd::g_faceCo
 // the default: mirror the focused color (cwPaintBarBackground's rule).
 inline void setWinInactiveColor(int col)                         { cwd::g_faceColIn = col; cwd::g_faceGradIn = col; cwd::cwRepaint(); }
 inline void setWinInactiveColor(int col, int gradColor)          { cwd::g_faceColIn = col; cwd::g_faceGradIn = gradColor; cwd::cwRepaint(); }
+// v7.6.2: the close button's hover red is a knob -- the field's call. One
+// ARGB int (0xAARRGGBB); the alpha channel is ignored (the hover ramp owns
+// the fade, the color rides it). Default: the real thing's full red,
+// RGB(232,17,35) -- the old fixed 0xCC0000 was a step dark.
+inline void setWinCloseBtnColor(int col)                         { cwd::g_closeHover = (DWORD)col; cwd::cwRepaint(); }
 
 inline void setWinTitleTextColor(int color, int gradientCol,
                                  int inactiveColor, int gradientInactiveCol) {
@@ -1647,6 +1736,7 @@ inline void changeWinTitlebarColor(int)                                {}
 inline void changeWinTitlebarColor(int, int)                           {}
 inline void setWinInactiveColor(int)                                   {}
 inline void setWinInactiveColor(int, int)                              {}
+inline void setWinCloseBtnColor(int)                                   {}
 inline void setWinTitleTextColor(int, int, int, int)                   {}
 inline void setWinTitleTextColor(int, int, int)                        {}
 inline void setWinTitleTextColor(int, int)                             {}
