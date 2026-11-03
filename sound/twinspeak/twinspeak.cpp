@@ -7849,8 +7849,8 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)(S(479) + kCapH) + 0.5f,
                                         (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.5.5 |  %s",  // v7.5.5 the version bump (every build bumps now, the field's rule; v7.5.4
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // ended the v7.5.3 letter line; the bar lives in customWindow.h
+    snprintf(vbuf, sizeof(vbuf), "v7.6.0 |  %s",  // v7.6.0 the base line returns -- the narrower buttons (cwS(45)),
+             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());     // the square's true center, the inactive lapse (12.5%, 100 ms)
     const RECT ver = { S(300), S(8) + kCapH, S(866), S(30) + kCapH };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,

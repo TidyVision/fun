@@ -58,7 +58,8 @@
 //         Which caption buttons exist besides CLOSE (close is always kept,
 //         always rightmost; maximize sits between minimize and close; with
 //         maximize off, minimize sits directly beside close -- the twinspeak
-//         layout). Buttons are 47 design-px wide each, the sample's widths.
+//         layout). Buttons are 45 design-px wide each (v7.6.0: two
+//         narrower than the sample's 47 -- the field's call).
 //         Default: minimize on, maximize off.
 //
 //     setCanWinResize(bool resize)
@@ -263,6 +264,14 @@ inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation 
 inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
 inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
 inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is running
+// v7.6.0: the inactive lapse's remnant -- when the MINIMIZE button's hover
+// ends on an INACTIVE window, the hover presentation is SET to 12.5% (32 of
+// 255) and that remnant drains over kCwMinLapseMs, the glyph landing on the
+// half-there look it rests at (the field's measured vanilla quirk; see
+// cwHovMinLapse below). Minimize only, inactive only.
+inline constexpr int  kCwMinLapseAlpha = 32;   // 12.5% of 255
+inline constexpr int  kCwMinLapseMs    = 100;  // the fade-back's whole life
+inline bool g_minLapse = false;                // the remnant is draining
 inline const DWORD kCloseHover = 0xFFCC0000;   // vanilla red, not configurable
 inline std::wstring g_fontFace = L"Segoe UI";
 inline int  g_fontPx      = 14;
@@ -391,19 +400,47 @@ inline void cwHovAnimTick() {
     // v7.5.4: the ramps' tempo follows the activation state -- twice the
     // speed (half the durations) while the window is unfocused.
     const int inMs  = g_hovInactive ? kHovFadeInMs  / kHovInactiveSpeed : kHovFadeInMs;
-    const int outMs = g_hovInactive ? kHovFadeOutMs / kHovInactiveSpeed : kHovFadeOutMs;
     for (int i = 0; i < 3; ++i) {
         const bool held = (g_hover == i + 1);
         int a = g_hovA[i];
+        // v7.6.0: the inactive lapse's fade-back -- the 12.5% remnant drains
+        // at its own pace (a full-range outMs would drain 32 alpha in ~12
+        // ms; the lapse pace spreads it across the whole 100 ms) and the
+        // latch dies the tick the ramp lands or the button is re-hovered.
+        const bool lapse = (i == 0 && g_minLapse && !held);
+        const int outMs = lapse
+            ? kCwMinLapseMs * 255 / kCwMinLapseAlpha        // 100 ms for the 32
+            : (g_hovInactive ? kHovFadeOutMs / kHovInactiveSpeed : kHovFadeOutMs);
         if (held) a += (int)(dt * 255 / inMs);
         else      a -= (int)(dt * 255 / outMs);
         if (a > 255) a = 255;
         if (a < 0) a = 0;
         if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
         if ((held && a < 255) || (!held && a > 0)) busy = true;
+        if (i == 0 && (held || a <= 0)) g_minLapse = false;
     }
     cwRepaint();                                    // the painter reads g_hovA
     if (!busy) { KillTimer(w, kHovTimerId); g_hovTimerOn = false; }
+}
+
+// ---- v7.6.0: the inactive lapse (the minimize button) -----------------------
+// The field, on the unmodified Windows 10 bar: "When an inactive titlebar
+// button hover ends, it also sets the transparency to be 12.5% fading back
+// half-transparent after 100ms. Yes, this only happens with the minimize
+// button on the unmodified windows 10 window style. Not google chrome."
+// The parse, stated so it can be corrected: on an INACTIVE window, when the
+// MINIMIZE button's hover ends, the hover presentation does not keep
+// sliding down its ramp -- it is SET to 12.5% (g_hovA[0] = 32 of 255: the
+// tint at an eighth of kHovTintAlpha, the glyph most of the way back toward
+// its half-there rest) and that remnant drains over its OWN 100 ms, the
+// glyph landing on the half-transparent look it rests at
+// (kGlyphInactiveAlpha). Minimize only, inactive only; deactivation clears
+// plain (the WM_NCACTIVATE case), and re-hovering the button hands it back
+// to the normal ramps.
+inline void cwHovMinLapse() {
+    g_hovA[0]  = kCwMinLapseAlpha;   // the transparency set to 12.5%
+    g_minLapse = true;               // the fade-back runs its own 100 ms
+    cwHovAnimEnsure();               // the train owns the repaints, as always
 }
 
 // ---- v7.5.3d: the DPI-responsive child ledger --------------------------------
@@ -446,13 +483,14 @@ inline void cwRelayoutChildren() {
 inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
 
 // ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
-// Client coordinates over a bar 0..g_barH tall, buttons 47 design-px wide,
+// Client coordinates over a bar 0..g_barH tall, buttons 45 design-px wide
+// (v7.6.0: two narrower than the sample's 47 -- the field's call),
 // stacked from the right edge: close always; then maximize (if present);
 // then minimize. With maximize off, minimize sits beside close -- the
-// twinspeak geometry, byte for byte.
+// twinspeak geometry, minus the field's two pixels.
 struct CwButtonRects { RECT close, maximize, minimize; };
 inline CwButtonRects cwButtonRects(int ww) {
-    const int bw = cwS(47);
+    const int bw = cwS(45);
     RECT close = { 0, 0, ww, g_barH };
     close.top += WIN32_FAKE_SHADOW_HEIGHT;
     close.left = close.right - bw;
@@ -620,7 +658,14 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
             g.ResetClip();
             g.DrawRectangle(&p, cx - cwS(5), cy - cwS(3), cwS(8), cwS(8));   // the front sheet, full
         } else {
-            g.DrawRectangle(&p, cx - cwS(4), cy - cwS(4), cwS(9), cwS(9));
+            // v7.6.0 the square's true center: a 9px path from an integer
+            // origin centers its pen strokes on cx+0.5 (x = cx-4, path to
+            // cx+5 -- half a pixel right AND low of the X's and the line's
+            // center); the REAL overload draws the same 9px square at
+            // cx-4.5/cy-4.5, strokes on cx+/-4.5, midpoint (cx, cy) exact.
+            g.DrawRectangle(&p, (Gdiplus::REAL)(cx - cwSf(4.5f)),
+                                (Gdiplus::REAL)(cy - cwSf(4.5f)),
+                                cwSf(9.0f), cwSf(9.0f));
         }
     }
     // close (always; vanilla red hover, white X -- both ride the same linear
@@ -1205,7 +1250,17 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (PtInRect(&br.close, cursor_point)) nh = cwHovClose;
         else if (g_btnMax && PtInRect(&br.maximize, cursor_point)) nh = cwHovMax;
         else if (g_btnMin && PtInRect(&br.minimize, cursor_point)) nh = cwHovMin;
-        if (nh != g_hover) { g_hover = nh; cwHovAnimEnsure(); }   // the fade owns the repaints
+        if (nh != g_hover) {
+            const int was = g_hover;
+            g_hover = nh;
+            // v7.6.0: leaving the minimize button on an INACTIVE window sets
+            // its remnant to 12.5% for a 100 ms fade-back; every other hover
+            // change rides the normal ramps
+            if (was == cwHovMin && nh == cwHovNone && g_hovInactive)
+                cwHovMinLapse();
+            else
+                cwHovAnimEnsure();             // the fade owns the repaints
+        }
         TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT, w, 0 };
         TrackMouseEvent(&tme);          // the leave that starts the 100 ms fade-out
         *out = DefWindowProcW(w, msg, wp, lp); return true; }
@@ -1262,7 +1317,14 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         return false;
     case WM_NCMOUSELEAVE:
         // the cursor left the window: the fade-out owns what is on screen now
-        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        if (g_hover != cwHovNone) {
+            const int was = g_hover;
+            g_hover = cwHovNone;
+            if (was == cwHovMin && g_hovInactive)
+                cwHovMinLapse();               // v7.6.0: the inactive lapse
+            else
+                cwHovAnimEnsure();             // the fade owns the repaints
+        }
         return false;
     case WM_TIMER:
         // the hover fade train's own tick; every other timer is the host's
@@ -1350,7 +1412,14 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         return false;   // the host's DefWindowProc finishes the protocol
     case WM_MOUSEMOVE:
         // into the client = no caption button hovered
-        if (g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        if (g_hover != cwHovNone) {
+            const int was = g_hover;
+            g_hover = cwHovNone;
+            if (was == cwHovMin && g_hovInactive)
+                cwHovMinLapse();               // v7.6.0: the inactive lapse
+            else
+                cwHovAnimEnsure();             // the fade owns the repaints
+        }
         return false;
     default:
         if (g_trayUp && g_trayMsg && msg == g_trayMsg) {
