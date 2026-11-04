@@ -47,10 +47,19 @@
 //  the inactive lapse and the linear 100/150 ramps are RETIRED -- the
 //  decompile out-answers them.
 //
-//  THE INACTIVE LAW -- UpdateButtonVisuals (0x25364) picks the glyph
-//  opacity with TreatAsActiveWindow: 1.0 active, 0.4 inactive (the float
-//  pair at .rdata CFA0C/CFA18, read byte-exact): the ink dials 254/102.
-//  Hover and press never engage on an inactive window.
+//  THE INACTIVE LAW -- UpdateButtonVisuals (0x25364) picks the button
+//  visuals' target opacity with TreatAsActiveWindow: 1.0 active, 0.4
+//  inactive (the float pair at .rdata CFA0C/CFA18, read byte-exact):
+//  the ink dials 254/102. v7.7.11: the HOVER engages on an inactive
+//  window too -- the same 160 ms timeline, the same 2x-in/1x-out
+//  curves, riding to the 0.4 target (the field's "different rates" is
+//  the 0.4 target on the shared clock: the strength-per-second is 40%
+//  of the active ramp in, and the 1x ramp out takes the full 160 ms
+//  from a smaller peak). An activation flip RETARGETS the running
+//  channels (the from-snapshot re-taken -- the RedrawVisual crossfade
+//  law) instead of killing them: hover crosses 1.0 -> 0.4 smoothly when
+//  the window loses focus and 0.4 -> 1.0 when it regains it, exactly
+//  the SetVisualStates re-run the native does on the flip.
 //
 //  THE BORDER, REGISTRY EDITION -- uDWM hardcodes no registry names; it
 //  reads uxtheme's GetUserColorPreference/GetColorFromPreference, whose
@@ -65,6 +74,18 @@
 //  on -> the accent at full strength; off -> the native idle line (white
 //  at the sheet's 0.2 -- the native 62-over-0e0808 measure). The line is
 //  GONE while maximized (the native maximized clip runs the border off).
+//  v7.7.11 THE INACTIVE SHEET LINE: ColorPrevalence on + inactive ->
+//  AccentColorInactive when the value exists, else the uDWM state
+//  table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B -- the 43,43,43 the
+//  field called, at the sheet's 0.5 alpha): BGRA(43,43,43,128). The
+//  flip lands on WM_NCACTIVATE/WM_ACTIVATE AND at the minimize moment
+//  (SC_MINIMIZE + WM_SIZE SIZE_MINIMIZED): the frame presented as the
+//  window goes iconic -- and the taskbar preview after it -- carries
+//  the inactive line, the inactive face and the retargeted channels.
+//  dwmcore.dll was re-scanned for the field (3,589,632 bytes, every
+//  2B 2B 2B byte run, every 0x80-alpha DWORD, the 43/255 float): it
+//  hardcodes NO chroma at all -- it renders what uDWM stages; the
+//  inactive color law lives in uDWM.dll's own tables.
 //
 //  THE TOP AND BOTTOM -- the extend carrier covers the WHOLE caption band
 //  ({0,0,cwEffBarH(),0}): every band row composites through the same
@@ -484,9 +505,35 @@ inline DWORD g_btnPrsT0[4]  = { 0, 0, 0, 0 };
 inline int   g_btnPrsFrom[4] = { 0, 0, 0, 0 };
 inline bool  g_btnTrack  = false;       // TRACKMOUSEEVENT is armed
 inline bool  g_btnAnim   = false;       // the 16 ms clock is running
+// v7.7.11 THE INACTIVE TARGETS -- UpdateButtonVisuals (0x25364) picks the
+// button visuals' target opacity with TreatAsActiveWindow: 1.0f active
+// (.rdata CFA0C), 0.4f inactive (.rdata CFA18). 0.4 * 255 = 102 -- the ink's
+// own inactive dial. The hover engages on an inactive window and rides to
+// THIS target on the same 160 ms clock: the field's "different rates".
+inline constexpr int kCwHoverTgtAct   = 255;   // the 1.0f at CFA0C
+inline constexpr int kCwHoverTgtInact = 102;   // the 0.4f at CFA18
+// the activation ledger: g_winActive is the last known state; g_forceInact
+// pins the INACTIVE law across the minimize moment (SC_MINIMIZE dispatch and
+// WM_SIZE SIZE_MINIMIZED) -- the window is still GetActiveWindow() while the
+// frame is presented, and the frame must present the inactive top bar, the
+// inactive face and the retargeted channels anyway. Cleared by WM_ACTIVATE /
+// WM_NCACTIVATE active and by any non-iconic WM_SIZE.
+inline bool  g_winActive  = true;
+inline bool  g_forceInact = false;
+// ONE activation read for the whole header -- the painters, the channel
+// targets and the flip handlers all answer this (the host's `active` paint
+// argument is a hint; this is the law).
+inline bool cwWinActive() {
+    if (g_forceInact) return false;                   // the minimize moment
+    if (!g_host || !IsWindow(g_host)) return true;    // pre-creation: active
+    return GetActiveWindow() == g_host;
+}
 // one eased read of a channel: the 0x7b10 law. (from -> target; P = elapsed /
-// 160 ms; the arriving side rides the 2x ramp clamped at target, the leaving
-// side rides the 1x ramp to zero at the full timeline.)
+// 160 ms. The arriving side rides the 2x ramp clamped at target -- full at
+// 80 ms; a retarget between two NONZERO strengths rides the same 2x ramp down
+// (the fade END synced to the new [0x194], the incoming curve of
+// ComputeFadeValues: start + 2P(end-start)); a TRUE leave (target 0) rides
+// the 1x ramp to zero at the full timeline.)
 inline int cwFadeChannel(DWORD now, DWORD t0, int from, int target) {
     if (from == target) return target;
     const DWORD el = now - t0;
@@ -495,6 +542,13 @@ inline int cwFadeChannel(DWORD now, DWORD t0, int from, int target) {
     if (target > from) {
         float a = (float)from + 2.0f * P * (float)(target - from);
         if (a > (float)target) a = (float)target;
+        return (int)(a + 0.5f);
+    }
+    if (target > 0) {
+        // v7.7.11: the activation retarget (1.0 <-> 0.4) -- the incoming
+        // curve driven DOWN to the new end, arriving at half the timeline.
+        float a = (float)from + 2.0f * P * (float)(target - from);
+        if (a < (float)target) a = (float)target;
         return (int)(a + 0.5f);
     }
     return (int)((float)from * (1.0f - P) + 0.5f);
@@ -528,6 +582,12 @@ inline void cwStripAnimTick() {
     }
     const DWORD now = GetTickCount();
     bool busy = false;
+    // v7.7.11: the channel targets answer the activation ledger -- the hover
+    // (and the press, should one latch before activation lands) rides to
+    // 255 on an active window, 102 on an inactive one: UpdateButtonVisuals'
+    // TreatAsActiveWindow pair, on the shared 160 ms clock.
+    const bool winAct = cwWinActive();
+    const int hTgt = winAct ? kCwHoverTgtAct : kCwHoverTgtInact;
     // v7.7.10: the sweep rides the cursor's REAL position too -- a leave the
     // queue never delivered (a menu loop ate it, tracking was consumed) can
     // no longer strand a lit glow: while the timeline runs, every tick
@@ -543,8 +603,8 @@ inline void cwStripAnimTick() {
         }
     }
     for (int i = 1; i <= 3; ++i) {
-        const int hT = (g_btnHover == i) ? 255 : 0;
-        const int pT = (g_btnPress == i) ? 255 : 0;
+        const int hT = (g_btnHover == i) ? hTgt : 0;
+        const int pT = (g_btnPress == i) ? hTgt : 0;
         g_btnHoverA[i] = cwFadeChannel(now, g_btnHovT0[i], g_btnHovFrom[i], hT);
         g_btnPressA[i] = cwFadeChannel(now, g_btnPrsT0[i], g_btnPrsFrom[i], pT);
         if (g_btnHoverA[i] != hT || g_btnPressA[i] != pT) busy = true;
@@ -563,10 +623,19 @@ inline void cwStripAnimTick() {
 // this, and re-arming TrackMouseEvent from inside a leave handler races the
 // system's own one-shot tracking into an arm/leave loop.
 inline void cwStripHoverRetarget(HWND w, int cx, int cy) {
-    // the uDWM rule -- an inactive window's buttons do not light (the native
-    // buttons only track the mouse on an active window).
+    // v7.7.11: the hover lives on INACTIVE windows too -- UpdateButtonVisuals
+    // (0x25364) re-runs SetVisualStates with TreatAsActiveWindow's target at
+    // every state change (1.0 active / 0.4 inactive): the buttons track the
+    // mouse on an unfocused window and the glow rides to the 0.4 target. The
+    // hit test gains the WindowFromPoint guard: with the inactive law the
+    // tick's re-derive runs while OTHER windows own the cursor -- a window
+    // stacked above ours must not light our buttons through its own pixels.
     int hit = cwBtnNone;
-    if (!g_host || GetActiveWindow() == g_host) hit = cwStripBtnAt(w, cx, cy);
+    if (g_host && IsWindow(g_host)) {
+        POINT spt;
+        if (GetCursorPos(&spt) && WindowFromPoint(spt) == g_host)
+            hit = cwStripBtnAt(w, cx, cy);
+    }
     if (g_btnPress && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
         cwStripRetargetPrs(g_btnPress);
         g_btnPress = cwBtnNone;
@@ -599,6 +668,27 @@ inline void cwStripHoverUpdate(HWND w, int cx, int cy) {
                                 TME_LEAVE | TME_NONCLIENT, w, 0 };
         if (TrackMouseEvent(&tme)) g_btnTrack = true;
     }
+}
+// v7.7.11 THE ACTIVATION FLIP -- the SetVisualStates re-run: UpdateButtonVisuals
+// picks the target opacity with TreatAsActiveWindow on EVERY visual-state
+// pass, so the native running fades re-target when the window's activation
+// changes. The from-snapshot is re-taken from the CURRENT alpha (the
+// RedrawVisual crossfade law) so a channel mid-fade crosses 1.0 <-> 0.4
+// smoothly instead of popping or dying. Called from WM_NCACTIVATE /
+// WM_ACTIVATE and from the minimize-moment transaction.
+inline void cwStripActivationFlip() {
+    bool moving = false;
+    for (int i = 1; i <= 3; ++i) {
+        if (g_btnHoverA[i] || g_btnHover == i) {
+            if (g_btnHoverA[i]) { g_btnHovFrom[i] = g_btnHoverA[i]; g_btnHovT0[i] = GetTickCount(); }
+            moving = true;
+        }
+        if (g_btnPressA[i] || g_btnPress == i) {
+            if (g_btnPressA[i]) { g_btnPrsFrom[i] = g_btnPressA[i]; g_btnPrsT0[i] = GetTickCount(); }
+            moving = true;
+        }
+    }
+    if (moving) cwStripAnimArm();
 }
 
 // ---- v7.7.5 THE DIAL (moved from the host, v7.7.9) --------------------------
@@ -738,12 +828,16 @@ inline bool cwSheetSetup(HWND w) {
 // ---- the painters ------------------------------------------------------------
 // BACKGROUND: the face seat (the band IS the titlebar color, alpha 254 through
 // the blend path) + the registry sheet line on row 0 (restored only -- the
-// maximized clip runs the border off).
+// maximized clip runs the border off). v7.7.11: BOTH read the header's own
+// activation ledger (cwWinActive -- the host's `active` argument is a hint;
+// the minimize moment MUST present the inactive law while GetActiveWindow()
+// still answers this window).
 inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
     if (!g_enabled) return;
+    const bool act = cwWinActive();
     const int bh = cwEffBarH();
-    const int face = active ? g_faceCol : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
-    const int grad = active ? g_faceGrad : (g_faceGradIn < 0 ? g_faceGrad : g_faceGradIn);
+    const int face = act ? g_faceCol : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int grad = act ? g_faceGrad : (g_faceGradIn < 0 ? g_faceGrad : g_faceGradIn);
     if (face == grad) {   // the solid collapse (a gradient between equals is exact)
         const Gdiplus::SolidBrush seat(GBand(
             RGB(cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)), 254));
@@ -758,13 +852,25 @@ inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
     }
     // THE REGISTRY SHEET LINE (row 0): the accent when ColorPrevalence says
     // so, the native idle line (white @ 0.2) otherwise, gone when maximized.
+    // v7.7.11 THE INACTIVE SHEET LINE: ColorPrevalence on + inactive ->
+    // AccentColorInactive when the registry value exists, else the uDWM state
+    // table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B) at the sheet's half
+    // alpha -- BGRA(43,43,43,128), the color the field called. dwmcore.dll
+    // was scanned for it and stages no chroma at all; the law is uDWM's own.
     if (!(g_host && IsWindow(g_host) && cwIsMaximized(g_host))) {
         COLORREF bc = RGB(255, 255, 255);
         BYTE a = 51;                       // the sheet's 0.2 (the native measure)
         if (g_borderPrevalence && g_borderHaveAccent) {
-            bc = active ? g_borderAccent
-                        : (g_borderHaveAccentIn ? g_borderAccentInCol : g_borderAccent);
-            a = 254;
+            if (act) {
+                bc = g_borderAccent;
+                a = 254;
+            } else if (g_borderHaveAccentIn) {
+                bc = g_borderAccentInCol;      // the registry override, full
+                a = 254;
+            } else {
+                bc = RGB(43, 43, 43);          // the uDWM inactive base CD7E4
+                a = 128;                       // at the sheet's 0.5 alpha
+            }
         }
         const Gdiplus::SolidBrush b(GBand(bc, a));
         g.FillRectangle(&b, 0, 0, ww, 1);
@@ -785,13 +891,16 @@ inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
     cwStripRects(rc, ww);
     const bool maxed = g_host && IsWindow(g_host) && cwIsMaximized(g_host);
     const bool dark = (g_dwmDark != 0);
-    const bool winActive = !g_host || (GetActiveWindow() == g_host);
+    const bool winActive = cwWinActive();   // v7.7.11: the header's own ledger
     const int glyphA = winActive ? 254 : 102;   // the 0.4 law (254 * 0.4 = 101.6)
-    // v7.7.10: the glow's own backdrop -- the face the patch bakes under its
-    // ink (the ACTIVE face; the glow never shows on an inactive window, so
-    // the inactive mirror never reaches the patch math).
-    const COLORREF faceC = RGB(cwChannel(g_faceCol, 16), cwChannel(g_faceCol, 8),
-                               cwChannel(g_faceCol, 0));
+    // the glow's own backdrop -- the face the patch bakes under its ink. The
+    // CURRENT face: active or the inactive mirror -- the inactive glow rides
+    // at the 0.4 target over the SAME face the seat painted (the patch stays
+    // opaque, matched to the seat underneath it).
+    const int faceSeat = winActive ? g_faceCol
+                                   : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const COLORREF faceC = RGB(cwChannel(faceSeat, 16), cwChannel(faceSeat, 8),
+                               cwChannel(faceSeat, 0));
     // ---- the glow: the three rects, the animated ink, nothing else. The dark
     // dial lays white ink under the white glass-ink glyphs; the light dial
     // black under the dark ones; the close keeps the native red -- the
@@ -811,8 +920,12 @@ inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
     for (int i = 1; i <= 3; ++i) {
         if (i == cwBtnMin && !g_btnMin) continue;   // the dead slot is face
         if (i == cwBtnMax && !g_btnMax) continue;
-        const int ha = winActive ? g_btnHoverA[i] : 0;
-        const int pa = winActive ? g_btnPressA[i] : 0;
+        // v7.7.11: the channels are UNGATED -- on an inactive window they
+        // carry the 0.4 target themselves (kCwHoverTgtInact), so the patch
+        // strength lands at 40% of the active values, the UpdateButtonVisuals
+        // law, with no painter-side gate to fight the timeline.
+        const int ha = g_btnHoverA[i];
+        const int pa = g_btnPressA[i];
         int a = (i == cwBtnClose)
               ? (ha * kBtnRedHover  + pa * kBtnRedPress)  / 255
               : (ha * kBtnFadeHover + pa * kBtnFadePress) / 255;
@@ -1041,13 +1154,58 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // visuals are uDWM's own at compose time) while the activation
         // contract stays DefWindowProc's. The band re-inks on BOTH edges of
         // the flip (the glyphs re-render at the inactive 0.4, the title
-        // re-dims, the sheet line rides its registry law); the hover drops --
-        // the native buttons do not light on an unfocused window.
+        // re-dims, the sheet line rides its registry law).
+        // v7.7.11: the hover is NOT killed on the flip anymore -- the native
+        // UpdateButtonVisuals re-runs SetVisualStates on the flip and the
+        // running fades RETARGET (1.0 <-> 0.4, the from-snapshot re-taken);
+        // the cursor still over a button keeps its (now 0.4-strength) glow
+        // on the unfocused window, the field's inactive-hover law.
         const LRESULT r = DefWindowProcW(w, msg, wp, (LPARAM)-1);
-        if (g_btnHover) g_btnHover = cwBtnNone;
-        g_btnHoverA[1] = g_btnHoverA[2] = g_btnHoverA[3] = 0;   // no stale glow
+        const bool act = (wp != 0);
+        if (act) g_forceInact = false;
+        if (act != g_winActive) { g_winActive = act; cwStripActivationFlip(); }
         cwRepaint();
         *out = r; return true; }
+    case WM_ACTIVATE:
+        // v7.7.11: the activation ledger's second edge (WM_NCACTIVATE's
+        // sibling -- ShowWindow/SetForegroundOrder paths can deliver one
+        // without the other). WA_INACTIVE == 0; any nonzero low word is
+        // WA_ACTIVE / WA_CLICKACTIVE. The flip retargets the running
+        // channels and re-inks the band, exactly like WM_NCACTIVATE.
+        if (LOWORD(wp) != WA_INACTIVE) g_forceInact = false;
+        if ((LOWORD(wp) != WA_INACTIVE) != g_winActive) {
+            g_winActive = (LOWORD(wp) != WA_INACTIVE);
+            cwStripActivationFlip();
+            cwRepaint();
+        }
+        return false;
+    case WM_SYSCOMMAND:
+        // v7.7.11 THE MINIMIZE MOMENT: the frame presented as the window goes
+        // iconic -- and the taskbar's live preview after it -- must carry the
+        // INACTIVE top bar (the uDWM state table's inactive entry at the
+        // sheet's 0.5 alpha), the inactive face and the retargeted channels.
+        // The flip lands BEFORE the default flow takes the command: the
+        // ledger pins the inactive law, the channels re-target, and ONE
+        // synchronous band repaint + DwmFlush present the inactive frame so
+        // the minimize animation samples it, not the stale active one.
+        // SC_RESTORE releases the pin; the activation contract re-lands the
+        // active law on the WM_NCACTIVATE(TRUE) that follows.
+        if ((wp & 0xFFF0) == SC_MINIMIZE) {
+            g_forceInact = true;
+            g_winActive = false;
+            cwStripActivationFlip();
+            if (IsWindowVisible(w) && !IsIconic(w)) {
+                cwRepaint();                     // the band into the update region
+                // ONE synchronous present, no erase pass (the v7.0.9 law):
+                // the host's buffered WM_PAINT lands the inactive frame and
+                // DWM is told the frame is there before the animation runs.
+                RedrawWindow(w, nullptr, nullptr, RDW_NOERASE | RDW_UPDATENOW);
+                cwDwmFlush();
+            }
+        } else if ((wp & 0xFFF0) == SC_RESTORE) {
+            g_forceInact = false;
+        }
+        return false;
     case WM_DWMCOMPOSITIONCHANGED:
         // composition can restart under the window (driver reset, an RDP
         // session) -- the extend is a geometry commitment to a DWM that no
@@ -1058,6 +1216,17 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         if (IsWindowVisible(w) && !IsIconic(w)) cwRepaint();
         return false;
     case WM_SIZE: {
+        // v7.7.11: the iconic edge pins the inactive law (ShowWindow(SW_MINIMIZE)
+        // can reach WM_SIZE without riding WM_SYSCOMMAND); any real size
+        // (SIZE_RESTORED / the restore path) releases it -- the activation
+        // contract re-lands the active law the moment the window is focused.
+        if (wp == SIZE_MINIMIZED) {
+            g_forceInact = true;
+            g_winActive = false;
+            cwStripActivationFlip();
+            return false;
+        }
+        g_forceInact = false;
         // THE MAXIMIZE FLIP -- the extend carrier, the caption height and the
         // children. cwEffBarH() answers one px short while maximized (the
         // border row vanishes); the flip re-runs the sheet setup (the carrier
@@ -1175,8 +1344,10 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         POINT cpt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
         ScreenToClient(w, &cpt);
         // no active gate here: the native first click on an INACTIVE window's
-        // button still acts (win32k activates on the down) -- only the HOVER
-        // refuses to light on an unfocused window (the 0.4 law).
+        // button still acts (win32k activates on the down -- WM_MOUSEACTIVATE
+        // lands before the NC down, so the press latches on the now-active
+        // window at the full strength; the HOVER's own inactive law is the
+        // 0.4 target, v7.7.11).
         const int hit = cwStripBtnAt(w, cpt.x, cpt.y);
         if (hit) {
             cwStripRetargetPrs(hit);
