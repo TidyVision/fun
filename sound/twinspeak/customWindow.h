@@ -1,25 +1,39 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.7.10)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.7.12)
 // =====================================================================
-// A single-header custom window-chrome API for Windows 10/11. v7.7.10 is
-// the field's three-receipt patch on the v7.7.9 consolidation, all inside
-// this file: THE OPAQUE PATCH (the hover/press glow bakes the face color
-// under its ink and rides alpha 254 -- the band composites BY ALPHA and a
-// bare-ink fill punched the face seat out, glass showed through the hovered
-// button), THE INVERTED VALUE FIX (AccentColor is 0xAABBGGRR; the sheet
-// line's decode had R and B swapped -- the default blue accent painted
-// orange), and THE HOVER THAT NEVER LIT (TME_LEAVE alone tracks the client;
-// armed from NC traffic the WM_MOUSELEAVE fired instantly and the hover
-// died the moment it lit -- press was the only visible glow. Both leaves
-// are tracked now and every leave re-derives from the cursor's real
-// position; the fade tick sweeps the same way). The v7.7.9 consolidation
-// stands unchanged beneath: THE WHOLE uDWM-LAW CHROME LIVES HERE NOW --
-// the caption band, the caption-button rects (the 0x21bc0 maximized law),
-// the hover/press glow WITH THE REAL uDWM TIMELINE, the glyphs, the uDWM
-// title, the icon, the sheet line with the REGISTRY border colors, the
-// hit tests, the NC mouse contract, the HSL dial and the extend carrier.
-// The host (twinspeak) creates the window, calls cwAttach, forwards its
-// messages through cwWndProc FIRST and paints the two chrome halves
-// inside its own buffered frame. That is the reason this API exists.
+// A single-header custom window-chrome API for Windows 10/11. v7.7.12 is
+// the field's transition round, all inside this file: THE SINGLE-PRESENT
+// FLIP (the maximize/restore transition lands ONE synchronous whole-frame
+// RedrawWindow after the carrier and the children move -- the trailing
+// second queued repaint of v7.7.9..v7.7.11 is retired, so no intermediate
+// frame can reach the compositor mid-animation), THE DPI CARRIER RE-LAND
+// (cwDpiChanged re-runs cwSheetSetup: the extend carrier is a geometry
+// commitment measured in REAL px -- at the old scale's height after a DPI
+// change it left the band's glass sheet wrong for the window's whole life
+// at the new scale -- the top-bar corruption the field filmed), and THE
+// ALWAYS-HALF INACTIVE BORDER (the inactive sheet line is BGRA(43,43,43,
+// 128) in every registry weather -- the AccentColorInactive override is
+// retired; the field's "always at a half-transparent 43,43,43"). The
+// v7.7.9..v7.7.11 consolidation stands unchanged beneath: THE WHOLE
+// uDWM-LAW CHROME LIVES HERE NOW -- the caption band, the caption-button
+// rects (the 0x21bc0 maximized law), the hover/press glow WITH THE REAL
+// uDWM TIMELINE, the glyphs, the uDWM title, the icon, the sheet line
+// with the REGISTRY border colors, the hit tests, the NC mouse contract,
+// the HSL dial and the extend carrier. The host (twinspeak) creates the
+// window, calls cwAttach, forwards its messages through cwWndProc FIRST
+// and paints the two chrome halves inside its own buffered frame. That is
+// the reason this API exists.
+//
+// REFERENCE BINARIES: uDWM.dll decides, dwmcore.dll draws, and -- the
+// field's standing order since this round -- uxtheme.dll is the reference
+// for the IN-CLIENT UI: its GetThemeSysSize (0x50840 + the scale helper
+// 0x4abfc + the DPI source 0x135e8) is the scaling law the host's S()
+// already matches byte-for-byte: scaled = MulDiv(value, processDpi, 96),
+// processDpi = IsProcessDPIAware() ? GetDeviceCaps(GetDC(nullptr),
+// LOGPIXELSX) : 96. The WM_DPICHANGED handler re-derives the scale FIRST
+// and moves the window SECOND, so every geometry decision inside the
+// resize (the NCCALCSIZE insets, the erase, the child seats) answers at
+// the NEW scale -- the uxtheme MulDiv applied at the moment the resize
+// asks for it.
 //
 // THE LAWS THIS FILE IMPLEMENTS (evidence: uDWM.dll, PDB-backed symbols):
 //
@@ -61,6 +75,33 @@
 //  the window loses focus and 0.4 -> 1.0 when it regains it, exactly
 //  the SetVisualStates re-run the native does on the flip.
 //
+//  THE ICON -- CTopLevelWindow::UpdateIcon (0x3cfd8) + UpdateWindowVisuals
+//  (0x23ad0): the caption icon is a CImage visual at window+0x210, created
+//  (0x2435e) and pinned by VisualCollection::InsertRelative; v7.7.12 THE
+//  ICON FADE VERDICT, found and closed: uDWM.dll carries NO titlebar icon
+//  fade on the inactive state. CImage::SetOpacity (0x8ac00) exists but has
+//  ZERO call sites in the whole .text; CVisual::SetOpacity (0x20a90)'s 47
+//  call sites are the layered-window alpha (CWindowList::AlphaChange
+//  0x112f0 byte/255), show/hide (0x1a20c), iconic thumbnails and the touch
+//  visuals -- none targets the icon (and CAtlasedImage::SetOpacity
+//  0x225c8 is ridden by the button crossfade pair and the shadow at
+//  every PDB-named site); the activation flip (CWindowList::
+//  ActivationChange 0x288e0 -> sub_289e8) flags the window data and re-runs
+//  UpdateWindowVisuals, and that function touches the icon ONLY for its
+//  hit-test override (CImage+0xc0 = 0/3 at 0x241e5 -- CVisual's ctor dials
+//  the same field to -2, DoHitTest compares it to -1; it is NOT a draw
+//  state). The dimming the eye reads on an inactive caption rides the
+//  FACE BENEATH the icon: the glass blend weight per state (.rdata CCD90
+//  = 0.2 active / CCDC0 = 0.6 inactive) re-blends the whole band, the
+//  TITLE re-inks through BlendColors at the CFA18 0.4 weight and the
+//  BUTTON glyphs dial to the 0.4 target -- the icon bitmap itself renders
+//  at FULL opacity in both states, and this file draws it the same way
+//  (cwPaintCaptionIcon: no fade, no dim -- 100% accurate to uDWM.dll).
+//  dwmcore.dll and uxtheme.dll were scanned the same round: the
+//  compositor stages no chroma of its own, and uxtheme's DrawThemeIcon
+//  (0x4f2c0) is a forwarder into the caller-driven image-list draw with
+//  no inactive machinery.
+
 //  THE BORDER, REGISTRY EDITION -- uDWM hardcodes no registry names; it
 //  reads uxtheme's GetUserColorPreference/GetColorFromPreference, whose
 //  store (the strings inside uxtheme.dll) is:
@@ -74,17 +115,19 @@
 //  on -> the accent at full strength; off -> the native idle line (white
 //  at the sheet's 0.2 -- the native 62-over-0e0808 measure). The line is
 //  GONE while maximized (the native maximized clip runs the border off).
-//  v7.7.11 THE INACTIVE SHEET LINE: ColorPrevalence on + inactive ->
-//  AccentColorInactive when the value exists, else the uDWM state
-//  table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B -- the 43,43,43 the
-//  field called, at the sheet's 0.5 alpha): BGRA(43,43,43,128). The
-//  flip lands on WM_NCACTIVATE/WM_ACTIVATE AND at the minimize moment
-//  (SC_MINIMIZE + WM_SIZE SIZE_MINIMIZED): the frame presented as the
-//  window goes iconic -- and the taskbar preview after it -- carries
-//  the inactive line, the inactive face and the retargeted channels.
-//  dwmcore.dll was re-scanned for the field (3,589,632 bytes, every
-//  2B 2B 2B byte run, every 0x80-alpha DWORD, the 43/255 float): it
-//  hardcodes NO chroma at all -- it renders what uDWM stages; the
+//  v7.7.12 THE ALWAYS-HALF INACTIVE BORDER: on the inactive state the
+//  sheet line is BGRA(43,43,43,128) in EVERY registry weather -- the
+//  uDWM state table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B, the
+//  43,43,43 the field called) at the sheet's own half alpha, and the
+//  v7.7.11 AccentColorInactive override is RETIRED (the field: "the
+//  inactive window's border color is always at a half-transparent
+//  43,43,43"). The flip lands on WM_NCACTIVATE/WM_ACTIVATE AND at the
+//  minimize moment (SC_MINIMIZE + WM_SIZE SIZE_MINIMIZED): the frame
+//  presented as the window goes iconic -- and the taskbar preview after
+//  it -- carries the inactive line, the inactive face and the retargeted
+//  channels. dwmcore.dll was re-scanned for the field (3,589,632 bytes,
+//  every 2B 2B 2B byte run, every 0x80-alpha DWORD, the 43/255 float):
+//  it hardcodes NO chroma at all -- it renders what uDWM stages; the
 //  inactive color law lives in uDWM.dll's own tables.
 //
 //  THE TOP AND BOTTOM -- the extend carrier covers the WHOLE caption band
@@ -287,11 +330,25 @@ inline UINT cwDpi() {
 // call re-derives everything; the host re-scales and then cwRelayoutChildren()
 // moves the tracked children. Registered nowhere -- the HOST's WM_DPICHANGED
 // case calls this (twinspeak does), then runs its own hook chain.
+// v7.7.12 THE DPI CARRIER RE-LAND: the extend carrier ({0,0,cwEffBarH(),0})
+// is a geometry commitment measured in REAL px -- re-derived g_barH with the
+// old-scale carrier still landed leaves the band's glass sheet at the WRONG
+// height for the window's whole life at the new scale (the top-bar corruption
+// the field filmed on every DPI change). The re-derivation re-runs
+// cwSheetSetup now: the carrier, the registry border read and the dial's
+// attribute re-land in the same transaction, before the host's SetWindowPos
+// can show a single frame at the new scale. Pre-attach calls (the boot seed)
+// skip the carrier -- there is no window yet; cwAttach lands it.
+inline bool cwSheetSetup(HWND w);                 // defined with the DWMAPI seam
 inline void cwDpiChanged(UINT dpi) {
     if (dpi && dpi != g_dpi) {
         g_dpi = dpi;
         g_barH = MulDiv(kBarHDesign, (int)dpi, 96);
         g_titleFontDirty = true;          // the caption font rides the scale
+        if (g_host && IsWindow(g_host)) {
+            cwSheetSetup(g_host);         // the carrier rides the new bar height
+            cwRepaint();
+        }
     }
 }
 // the uDWM caption font state (declared here, derived in cwEnsureTitleFont)
@@ -723,7 +780,10 @@ inline void cwApplyDwmMode() {
 //     ColorPrevalence (DWORD)   "show accent color on title bars and borders"
 //     AccentColor (DWORD)       0xAABBGGRR (alpha, B, G, R -- the default blue
 //                               accent #0078D7 stores as 0xffd77800)
-//     AccentColorInactive       same layout, optional (1903+)
+//     AccentColorInactive       same layout, optional (1903+) -- in the
+//                               STORE, but v7.7.12 retires the house's read
+//                               of it: the inactive line is always the state
+//                               table's half-transparent 43,43,43
 //     ColorizationColor         0xAARRGGBB, the fallback when AccentColor is
 //                               absent
 // DWM paints the 1px left/right/bottom strips itself (the NCCALCSIZE recipe's
@@ -731,12 +791,12 @@ inline void cwApplyDwmMode() {
 inline bool     g_borderPrevalence  = false;
 inline bool     g_borderHaveAccent  = false;
 inline COLORREF g_borderAccent      = RGB(0, 0, 0);
-inline bool     g_borderHaveAccentIn = false;
-inline COLORREF g_borderAccentInCol  = RGB(0, 0, 0);
+// v7.7.12: the AccentColorInactive read is RETIRED with the override -- the
+// inactive sheet line is the uDWM state table's own entry at the sheet's
+// half alpha, in every registry weather (see the always-half law above).
 inline void cwBorderReadColors() {
     g_borderPrevalence = false;
     g_borderHaveAccent = false;
-    g_borderHaveAccentIn = false;
     HKEY k;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\DWM",
                       0, KEY_READ, &k) != ERROR_SUCCESS) return;
@@ -756,12 +816,6 @@ inline void cwBorderReadColors() {
                          (LPBYTE)&v, &cb) == ERROR_SUCCESS && type == REG_DWORD) {
         g_borderAccent = RGB(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF); // 0xAABBGGRR
         g_borderHaveAccent = true;
-    }
-    cb = sizeof(v);
-    if (RegQueryValueExA(k, "AccentColorInactive", nullptr, &type,
-                         (LPBYTE)&v, &cb) == ERROR_SUCCESS && type == REG_DWORD) {
-        g_borderAccentInCol = RGB(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
-        g_borderHaveAccentIn = true;
     }
     if (!g_borderHaveAccent) {   // the ColorizationColor fallback (0xAARRGGBB)
         cb = sizeof(v);
@@ -852,25 +906,22 @@ inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
     }
     // THE REGISTRY SHEET LINE (row 0): the accent when ColorPrevalence says
     // so, the native idle line (white @ 0.2) otherwise, gone when maximized.
-    // v7.7.11 THE INACTIVE SHEET LINE: ColorPrevalence on + inactive ->
-    // AccentColorInactive when the registry value exists, else the uDWM state
-    // table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B) at the sheet's half
-    // alpha -- BGRA(43,43,43,128), the color the field called. dwmcore.dll
-    // was scanned for it and stages no chroma at all; the law is uDWM's own.
+    // v7.7.12 THE ALWAYS-HALF INACTIVE BORDER: on the inactive state the
+    // line is BGRA(43,43,43,128) in EVERY registry weather -- the uDWM state
+    // table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B) at the sheet's own
+    // 0.5 alpha, no registry override (the field: "the inactive window's
+    // border color is always at a half-transparent 43,43,43"; the v7.7.11
+    // AccentColorInactive branch is retired). dwmcore.dll was scanned for it
+    // and stages no chroma at all; the law is uDWM's own.
     if (!(g_host && IsWindow(g_host) && cwIsMaximized(g_host))) {
         COLORREF bc = RGB(255, 255, 255);
         BYTE a = 51;                       // the sheet's 0.2 (the native measure)
-        if (g_borderPrevalence && g_borderHaveAccent) {
-            if (act) {
-                bc = g_borderAccent;
-                a = 254;
-            } else if (g_borderHaveAccentIn) {
-                bc = g_borderAccentInCol;      // the registry override, full
-                a = 254;
-            } else {
-                bc = RGB(43, 43, 43);          // the uDWM inactive base CD7E4
-                a = 128;                       // at the sheet's 0.5 alpha
-            }
+        if (g_borderPrevalence && g_borderHaveAccent && act) {
+            bc = g_borderAccent;
+            a = 254;
+        } else if (!act) {
+            bc = RGB(43, 43, 43);          // the uDWM inactive base CD7E4
+            a = 128;                       // at the sheet's 0.5 alpha -- ALWAYS
         }
         const Gdiplus::SolidBrush b(GBand(bc, a));
         g.FillRectangle(&b, 0, 0, ww, 1);
@@ -1057,6 +1108,18 @@ inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool acti
 // v7.7.6 THE CAPTION ICON -- the small icon in its native slot at the
 // caption's left, vertically centered in the caption block. GDI (DrawIconEx)
 // runs AFTER the GDI+ scope dies -- the house never mixes them on one DC.
+// v7.7.12 THE ICON FADE VERDICT (the field asked for the disassembly of
+// "the titlebar icon fade on the inactive window state"): there is NONE
+// in uDWM.dll -- CImage::SetOpacity (0x8ac00) has ZERO call sites in the
+// whole .text, CVisual::SetOpacity's (0x20a90) 47 call sites all target
+// the layered alpha / show-hide / thumbnails / touch visuals, and the
+// activation flip's UpdateWindowVisuals touches the icon only for its
+// hit-test override (CImage+0xc0 = 0/3 at 0x241e5). The inactive dim the
+// eye reads is the FACE BENEATH the icon re-blending (the glass state
+// weights CCD90 = 0.2 / CCDC0 = 0.6) plus the title's CFA18 0.4 color
+// blend and the buttons' 0.4 glyph dial. The icon therefore draws at FULL
+// opacity in both states here -- the 100%-accurate answer. Full receipts:
+// the header's THE ICON block and the v7.7.12 changelog.
 inline void cwPaintCaptionIcon(HDC dc, int cw) {
     if (!g_host || !dc) return;
     HICON hic = (HICON)SendMessageW(g_host, WM_GETICON, ICON_SMALL, 0);
@@ -1230,9 +1293,16 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         // THE MAXIMIZE FLIP -- the extend carrier, the caption height and the
         // children. cwEffBarH() answers one px short while maximized (the
         // border row vanishes); the flip re-runs the sheet setup (the carrier
-        // follows the band), re-seats the tracked children at the new delta
-        // and lands ONE synchronous whole-frame repaint before the flip's
-        // compose can sample anything stale. Iconic transitions are skipped.
+        // follows the band) and re-seats the tracked children at the new
+        // delta. v7.7.12 THE SINGLE-PRESENT FLIP: ONE synchronous whole-frame
+        // RedrawWindow (the band rows INCLUDED -- the client rect covers
+        // them) lands the flip; the trailing cwRepaint() the older rounds
+        // queued after the synchronous pass is retired -- a second queued
+        // paint behind RDW_UPDATENOW is exactly the kind of stray frame the
+        // compositor can sample mid-animation (the field's "temporarily
+        // corrupt" on maximize/restore). RDW_FRAME rides along so the NC
+        // border strips re-dress in the same present. Iconic transitions are
+        // skipped.
         if (!IsIconic(w)) {
             const bool maxed = cwIsMaximized(w);
             if (maxed != g_wasMax) {
@@ -1242,9 +1312,8 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
                 if (IsWindowVisible(w)) {
                     RECT cr; GetClientRect(w, &cr);
                     RedrawWindow(w, &cr, nullptr,
-                                 RDW_INVALIDATE | RDW_ERASE
+                                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME
                                  | RDW_ALLCHILDREN | RDW_UPDATENOW);
-                    cwRepaint();
                 }
             }
         }
