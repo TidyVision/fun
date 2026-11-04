@@ -5117,6 +5117,7 @@ static void guiStripGpuRelease();   // v7.0.7 (defined with the tab strip)
 
 // (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
 // itself -- v7.0.9 paints the bar from the live guic:: colors instead.)
+static void guiApplyDwmMode();   // v7.7.5: THE DIAL -- defined with the band machinery
 
 // v7.6.14: guiApplyDwmCaption is RETIRED -- there is no native caption left
 // to tint. Its two calls were Windows 11-only: on the field's Windows 10
@@ -5146,6 +5147,10 @@ static void applyTheme(int i) {
     TSREBR(g_brPanel2, guic::cPanel2);
     TSREBR(g_brLog,    guic::cLogBg);
     #undef TSREBR
+    // v7.7.5 THE DIAL: the titlebar color changed (the band's face IS this
+    // theme's background) -- its HSL lightness re-picks the immersive mode
+    // right here, in the same transaction as the colors and the brushes.
+    guiApplyDwmMode();
     // v7.6.14: no caption re-seed call -- the strip IS client pixels and
     // reads guic:: live; the RDW repaint below lands the new colors on it.
     if (g_hwnd) {
@@ -7050,11 +7055,14 @@ static bool guiCreateRealWindow() {
             const int ncrp = 2;     // DWMNCRP_ENABLED
             dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
                    &ncrp, sizeof(ncrp));
-            const int darkOn = 1;
-            if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                              &darkOn, sizeof(darkOn)))) {
-                dwmSet(g_hwnd, 19, &darkOn, sizeof(darkOn));
-            }
+            // v7.7.5: the always-on dark-mode pin retires (v7.1.27's
+            // standing order is superseded) -- the dial owns the attribute
+            // now: guiApplyDwmMode reads the titlebar color's HSL lightness
+            // ("whenever the titlebar color's hsl lightness is over 128 it
+            // switches to light mode and vice versa") and programs 20 with
+            // the 19 fallback itself. applyTheme parked the mode pre-
+            // creation; this call lands it on the live window.
+            guiApplyDwmMode();
         }
         // v7.6.14: guiApplyDwmCaption is retired with the native caption --
         // there is nothing left for DWMWA_CAPTION_COLOR to tint (no NC area
@@ -7444,6 +7452,164 @@ static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
 #ifndef GET_Y_LPARAM
 #define GET_Y_LPARAM(lp)   ((int)(short)HIWORD(lp))
 #endif
+// ---- v7.7.5 THE CAPTION GLOW -- the hover animations, the house's own ------
+// The field: "Now it just needs the hovering animations like I want, and it's
+// truly alive, just without the icon and title text." The buttons keep the
+// v7.7.4 geometry (the decompile's 0x222a8 formula, capture-verified to
+// 1.5px) but answer HTCLIENT again: an animated glow cannot live under
+// uDWM's instant native fill (any native hit code lights it). So the house
+// runs the whole state machine -- TRACKMOUSEEVENT tracks the band, a 16 ms
+// timer eases the per-button hover/press alphas, guiPaintBtns lays the ink
+// over the sheet through GDI+ alpha (the v7.1.27 mechanism: partial alpha
+// over the face's alpha-0 rows composites as translucent ink on the glass).
+// uDWM's idle glyphs keep composing on top (they compose regardless of the
+// hit codes -- the v7.7.2 capture proved it): the fill is the house's, the
+// glyph ink is the dial's below. No icon, no title text -- untouched.
+enum { kBtnNone = 0, kBtnMin = 1, kBtnMax = 2, kBtnClose = 3 };
+static int  g_btnHover  = kBtnNone;    // the button under the cursor (0 = none)
+static int  g_btnPress  = kBtnNone;    // the button held down
+static int  g_btnHoverA[4] = { 0, 0, 0, 0 };   // hover alpha 0..255 per button
+static int  g_btnPressA[4] = { 0, 0, 0, 0 };   // press alpha 0..255 per button
+static bool g_btnTrack  = false;       // TRACKMOUSEEVENT is armed
+static bool g_btnAnim   = false;       // the 16 ms clock (timer 4) is running
+enum { kBtnFadeHover = 46, kBtnFadePress = 44,    // neutral ink strength /255
+       kBtnRedHover  = 185, kBtnRedPress  = 45 }; // close-red strength  /255
+
+// the buttons' rects -- v7.7.4's decompile formula verbatim (0x222a8:
+// cysize = SM_CYSIZE, glyph = floor(cys*21/22+0.5), close = glyph*49/22,
+// minmax = glyph*48/22 -- 47/46/46 at 100%), right-to-left, NO seams, flush
+// to the client's right edge, the caption block tall (SM_CYCAPTION + the
+// frame = 31 at 100%), clamped under the band. One helper now -- the hit
+// test, the mouse side and the painter share the exact same numbers.
+static void stripBtnRects(RECT rc[3], int clientRight) {
+    const int cys = cwd::cwMetric(SM_CYSIZE);
+    const int glyph = (cys * 21 + 11) / 22;                // floor(cys*0.9545+0.5)
+    const int cW = (glyph * 49 + 11) / 22;                 // close   47 at 100%
+    const int mW = (glyph * 48 + 11) / 22;                 // min/max 46
+    const int bh = cwd::cwMetric(SM_CYCAPTION)
+                 + cwd::cwMetric(SM_CYFRAME)
+                 + cwd::cwMetric(SM_CXPADDEDBORDER);       // 31 at 100%
+    const int bbot = (bh < g_capH) ? bh : g_capH - 1;
+    rc[2].left = clientRight - cW;          rc[2].top = 0;    // close
+    rc[2].right = clientRight;              rc[2].bottom = bbot;
+    rc[1].left = clientRight - cW - mW;     rc[1].top = 0;    // max
+    rc[1].right = clientRight - cW;         rc[1].bottom = bbot;
+    rc[0].left = clientRight - cW - 2 * mW; rc[0].top = 0;    // min
+    rc[0].right = clientRight - cW - mW;    rc[0].bottom = bbot;
+}
+static int stripBtnAt(HWND w, int x, int y) {
+    RECT crc, rc[3];
+    GetClientRect(w, &crc);
+    stripBtnRects(rc, crc.right);
+    for (int i = 0; i < 3; ++i)
+        if (x >= rc[i].left && x < rc[i].right &&
+            y >= rc[i].top  && y < rc[i].bottom)
+            return i + 1;
+    return kBtnNone;
+}
+static void stripInvalidate(HWND w) {
+    RECT crc, rc[3];
+    GetClientRect(w, &crc);
+    stripBtnRects(rc, crc.right);
+    for (int i = 0; i < 3; ++i) InvalidateRect(w, &rc[i], FALSE);
+}
+// one eased step of an alpha toward its target: x num/8 per 16 ms tick, a
+// one-unit nudge when the step rounds to zero, clamped -- no overshoot.
+static int stripEase(int a, int t, int num) {
+    if (a == t) return a;
+    int d = ((t - a) * num) / 8;
+    if (d == 0) d = (t > a) ? 1 : -1;
+    a += d;
+    if ((d > 0 && a > t) || (d < 0 && a < t)) a = t;
+    return a;
+}
+static void stripAnimArm(HWND w) {
+    if (!g_btnAnim) { SetTimer(w, 4, 16, nullptr); g_btnAnim = true; }
+}
+static void stripAnimStep(HWND w) {
+    bool busy = false;
+    for (int i = 1; i <= 3; ++i) {
+        const int hT = (g_btnHover == i) ? 255 : 0;
+        const int pT = (g_btnPress == i) ? 255 : 0;
+        g_btnHoverA[i] = stripEase(g_btnHoverA[i], hT, 3);
+        g_btnPressA[i] = stripEase(g_btnPressA[i], pT, 5);
+        if (g_btnHoverA[i] != hT || g_btnPressA[i] != pT) busy = true;
+    }
+    stripInvalidate(w);                     // the tick's frame rides the blit
+    if (!busy && g_btnAnim) { KillTimer(w, 4); g_btnAnim = false; }
+}
+static void stripHoverUpdate(HWND w, LPARAM lp) {
+    const int hit = stripBtnAt(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+    if (hit != g_btnHover) { g_btnHover = hit; stripAnimArm(w); }
+    if (!g_btnTrack) {
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, w, 0 };
+        if (TrackMouseEvent(&tme)) g_btnTrack = true;
+    }
+}
+
+// ---- v7.7.5 THE DIAL -- the immersive mode rides the titlebar color --------
+// The field: "make it so the whenever the titlebar color's hsl lightness is
+// over 128 it switches to light mode and vice versa." The titlebar color is
+// the band's own face -- guic::cBg, the live theme's background (the v7.7.4
+// changelog, section 1: "the band is the theme's own face -- the field's
+// titlebar color, confirmed"). The dial is the HSL lightness
+//         L = (max(r,g,b) + min(r,g,b)) / 2     -- 0..255, NOT the luma
+// and the switch is DWMWA_USE_IMMERSIVE_DARK_MODE (20, fallback 19) -- the
+// attribute v7.1.27 pinned always-on and the field guessed at in v7.7.2:
+//     L > 128  -> light mode (0): the sheet composes white glass, the
+//                 caption ink turns dark -- a light titlebar on light themes
+//     L <= 128 -> dark mode (1): the dark sheet, the white glass-ink glyphs
+//                 -- the exact look the field signed off on
+// applyTheme calls this on every theme click ("whenever" the color changes),
+// creation lands the parked mode once the window exists.
+static int  g_dwmDark = 1;             // the mode the glow's ink reads
+static bool guiStripWantsLight() {
+    const COLORREF c = guic::cBg;
+    const int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    const int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    return (mx + mn) / 2 > 128;        // the field's 128 dial, HSL L, 0..255
+}
+static void guiApplyDwmMode() {
+    g_dwmDark = guiStripWantsLight() ? 0 : 1;
+    if (!g_hwnd) return;               // pre-creation: parked; creation lands it
+    typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+    const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+        LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+    if (dwmSet) {
+        if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                          &g_dwmDark, sizeof(g_dwmDark)))) {
+            dwmSet(g_hwnd, 19, &g_dwmDark, sizeof(g_dwmDark));
+        }
+    }
+}
+
+// the glow pass -- the three rects, the animated ink, nothing else. Dark
+// mode lays white ink under the white glass-ink glyphs; light mode lays
+// black under the dark ones; the close keeps the native red (196,43,28)
+// both ways -- the one colored affordance udwm itself has. GDI+ writes the
+// ALPHA, the DWM composites the ink over the sheet by it: the fade IS the
+// alpha.
+static void guiPaintBtns(Gdiplus::Graphics& gs, int cw) {
+    RECT rc[3];
+    stripBtnRects(rc, cw);
+    const bool dark = (g_dwmDark != 0);
+    for (int i = 1; i <= 3; ++i) {
+        const int ha = g_btnHoverA[i], pa = g_btnPressA[i];
+        int a = (i == kBtnClose)
+              ? (ha * kBtnRedHover  + pa * kBtnRedPress)  / 255
+              : (ha * kBtnFadeHover + pa * kBtnFadePress) / 255;
+        if (a <= 0) continue;
+        if (a > 255) a = 255;
+        const RECT& r = rc[i - 1];
+        const Gdiplus::Rect gr(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        const COLORREF ink = (i == kBtnClose) ? RGB(196, 43, 28)
+                           : (dark ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        Gdiplus::SolidBrush br(GCol(ink, (BYTE)a));
+        gs.FillRectangle(&br, gr);
+    }
+}
+
 // The complete frame face -- background, page panel, log frame, version line,
 // watermark -- into ANY dc (the memory buffer normally, the screen directly
 // as the no-buffer fallback).
@@ -7464,6 +7630,12 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // still owns every pixel and the band is plain theme face.
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
+    {   // v7.7.5: the caption glow -- device space, BEFORE the shift. The
+        // scoped Graphics dies here, restoring the DC to the state it saved
+        // at construction (identity) -- the shift below cannot be eaten.
+        Gdiplus::Graphics gs(dc);
+        guiPaintBtns(gs, cw);
+    }
     SetViewportOrgEx(dc, 0, g_capH, nullptr);   // v7.6.14: the content body rides below the band
     const RECT panel = { S(12), KPANEL_T, S(866), KPANEL_B };
     FillRect(dc, &panel, g_brPanel);
@@ -7487,7 +7659,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(852) + 1.0f,
                                         (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.7.4 |  %s",   // v7.7.4 THE SHEET BUTTONS ANSWER (the field: "I can only hover over the minimize button on the extreme case of me resizing the window to be 100px wide") -- WM_NCHITTEST now answers the native button hit codes HTMINBUTTON/HTMAXBUTTON/HTCLOSE over the extend band; the rects are the decompile's own formula (0x222a8: cysize = SM_CYSIZE, glyph = floor(cys*21/22+0.5), close = glyph*49/22, minmax = glyph*48/22 -- 47/46/46 at 100%, NO seams, flush to the client's right edge, height = SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER = 31), buttons BEFORE the top resize band (the native order); the click rides the untouched native NC path (WM_NCLBUTTONDOWN -> DefWindowProc -> SC_MINIMIZE/SC_MAXIMIZE/SC_RESTORE, SC_CLOSE -> WM_CLOSE hide-to-tray) and the hover is uDWM's own compose (the white glass-ink glyphs the field sees; the dark-mode attribute stays untouched on the standing order) -- the v7.7.3 capture measured the drawn buttons at X center 856.5, square 809.5, dash 765: every center within 1.5px of the answer rects -- the 100px quirk explained: DefWindowProc answers HTCLIENT for every band point (the stored client rect owns the top), the house re-answered HTCAPTION, so no button NC traffic ever flowed; uDWM's clamped layout at 100px was the one side door its own walk still caught -- v7.7.3 THE OLD CUSTOM WINDOW LEAVES, THE UDW RECIPE STAYS (the field: "don't do anything else and remove the old custom window whilst retaining the new uDWM decompiled code that's for this specific window" -- handed down on a v7.7.2 capture that finally showed the strip and, with it, the double border and the white caption parts) -- REMOVED WHOLE: guiPaintStrip (the 33px face, the separator, the row-0 border line, the hover/press bands, the three glyphs, the title), stripBtnRects/stripBtnAt, stripHoverUpdate/stripInvalidate, stripBlend/stripIsDark/stripTextColor, g_btnHover/g_btnPress/g_stripActive/g_stripTrack, the four strip mouse cases, the strip's HTCLIENT answer in WM_NCHITTEST, and the title font g_fTitle -- the last customWindow.h object in the house; RETAINED VERBATIM: the decompiled recipe for this window (NCCALCSIZE's real left/right/bottom insets, the top client-covered, the extend carrier {0,0,32,0}, NCHITTEST DefWindowProc-first + the caption band HTCAPTION, NCACTIVATE DefWindowProc(wp,-1), the buffered face, the never-black erase belt); guiPaintFrame fills the WHOLE buffer with the theme face BEFORE the viewport shift so the band rows 0..g_capH-1 are plain face -- the house paints nothing above the content anymore, and the double border is gone by construction; the children keep their +kCapHDesign seats -- nothing below the band moved a pixel -- v7.7.2 THE FIELD'S 32 + THE BLIT THAT HID THE STRIP (the field: "Try to extend to 0,0,32,0"; and the strip's pixels never reached the screen since v7.6.14 -- the content-pass Graphics outlived guiPaintFrame's tail origin reset and restored the DC to (0, g_capH), so the BitBlt's logical source read buffer row y+g_capH for screen row y: the strip landed at screen rows -33..-1, every painted frame floated 33px above its children -- WM_PAINT now resets g_frmDc's origin after the last Graphics is gone and before the blit; the extend is {0,0,32,0}, the field's number) -- v7.7.1 THE OTHER HALF OF THE RECIPE (THE FIELD: "I still just see a borderless window, but thanks for the drop shadow"): the shadow's return proved the extend carrier works and the border's absence proved it was never the whole recipe -- the house's own decode already said why ("v7.6.10 never hit it because customWindow.h left REAL non-client insets on left/right/bottom, so the metrics never went to zero"), so WM_NCCALCSIZE keeps the proven v7.6.10 answer again (customWindow.h's handler, main.c verbatim): the client is the window MINUS the frame insets on left/right/bottom, real NC strips whose metrics stay nonzero so uDWM draws the native 1px border in them; the top stays client-covered (the strip's row 0 is the top border line), maximized gives all four sides back; the creation size adds the insets (outer = 880x653 design client + 2*fx + fy, so the CLIENT lands at the designed size and the border wraps it); WM_NCHITTEST rides customWindow.h's proven order -- DefWindowProc FIRST (the real NC bands give it the native edges, corners included -- HTBOTTOMLEFT/HTBOTTOMRIGHT survive the v7.6.14 hand-rolled bands that answered HTBOTTOM straight across), every edge answer rides back untouched, then the strip re-answers in CLIENT space: buttons HTCLIENT before the top resize band (the native order), the rest HTCAPTION (the v7.6.14 math had tested the buttons against the WINDOW width while the painter drew them against the CLIENT width -- the same numbers only while client == window); guiInitDpi syncs cwd's metric DPI at boot so the insets agree with the creation size at every scale above 100% -- v7.7.0 THE ONE-CALL FRAME KEEPER (THE RECIPE, EXECUTED): the field ordered v7.7.0 straight from section 9 of download/uDWM-decompile-notes-v2.txt -- the uDWM decode says WM_NCCALCSIZE 0 zeroes the kernel's four frame metrics, the style digest loses bit 2 ("framed") and s_ChooseWindowFrameFromStyle downgrades the window to the basic frame (no border, no shadow, no caption parts -- the exact v7.6.14 symptom), so ONE DwmExtendFrameIntoClientArea({0,0,1,0}) after creation keeps the CWindowData sheet margins nonzero and FRAME[1] -- the native 1px border + the native shadow -- attached to the client-equals-window shell; WM_NCACTIVATE now answers DefWindowProc(wp,-1) per 9e (never a bare TRUE); the strip paints client row 0 itself as the top border line (guic::cLine, zoom-guarded -- "0px vertical is reserved for the fake top bar"), and the extend band itself stays invisible under it (the carrier, not a visible pixel); 9a/9b/9d already matched (WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, NCCALCSIZE 0 + maximized frame insets, buttons HTCLIENT / strip HTCAPTION / DPI-correct edges) -- v7.6.14 THE STRIP COMES HOME (WINDOWS 10 FIRST): "I'm on Windows 10 btw. That's the whole reason in why I'm here." -- the v7.6.13 caption color rode DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11 only: on Win10 both fail and the caption stays system gray, and no font API exists on any Windows), so the window keeps the native restart's plain WS_OVERLAPPEDWINDOW shell and takes back ONE band: the caption strip, 33 design px (kBarHDesign), painted inside the buffered face -- theme cBg face + 1px cLine separator, the CUSTOM TITLEBAR FONT again (Segoe UI -14 semibold, the cwSeedTitleFont seed) at the pseudocode's 12px padding, the v7.6.13 color pair (dark: 160,200,205 / light: cText; inactive cDim), and OUR buttons: 2 FIXED PHYSICAL px seams + 2px right inset ("Do 2px"), 1 design px of daylight on top (the field's y=1), the proven native glyphs (dash S(10)x1, square S(9)+1, restore pair S(8)/S(2) in a S(10) span, X span S(10), 1px strokes), close hover the native red (196,43,28); HTCAPTION on the strip keeps drag/Aero snap/double-click maximize Windows' own, the resize edges answer the DPI-correct frame metrics, the maximized client insets by the frame on all four sides, and the first content pixel sits DIRECTLY below the strip (every child + the content body shift kCapHDesign design px -- "draw something just below the titlebar buttons" is the layout contract) -- DPI rides the standard WM_DPICHANGED path, no guards, "forget about the dpi issue entirely" -- v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption took the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" was back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window became a plain WS_OVERLAPPEDWINDOW: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story were Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome was not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay)
+    snprintf(vbuf, sizeof(vbuf), "v7.7.5 |  %s",   // v7.7.5 THE GLOW AND THE DIAL (the field: "Now it just needs the hovering animations like I want, and it's truly alive, just without the icon and title text. In the meanwhile, make it so the whenever the titlebar color's hsl lightness is over 128 it switches to light mode and vice versa") -- THE GLOW: the three caption parts answer HTCLIENT again (v7.7.4's native hit codes stood down -- a native code lights uDWM's own INSTANT fill and the fade cannot live under it), the geometry stays v7.7.4's capture-verified decompile formula now shared as stripBtnRects (0x222a8: cysize = SM_CYSIZE, glyph = floor(cys*21/22+0.5), close = glyph*49/22, minmax = glyph*48/22 -- 47/46/46 at 100%, NO seams, flush to the client's right edge, the caption block tall), and the hover/press glow is the house's own animated ink: WM_MOUSEMOVE arms TRACKMOUSEEVENT, the revived 16 ms timer 4 (v7.2.15 retired the id, v7.7.5 re-enlists it) eases the per-button hover/press alphas x3/8 and x5/8 per tick with a sub-step snap and kills itself on settle, guiPaintBtns fills the rects through GDI+ so the ALPHA rides the sheet blend (the v7.1.27 mechanism: partial alpha over the face's alpha-0 rows composites as translucent ink on the glass), neutral ink at 18% hover +17% press (white on a dark titlebar, black on a light one -- the dial's own pair) and the native close red 196,43,28 at 73% +18%; the clicks ride the client path again (SetCapture holds the press honest, WM_LBUTTONUP on the birth button -> PostMessage SC_MINIMIZE / SC_MAXIMIZE-SC_RESTORE / SC_CLOSE -> WM_CLOSE hide-to-tray) and uDWM keeps composing the idle glyphs on top (they compose regardless of the hit codes -- the v7.7.2 capture proved it) -- THE DIAL: the immersive dark-mode attribute is no longer always-on (v7.1.27's pin retires); guiApplyDwmMode reads the titlebar color -- the band's own face guic::cBg, the field's confirmed titlebar color (v7.7.4 changelog section 1) -- takes the HSL lightness L = (max+min)/2 on the 0..255 dial (NOT the luma) and programs DWMWA_USE_IMMERSIVE_DARK_MODE (20, fallback 19): L > 128 -> light mode (0, the white sheet and the dark glass-ink glyphs), L <= 128 -> dark mode (1, the dark sheet and the white glass-ink glyphs the field has been seeing); applyTheme calls it on every theme click -- the "whenever" -- and creation lands the parked mode once the window exists; no icon and no title text, exactly as the field left it -- v7.7.4 THE SHEET BUTTONS ANSWER (the field: "I can only hover over the minimize button on the extreme case of me resizing the window to be 100px wide") -- WM_NCHITTEST now answers the native button hit codes HTMINBUTTON/HTMAXBUTTON/HTCLOSE over the extend band; the rects are the decompile's own formula (0x222a8: cysize = SM_CYSIZE, glyph = floor(cys*21/22+0.5), close = glyph*49/22, minmax = glyph*48/22 -- 47/46/46 at 100%, NO seams, flush to the client's right edge, height = SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER = 31), buttons BEFORE the top resize band (the native order); the click rides the untouched native NC path (WM_NCLBUTTONDOWN -> DefWindowProc -> SC_MINIMIZE/SC_MAXIMIZE/SC_RESTORE, SC_CLOSE -> WM_CLOSE hide-to-tray) and the hover is uDWM's own compose (the white glass-ink glyphs the field sees; the dark-mode attribute stays untouched on the standing order) -- the v7.7.3 capture measured the drawn buttons at X center 856.5, square 809.5, dash 765: every center within 1.5px of the answer rects -- the 100px quirk explained: DefWindowProc answers HTCLIENT for every band point (the stored client rect owns the top), the house re-answered HTCAPTION, so no button NC traffic ever flowed; uDWM's clamped layout at 100px was the one side door its own walk still caught -- v7.7.3 THE OLD CUSTOM WINDOW LEAVES, THE UDW RECIPE STAYS (the field: "don't do anything else and remove the old custom window whilst retaining the new uDWM decompiled code that's for this specific window" -- handed down on a v7.7.2 capture that finally showed the strip and, with it, the double border and the white caption parts) -- REMOVED WHOLE: guiPaintStrip (the 33px face, the separator, the row-0 border line, the hover/press bands, the three glyphs, the title), stripBtnRects/stripBtnAt, stripHoverUpdate/stripInvalidate, stripBlend/stripIsDark/stripTextColor, g_btnHover/g_btnPress/g_stripActive/g_stripTrack, the four strip mouse cases, the strip's HTCLIENT answer in WM_NCHITTEST, and the title font g_fTitle -- the last customWindow.h object in the house; RETAINED VERBATIM: the decompiled recipe for this window (NCCALCSIZE's real left/right/bottom insets, the top client-covered, the extend carrier {0,0,32,0}, NCHITTEST DefWindowProc-first + the caption band HTCAPTION, NCACTIVATE DefWindowProc(wp,-1), the buffered face, the never-black erase belt); guiPaintFrame fills the WHOLE buffer with the theme face BEFORE the viewport shift so the band rows 0..g_capH-1 are plain face -- the house paints nothing above the content anymore, and the double border is gone by construction; the children keep their +kCapHDesign seats -- nothing below the band moved a pixel -- v7.7.2 THE FIELD'S 32 + THE BLIT THAT HID THE STRIP (the field: "Try to extend to 0,0,32,0"; and the strip's pixels never reached the screen since v7.6.14 -- the content-pass Graphics outlived guiPaintFrame's tail origin reset and restored the DC to (0, g_capH), so the BitBlt's logical source read buffer row y+g_capH for screen row y: the strip landed at screen rows -33..-1, every painted frame floated 33px above its children -- WM_PAINT now resets g_frmDc's origin after the last Graphics is gone and before the blit; the extend is {0,0,32,0}, the field's number) -- v7.7.1 THE OTHER HALF OF THE RECIPE (THE FIELD: "I still just see a borderless window, but thanks for the drop shadow"): the shadow's return proved the extend carrier works and the border's absence proved it was never the whole recipe -- the house's own decode already said why ("v7.6.10 never hit it because customWindow.h left REAL non-client insets on left/right/bottom, so the metrics never went to zero"), so WM_NCCALCSIZE keeps the proven v7.6.10 answer again (customWindow.h's handler, main.c verbatim): the client is the window MINUS the frame insets on left/right/bottom, real NC strips whose metrics stay nonzero so uDWM draws the native 1px border in them; the top stays client-covered (the strip's row 0 is the top border line), maximized gives all four sides back; the creation size adds the insets (outer = 880x653 design client + 2*fx + fy, so the CLIENT lands at the designed size and the border wraps it); WM_NCHITTEST rides customWindow.h's proven order -- DefWindowProc FIRST (the real NC bands give it the native edges, corners included -- HTBOTTOMLEFT/HTBOTTOMRIGHT survive the v7.6.14 hand-rolled bands that answered HTBOTTOM straight across), every edge answer rides back untouched, then the strip re-answers in CLIENT space: buttons HTCLIENT before the top resize band (the native order), the rest HTCAPTION (the v7.6.14 math had tested the buttons against the WINDOW width while the painter drew them against the CLIENT width -- the same numbers only while client == window); guiInitDpi syncs cwd's metric DPI at boot so the insets agree with the creation size at every scale above 100% -- v7.7.0 THE ONE-CALL FRAME KEEPER (THE RECIPE, EXECUTED): the field ordered v7.7.0 straight from section 9 of download/uDWM-decompile-notes-v2.txt -- the uDWM decode says WM_NCCALCSIZE 0 zeroes the kernel's four frame metrics, the style digest loses bit 2 ("framed") and s_ChooseWindowFrameFromStyle downgrades the window to the basic frame (no border, no shadow, no caption parts -- the exact v7.6.14 symptom), so ONE DwmExtendFrameIntoClientArea({0,0,1,0}) after creation keeps the CWindowData sheet margins nonzero and FRAME[1] -- the native 1px border + the native shadow -- attached to the client-equals-window shell; WM_NCACTIVATE now answers DefWindowProc(wp,-1) per 9e (never a bare TRUE); the strip paints client row 0 itself as the top border line (guic::cLine, zoom-guarded -- "0px vertical is reserved for the fake top bar"), and the extend band itself stays invisible under it (the carrier, not a visible pixel); 9a/9b/9d already matched (WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, NCCALCSIZE 0 + maximized frame insets, buttons HTCLIENT / strip HTCAPTION / DPI-correct edges) -- v7.6.14 THE STRIP COMES HOME (WINDOWS 10 FIRST): "I'm on Windows 10 btw. That's the whole reason in why I'm here." -- the v7.6.13 caption color rode DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11 only: on Win10 both fail and the caption stays system gray, and no font API exists on any Windows), so the window keeps the native restart's plain WS_OVERLAPPEDWINDOW shell and takes back ONE band: the caption strip, 33 design px (kBarHDesign), painted inside the buffered face -- theme cBg face + 1px cLine separator, the CUSTOM TITLEBAR FONT again (Segoe UI -14 semibold, the cwSeedTitleFont seed) at the pseudocode's 12px padding, the v7.6.13 color pair (dark: 160,200,205 / light: cText; inactive cDim), and OUR buttons: 2 FIXED PHYSICAL px seams + 2px right inset ("Do 2px"), 1 design px of daylight on top (the field's y=1), the proven native glyphs (dash S(10)x1, square S(9)+1, restore pair S(8)/S(2) in a S(10) span, X span S(10), 1px strokes), close hover the native red (196,43,28); HTCAPTION on the strip keeps drag/Aero snap/double-click maximize Windows' own, the resize edges answer the DPI-correct frame metrics, the maximized client insets by the frame on all four sides, and the first content pixel sits DIRECTLY below the strip (every child + the content body shift kCapHDesign design px -- "draw something just below the titlebar buttons" is the layout contract) -- DPI rides the standard WM_DPICHANGED path, no guards, "forget about the dpi issue entirely" -- v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption took the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" was back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window became a plain WS_OVERLAPPEDWINDOW: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story were Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome was not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7636,6 +7808,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(w, &cpt);
+        // v7.7.5 THE GLOW TAKES THE BUTTONS BACK: the native hit codes of
+        // v7.7.4 stand down -- a native code lights uDWM's own INSTANT fill
+        // over the band, and the fade the field ordered cannot live under
+        // it. The buttons answer HTCLIENT again (the proven v7.6.14 route:
+        // the clicks ride client messages) while the geometry below stays
+        // v7.7.4's capture-verified decompile formula, shared with the
+        // mouse side and the painter through stripBtnRects. The glow is the
+        // house's own animated ink -- stripHoverUpdate arms TRACKMOUSEEVENT,
+        // the 16 ms timer 4 eases the per-button alphas, guiPaintBtns lays
+        // them over the sheet through GDI+ alpha. uDWM keeps composing the
+        // idle glyphs (they compose regardless of the hit codes -- the
+        // v7.7.2 capture proved it); only the fill under them is ours.
         // v7.7.4 THE SHEET BUTTONS ANSWER (recipe 9d's other half -- the
         // hit-test walk the decompile decoded at 0x33130 + the per-button
         // update at 0x222a8): uDWM draws the three caption parts over the
@@ -7656,22 +7840,13 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // = 31 at 100%. Buttons win over the top resize band (the native
         // order: rows 1..8 over a button are the button's, exactly like
         // the real caption).
-        const int cys = cwd::cwMetric(SM_CYSIZE);              // 22 at 100%
-        const int glyph = (cys * 21 + 11) / 22;                // floor(cys*0.9545+0.5)
-        const int cW = (glyph * 49 + 11) / 22;                 // close   47 at 100%
-        const int mW = (glyph * 48 + 11) / 22;                 // min/max 46
-        const int bh = cwd::cwMetric(SM_CYCAPTION)
-                     + cwd::cwMetric(SM_CYFRAME)
-                     + cwd::cwMetric(SM_CXPADDEDBORDER);       // 31 at 100%
-        const int bbot = (bh < g_capH) ? bh : g_capH - 1;
         RECT crc; GetClientRect(w, &crc);
-        const RECT rCl = { crc.right - cW, 0, crc.right, bbot };
-        const RECT rMx = { crc.right - cW - mW, 0, crc.right - cW, bbot };
-        const RECT rMn = { crc.right - cW - 2 * mW, 0, crc.right - cW - mW, bbot };
-        if (cpt.y >= 0 && cpt.y < bbot) {
-            if      (PtInRect(&rCl, cpt)) return HTCLOSE;
-            else if (PtInRect(&rMx, cpt)) return HTMAXBUTTON;
-            else if (PtInRect(&rMn, cpt)) return HTMINBUTTON;
+        RECT rB[3];
+        stripBtnRects(rB, crc.right);   // the decompile's formula, one source
+        if (cpt.y >= 0 && cpt.y < rB[0].bottom) {
+            if      (PtInRect(&rB[2], cpt)) return HTCLIENT;   // close
+            else if (PtInRect(&rB[1], cpt)) return HTCLIENT;   // max
+            else if (PtInRect(&rB[0], cpt)) return HTCLIENT;   // min
         }
         if (!IsZoomed(w)) {     // the top resize band, re-answered in-client
             const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
@@ -7688,9 +7863,45 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // activation contract so the DWM frame state never fights the
         // frame. v7.7.3: no strip re-face anymore -- there is no strip.
         return DefWindowProcW(w, msg, wp, (LPARAM)-1);
-    // v7.7.3: the strip's four mouse cases (WM_MOUSEMOVE/WM_MOUSELEAVE/
-    // WM_LBUTTONDOWN/WM_LBUTTONUP) retired with the strip object -- the
-    // window's own client mouse messages belong to the children again.
+    // ---- v7.7.5 THE GLOW'S MOUSE SIDE: the four client cases are BACK ----
+    // v7.7.3 retired them with the strip object; v7.7.5 re-enlists them for
+    // the animated buttons. The band's HTCLIENT answers route the traffic
+    // here; the children never lose a message (their mouse goes to their
+    // own wndprocs -- the window-level cases only ever see the band).
+    case WM_MOUSEMOVE:
+        stripHoverUpdate(w, lp);
+        break;
+    case WM_MOUSELEAVE:
+        g_btnTrack = false;
+        if (g_btnHover) { g_btnHover = kBtnNone; stripAnimArm(w); }
+        break;
+    case WM_LBUTTONDOWN: {
+        const int hit = stripBtnAt(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (hit) {
+            g_btnPress = hit;
+            SetCapture(w);          // the press stays honest off the rect
+            stripAnimArm(w);
+        }
+        break; }
+    case WM_CAPTURECHANGED:
+        if (g_btnPress) { g_btnPress = kBtnNone; stripAnimArm(w); }
+        break;
+    case WM_LBUTTONUP: {
+        const int hit = stripBtnAt(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (hit && hit == g_btnPress) {
+            // SC_CLOSE lands in WM_CLOSE (hide to tray, engine keeps running)
+            // -- the same gesture the native close button delivered.
+            if (hit == kBtnMin)        PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+            else if (hit == kBtnMax)   PostMessageW(w, WM_SYSCOMMAND,
+                                                      IsZoomed(w) ? SC_RESTORE : SC_MAXIMIZE, 0);
+            else if (hit == kBtnClose) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
+        }
+        if (g_btnPress) {
+            g_btnPress = kBtnNone;
+            if (GetCapture() == w) ReleaseCapture();
+            stripAnimArm(w);
+        }
+        break; }
     // v7.5.3c: WM_WINDOWPOSCHANGING (the size lock's second belt -- it
     // pinned every sizing pass to the designed 880x620+insets) stands down
     // for the resize test. The shell may size the window freely now; the
@@ -8176,6 +8387,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_trayVisible) KillTimer(w, 3);
             return 0;
         }
+        // v7.7.5: timer 4 is BACK -- v7.2.15 retired the wp == 4 tick, the
+        // id is re-enlisted as the caption glow's clock: 16 ms eased steps
+        // of the per-button hover/press alphas; it kills itself when every
+        // alpha sits on its target (see stripAnimStep).
+        if (wp == 4) { stripAnimStep(w); return 0; }
         // v7.0.3: timer 2 drives the tab fade-in; ONLY the strip repaints
         // each tick. When the run completes the timer kills itself and lands
         // one final full-strength pass -- no fractional-alpha frame remains.
