@@ -5039,6 +5039,13 @@ static void guiInitDpi() {
         ReleaseDC(nullptr, sdc);
     }
     guiApplyDpi();
+    // v7.7.1: cwd's metric DPI rides the same boot derivation. The
+    // WM_NCCALCSIZE insets and the NCHITTEST bands read cwd::cwMetric
+    // (GetSystemMetricsForDpi at cwd's dpi), which would otherwise answer
+    // the 96-dpi defaults until the first WM_DPICHANGED, while S() already
+    // scales at the primary's sign-in DPI -- the insets would disagree with
+    // the creation size at every scale above 100%.
+    cwd::cwDpiChanged(g_dpi96);
 }
 
 // v7.6.12 THE NATIVE RESTART -- the field: "I would just start over and not
@@ -7002,12 +7009,17 @@ static bool guiCreateRealWindow() {
     // v7.1.26 THE WINDOW IS UNICODE, END TO END: CreateWindowExW +
     // DefWindowProcW -- the title is the full brand the taskbar, Alt-Tab
     // and Task Manager's app entry read.
-    RECT fr = { 0, 0, KCLI_W, KCLI_H + g_capH };
-    // v7.6.14: the strip is client again -- WM_NCCALCSIZE answers 0, so the
-    // window IS the client and AdjustWindowRectEx's caption reservation
-    // would only inflate the frame. The outer size is the designed 880x620
-    // content plus the 33-design-px strip.
-    const int kww = fr.right - fr.left, kwh = fr.bottom - fr.top;
+    // v7.7.1: the outer rect carries the frame's own NC strips again (the
+    // WM_NCCALCSIZE insets on left/right/bottom) -- outer = the designed
+    // 880x620 content + the 33-design-px strip + two side insets and the
+    // bottom inset, so the CLIENT lands at exactly 880x653 design px and
+    // uDWM draws its native 1px border in the strips around it. (v7.6.14
+    // answered NCCALCSIZE 0, so outer == client and no insets were added;
+    // v7.7.0's extend alone bought the shadow back but never the border.)
+    const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+    const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+    const int kww = KCLI_W + 2 * fx;
+    const int kwh = KCLI_H + g_capH + fy;
     g_hwnd = CreateWindowExW(0, L"twinspeak.control",
                              L"TidyVision TwinSpeak",     // v7.2.1: the brand the taskbar,
                                                           // Alt-Tab and Task Manager read
@@ -7654,11 +7666,22 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
-    g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(13) + 0.5f,
-                                        (Gdiplus::REAL)S(479) + 0.5f,
-                                        (Gdiplus::REAL)S(853), (Gdiplus::REAL)S(115)));
+    // v7.7.1 THE CONSOLE FRAME HUGS THE PANE: the rect is the pane's OWN
+    // device rect (the creation numbers, S(y + kCapHDesign)) expanded 1px on
+    // every side. The old independent S(13)/S(479) derivation rounded the
+    // frame and the pane separately (two roundings vs the child's one), and
+    // at 150% the drift showed: S(479)+S(33) = 769 while the pane sits at
+    // S(513) = 770, and the bottom edge hung 2px loose (S(115) != S(114)+1)
+    // -- the console frame floated off the pane at odd scales. The pane is
+    // the anchor now; the frame cannot miss it. At 100% the numbers are
+    // identical to the old ones (13.5, 479.5, 853, 115).
+    g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(14) - 0.5f,
+                                        (Gdiplus::REAL)S(480 + kCapHDesign)
+                                            - (Gdiplus::REAL)g_capH - 0.5f,
+                                        (Gdiplus::REAL)S(852) + 1.0f,
+                                        (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.7.0 |  %s",   // v7.7.0 THE ONE-CALL FRAME KEEPER (THE RECIPE, EXECUTED): the field ordered v7.7.0 straight from section 9 of download/uDWM-decompile-notes-v2.txt -- the uDWM decode says WM_NCCALCSIZE 0 zeroes the kernel's four frame metrics, the style digest loses bit 2 ("framed") and s_ChooseWindowFrameFromStyle downgrades the window to the basic frame (no border, no shadow, no caption parts -- the exact v7.6.14 symptom), so ONE DwmExtendFrameIntoClientArea({0,0,1,0}) after creation keeps the CWindowData sheet margins nonzero and FRAME[1] -- the native 1px border + the native shadow -- attached to the client-equals-window shell; WM_NCACTIVATE now answers DefWindowProc(wp,-1) per 9e (never a bare TRUE); the strip paints client row 0 itself as the top border line (guic::cLine, zoom-guarded -- "0px vertical is reserved for the fake top bar"), and the extend band itself stays invisible under it (the carrier, not a visible pixel); 9a/9b/9d already matched (WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, NCCALCSIZE 0 + maximized frame insets, buttons HTCLIENT / strip HTCAPTION / DPI-correct edges) -- v7.6.14 THE STRIP COMES HOME (WINDOWS 10 FIRST): "I'm on Windows 10 btw. That's the whole reason in why I'm here." -- the v7.6.13 caption color rode DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11 only: on Win10 both fail and the caption stays system gray, and no font API exists on any Windows), so the window keeps the native restart's plain WS_OVERLAPPEDWINDOW shell and takes back ONE band: the caption strip, 33 design px (kBarHDesign), painted inside the buffered face -- theme cBg face + 1px cLine separator, the CUSTOM TITLEBAR FONT again (Segoe UI -14 semibold, the cwSeedTitleFont seed) at the pseudocode's 12px padding, the v7.6.13 color pair (dark: 160,200,205 / light: cText; inactive cDim), and OUR buttons: 2 FIXED PHYSICAL px seams + 2px right inset ("Do 2px"), 1 design px of daylight on top (the field's y=1), the proven native glyphs (dash S(10)x1, square S(9)+1, restore pair S(8)/S(2) in a S(10) span, X span S(10), 1px strokes), close hover the native red (196,43,28); HTCAPTION on the strip keeps drag/Aero snap/double-click maximize Windows' own, the resize edges answer the DPI-correct frame metrics, the maximized client insets by the frame on all four sides, and the first content pixel sits DIRECTLY below the strip (every child + the content body shift kCapHDesign design px -- "draw something just below the titlebar buttons" is the layout contract) -- DPI rides the standard WM_DPICHANGED path, no guards, "forget about the dpi issue entirely" -- v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption took the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" was back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window became a plain WS_OVERLAPPEDWINDOW: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story were Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome was not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay)
+    snprintf(vbuf, sizeof(vbuf), "v7.7.1 |  %s",   // v7.7.1 THE OTHER HALF OF THE RECIPE (THE FIELD: "I still just see a borderless window, but thanks for the drop shadow"): the shadow's return proved the extend carrier works and the border's absence proved it was never the whole recipe -- the house's own decode already said why ("v7.6.10 never hit it because customWindow.h left REAL non-client insets on left/right/bottom, so the metrics never went to zero"), so WM_NCCALCSIZE keeps the proven v7.6.10 answer again (customWindow.h's handler, main.c verbatim): the client is the window MINUS the frame insets on left/right/bottom, real NC strips whose metrics stay nonzero so uDWM draws the native 1px border in them; the top stays client-covered (the strip's row 0 is the top border line), maximized gives all four sides back; the creation size adds the insets (outer = 880x653 design client + 2*fx + fy, so the CLIENT lands at the designed size and the border wraps it); WM_NCHITTEST rides customWindow.h's proven order -- DefWindowProc FIRST (the real NC bands give it the native edges, corners included -- HTBOTTOMLEFT/HTBOTTOMRIGHT survive the v7.6.14 hand-rolled bands that answered HTBOTTOM straight across), every edge answer rides back untouched, then the strip re-answers in CLIENT space: buttons HTCLIENT before the top resize band (the native order), the rest HTCAPTION (the v7.6.14 math had tested the buttons against the WINDOW width while the painter drew them against the CLIENT width -- the same numbers only while client == window); guiInitDpi syncs cwd's metric DPI at boot so the insets agree with the creation size at every scale above 100% -- v7.7.0 THE ONE-CALL FRAME KEEPER (THE RECIPE, EXECUTED): the field ordered v7.7.0 straight from section 9 of download/uDWM-decompile-notes-v2.txt -- the uDWM decode says WM_NCCALCSIZE 0 zeroes the kernel's four frame metrics, the style digest loses bit 2 ("framed") and s_ChooseWindowFrameFromStyle downgrades the window to the basic frame (no border, no shadow, no caption parts -- the exact v7.6.14 symptom), so ONE DwmExtendFrameIntoClientArea({0,0,1,0}) after creation keeps the CWindowData sheet margins nonzero and FRAME[1] -- the native 1px border + the native shadow -- attached to the client-equals-window shell; WM_NCACTIVATE now answers DefWindowProc(wp,-1) per 9e (never a bare TRUE); the strip paints client row 0 itself as the top border line (guic::cLine, zoom-guarded -- "0px vertical is reserved for the fake top bar"), and the extend band itself stays invisible under it (the carrier, not a visible pixel); 9a/9b/9d already matched (WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, NCCALCSIZE 0 + maximized frame insets, buttons HTCLIENT / strip HTCAPTION / DPI-correct edges) -- v7.6.14 THE STRIP COMES HOME (WINDOWS 10 FIRST): "I'm on Windows 10 btw. That's the whole reason in why I'm here." -- the v7.6.13 caption color rode DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11 only: on Win10 both fail and the caption stays system gray, and no font API exists on any Windows), so the window keeps the native restart's plain WS_OVERLAPPEDWINDOW shell and takes back ONE band: the caption strip, 33 design px (kBarHDesign), painted inside the buffered face -- theme cBg face + 1px cLine separator, the CUSTOM TITLEBAR FONT again (Segoe UI -14 semibold, the cwSeedTitleFont seed) at the pseudocode's 12px padding, the v7.6.13 color pair (dark: 160,200,205 / light: cText; inactive cDim), and OUR buttons: 2 FIXED PHYSICAL px seams + 2px right inset ("Do 2px"), 1 design px of daylight on top (the field's y=1), the proven native glyphs (dash S(10)x1, square S(9)+1, restore pair S(8)/S(2) in a S(10) span, X span S(10), 1px strokes), close hover the native red (196,43,28); HTCAPTION on the strip keeps drag/Aero snap/double-click maximize Windows' own, the resize edges answer the DPI-correct frame metrics, the maximized client insets by the frame on all four sides, and the first content pixel sits DIRECTLY below the strip (every child + the content body shift kCapHDesign design px -- "draw something just below the titlebar buttons" is the layout contract) -- DPI rides the standard WM_DPICHANGED path, no guards, "forget about the dpi issue entirely" -- v7.6.13 THE CAPTION RE-SEED + THE NEVER-BLACK BELT: the native caption took the theme's face and title colors through DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR (Win 11) so "the custom color" was back without any custom window; WM_ERASEBKGND fills the theme background (an unpainted client can no longer composite black), the first show from hidden forces one on-screen repaint (a failed hidden pre-render can no longer freeze the failed surface), and the first buffered frame logs its center pixel to the pane. -- v7.6.12 THE NATIVE RESTART: "start over and not rely on a custom window (if at all), and try to draw something just below the titlebar buttons" -- the window became a plain WS_OVERLAPPEDWINDOW: the caption, the icon, the three buttons, their hover states, the red close, snap layouts, maximize, the resize edges, the shadow and the DPI story were Windows' own, pixel-perfect by definition at every scale; customWindow.h's chrome was not attached (the child ledger cwTrackChild/cwRelayoutChildren and the tray helpers stay)
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7748,53 +7771,79 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0; }
     // ---- v7.6.14 THE STRIP: the window answers its own frame again ----------
     // The plain WS_OVERLAPPEDWINDOW shell stays; only the caption band is
-    // taken back. WM_NCCALCSIZE makes the client the whole window (the strip
-    // paints row 0), WM_NCHITTEST hands the resize edges and the drag to the
-    // system, the buttons answer HTCLIENT and live as client messages.
+    // taken back. WM_NCCALCSIZE keeps real NC insets on left/right/bottom
+    // (v7.7.1: the frame's own strips -- the native border lives in them),
+    // WM_NCHITTEST hands the resize edges and the drag to the system, the
+    // buttons answer HTCLIENT and live as client messages.
     case WM_NCCALCSIZE: {
-        // wParam TRUE: the client IS the window -- the strip paints row 0.
-        // wParam FALSE rides DefWindowProc (the creation pass).
-        // Maximized: Windows inflates the rect past the monitor by the frame
-        // thickness -- give it back or the strip lands off-screen.
+        // v7.7.1 THE OTHER HALF OF THE RECIPE. v7.7.0 carried the extend
+        // (the sheet carrier -- the shadow the field confirmed) but answered
+        // wParam TRUE with 0: client == window, CWindowData's four frame
+        // metrics all zero, and uDWM's GetCurrentStyle never re-attaches the
+        // frame ANATOMY -- the 1px border lines. A shadow around a naked
+        // surface: "I still just see a borderless window." The house's own
+        // decode already said why: "v7.6.10 never hit it because
+        // customWindow.h left REAL non-client insets on left/right/bottom,
+        // so the metrics never went to zero." So the proven v7.6.10 answer
+        // comes back (customWindow.h's handler, main.c verbatim): the client
+        // is the window MINUS the frame insets on left/right/bottom -- real
+        // NC strips, uDWM draws the native 1px border in them and the
+        // metrics stay nonzero at every NCCALCSIZE pass. The top stays
+        // client-covered on purpose (a top gap makes the DWM paint a ghost
+        // caption OUTSIDE the window rect; the strip's row 0 is the top
+        // border line, the house's own ink). Maximized: Windows inflates the
+        // rect past the monitor by the frame thickness on all four sides --
+        // give all four back or the strip lands off-screen.
         if (!wp) break;
-        if (IsZoomed(w)) {
-            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
-            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
-            NCCALCSIZE_PARAMS* ncp = (NCCALCSIZE_PARAMS*)lp;
-            ncp->rgrc[0].left   += fx;   ncp->rgrc[0].top    += fy;
-            ncp->rgrc[0].right  -= fx;   ncp->rgrc[0].bottom -= fy;
-        }
-        return 0; }
+        const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+        const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+        NCCALCSIZE_PARAMS* ncp = (NCCALCSIZE_PARAMS*)lp;
+        ncp->rgrc[0].left   += fx;   ncp->rgrc[0].right  -= fx;
+        ncp->rgrc[0].bottom -= fy;
+        if (IsZoomed(w)) ncp->rgrc[0].top += fy;
+        return TRUE; }
     case WM_NCHITTEST: {
-        // Native resize edges first (Windows' own thickness, DPI-correct via
-        // GetSystemMetricsForDpi), then the strip: the buttons answer
-        // HTCLIENT (their clicks are client messages), the rest of the strip
-        // answers HTCAPTION -- drag, Aero snap, double-click maximize and
-        // Win+arrows stay the system's own. The buttons win over the top
-        // edge band (the native order: rows 1..8 over a button are the
-        // button's, exactly like the real caption).
-        const POINT spt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        RECT wrc; GetWindowRect(w, &wrc);
-        const int ww = wrc.right - wrc.left, wh = wrc.bottom - wrc.top;
-        const int x = spt.x - wrc.left, y = spt.y - wrc.top;
-        if (stripBtnAt(x, y, ww)) return HTCLIENT;
-        if (!IsZoomed(w)) {
-            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
-            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
-            if (y < fy)       return (x < fx) ? HTTOPLEFT : (x >= ww - fx) ? HTTOPRIGHT : HTTOP;
-            if (x < fx)       return HTLEFT;
-            if (x >= ww - fx) return HTRIGHT;
-            if (y >= wh - fy) return HTBOTTOM;
+        // v7.7.1 customWindow.h's proven order: DefWindowProc FIRST -- the
+        // real NC insets give it the native edge bands, corners included
+        // (HTBOTTOMLEFT/HTBOTTOMRIGHT survive; the v7.6.14 hand-rolled bands
+        // answered HTBOTTOM straight across the bottom edge) -- and every
+        // edge answer rides straight back. Then the strip re-answers the
+        // band the zero-height top band confuses, in CLIENT space (the
+        // client sits inside the insets now; the v7.6.14 math tested the
+        // buttons against the WINDOW width while the painter drew them
+        // against the CLIENT width -- the same numbers only while client ==
+        // window): the buttons answer HTCLIENT (their clicks are client
+        // messages) and win over the top edge band (the native order: rows
+        // 1..8 over a button are the button's, exactly like the real
+        // caption), the rest of the strip answers HTCAPTION -- drag, Aero
+        // snap, double-click maximize and Win+arrows stay the system's own.
+        const LRESULT hit = DefWindowProcW(w, msg, wp, lp);
+        switch (hit) {          // the real NC edges, native, corners included
+            case HTLEFT: case HTRIGHT:
+            case HTTOPLEFT: case HTTOP: case HTTOPRIGHT:
+            case HTBOTTOMLEFT: case HTBOTTOM: case HTBOTTOMRIGHT:
+                return hit;
         }
-        return (y < g_capH) ? HTCAPTION : HTCLIENT; }
+        RECT crc; GetClientRect(w, &crc);
+        POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(w, &cpt);
+        if (cpt.y >= 0 && cpt.y < g_capH && stripBtnAt(cpt.x, cpt.y, crc.right))
+            return HTCLIENT;
+        if (!IsZoomed(w)) {     // the top resize band, re-answered in-client
+            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            if (cpt.y >= 0 && cpt.y < fy) return HTTOP;
+        }
+        return (cpt.y >= 0 && cpt.y < g_capH) ? HTCAPTION : hit; }
     case WM_NCACTIVATE:
         // v7.7.0 (report section 9e): the answer is DefWindowProc with
         // lParam -1 -- never a bare TRUE. The -1 stops DefWindowProc from
-        // repainting the (nonexistent) NC area on every activation flip;
-        // riding DefWindowProc's own return keeps the activation contract
-        // so the DWM frame state never fights the strip. The strip still
-        // re-faces on the state change (title and glyphs step down to
-        // cDim; the face itself never changes).
+        // repainting the NC area on every activation flip (v7.7.1: the area
+        // exists again -- the frame's border strips -- and its visuals are
+        // uDWM's own at compose time; a classic repaint here would only
+        // fight them); riding DefWindowProc's own return keeps the
+        // activation contract so the DWM frame state never fights the
+        // strip. The strip still re-faces on the state change (title and
+        // glyphs step down to cDim; the face itself never changes).
         g_stripActive = (wp != 0);
         stripInvalidate(w);
         return DefWindowProcW(w, msg, wp, (LPARAM)-1);
