@@ -45,7 +45,8 @@
 //  48/22 stride for all three, each fill = stride - 0.5 (the half-px
 //  tails are REAL pixels -- the tail column renders at half the patch
 //  alpha), 0.5 px seams, the close's right edge 1.5 px inside, top 0,
-//  height one px short (bh = SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER).
+//  height one px short (v7.7.13: bh = SM_CYCAPTION while maximized -- the
+//  frame rows hang off-screen; restored bh = the full three-metric sum).
 //
 //  THE HOVER TIMELINE -- CButton::ActivateTimeline (0x77b4) feeds
 //  CTimelineBase the double at .rdata CC920 = 0x3FC47AE140000000 =
@@ -132,13 +133,19 @@
 //
 //  THE TOP AND BOTTOM -- the extend carrier covers the WHOLE caption band
 //  ({0,0,cwEffBarH(),0}): every band row composites through the same
-//  alpha path, from row 0 (the sheet line) to the band's LAST row. The
-//  face seat fills rows 0..cwEffBarH()-1 at alpha 254 (the 254 law --
-//  GDI+'s opaque fast path writes alpha 0, which composites as NOTHING
-//  inside the extend band). MAXIMIZED the caption is ONE PHYSICAL PX
-//  SHORTER (the border row vanishes): cwEffBarH() = g_barH - 1, and every
+//  alpha path, from row 0 (the sheet line) to the band's LAST row.
+//  v7.7.13 THE GLASS BAND: the face seat fills rows 0..cwEffBarH()-1 at the
+//  uDWM glass-blend weights (.rdata CCD90 = 0.2 active / CCDC0 = 0.6
+//  inactive) -- alpha 204 active / 102 inactive, drawn with
+//  CompositingModeSourceCopy so the seat REPLACES the erase's opaque rows
+//  and the glass behind the window shows through: the half-transparent top
+//  bar. The hover/press patches and their half-px tails ride the SAME seat
+//  alpha (the button area composites exactly like the band around it -- no
+//  hole, the v7.7.10 opaque-hover law kept by uniformity). MAXIMIZED the
+//  caption drops to SM_CYCAPTION alone (the frame rows hang off-screen,
+//  v7.7.13's live-metrics law): cwEffBarH() answers CYCAPTION, and every
 //  tracked child rides the same delta in cwRelayoutChildren -- the host's
-//  tab bar and content land exactly one row higher, the native way.
+//  tab bar and content land exactly CYFRAME+PADDED rows higher, the native way.
 //
 //  THE DIAL -- the titlebar color's HSL lightness (L = (max+min)/2, NOT
 //  luma) > 128 -> light mode, <= 128 -> dark mode, programmed as
@@ -288,21 +295,27 @@ inline void (*g_repaint)(HWND) = nullptr; // the host's repaint callback
 inline void (*g_trayHide)(HWND) = nullptr;
 inline void (*g_trayShow)(HWND) = nullptr;
 inline void (*g_dpiHook)() = nullptr;
-// v7.5.3d: the caption height -- 33 design px (the house-measured DWM caption),
-// scaled by the header's DPI and re-derived on cwDpiChanged.
-inline constexpr int kBarHDesign = 33;
-inline int    g_barH      = 33;           // REAL px
+// v7.7.13 THE LIVE-METRICS CAPTION -- the four reference captures decide it.
+// RESTORED the caption band is SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER
+// at the WINDOW's own DPI: 23+4+4 = 31 at 96 dpi (the 100% capture measures
+// exactly 31, hard boundary), and 52 at the field's 175% rig -- a sum the
+// OS's own metric rounding produces ON THAT MACHINE, which is why the three
+// metrics are READ LIVE through GetSystemMetricsForDpi instead of MulDiv'd
+// from a design constant: a customized WindowMetrics border entry changes
+// the sum and Explorer follows it, so the house follows it. MAXIMIZED the
+// band is SM_CYCAPTION alone (23 at 96 / 40 at 168 -- both maximized
+// captures, restore-glyph windows, measure exactly CYCAPTION: the frame
+// rows hang off-screen). The 33-design-px law and the v7.7.9
+// one-physical-px maximized delta are retired -- they answered 33/32 at
+// 96 dpi and 57/56 at 168 against the captures' 31/23 and 52/40.
+inline int    g_barH      = 31;           // REAL px, re-derived in cwDpiChanged
 inline bool   g_wasMax    = false;        // the WM_SIZE maximize-flip latch
-// v7.7.9 THE MAXIMIZED CAPTION -- one physical px shorter than restored: the
-// border row vanishes with the visible top border (the native maximized clip),
-// the buttons sit at top 0 and lose their one px, and EVERYTHING below -- the
-// face seat, the sheet line, the extend carrier, the tracked children, the
-// host's content viewport -- rides cwEffBarH() so the whole window moves the
-// native one row. (The old 24-design-px maximized caption is retired; the
-// decompile's maximized law and the field's own captures out-answer it.)
 inline bool cwIsMaximized(HWND w);              // defined with the small helpers
+inline int cwMetric(int idx);                   // defined with the small helpers
 inline int cwEffBarH() {
-    return (g_host && IsWindow(g_host) && cwIsMaximized(g_host)) ? g_barH - 1 : g_barH;
+    if (g_host && IsWindow(g_host) && cwIsMaximized(g_host))
+        return cwMetric(SM_CYCAPTION);    // the frame rows hang off-screen
+    return g_barH;
 }
 inline int cwBarHeightNow() { return cwEffBarH(); }
 inline void cwRepaint() {
@@ -343,7 +356,8 @@ inline bool cwSheetSetup(HWND w);                 // defined with the DWMAPI sea
 inline void cwDpiChanged(UINT dpi) {
     if (dpi && dpi != g_dpi) {
         g_dpi = dpi;
-        g_barH = MulDiv(kBarHDesign, (int)dpi, 96);
+        g_barH = cwMetric(SM_CYCAPTION) + cwMetric(SM_CYFRAME)
+               + cwMetric(SM_CXPADDEDBORDER);   // the live-metrics caption
         g_titleFontDirty = true;          // the caption font rides the scale
         if (g_host && IsWindow(g_host)) {
             cwSheetSetup(g_host);         // the carrier rides the new bar height
@@ -368,6 +382,24 @@ inline int cwMetric(int idx) {
 }
 inline int cwS(int v) { return MulDiv(v, (int)cwd::cwDpi(), 96); }        // design px -> real px
 inline float cwSf(float v) { return v * (float)cwd::cwDpi() / 96.0f; }
+// v7.7.13 THE WINDOW-FIT ZOOM -- the in-client UI's own multiplier, per-mille.
+// The Explorer-rect window (the field's 1130x683 physical) is SMALLER in dip
+// terms than the 880x654 design at 175%, so the design canvas scales by
+// min(clientW / S0(880), clientH / S0(654)) -- the UI always fits the window
+// it is given. cwS stays PURE (the band internals -- the button rects, the
+// glyph strokes, the uDWM caption font -- must NEVER zoom: they are the
+// native metrics law); only the CHILD LEDGER rides cwKidS. The host derives
+// the percentage in its guiApplyZoom and lands it through cwSetUiZoom.
+inline int  g_zoomPct = 1000;   // per-mille, 1000 = the design scale
+inline int  g_kidOffX = 0;      // the canvas centering offset, real px
+inline int cwKidS(int v) { return MulDiv(v, (int)cwd::cwDpi() * g_zoomPct, 96000); }
+inline void cwSetUiZoom(int pct) { if (pct >= 100 && pct <= 4000) g_zoomPct = pct; }
+inline void cwSetKidOffsetX(int x) { g_kidOffX = x; }
+// the child seat formulas -- the CREATION site and the ledger's relayout MUST
+// answer the same pixel (they did via shared S() math since v7.6.14; the zoom
+// and the canvas offset ride the same helpers now).
+inline int cwKidX(int designX) { return g_kidOffX + cwKidS(designX); }
+inline int cwKidY(int designY) { return cwKidS(designY) + cwEffBarH(); }   // underBar seats
 inline DWORD cwArgbOf(COLORREF c) {
     return 0xFF000000u | ((DWORD)GetRValue(c) << 16)
                        | ((DWORD)GetGValue(c) << 8) | (DWORD)GetBValue(c);
@@ -469,8 +501,10 @@ inline void cwEnsureTitleFont() {
 
 // ---- v7.7.9 THE BUTTON RECTS (the 0x21bc0 / 0x222a8 law, whole) -------------
 // glyph = round(SM_CYSIZE * 21/22); stride = round(glyph * 48/22) -- the SAME
-// stride in BOTH states; the restored close = round(glyph * 49/22). bh =
-// SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER (31 at 100%).
+// stride in BOTH states; the restored close = round(glyph * 49/22). bh = the
+// v7.7.13 live-metrics caption: CYCAPTION + CYFRAME + PADDED restored, and
+// CYCAPTION alone maximized (the frame rows hang off-screen -- the maximized
+// captures measure exactly CYCAPTION; the v7.7.9 minus-one-px law is retired).
 //   RESTORED: the contiguous flush-right stack, one px inside the right edge,
 //   one px down (the offset dial's 1), clamped at the caption's floor.
 //   MAXIMIZED: top 0, height one px short, every fill = stride - 0.5 (the
@@ -485,10 +519,11 @@ inline void cwStripRectsF(CwStripRectF rc[3], float clientRight) {
     const int glyph = (cys * 21 + 11) / 22;                // round(cys*21/22)
     const int sW = (glyph * 48 + 11) / 22;                 // the stride 46 at 100%
     const int cW = (glyph * 49 + 11) / 22;                 // restored close 47
-    const int bh = cwMetric(SM_CYCAPTION)
-                 + cwMetric(SM_CYFRAME)
-                 + cwMetric(SM_CXPADDEDBORDER);            // 31 at 100%
-    if (g_host && IsWindow(g_host) && cwIsMaximized(g_host)) {
+    const bool maxed = g_host && IsWindow(g_host) && cwIsMaximized(g_host);
+    const int bh = maxed ? cwMetric(SM_CYCAPTION)          // the frame rows hang off
+                         : cwMetric(SM_CYCAPTION) + cwMetric(SM_CYFRAME)
+                         + cwMetric(SM_CXPADDEDBORDER);    // 31 at 100%, the rig's own sum at 175%
+    if (maxed) {
         const float fill = (float)sW - 0.5f;
         const float R    = clientRight - 1.5f;
         rc[2].left = R - fill;                 rc[2].right = R;                     // close
@@ -879,10 +914,16 @@ inline bool cwSheetSetup(HWND w) {
     return SUCCEEDED(ext(w, &sheet));
 }
 
-// ---- the painters ------------------------------------------------------------
-// BACKGROUND: the face seat (the band IS the titlebar color, alpha 254 through
-// the blend path) + the registry sheet line on row 0 (restored only -- the
-// maximized clip runs the border off). v7.7.11: BOTH read the header's own
+// ---- the painters --------------------------------------------------------
+// BACKGROUND: the face seat at the uDWM GLASS WEIGHTS (v7.7.13: alpha 204
+// active / 102 inactive -- .rdata CCD90 = 0.2 / CCDC0 = 0.6, the face blended
+// OVER the extend glass, the half-transparent top bar) + the registry sheet
+// line on row 0 (restored only -- the maximized clip runs the border off).
+// The seat and the line draw with CompositingModeSourceCopy: the seat must
+// REPLACE the erase's opaque rows in the buffer (a source-over fill at alpha
+// 204 would leave the erase's 255 alpha in the band and the glass could never
+// show), and the line composes over the seat in straight-alpha math first so
+// its own alpha byte lands exact. v7.7.11: BOTH read the header's own
 // activation ledger (cwWinActive -- the host's `active` argument is a hint;
 // the minimize moment MUST present the inactive law while GetActiveWindow()
 // still answers this window).
@@ -892,15 +933,19 @@ inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
     const int bh = cwEffBarH();
     const int face = act ? g_faceCol : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
     const int grad = act ? g_faceGrad : (g_faceGradIn < 0 ? g_faceGrad : g_faceGradIn);
+    // the glass weights: the band = the face blended over the glass at
+    // 0.2 (active) / 0.6 (inactive) -- the seat alpha = 255 x (1 - weight).
+    const BYTE seatA = act ? 204 : 102;
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);   // raw (color, alpha) writes
     if (face == grad) {   // the solid collapse (a gradient between equals is exact)
         const Gdiplus::SolidBrush seat(GBand(
-            RGB(cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)), 254));
+            RGB(cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)), seatA));
         g.FillRectangle(&seat, 0, 0, ww, bh);
     } else {
         Gdiplus::LinearGradientBrush brush(
             Gdiplus::Rect(0, 0, ww + 1, bh + 1),
-            Gdiplus::Color(254, cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)),
-            Gdiplus::Color(254, cwChannel(grad, 16), cwChannel(grad, 8), cwChannel(grad, 0)),
+            Gdiplus::Color(seatA, cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)),
+            Gdiplus::Color(seatA, cwChannel(grad, 16), cwChannel(grad, 8), cwChannel(grad, 0)),
             Gdiplus::LinearGradientModeVertical);
         g.FillRectangle(&brush, 0, 0, ww, bh);
     }
@@ -923,9 +968,24 @@ inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
             bc = RGB(43, 43, 43);          // the uDWM inactive base CD7E4
             a = 128;                       // at the sheet's 0.5 alpha -- ALWAYS
         }
-        const Gdiplus::SolidBrush b(GBand(bc, a));
+        // v7.7.13: the line composes OVER the translucent seat in straight
+        // alpha first, then lands as ONE SourceCopy write -- the alpha byte
+        // is the exact composite (a source-over fill would leave the byte at
+        // the line's own alpha and the border row would go translucent with
+        // the band). seatC = the face the seat painted with.
+        const int seatCr = cwChannel(face, 16), seatCg = cwChannel(face, 8),
+                  seatCb = cwChannel(face, 0);
+        const int lr = cwChannel(bc, 16), lg = cwChannel(bc, 8), lb = cwChannel(bc, 0);
+        const float wa = a / 255.0f, wd = seatA / 255.0f;
+        const int outA = (int)(a + seatA * (255 - a) / 255.0f + 0.5f);
+        const int outR = (int)((wa * lr + (1 - wa) * wd * seatCr) * 255.0f / outA + 0.5f);
+        const int outG = (int)((wa * lg + (1 - wa) * wd * seatCg) * 255.0f / outA + 0.5f);
+        const int outB = (int)((wa * lb + (1 - wa) * wd * seatCb) * 255.0f / outA + 0.5f);
+        const Gdiplus::SolidBrush b(Gdiplus::Color(
+            (BYTE)outA, (BYTE)outR, (BYTE)outG, (BYTE)outB));
         g.FillRectangle(&b, 0, 0, ww, 1);
     }
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);   // hand the scope back clean
 }
 
 // FOREGROUND: the glow (the uDWM timeline), the glyphs, the uDWM title. The
@@ -936,6 +996,7 @@ inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
     if (!g_enabled) return;
     gs.SetSmoothingMode(Gdiplus::SmoothingModeNone);
     gs.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);   // the glyphs + the title blend
     CwStripRectF rf[3];
     cwStripRectsF(rf, (float)ww);
     RECT rc[3];
@@ -957,17 +1018,17 @@ inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
     // black under the dark ones; the close keeps the native red -- the
     // setWinCloseBtnColor knob's (default the real thing's RGB(232,17,35);
     // the hardcoded 196,43,28 that ignored the knob is retired).
-    // v7.7.10 THE OPAQUE PATCH: the band composites BY ALPHA and each GDI+
-    // fill REPLACES the pixel under it (the 254 law) -- a patch drawn as bare
-    // ink at alpha 46 punched the opaque face seat OUT of the buffer, and the
-    // glass behind the window showed through the hovered button (the field:
-    // "make sure that the titlebar button hovers are opaque"). The patch now
-    // carries its own backdrop: the color is the FACE blended toward the ink
-    // at the signed strength, drawn at alpha 254. The fade animates the COLOR
-    // over an opaque button, never the alpha -- no state of the timeline can
-    // show glass. The half-px tails ride the same law at their real coverage
-    // (the tail column = the face blended toward the PATCH, still opaque);
-    // the maximized fills' 0.5 px tails stay real pixels.
+    // v7.7.10 THE OPAQUE PATCH, v7.7.13 THE GLASS SEAT: the band now rides
+    // the uDWM glass weights (the seat at 204/102), so the patch rides the
+    // SAME seat alpha -- the hovered button composites EXACTLY like the band
+    // around it (the color is the FACE blended toward the ink at the signed
+    // strength, at the seat's alpha, one SourceCopy write). No hole, no
+    // opaque block: the glass shows through the button exactly as much as
+    // through the band, which is what the field's "hovers are opaque" was
+    // protecting (the v7.7.5 artifact was a bare-ink fill punching the seat
+    // OUT -- alpha 46 next to alpha 254). The half-px tails ride the same
+    // law at their real coverage; the maximized fills' 0.5 px tails stay
+    // real pixels.
     for (int i = 1; i <= 3; ++i) {
         if (i == cwBtnMin && !g_btnMin) continue;   // the dead slot is face
         if (i == cwBtnMax && !g_btnMax) continue;
@@ -993,18 +1054,25 @@ inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
                                  (int)(g_closeHover & 0xFF))
                            : (dark ? RGB(255, 255, 255) : RGB(0, 0, 0));
         const COLORREF patch = cwLerpRGB(faceC, ink, a / 255.0);
+        const BYTE patchA = winActive ? 204 : 102;   // the seat's own glass weight
         const int cl = (lf > 0.001f) ? il + 1 : il;      // the full columns
         if (ir > cl) {
-            const Gdiplus::SolidBrush br(GBand(patch, 254));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+            const Gdiplus::SolidBrush br(GBand(patch, patchA));
             gs.FillRectangle(&br, Gdiplus::Rect(cl, it, ir - cl, ib - it));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         }
         if (lf > 0.001f) {                               // the left half column
-            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, lf), 254));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, lf), patchA));
             gs.FillRectangle(&br, Gdiplus::Rect(il, it, 1, ib - it));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         }
         if (rf2 > 0.001f) {                              // the right half column
-            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, rf2), 254));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, rf2), patchA));
             gs.FillRectangle(&br, Gdiplus::Rect(ir, it, 1, ib - it));
+            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         }
     }
     // ---- the glyphs -- the house's own (uDWM's compose retired with
@@ -1143,38 +1211,53 @@ inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
 // here; on WM_DPICHANGED (and on the maximize flip, v7.7.9) the header
 // re-positions every tracked child, re-seats its font (a pointer into the
 // host's HFONT slot) and runs its per-child fixup (combobox item heights).
-// v7.7.9 THE MAXIMIZED DELTA: the caption is one physical px shorter while
-// maximized, so EVERY tracked child lands one row higher (cwS(y) + the
-// delta); underBar children ride the effective height outright.
+// v7.7.9 THE MAXIMIZED DELTA, v7.7.13 THE LIVE-METRICS LAW: underBar
+// children ride the EFFECTIVE caption height outright -- restored that is
+// CYCAPTION+CYFRAME+PADDED, maximized CYCAPTION alone -- so the whole
+// below-caption story moves the native delta at every scale and state.
+// v7.7.13 THE WINDOW-FIT ZOOM: the seats ride cwKidS (the design x the zoom
+// and the canvas centering offset); w < 0 = the fill-to-right mode (the
+// width = the client right - the seat x - the cwKidS(-w) right pad); and
+// bottomPad > 0 = the fill-to-bottom mode (the height = the client bottom -
+// the seat y - the cwKidS(bottomPad) floor pad -- the log pane grows with
+// the window the way it always visually promised to).
 struct CwTrackedChild {
     HWND    h;
-    int     x, y, w, ht;        // design px
+    int     x, y, w, ht;        // design px (w < 0: the fill-to-right mode)
     bool    underBar;           // the y rides the header's bar height
     HFONT*  font;               // the host's font slot, re-sent after a move
     int     comboItemH;         // > 0: CB_SETITEMHEIGHT(-1) after the move
+    int     bottomPad;          // > 0: the fill-to-bottom mode (design px)
 };
 inline std::vector<CwTrackedChild> g_kids;
 inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
                          bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0) {
+                         int comboItemH = 0, int bottomPad = 0) {
     for (auto& k : g_kids)
         if (k.h == h) { k.x = x; k.y = y; k.w = w; k.ht = ht;
                         k.underBar = underBar; k.font = font;
-                        k.comboItemH = comboItemH; return; }
-    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH });
+                        k.comboItemH = comboItemH; k.bottomPad = bottomPad; return; }
+    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH, bottomPad });
 }
 inline void cwRelayoutChildren() {
     const int barNow = cwEffBarH();
-    const int capDelta = barNow - g_barH;   // 0 restored, -1 maximized
+    const int capDelta = barNow - g_barH;   // 0 restored, the maximized delta
+    RECT crc = {};
+    if (g_host && IsWindow(g_host)) GetClientRect(g_host, &crc);
     for (auto& k : g_kids) {
         if (!k.h || !IsWindow(k.h)) continue;
-        SetWindowPos(k.h, nullptr,
-                     cwS(k.x), cwS(k.y) + (k.underBar ? barNow : capDelta),
-                     cwS(k.w), cwS(k.ht),
+        const int x  = cwKidX(k.x);
+        const int y  = cwKidS(k.y) + (k.underBar ? barNow : capDelta);
+        int w  = cwKidS(k.w);
+        int ht = cwKidS(k.ht);
+        if (k.w < 0)          w  = crc.right - x - cwKidS(-k.w);   // fill to the right
+        if (k.bottomPad > 0)  ht = crc.bottom - y - cwKidS(k.bottomPad);
+        if (ht < cwKidS(8))   ht = cwKidS(8);                     // the floor
+        SetWindowPos(k.h, nullptr, x, y, w, ht,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         if (k.font && *k.font) SendMessageW(k.h, WM_SETFONT, (WPARAM)*k.font, TRUE);
         if (k.comboItemH > 0) {
-            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwS(k.comboItemH));
+            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwKidS(k.comboItemH));
             InvalidateRect(k.h, nullptr, FALSE);
         }
     }
@@ -1291,8 +1374,9 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
         }
         g_forceInact = false;
         // THE MAXIMIZE FLIP -- the extend carrier, the caption height and the
-        // children. cwEffBarH() answers one px short while maximized (the
-        // border row vanishes); the flip re-runs the sheet setup (the carrier
+        // children. cwEffBarH() answers SM_CYCAPTION while maximized (the
+        // frame rows hang off-screen, v7.7.13's live-metrics law); the flip
+        // re-runs the sheet setup (the carrier
         // follows the band) and re-seats the tracked children at the new
         // delta. v7.7.12 THE SINGLE-PRESENT FLIP: ONE synchronous whole-frame
         // RedrawWindow (the band rows INCLUDED -- the client rect covers
@@ -1662,26 +1746,32 @@ inline void putWindowinTray(bool hide) {
 // and the whole-band extend carrier. A fresh consumer needs NOTHING else.
 inline void cwAttach(HWND w, void (*repaint)(HWND)) {
     cwd::g_host = w; cwd::g_repaint = repaint;
-    cwd::g_barH = MulDiv(cwd::kBarHDesign, (int)cwd::cwDpi(), 96);
+    cwd::g_barH = cwd::cwMetric(SM_CYCAPTION) + cwd::cwMetric(SM_CYFRAME)
+                + cwd::cwMetric(SM_CXPADDEDBORDER);   // the live-metrics caption
     cwd::cwEnsureTitleFont();
     cwd::cwSheetSetup(w);   // the registry border + the dial + the band carrier
 }
 inline void cwSetBarHeight(int px)                  { cwd::g_barH = px; }
-// v7.5.3d: the bar height is the header's own -- 33 design px at the header's
-// dpi. A host adopts this as its caption-height layout contract.
+// v7.7.13: the bar height is the header's own -- the live-metrics caption at
+// the header's dpi (CYCAPTION + CYFRAME + PADDED). A host adopts this as its
+// caption-height layout contract.
 inline int  cwBarHeight()                           { return cwd::g_barH; }
-// v7.7.9: the EFFECTIVE caption height -- one physical px short while the
-// window is maximized (the border row vanishes). The host's content viewport
-// and every below-caption coordinate answer through this.
+// v7.7.13: the EFFECTIVE caption height -- SM_CYCAPTION alone while the
+// window is maximized (the frame rows hang off-screen). The host's content
+// viewport and every below-caption coordinate answer through this.
 inline int  cwBarHeightNow()                        { return cwd::cwEffBarH(); }
 inline UINT cwDpi()                                 { return cwd::cwDpi(); }
 inline void cwDpiChanged(UINT dpi)                  { cwd::cwDpiChanged(dpi); }
 inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
                          bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0) {
-    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH);
+                         int comboItemH = 0, int bottomPad = 0) {
+    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH, bottomPad);
 }
 inline void cwRelayoutChildren()                    { cwd::cwRelayoutChildren(); }
+inline void cwSetUiZoom(int pct)                    { cwd::cwSetUiZoom(pct); }
+inline void cwSetKidOffsetX(int x)                  { cwd::cwSetKidOffsetX(x); }
+inline int  cwKidX(int designX)                     { return cwd::cwKidX(designX); }
+inline int  cwKidY(int designY)                     { return cwd::cwKidY(designY); }
 inline void cwSetDpiHook(void (*hook)())            { cwd::cwSetDpiHook(hook); }
 inline void cwSetTrayHost(void (*hide)(HWND), void (*show)(HWND)) {
     cwd::g_trayHide = hide; cwd::g_trayShow = show;
@@ -1750,10 +1840,14 @@ inline void enableWinIcon(bool)                                        {}
 inline void setWinTitlebarButtonLayout(bool, bool)                     {}
 inline void setCanWinResize(bool)                                      {}
 inline void putWindowinTray(bool)                                      {}
-inline int  cwBarHeight()                                              { return 33; }
-inline int  cwBarHeightNow()                                           { return 33; }
-inline void cwTrackChild(void*, int, int, int, int, bool, void*, int)  {}
+inline int  cwBarHeight()                                              { return 31; }
+inline int  cwBarHeightNow()                                           { return 31; }
+inline void cwTrackChild(void*, int, int, int, int, bool, void*, int, int)  {}
 inline void cwRelayoutChildren()                                       {}
+inline void cwSetUiZoom(int)                                           {}
+inline void cwSetKidOffsetX(int)                                       {}
+inline int  cwKidX(int)                                                { return 0; }
+inline int  cwKidY(int)                                                { return 0; }
 inline void cwSetDpiHook(void (*)())                                   {}
 
 #endif /* _WIN32 */
