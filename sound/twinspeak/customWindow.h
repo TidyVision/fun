@@ -1,237 +1,180 @@
-// customWindow.h -- THE ONE-FILE WINDOW (v7.7.12)
+// customWindow.h -- THE ONE-FILE WINDOW (v7.5.5)
 // =====================================================================
-// A single-header custom window-chrome API for Windows 10/11. v7.7.12 is
-// the field's transition round, all inside this file: THE SINGLE-PRESENT
-// FLIP (the maximize/restore transition lands ONE synchronous whole-frame
-// RedrawWindow after the carrier and the children move -- the trailing
-// second queued repaint of v7.7.9..v7.7.11 is retired, so no intermediate
-// frame can reach the compositor mid-animation), THE DPI CARRIER RE-LAND
-// (cwDpiChanged re-runs cwSheetSetup: the extend carrier is a geometry
-// commitment measured in REAL px -- at the old scale's height after a DPI
-// change it left the band's glass sheet wrong for the window's whole life
-// at the new scale -- the top-bar corruption the field filmed), and THE
-// ALWAYS-HALF INACTIVE BORDER (the inactive sheet line is BGRA(43,43,43,
-// 128) in every registry weather -- the AccentColorInactive override is
-// retired; the field's "always at a half-transparent 43,43,43"). The
-// v7.7.9..v7.7.11 consolidation stands unchanged beneath: THE WHOLE
-// uDWM-LAW CHROME LIVES HERE NOW -- the caption band, the caption-button
-// rects (the 0x21bc0 maximized law), the hover/press glow WITH THE REAL
-// uDWM TIMELINE, the glyphs, the uDWM title, the icon, the sheet line
-// with the REGISTRY border colors, the hit tests, the NC mouse contract,
-// the HSL dial and the extend carrier. The host (twinspeak) creates the
-// window, calls cwAttach, forwards its messages through cwWndProc FIRST
-// and paints the two chrome halves inside its own buffered frame. That is
-// the reason this API exists.
+// A single-header custom window-chrome API for Windows 10/11: a borderless
+// window that keeps the REAL frame machinery (DWM shadow on WS_THICKFRAME,
+// real NC strips via WM_NCCALCSIZE insets, HTCAPTION drag/snap/Alt+Space,
+// caption buttons, the caption right-click system menu) while the app paints
+// the caption itself. Extracted verbatim from the twinspeak panel -- the
+// v7.1.24 adoption of Microsoft's Win32 custom title bar sample (main.c),
+// tuned in the field from v7.1.17 through v7.4.11 (ghost shadows, the sheet
+// row, the RAD activation contract, the taskbar button birth).
 //
-// REFERENCE BINARIES: uDWM.dll decides, dwmcore.dll draws, and -- the
-// field's standing order since this round -- uxtheme.dll is the reference
-// for the IN-CLIENT UI: its GetThemeSysSize (0x50840 + the scale helper
-// 0x4abfc + the DPI source 0x135e8) is the scaling law the host's S()
-// already matches byte-for-byte: scaled = MulDiv(value, processDpi, 96),
-// processDpi = IsProcessDPIAware() ? GetDeviceCaps(GetDC(nullptr),
-// LOGPIXELSX) : 96. The WM_DPICHANGED handler re-derives the scale FIRST
-// and moves the window SECOND, so every geometry decision inside the
-// resize (the NCCALCSIZE insets, the erase, the child seats) answers at
-// the NEW scale -- the uxtheme MulDiv applied at the moment the resize
-// asks for it.
+// The ELEVEN public functions are the whole API:
 //
-// THE LAWS THIS FILE IMPLEMENTS (evidence: uDWM.dll, PDB-backed symbols):
+//     enableCustomWin(bool enable)
+//         Turn the custom chrome on or off. On: the window must have been
+//         created with cwFrameStyle() (or at least WITHOUT WS_CAPTION) and
+//         the host wndproc must forward messages through cwWndProc() first.
+//         Off (runtime): the header adds WS_CAPTION back and answers nothing
+//         -- the vanilla frame returns. Default: on.
 //
-//  THE BUTTON RECTS -- CTopLevelWindow::UpdateNCAreaPositionsAndSizes
-//  (0x21bc0) + UpdateNCAreaButton (0x222a8): glyph = round(SM_CYSIZE *
-//  21/22), stride = round(glyph * 48/22), restored close = round(glyph *
-//  49/22). RESTORED: the contiguous flush-right stack one px inside the
-//  right edge and one px down (the offset dial's 1). MAXIMIZED: the SAME
-//  48/22 stride for all three, each fill = stride - 0.5 (the half-px
-//  tails are REAL pixels -- the tail column renders at half the patch
-//  alpha), 0.5 px seams, the close's right edge 1.5 px inside, top 0,
-//  height one px short (v7.7.13: bh = SM_CYCAPTION while maximized -- the
-//  frame rows hang off-screen; restored bh = the full three-metric sum).
+//     changeWinTitlebarColor(int col) / (int col, int gradColor)
+//         The caption bar's background. One argument: solid. Two: a vertical
+//         top->bottom gradient col -> gradColor. Colors are ARGB ints
+//         (0xAARRGGBB). Default: dark slate (the twinspeak seed).
 //
-//  THE HOVER TIMELINE -- CButton::ActivateTimeline (0x77b4) feeds
-//  CTimelineBase the double at .rdata CC920 = 0x3FC47AE140000000 =
-//  0.16 SECONDS, and CButton::ComputeFadeValues (0x7b10) rides it:
-//      incoming alpha = start + 2P(end-start), clamped at end   (2x ramp,
-//          full at HALF the timeline -- 80 ms)
-//      outgoing alpha = (end - P) * C                           (1x ramp,
-//          gone at the full 160 ms)
-//  RedrawVisual (0x22648) chains consecutive fades by swapping the two
-//  crossfade images with no pop. This file runs the same law per button:
-//  a 16 ms timer, a hover channel and a press channel, each with its own
-//  (t0, from) snapshot at every state change. The v7.5.x tempo brackets,
-//  the inactive lapse and the linear 100/150 ramps are RETIRED -- the
-//  decompile out-answers them.
+//     setWinInactiveColor(int col) / (int col, int gradColor)     v7.5.5
+//         The caption bar's background while the window is INACTIVE. One
+//         argument: solid. Two: a vertical top->bottom gradient. -1 restores
+//         the default: mirror the focused color. The field's reason: the
+//         real Windows 10 dark mode turns the bar GRAY on inactive and
+//         keeps it black on focused -- a distinct inactive face is exactly
+//         that. Colors are ARGB ints (0xAARRGGBB).
 //
-//  THE INACTIVE LAW -- UpdateButtonVisuals (0x25364) picks the button
-//  visuals' target opacity with TreatAsActiveWindow: 1.0 active, 0.4
-//  inactive (the float pair at .rdata CFA0C/CFA18, read byte-exact):
-//  the ink dials 254/102. v7.7.11: the HOVER engages on an inactive
-//  window too -- the same 160 ms timeline, the same 2x-in/1x-out
-//  curves, riding to the 0.4 target (the field's "different rates" is
-//  the 0.4 target on the shared clock: the strength-per-second is 40%
-//  of the active ramp in, and the 1x ramp out takes the full 160 ms
-//  from a smaller peak). An activation flip RETARGETS the running
-//  channels (the from-snapshot re-taken -- the RedrawVisual crossfade
-//  law) instead of killing them: hover crosses 1.0 -> 0.4 smoothly when
-//  the window loses focus and 0.4 -> 1.0 when it regains it, exactly
-//  the SetVisualStates re-run the native does on the flip.
+//     setWinTitleTextColor(int color, int gradientCol,
+//                          int inactiveColor = color,
+//                          int gradientInactiveCol = gradientCol)
+//         The title text, BOTH states in one call. Focused: color ->
+//         gradientCol (a vertical top->bottom gradient; pass the same color
+//         twice for solid). Inactive: inactiveColor ->
+//         gradientInactiveCol, which default to the focused pair -- the
+//         text only dims with focus when told to. Colors are ARGB ints
+//         (0xAARRGGBB). Default: the cyan-gray gradient.
 //
-//  THE ICON -- CTopLevelWindow::UpdateIcon (0x3cfd8) + UpdateWindowVisuals
-//  (0x23ad0): the caption icon is a CImage visual at window+0x210, created
-//  (0x2435e) and pinned by VisualCollection::InsertRelative; v7.7.12 THE
-//  ICON FADE VERDICT, found and closed: uDWM.dll carries NO titlebar icon
-//  fade on the inactive state. CImage::SetOpacity (0x8ac00) exists but has
-//  ZERO call sites in the whole .text; CVisual::SetOpacity (0x20a90)'s 47
-//  call sites are the layered-window alpha (CWindowList::AlphaChange
-//  0x112f0 byte/255), show/hide (0x1a20c), iconic thumbnails and the touch
-//  visuals -- none targets the icon (and CAtlasedImage::SetOpacity
-//  0x225c8 is ridden by the button crossfade pair and the shadow at
-//  every PDB-named site); the activation flip (CWindowList::
-//  ActivationChange 0x288e0 -> sub_289e8) flags the window data and re-runs
-//  UpdateWindowVisuals, and that function touches the icon ONLY for its
-//  hit-test override (CImage+0xc0 = 0/3 at 0x241e5 -- CVisual's ctor dials
-//  the same field to -2, DoHitTest compares it to -1; it is NOT a draw
-//  state). The dimming the eye reads on an inactive caption rides the
-//  FACE BENEATH the icon: the glass blend weight per state (.rdata CCD90
-//  = 0.2 active / CCDC0 = 0.6 inactive) re-blends the whole band, the
-//  TITLE re-inks through BlendColors at the CFA18 0.4 weight and the
-//  BUTTON glyphs dial to the 0.4 target -- the icon bitmap itself renders
-//  at FULL opacity in both states, and this file draws it the same way
-//  (cwPaintCaptionIcon: no fade, no dim -- 100% accurate to uDWM.dll).
-//  dwmcore.dll and uxtheme.dll were scanned the same round: the
-//  compositor stages no chroma of its own, and uxtheme's DrawThemeIcon
-//  (0x4f2c0) is a forwarder into the caller-driven image-list draw with
-//  no inactive machinery.
-
-//  THE BORDER, REGISTRY EDITION -- uDWM hardcodes no registry names; it
-//  reads uxtheme's GetUserColorPreference/GetColorFromPreference, whose
-//  store (the strings inside uxtheme.dll) is:
-//      HKCU\Software\Microsoft\Windows\DWM : ColorPrevalence (DWORD),
-//          AccentColor (DWORD, 0xAABBGGRR -- default blue 0xffd77800),
-//          AccentColorInactive (DWORD, same layout, optional),
-//          ColorizationColor (DWORD, 0xAARRGGBB, the fallback).
-//  DWM itself paints the 1px left/right/bottom strips the NCCALCSIZE
-//  recipe hands it (v7.7.8's uDWM edition, unchanged). The house's TOP
-//  sheet line (row 0) now mirrors the same registry law: ColorPrevalence
-//  on -> the accent at full strength; off -> the native idle line (white
-//  at the sheet's 0.2 -- the native 62-over-0e0808 measure). The line is
-//  GONE while maximized (the native maximized clip runs the border off).
-//  v7.7.12 THE ALWAYS-HALF INACTIVE BORDER: on the inactive state the
-//  sheet line is BGRA(43,43,43,128) in EVERY registry weather -- the
-//  uDWM state table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B, the
-//  43,43,43 the field called) at the sheet's own half alpha, and the
-//  v7.7.11 AccentColorInactive override is RETIRED (the field: "the
-//  inactive window's border color is always at a half-transparent
-//  43,43,43"). The flip lands on WM_NCACTIVATE/WM_ACTIVATE AND at the
-//  minimize moment (SC_MINIMIZE + WM_SIZE SIZE_MINIMIZED): the frame
-//  presented as the window goes iconic -- and the taskbar preview after
-//  it -- carries the inactive line, the inactive face and the retargeted
-//  channels. dwmcore.dll was re-scanned for the field (3,589,632 bytes,
-//  every 2B 2B 2B byte run, every 0x80-alpha DWORD, the 43/255 float):
-//  it hardcodes NO chroma at all -- it renders what uDWM stages; the
-//  inactive color law lives in uDWM.dll's own tables.
+//     changeWinTextFont(const std::string& font = "Segoe UI")
+//         The title text face. Accepts a font FAMILY name ("Segoe UI") or a
+//         font file from C:/Windows/Fonts ("segoeuib.ttf", or a full path);
+//         files load privately (AddFontResourceEx FR_PRIVATE, this process
+//         only) and render under their own embedded family name. The size
+//         and weight come from the seed (cwSeedTitleFont, default 14 px
+//         semibold). Default: Segoe UI.
 //
-//  THE TOP AND BOTTOM -- the extend carrier covers the WHOLE caption band
-//  ({0,0,cwEffBarH(),0}): every band row composites through the same
-//  alpha path, from row 0 (the sheet line) to the band's LAST row.
-//  v7.7.13 THE GLASS BAND: the face seat fills rows 0..cwEffBarH()-1 at the
-//  uDWM glass-blend weights (.rdata CCD90 = 0.2 active / CCDC0 = 0.6
-//  inactive) -- alpha 204 active / 102 inactive, drawn with
-//  CompositingModeSourceCopy so the seat REPLACES the erase's opaque rows
-//  and the glass behind the window shows through: the half-transparent top
-//  bar. The hover/press patches and their half-px tails ride the SAME seat
-//  alpha (the button area composites exactly like the band around it -- no
-//  hole, the v7.7.10 opaque-hover law kept by uniformity). MAXIMIZED the
-//  caption drops to SM_CYCAPTION alone (the frame rows hang off-screen,
-//  v7.7.13's live-metrics law): cwEffBarH() answers CYCAPTION, and every
-//  tracked child rides the same delta in cwRelayoutChildren -- the host's
-//  tab bar and content land exactly CYFRAME+PADDED rows higher, the native way.
+//     enableWinIcon(bool enable)
+//         Draw the app icon at the left of the caption bar. The icon IS the
+//         window class icon -- the same one the vanilla titlebar, the
+//         taskbar and Alt-Tab show (GCLP_HICONSM / GCLP_HICON). Default: off.
 //
-//  THE DIAL -- the titlebar color's HSL lightness (L = (max+min)/2, NOT
-//  luma) > 128 -> light mode, <= 128 -> dark mode, programmed as
-//  DWMWA_USE_IMMERSIVE_DARK_MODE (attribute 20, fallback 19). It re-runs
-//  on every changeWinTitlebarColor -- the startup color-change case
-//  included: the band, the ink, the attribute, the registry border and
-//  the host's full-tree repaint all move in ONE transaction.
+//     setWinTitlebarButtonLayout(bool minimize, bool maximize)
+//         Which caption buttons exist besides CLOSE (close is always kept,
+//         always rightmost; maximize sits between minimize and close; with
+//         maximize off, minimize sits directly beside close -- the twinspeak
+//         layout). Buttons are 45.5 design px wide each (v7.6.0: two
+//         narrower than the sample's 47; v7.6.2: half a pixel BACK -- the
+//         field's call, and yes, seriously). Default: minimize on,
+//         maximize off.
 //
-//  THE TITLE -- the system NONCLIENTMETRICS lfCaptionFont, scaled by the
-//  window's DPI ratio (CWindowData::GetNonClientCaptionFont 0x3dff8;
-//  there is no per-window font API in uDWM.dll), drawn vertically
-//  centered right of the icon slot, ellipsis-clamped before the buttons,
-//  ink = the dial's pair (white on dark, black on light), dimmed toward
-//  the face while the window is inactive. The icon is the window class
-//  icon (WM_GETICON / GCLP_HICONSM / GCLP_HICON), DrawIconEx AFTER the
-//  GDI+ scope dies.
+//     setWinCloseBtnColor(int col)                                v7.6.2
+//         The close button's hover red. One ARGB int (0xAARRGGBB); the
+//         alpha channel is ignored -- the hover ramp owns the fade, the
+//         color rides it. Default: RGB(232,17,35), the real thing's full
+//         red (#E81123) -- the old 0xCC0000 was a step dark.
 //
-//  THE HIT CODES -- the buttons answer HTMINBUTTON / HTMAXBUTTON /
-//  HTCLOSE (20) over the exact float rects (float contains(): the half
-//  columns hit, no dead pixel), BEFORE every resize edge (the native
-//  order). The band mouse arrives as NC traffic; the house runs the
-//  native press-release-cancel contract itself (press on down, release
-//  over the same rect fires, drag-off cancels, WM_CANCELMODE and the
-//  off-window release sweep un-latch). The caption right-click system
-//  menu is retired with WS_SYSMENU (v7.7.6 -- the button-group gate).
+//     setCanWinResize(bool resize)
+//         Whether the window accepts resize/maximize COMMANDS. With resize
+//         on, WS_THICKFRAME (which the DWM shadow needs) resizes. With
+//         resize off (v7.5.1 THE HONEST BORDER) the header refuses
+//         SC_SIZE / SC_MAXIMIZE, the maximize button dispatches nowhere,
+//         AND the hit-test stops advertising: every edge band answers
+//         HTBORDER instead of the sizing codes, so the cursor stays an
+//         arrow and the mouse registers a fixed window as fixed -- a drag
+//         never starts, where it used to "end where it started". Default:
+//         false.
 //
-// THE ELEVEN PUBLIC FUNCTIONS (the API -- unchanged in shape):
-//     enableCustomWin(bool)                     the on/off switch
-//     changeWinTitlebarColor(col) / (col,grad)  the caption face (ARGB)
-//     setWinInactiveColor(col) / (col,grad)     the inactive face (-1 mirrors)
-//     setWinTitleTextColor(color, grad, inact, inactGrad)  the title ink
-//     changeWinTextFont(font)                   the legacy seed (the uDWM
-//                                               caption font owns the title
-//                                               by default since v7.7.6)
-//     enableWinIcon(bool)                       the class icon at the left
-//     setWinTitlebarButtonLayout(min, max)      which buttons exist
-//     setWinCloseBtnColor(col)                  the close hover red
-//     setCanWinResize(bool)                     the honest border
-//     putWindowinTray(bool)                     the tray gesture
+//     The button hover (v7.5.3d..v7.5.4): no longer a color knob. The minimize
+//     and maximize buttons show a 10% black tint (measured off the real
+//     thing) that fades in over 100 ms and out over 150 ms, LINEAR -- at
+//     TWICE the speed while the window is unfocused (v7.5.4: 50/75 ms, the
+//     real caption's inactive behavior; file explorer shows it) -- painted
+//     over everything in the button, in a band of its own (v7.5.3f): ONE
+//     real px of daylight at the top (row 0 -- the border row -- is never
+//     covered; the v7.5.3e top pin is retired) and the whole band THREE real
+//     px shorter than the bar (two px of daylight at the bottom), with crisp
+//     whole-pixel seams between neighbouring buttons (the anti-aliased
+//     sub-pixel seams smeared the edges; integer renders the hairline); the
+//     glyphs ride the band, two real px higher to stay centered in it, and
+//     while the window is UNFOCUSED the glyphs are half transparent -- a
+//     hovered button's glyph rides its fade back to full (v7.5.4, the
+//     task-manager behavior). The close button fades its vanilla red the
+//     same way and the X whitens with it.
+//     changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are retired.
 //
-// Host plumbing (a window that already runs its own machinery adopts the
-// chrome without behavior change through these; a fresh consumer needs
-// none of them):
+//     putWindowinTray(bool hide)
+//         hide=true: hide the window to the tray NOW, SILENTLY -- the
+//         gesture is the hide itself (position capture is the host's, the
+//         icon must already exist or the fallback below adds one) and it
+//         NEVER notifies: no balloon, no toast. Any "the window went to
+//         the tray" message belongs to the host's own close gesture, in
+//         host code (twinspeak's balloon lives in its WM_CLOSE, not here).
+//         With a tray host registered (cwSetTrayHost) the host owns the
+//         whole gesture; without one, the header's built-in fallback tray
+//         icon (the class icon, tooltip = window title, left-click
+//         restores) is added first so the window is always reachable
+//         again. hide=false: bring the window back (host path, or show +
+//         foreground).
+//
+// Host plumbing (a window that already runs its own machinery -- twinspeak --
+// adopts the chrome without behavior change through these; a fresh consumer
+// needs NONE of them):
 //     cwFrameStyle()               the window style the chrome expects
-//     cwIsMaximized(HWND)          the maximized test (WPL)
-//     cwAttach(HWND, void(*)(HWND))   the chrome window + the repaint fn
-//     cwSetBarHeight(int) / cwBarHeight() / cwBarHeightNow()
-//                                  the caption contract (cwBarHeightNow
-//                                  answers the maximized-short height)
+//     cwIsMaximized(HWND)          the sample's maximized test (WPL)
+//     cwAttach(HWND, void(*)(HWND))   the chrome window + the bar repaint fn
+//     cwSetBarHeight(int)          the caption bar height in REAL pixels
+//     cwBarHeight()                v7.5.3d: the header's own caption height
+//                                  (33 design px, dpi-scaled) -- the number
+//                                  a host adopts as its caption contract;
+//                                  cwSetBarHeight stays for hosts that keep
+//                                  their own
 //     cwTrackChild / cwRelayoutChildren / cwSetDpiHook
-//                                  the WM_DPICHANGED story (and the
-//                                  maximized caption delta, v7.7.9)
-//     cwSeedTitleFont(face, px, weight)   the legacy seed behind
-//                                  changeWinTextFont
+//                                  v7.5.3d: the WM_DPICHANGED story. The
+//                                  header re-derives itself (dpi, bar height,
+//                                  title font), applies the suggested rect,
+//                                  calls the host's hook (constants + fonts),
+//                                  then re-seats the tracked children.
+//     cwSeedTitleFont(face, px, weight)   size/weight behind changeWinTextFont
 //     cwSeedChrome(...)            per-theme seed of every chrome color
 //     cwSetTrayHost(hideFn, showFn)   putWindowinTray delegates to these
-//     cwPaintBarBackground(g, ww, active) / cwPaintBarForeground(g, [dc,]
-//                                  w, ww, active) / cwPaintChrome(...)
-//                                  the two chrome halves (HDC variant:
-//                                  pass the host's own buffer DC)
-//     cwPaintCaptionIcon(dc, ww)   the icon pass (GDI, after the GDI+ scope)
+//     cwPaintBarBackground(g, ww, active) / cwPaintBarForeground(g, w, ww, active)
+//     cwPaintChrome(g, w, ww, active)     both, one call (fresh consumers)
 //     cwWndProc(w, msg, wp, lp, &result)  FORWARD FIRST in the host wndproc
-//     cwDpi(HWND-less): cwDpi()/cwDpiChanged(dpi)  the host's DPI story
 //
-// Host contract:
-//   * Create the window with cwFrameStyle() (or twinspeak's
-//     WS_OVERLAPPED|WS_CAPTION|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|
-//     WS_CLIPCHILDREN -- WS_SYSMENU stays OUT, the button-group gate).
-//   * Call cwAttach after creation (it lands the extend carrier, the
-//     dial's dark-mode attribute, the square-corner + NC-render pins,
-//     the registry border read and the uDWM caption font).
-//   * The wndproc calls cwWndProc FIRST; unhandled messages keep flowing
-//     to the host's own cases and DefWindowProc.
-//   * Paint the chrome halves inside the host's own frame render
-//     (background, then foreground), run cwPaintCaptionIcon after the
-//     GDI+ scope, and shift the content viewport by cwBarHeightNow().
-//   * GDI+ started before the first paint; the class carries the icon.
-//   * The repaint callback is invoked on every state change (hover,
-//     theme, activation, layout); it should repaint the band
-//     synchronously -- or at least invalidate it.
+// The fake top border bar (the sheet row -- the window's REAL top border,
+// row 0 of the caption bar) is the header's too, since v7.5.3:
+//     cwSeedSheetRow(active, inactive)      the row bytes, BGRA u32 (defaults
+//                                           = the field's half-alpha gray)
+//     cwPatchSheetRow(bits, cw, active)     row 0 of the host's 32bpp buffer
+//     cwCommitSheetRowFast(w, active)       the row-first 1 px commit
+//                                           (private DIB + GdiFlush)
+//     cwSheetRowGate(bool)                  presenter stand-down gate
+//     cwSheetRowKick()                      restart the fade train
+//     cwSheetRowLatch(int) / cwSheetRowLatchValue()   the NC activation
+//                                           latch (-1/0/1, the frame's truth)
+//     cwSheetPresenterStart(w) / cwSheetPresenterStop()   the fade train
+//
+//     (v7.5.3b: the sheet itself is the header's too -- cwAttach runs
+//      cwSheetSetup, the {0,0,1,0} extend + the immersive dark mode
+//      border, and the WM_SYSCOMMAND(SC_MINIMIZE) ordered present lives
+//      in cwWndProc. A fresh consumer needs NO host DWM code at all.)
+//
+// Host contract (twinspeak already meets all of it):
+//   * GDI+ started (GdiplusStartup) before the first paint.
+//   * The window class carries the icon (hIcon/hIconSm) for enableWinIcon
+//     and the built-in tray.
+//   * The wndproc calls cwWndProc FIRST; unhandled messages keep flowing to
+//     the host's own cases and DefWindowProc.
+//   * The chrome draws face + icon + title + buttons; the host may draw its
+//     own border/edge rows around those calls (twinspeak sandwiches them:
+//     background, its glass-sheet row fill, its 1px bottom edge, foreground).
+//     The BYTE-DIRECT sheet row (the fake top border) is the header's now:
+//     the host patches its buffer with cwPatchSheetRow inside the bar paint
+//     and orders the flip frames with cwCommitSheetRowFast.
+//   * The repaint callback is invoked on every state change (hover, theme,
+//     layout); it should repaint the bar synchronously.
 //
 // Targets: Windows (the implementation). Every other target compiles the
-// stub block at the bottom -- the functions exist and do nothing, so host
-// code writes unchanged on both sides of #ifdef _WIN32.
-// Libraries (Windows): user32 gdi32 shell32 gdiplus advapi32 (-lole32 if
-// COM is used by the host itself).
+// stub block at the bottom -- the eleven functions exist and do nothing, so
+// host code writes unchanged on both sides of #ifdef _WIN32.
+// Libraries (Windows): user32 gdi32 shell32 gdiplus (-lole32 if COM is used
+// by the host itself).
 // =====================================================================
 
 #ifndef CUSTOMWINDOW_H_INCLUDED
@@ -255,7 +198,15 @@
 #define GET_Y_PARAM(lp) ((int)(short)HIWORD(lp))
 #endif
 
-// the tray hook in cwWndProc dispatches through the public API
+// main.c verbatim: the 1px top row the sample paints its fake shadow into --
+// in the sheet recipe it is the window's REAL top border (row 0). The button
+// rects start one row down so the border row is never covered.
+#ifndef WIN32_FAKE_SHADOW_HEIGHT
+#define WIN32_FAKE_SHADOW_HEIGHT 1
+#endif
+
+// the tray hook in cwWndProc dispatches through the public API -- declared
+// here so the namespace below can reach it before its definition lands
 inline void putWindowinTray(bool hide);
 
 namespace cwd {
@@ -266,68 +217,175 @@ inline int  g_faceCol     = 0xFF181B1F;   // titlebar, focused (solid or gradien
 inline int  g_faceGrad    = 0xFF090A0C;   // titlebar gradient bottom
 inline int  g_faceColIn   = -1;           // titlebar, unfocused (-1 = mirror focused)
 inline int  g_faceGradIn  = -1;
-inline int  g_textCol     = 0xFFA0C8CD;   // legacy title ink seed (the uDWM dial owns
-inline int  g_textGrad    = 0xFF6C868C;   //  the live title since v7.7.6; the seed
-inline int  g_textUn      = 0xFF7E888E;   //  stays for the changeWinTextFont consumers)
-inline int  g_textUnGrad  = -1;
-inline int  g_glyph       = -1;
-inline DWORD g_closeHover = 0xFFE81123;   // the close hover red (setWinCloseBtnColor)
+inline int  g_textCol     = 0xFFA0C8CD;   // title text, focused (gradient top)
+inline int  g_textGrad    = 0xFF6C868C;   // title text gradient bottom
+inline int  g_textUn      = 0xFF7E888E;   // title text, unfocused (solid...
+inline int  g_textUnGrad  = -1;           // ...or gradient bottom when >= 0)
+inline int  g_glyph       = -1;           // button glyphs, focused (-1 = g_textCol)
+// v7.5.3d..v7.5.4: the hover is no longer a solid face color. The min/max
+// hover is a black TINT -- 10% alpha (0x1A = 26, measured off a real
+// Windows 10 caption button) -- that fades in over 100 ms and out over
+// 150 ms, LINEAR (HALF those durations while the window is unfocused,
+// v7.5.4: the real thing fades its caption buttons at twice the speed
+// while inactive -- the field watches file explorer do it), painted OVER
+// everything in the button (the glyph included), in a band of
+// its own (v7.5.3f): ONE real px of daylight at the top -- row 0, the
+// border row, is never covered (the v7.5.3e top pin lived one build) -- and
+// THREE real px shorter than the bar, two px of daylight at the bottom. The
+// seams between neighbouring buttons are WHOLE pixels (the real thing's 0.5
+// design px hairline snapped to physical pixels -- the old anti-aliased
+// sub-pixel insets smeared the edges into a two-column gradient, the
+// field's "blurred"). The close button fades its vanilla red the same way;
+// the X lerps to white with the fill.
+inline constexpr int kHovTintAlpha = 26;    // 10% of 255 (0x1A), the measured value
+// v7.5.5: the tint's CHANNEL follows the face being painted -- the field's
+// rule: HSL lightness < 128 (kHovDarkFaceL) reads as a dark face, and the
+// real caption's hover LIGHTENS a dark face: the UWP dark resources put the
+// button hover a step lighter than the face (#343434 over #171717, which
+// reads as a ~12.5% white overlay -- the field considered 12.5% for both
+// modes and kept the measured 10%). A light face keeps the measured black
+// step. The alpha never changes, only the channel; the close red is
+// untouched -- the real close hover is red in both modes.
+inline constexpr int kHovDarkFaceL = 128;   // the field's dark-face line
+inline constexpr int kHovFadeInMs  = 100;   // pre-hover ramp, focused (v7.5.3e: was 150)
+inline constexpr int kHovFadeOutMs = 150;   // post-hover ramp, focused (v7.5.3f: e had 100, d had 300)
+// v7.5.4: the unfocused window's hover runs its own, faster ramps -- the
+// highlight snaps on and off the way the real caption's does when the
+// window does not have focus. g_hovInactive is latched in the WM_NCACTIVATE
+// case, next to the sheet-row latch (the frame's own truth, hover's view).
+// v7.6.1: the field's call -- 75 ms pre AND post (the resting values).
+// v7.6.2: they went DYNAMIC -- the pointer's tempo over the caption
+// steers them inside the field's bracket (a fast flick -- "have that
+// flashing effect be slowed down based on how fast you've unhovered the
+// thing"). The flash's fade-back rides the OUT value; the focused bar
+// keeps its flat 100/150.
+// v7.6.4: THE BRACKET ITSELF MOVES -- the field: "have the fade be 100ms
+// to 300ms instead." The floor is 100 (a slow, deliberate pull-off burns
+// it fast at 100, the flash barely lingers) and the ceiling 300 (a fast
+// flick stretches the fade-back toward 300).
+inline int kHovInactiveInMs  = 75;   // pre-hover ramp, unfocused (dynamic)
+inline int kHovInactiveOutMs = 75;   // post-hover ramp, unfocused (dynamic)
+inline constexpr int kHovInactiveMinMs = 100;   // the bracket's floor (v7.6.4: was 50)
+inline constexpr int kHovInactiveMaxMs = 300;   // the bracket's ceiling (v7.6.4: was 200)
+inline bool g_hovInactive = false;
+// v7.5.4: the glyphs ride the band -- the band took its three px off the
+// bottom of the bar, so a glyph centered on the FULL button rect hangs
+// below the highlight's visual center. Every caption glyph (min line, max
+// squares, close X) sits this many REAL px higher; unscaled, like the band
+// itself. The window icon and the title text do not ride.
+inline constexpr int kHovGlyphRide = 2;
+// v7.5.4: the UNFOCUSED caption's glyphs are HALF there -- the field's
+// task-manager observation: the real buttons dim to ~50% opacity while
+// their window is inactive. A hovered button's glyph rides its own fade
+// ramp (g_hovA[i]) back to full opacity; focused windows never dim.
+inline constexpr int kGlyphInactiveAlpha = 128;   // ~50% of 255
+inline constexpr UINT kHovTimerId  = 0x43485631u;  // the frame's own animation timer
+inline int   g_hovA[3] = { 0, 0, 0 };       // min, max, close: current alpha 0..255
+inline DWORD g_hovLast = 0;                 // the last tick's GetTickCount
+inline bool  g_hovTimerOn = false;          // the 16 ms animation timer is running
+// v7.6.1: the inactive lapse, on EVERY caption button -- when a button's
+// hover ends on an INACTIVE window, that button's GLYPH is set to ZERO
+// (kCwLapseAlpha = 0, fully transparent -- v7.6.3: the field's own
+// beginning-of-the-project knowledge, "the unhover alpha transparency
+// starts at 0 and fades back"; the old 32/12.5% floor was v7.6.0's
+// misparse of the vanilla read) and fades back to the half-there look it
+// rests at (kGlyphInactiveAlpha) over g_lapseMs[i], the leave's tempo
+// (v7.6.2). v7.6.0's cut read the
+// floor into the shared hover ramp instead (g_hovA = 32): the tint landed
+// at 3/255 and the glyph at 144 vs the 128 rest -- both under the eye,
+// which is exactly why the field saw nothing. The flash owns the glyph's
+// alpha OUTRIGHT now (g_lapseA, read directly by glyphCol); the ramp keeps
+// the tint. Inactive only -- the focused bar never lapses -- and every
+// activation change and hide takes the live flashes with it.
+inline constexpr int  kCwLapseAlpha = 0;    // the flash floor: FULLY transparent (v7.6.3, was 32)
+// v7.6.5 THE SLOW-LEAVE CAP -- the field: "if the titlebar button unhover
+// threshold is too slow (more than 250ms) then the fade thing is not done
+// at all." The leave's tempo (cwHovTempoMs, captured into
+// kHovInactiveOutMs at every leave site) answers for the threshold: past
+// 250 ms the lapse is SKIPPED OUTRIGHT -- the glyph never drops to zero
+// and simply rests at its half-there value. The fade-back only exists
+// inside [100, 250] ms; a 2 px/ms flick (the 300 ms ceiling) gets no flash
+// at all.
+// v7.6.6 -- the field: "Have kLapseMaxMs be 100ms instead too." The cap
+// drops onto the bracket's own floor: the lapse now lives ONLY at the
+// 100 ms floor tempo (a still, deliberate pull-off); every faster leave
+// -- anything past 100 ms, up to the 300 ms ceiling -- gets NO flash at
+// all, the glyph simply rests at its half-there value.
+inline constexpr int  kCwLapseMaxMs = 100;
+inline bool  g_lapseOn[3] = { false, false, false };  // min, max, close: a flash is live
+inline int   g_lapseA[3] = { 0, 0, 0 };               // the flash's glyph alpha, 0..128
+inline DWORD g_lapseT0[3] = { 0, 0, 0 };              // the unhover tick each flash started
+inline int   g_lapseMs[3] = { 100, 100, 100 };        // each flash's own fade-back life (v7.6.2: the leave's tempo)
+// v7.6.2: the pointer's tempo over the caption, feeding the durations --
+// an EMA of (px/ms)^2 sampled on every WM_NCMOUSEMOVE. Squared, so the
+// mapping needs no sqrt; a stale sample reads as stillness (the floor).
+inline DWORD g_hovMoveLast = 0;           // the last NCMOUSEMOVE tick
+inline POINT g_hovMovePt  = { 0, 0 };     // its position
+inline float g_hovSpeed2  = 0.0f;         // (px/ms)^2, EMA'd
+inline constexpr float kCwHovSpeedRef2 = 4.0f;  // a 2 px/ms flick pins the ceiling
+// The tempo -> a duration inside the bracket: the floor at rest, the
+// ceiling at (and past) the 2 px/ms reference, linear between.
+inline int cwHovTempoMs() {
+    float ratio = (GetTickCount() - g_hovMoveLast > 200) ? 0.0f
+                : g_hovSpeed2 / kCwHovSpeedRef2;
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+    return kHovInactiveMinMs
+         + (int)((float)(kHovInactiveMaxMs - kHovInactiveMinMs) * ratio + 0.5f);
+}
+// v7.6.2: the close hover is a knob now -- setWinCloseBtnColor(int col) --
+// and its default is the REAL full red, RGB(232,17,35) (the old 0xCC0000
+// was a step dark; the field's measure is the thing's own #E81123).
+inline DWORD g_closeHover = 0xFFE81123;   // ARGB; the alpha rides the hover ramp
 inline std::wstring g_fontFace = L"Segoe UI";
 inline int  g_fontPx      = 14;
 inline int  g_fontWeight  = FW_SEMIBOLD;
 inline bool g_icon        = false;
 inline bool g_btnMin      = true;
-inline bool g_btnMax      = true;         // v7.7.9: the uDWM stack is three wide; the
-                                          // layout knob still gates the middle button
-inline bool g_resizable   = true;         // v7.7.9: the uDWM window resizes; the honest
-                                          // border (setCanWinResize(false)) can still refuse
-// the uDWM caption font's dirty latch (re-derived on cwDpiChanged)
-inline bool g_titleFontDirty = true;
+inline bool g_btnMax      = false;
+inline bool g_resizable   = false;
+
+// ---- host plumbing state ---------------------------------------------------
+inline HWND   g_host      = nullptr;      // the chrome window
+// v7.5.3d: the bar height is the header's own truth now -- 33 design px
+// (the real DWM caption height; the old 31 was two px short), scaled by the
+// header's DPI and re-derived on WM_DPICHANGED. A host adopts it through
+// cwBarHeight() (twinspeak) or keeps seeding cwSetBarHeight() (others).
+inline constexpr int kBarHDesign = 33;
+// v7.6.3: THE MAXIMIZED CAPTION -- the real thing's maximized bar is
+// SHORTER: 24 design px (the border row's daylight is gone with the
+// sheet), the buttons one design px shorter than the bar, the close
+// button two design px narrower. cwEffBarH() answers the effective
+// height; every painter, rect and hit-test reads it.
+inline constexpr int kBarHMaxDesign = 24;
+inline bool   g_wasMax    = false;        // the WM_SIZE maximize-flip latch
+inline int    g_barH      = 33;           // caption bar height, REAL px (the NORMAL baseline)
+inline void (*g_repaint)(HWND) = nullptr;  // the host's synchronous bar repaint
+inline void (*g_trayHide)(HWND) = nullptr; // putWindowinTray(true)  -> host path
+inline void (*g_trayShow)(HWND) = nullptr; // putWindowinTray(false) -> host path
+// v7.5.3d: the DPI hook -- the one thing the header cannot do for a host is
+// re-derive ITS constants and fonts. On WM_DPICHANGED the header updates
+// itself (dpi, bar height, title font) and calls this AFTER the suggested
+// rect has been applied; the host re-scales and then cwRelayoutChildren()
+// moves the tracked children. Registered once, next to cwAttach.
+inline void (*g_dpiHook)() = nullptr;
+
+// hover: 0 none, 1 minimize, 2 maximize, 3 close (replaces GWLP_USERDATA)
+enum { cwHovNone = 0, cwHovMin = 1, cwHovMax = 2, cwHovClose = 3 };
+inline int g_hover = cwHovNone;
+
 // the built-in fallback tray (only when no tray host is registered)
 inline NOTIFYICONDATAW g_nid   = {};
 inline bool g_trayUp           = false;
 inline UINT g_trayMsg          = 0;          // WM_APP+n, registered on first use
 inline UINT g_taskbarCreated   = 0;
 
-// ---- the caption geometry ---------------------------------------------------
-inline HWND   g_host      = nullptr;      // the chrome window
-inline void (*g_repaint)(HWND) = nullptr; // the host's repaint callback
-inline void (*g_trayHide)(HWND) = nullptr;
-inline void (*g_trayShow)(HWND) = nullptr;
-inline void (*g_dpiHook)() = nullptr;
-// v7.7.13 THE LIVE-METRICS CAPTION -- the four reference captures decide it.
-// RESTORED the caption band is SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER
-// at the WINDOW's own DPI: 23+4+4 = 31 at 96 dpi (the 100% capture measures
-// exactly 31, hard boundary), and 52 at the field's 175% rig -- a sum the
-// OS's own metric rounding produces ON THAT MACHINE, which is why the three
-// metrics are READ LIVE through GetSystemMetricsForDpi instead of MulDiv'd
-// from a design constant: a customized WindowMetrics border entry changes
-// the sum and Explorer follows it, so the house follows it. MAXIMIZED the
-// band is SM_CYCAPTION alone (23 at 96 / 40 at 168 -- both maximized
-// captures, restore-glyph windows, measure exactly CYCAPTION: the frame
-// rows hang off-screen). The 33-design-px law and the v7.7.9
-// one-physical-px maximized delta are retired -- they answered 33/32 at
-// 96 dpi and 57/56 at 168 against the captures' 31/23 and 52/40.
-inline int    g_barH      = 31;           // REAL px, re-derived in cwDpiChanged
-inline bool   g_wasMax    = false;        // the WM_SIZE maximize-flip latch
-inline bool cwIsMaximized(HWND w);              // defined with the small helpers
-inline int cwMetric(int idx);                   // defined with the small helpers
-inline int cwEffBarH() {
-    if (g_host && IsWindow(g_host) && cwIsMaximized(g_host))
-        return cwMetric(SM_CYCAPTION);    // the frame rows hang off-screen
-    return g_barH;
-}
-inline int cwBarHeightNow() { return cwEffBarH(); }
-inline void cwRepaint() {
-    if (g_repaint && g_host) { g_repaint(g_host); return; }
-    if (g_host) {
-        RECT r; if (GetClientRect(g_host, &r)) {
-            r.bottom = cwEffBarH(); InvalidateRect(g_host, &r, FALSE);
-        }
-    }
-}
+// ---- the title font (family name or C:\Windows\Fonts file) -----------------
+inline Gdiplus::Font* g_font = nullptr;
+inline std::wstring g_fontKey;             // face|px|weight|dpi of the cached font
+inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
 
-// ---- small helpers ----------------------------------------------------------
+// ---- small helpers ---------------------------------------------------------
 inline UINT g_dpi = 0;                    // 0 = seed on the first cwDpi()
 inline UINT cwDpi() {
     if (!g_dpi) {
@@ -339,35 +397,12 @@ inline UINT cwDpi() {
     return g_dpi;
 }
 // v7.5.3d: WM_DPICHANGED -- the scale moved under the window. The header's
-// whole geometry derives from this (dpi, bar height, the caption font), so one
-// call re-derives everything; the host re-scales and then cwRelayoutChildren()
-// moves the tracked children. Registered nowhere -- the HOST's WM_DPICHANGED
-// case calls this (twinspeak does), then runs its own hook chain.
-// v7.7.12 THE DPI CARRIER RE-LAND: the extend carrier ({0,0,cwEffBarH(),0})
-// is a geometry commitment measured in REAL px -- re-derived g_barH with the
-// old-scale carrier still landed leaves the band's glass sheet at the WRONG
-// height for the window's whole life at the new scale (the top-bar corruption
-// the field filmed on every DPI change). The re-derivation re-runs
-// cwSheetSetup now: the carrier, the registry border read and the dial's
-// attribute re-land in the same transaction, before the host's SetWindowPos
-// can show a single frame at the new scale. Pre-attach calls (the boot seed)
-// skip the carrier -- there is no window yet; cwAttach lands it.
-inline bool cwSheetSetup(HWND w);                 // defined with the DWMAPI seam
+// whole geometry derives from this (cwS/cwSf, the bar height, the title
+// font's pixel height), so one store re-derives everything lazily; the
+// title font's cache key carries the DPI and rebuilds on the next paint.
 inline void cwDpiChanged(UINT dpi) {
-    if (dpi && dpi != g_dpi) {
-        g_dpi = dpi;
-        g_barH = cwMetric(SM_CYCAPTION) + cwMetric(SM_CYFRAME)
-               + cwMetric(SM_CXPADDEDBORDER);   // the live-metrics caption
-        g_titleFontDirty = true;          // the caption font rides the scale
-        if (g_host && IsWindow(g_host)) {
-            cwSheetSetup(g_host);         // the carrier rides the new bar height
-            cwRepaint();
-        }
-    }
+    if (dpi && dpi != g_dpi) { g_dpi = dpi; g_fontKey.clear(); }
 }
-// the uDWM caption font state (declared here, derived in cwEnsureTitleFont)
-inline HFONT    g_titleFont = nullptr;
-inline LOGFONTW g_titleLf   = {};
 // system metrics at the window's DPI (per-monitor-v2 correct; the plain
 // GetSystemMetrics answers the primary's sign-in scale). Loaded loose so
 // pre-1607 Windows keeps working.
@@ -380,43 +415,21 @@ inline int cwMetric(int idx) {
     if (fn) { const int v = fn(idx, cwDpi()); if (v) return v; }
     return GetSystemMetrics(idx);
 }
-inline int cwS(int v) { return MulDiv(v, (int)cwd::cwDpi(), 96); }        // design px -> real px
+inline int cwS(int v) { return MulDiv(v, (int)cwd::cwDpi(), 96); }        // design px -> real px (twinspeak's S())
 inline float cwSf(float v) { return v * (float)cwd::cwDpi() / 96.0f; }
-// v7.7.13 THE WINDOW-FIT ZOOM -- the in-client UI's own multiplier, per-mille.
-// The Explorer-rect window (the field's 1130x683 physical) is SMALLER in dip
-// terms than the 880x654 design at 175%, so the design canvas scales by
-// min(clientW / S0(880), clientH / S0(654)) -- the UI always fits the window
-// it is given. cwS stays PURE (the band internals -- the button rects, the
-// glyph strokes, the uDWM caption font -- must NEVER zoom: they are the
-// native metrics law); only the CHILD LEDGER rides cwKidS. The host derives
-// the percentage in its guiApplyZoom and lands it through cwSetUiZoom.
-inline int  g_zoomPct = 1000;   // per-mille, 1000 = the design scale
-inline int  g_kidOffX = 0;      // the canvas centering offset, real px
-inline int cwKidS(int v) { return MulDiv(v, (int)cwd::cwDpi() * g_zoomPct, 96000); }
-inline void cwSetUiZoom(int pct) { if (pct >= 100 && pct <= 4000) g_zoomPct = pct; }
-inline void cwSetKidOffsetX(int x) { g_kidOffX = x; }
-// the child seat formulas -- the CREATION site and the ledger's relayout MUST
-// answer the same pixel (they did via shared S() math since v7.6.14; the zoom
-// and the canvas offset ride the same helpers now).
-inline int cwKidX(int designX) { return g_kidOffX + cwKidS(designX); }
-inline int cwKidY(int designY) { return cwKidS(designY) + cwEffBarH(); }   // underBar seats
 inline DWORD cwArgbOf(COLORREF c) {
     return 0xFF000000u | ((DWORD)GetRValue(c) << 16)
                        | ((DWORD)GetGValue(c) << 8) | (DWORD)GetBValue(c);
 }
 inline int cwChannel(int argb, int shift) { return (argb >> shift) & 0xFF; }
-// v7.5.5: HSL lightness of an ARGB color, 0..255 -- L = (max + min) / 2. The
-// dial reads this (NOT luma): L > 128 -> light mode, <= 128 -> dark mode.
+
+// v7.5.5: HSL lightness of an ARGB color, 0..255 -- L = (max + min) / 2 on
+// the RGB channels. The hover's dark-face rule reads this (kHovDarkFaceL).
 inline int cwHslLightness(int argb) {
     const int r = cwChannel(argb, 16), g2 = cwChannel(argb, 8), b = cwChannel(argb, 0);
     const int mx = r > g2 ? (r > b ? r : b) : (g2 > b ? g2 : b);
     const int mn = r < g2 ? (r < b ? r : b) : (g2 < b ? g2 : b);
     return (mx + mn) / 2;
-}
-inline COLORREF cwLerpRGB(COLORREF a, COLORREF b, double t) {
-    return RGB(GetRValue(a) + (int)((GetRValue(b) - GetRValue(a)) * t),
-               GetGValue(a) + (int)((GetGValue(b) - GetGValue(a)) * t),
-               GetBValue(a) + (int)((GetBValue(b) - GetBValue(a)) * t));
 }
 inline bool cwIsMaximized(HWND w) {          // main.c verbatim
     WINDOWPLACEMENT placement = {0};
@@ -424,446 +437,804 @@ inline bool cwIsMaximized(HWND w) {          // main.c verbatim
     return GetWindowPlacement(w, &placement)
         && placement.showCmd == SW_SHOWMAXIMIZED;
 }
+// v7.6.3: the EFFECTIVE bar height -- 24 design px while the host window
+// is maximized, the normal 33 otherwise. Every bar consumer (the painters,
+// the button rects, the hit-test, the child relayout, cwRepaint) answers
+// through this one getter, so the maximized style is one branch, not a
+// second geometry.
+inline int cwEffBarH() {
+    return (g_host && cwIsMaximized(g_host)) ? cwS(kBarHMaxDesign) : g_barH;
+}
+inline void cwRepaint() {
+    if (g_repaint && g_host) { g_repaint(g_host); return; }
+    if (g_host) {
+        RECT r; if (GetClientRect(g_host, &r)) { r.bottom = cwEffBarH(); InvalidateRect(g_host, &r, FALSE); }
+    }
+}
+
+// ---- v7.5.3d: the hover fade train ------------------------------------------
+// Linear ramps per button (min, max, close): focused 100/150 ms, unfocused
+// 75/75 ms (v7.6.1; the v7.5.4 halving is retired) -- driven by a private
+// 16 ms WM_TIMER on the host window; every tick repaints the bar through the
+// host's synchronous painter, which reads g_hovA (and, v7.6.1, the lapse
+// arrays). The timer lives only while a ramp or a flash is in flight, then
+// it is gone again.
+inline void cwHovAnimEnsure() {
+    if (g_hovTimerOn || !g_host || !IsWindow(g_host)) return;
+    g_hovLast = GetTickCount();
+    if (SetTimer(g_host, kHovTimerId, 16, nullptr)) g_hovTimerOn = true;
+}
+inline void cwHovAnimTick() {
+    if (!g_hovTimerOn) return;
+    const HWND w = g_host;
+    if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w)) {
+        g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;      // nothing visible: rest
+        g_lapseOn[0] = g_lapseOn[1] = g_lapseOn[2] = false;   // v7.6.1: no flash survives the hide
+        KillTimer(w, kHovTimerId); g_hovTimerOn = false;
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DWORD dt = now - g_hovLast;
+    g_hovLast = now;
+    if (dt > 1000) dt = 1000;                       // a stalled queue must not jump the ramp
+    bool busy = false;
+    // v7.5.4: the ramps' tempo follows the activation state; v7.6.1: the
+    // unfocused tempo is its own 75 ms pre and post.
+    const int inMs  = g_hovInactive ? kHovInactiveInMs  : kHovFadeInMs;
+    const int outMs = g_hovInactive ? kHovInactiveOutMs : kHovFadeOutMs;
+    for (int i = 0; i < 3; ++i) {
+        const bool held = (g_hover == i + 1);
+        int a = g_hovA[i];
+        if (held) a += (int)(dt * 255 / inMs);
+        else      a -= (int)(dt * 255 / outMs);
+        if (a > 255) a = 255;
+        if (a < 0) a = 0;
+        if (a != g_hovA[i]) { g_hovA[i] = a; busy = true; }
+        if ((held && a < 255) || (!held && a > 0)) busy = true;
+        // v7.6.1: the lapse -- the flash's GLYPH alpha eases 0 -> 128
+        // (v7.6.3: the floor is FULL transparency, not 32) across its own
+        // life (g_lapseMs[i], the leave's tempo), timed off
+        // the unhover tick. It dies the tick it lands or the moment its
+        // button is re-hovered -- the normal ramp owns the glyph again from
+        // there.
+        if (g_lapseOn[i]) {
+            if (held) { g_lapseOn[i] = false; }
+            else {
+                const DWORD el = now - g_lapseT0[i];
+                // v7.6.2: the flash lives on the LEAVE's tempo --
+                // g_lapseMs[i], captured at trigger, inside the bracket
+                // (v7.6.4: [100, 300] -- "have the fade be 100ms to 300ms
+                // instead"); a fast flick stretches it toward 300, a slow
+                // pull-off burns it fast at 100.
+                if (el >= (DWORD)g_lapseMs[i]) g_lapseOn[i] = false;
+                else {
+                    g_lapseA[i] = kCwLapseAlpha
+                                + ((kGlyphInactiveAlpha - kCwLapseAlpha) * (int)el) / g_lapseMs[i];
+                    busy = true;
+                }
+            }
+        }
+    }
+    cwRepaint();                                    // the painter reads g_hovA
+    if (!busy) { KillTimer(w, kHovTimerId); g_hovTimerOn = false; }
+}
+
+// ---- v7.6.1: the inactive lapse (every caption button) -----------------------
+// The field, on the unmodified Windows 10 bar: "all titlebar buttons on
+// their inactive state do the thing where it goes to 12.5% transparency
+// right after unhovering and fading back to 50% transparency after 100ms"
+// -- and v7.6.3's correction, the reading the field knew "from the
+// beginning of trying to replicate windows 10's titlebar buttons": the
+// unhover transparency STARTS AT 0 -- the glyph vanishes outright -- and
+// fades back. The parse: on an INACTIVE window, when ANY button's hover
+// ends, that button's GLYPH alpha is SET to 0 of 255 (fully transparent)
+// -- right away, not on the next tick -- and eases back to its half-there
+// rest (kGlyphInactiveAlpha,
+// 128 = the "50% transparency") across g_lapseMs[i], the LEAVE's tempo
+// (v7.6.2: inside the tempo bracket; v7.6.4: [100, 300] -- a fast flick
+// stretches the flash toward 300, a slow pull-off burns it fast at 100).
+// v7.6.0 read the old
+// 12.5% floor into the shared hover ramp instead -- g_hovA = 32 lands the
+// tint at 3/255 and the glyph at 144 vs the 128 rest, both under the eye,
+// which is why the field saw nothing. Inactive only; every activation
+// change (the WM_NCACTIVATE case) and every hide (the tick's rest branch)
+// clears the flashes, and re-hovering a button hands its glyph back to
+// the ramps.
+inline void cwHovLapse(int i) {
+    if (i < 0 || i > 2) return;
+    // v7.6.5: the slow-leave cap -- kHovInactiveOutMs was JUST captured off
+    // the leave's tempo at every leave site (WM_NCMOUSEMOVE's change,
+    // WM_NCMOUSELEAVE, the WM_MOUSEMOVE walk into the client); past 250 ms
+    // the flash does not exist. The glyph rests where the ramps put it.
+    if (kHovInactiveOutMs > kCwLapseMaxMs) return;
+    g_lapseOn[i] = true;                 // the flash is live
+    g_lapseT0[i] = GetTickCount();       // its life starts now
+    g_lapseA[i]  = kCwLapseAlpha;        // the transparency set to ZERO, this very frame
+    g_lapseMs[i] = kHovInactiveOutMs;   // v7.6.2: the leave's tempo is the flash's life
+    cwHovAnimEnsure();                   // the train owns the repaints, as always
+}
+inline void cwHovLapseClearAll() {       // activation changes and hides take every flash
+    g_lapseOn[0] = g_lapseOn[1] = g_lapseOn[2] = false;
+}
+
+// ---- v7.5.3d: the DPI-responsive child ledger --------------------------------
+// Children that ride below the bar (design px in, real px out) register here;
+// on WM_DPICHANGED the header re-positions every tracked child at the new
+// scale, re-seats its font (a pointer into the host's HFONT slot -- the host
+// re-creates the font in its dpi hook) and runs its per-child fixup
+// (combobox item heights).
+struct CwTrackedChild {
+    HWND    h;
+    int     x, y, w, ht;        // design px
+    bool    underBar;           // the y rides the header's bar height
+    HFONT*  font;               // the host's font slot, re-sent after a move
+    int     comboItemH;         // > 0: CB_SETITEMHEIGHT(-1) after the move
+};
+inline std::vector<CwTrackedChild> g_kids;
+inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
+                         bool underBar = true, HFONT* font = nullptr,
+                         int comboItemH = 0) {
+    for (auto& k : g_kids)
+        if (k.h == h) { k.x = x; k.y = y; k.w = w; k.ht = ht;
+                        k.underBar = underBar; k.font = font;
+                        k.comboItemH = comboItemH; return; }
+    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH });
+}
+inline void cwRelayoutChildren() {
+    const int barNow = cwEffBarH();   // v7.6.3: the children ride the EFFECTIVE bar height
+    for (auto& k : g_kids) {
+        if (!k.h || !IsWindow(k.h)) continue;
+        SetWindowPos(k.h, nullptr,
+                     cwS(k.x), cwS(k.y) + (k.underBar ? barNow : 0),
+                     cwS(k.w), cwS(k.ht),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (k.font && *k.font) SendMessageW(k.h, WM_SETFONT, (WPARAM)*k.font, TRUE);
+        if (k.comboItemH > 0) {
+            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwS(k.comboItemH));
+            InvalidateRect(k.h, nullptr, FALSE);
+        }
+    }
+}
+inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
+
+// ---- the button rects (main.c's win32_get_title_bar_button_rects) ----------
+// v7.6.10 THE HALF-PIXEL MAXIMIZED STACK -- the field's own sub-pixel read
+// of the native strip: "the gap was actually 0.5px and also that the close
+// button's right reduction is 1.5px and not 2px. Pretty weird if you think
+// about it." The decompile agrees once halves are allowed: there is NO
+// 47/22 maximized ratio in 0x222a8 (the out-of-line tails 0x670d3/0x670e6
+// only ever pick 48/22 and 49/22, and the flag-2 tail is the TOOL WINDOW's
+// SM_CYSMSIZE path) -- the maximized buttons ride the SAME 48/22 chain
+// width as restored, on the SAME stride, with the last HALF px of every
+// button left to the face:
+//     stride = w_max = round(glyph * 48/22)   (46 @96, 70 @144)
+//     fill   = stride - 0.5                   (45.5 / 69.5 -- the halves)
+//     gap    = 0.5 px, FIXED physical         (the half-dark column)
+//     inset  = 1.5 px, FIXED physical         (close.right = ww - 1.5)
+// The stack total (3*stride + 1) equals the restored stack (2*w_max +
+// w_close, w_close = w_max + 1) at every dpi -- 139 @96, 211 @144 -- and
+// every glyph anchor off the FLOORED int view lands on the measured native
+// pixels (96: X 1890..1899, front 1844, back 1846, dash 1799..1808; 144:
+// X 1876..1890, front 1805, back 1808, dash 1736..1750 -- all four, both
+// scales, exact). The half px are REAL pixels: each fill's tail column
+// renders at HALF the patch alpha (fillPatch here, the cwSheetRowFill byte
+// path on row 0) -- exactly the 50% coverage the native compositor leaves.
+// The v7.6.9 round-up (45/68 fills, 1-2 px gap, 2-3 px inset -- MulDiv
+// halves) and the 47/22 ratio are RETIRED.
+// RESTORED: unchanged -- the CONTIGUOUS flush-right stack (46/46/47 @96,
+// 70/70/71 @144; 0x21bc0's cursor += width, no gap, the group rect flush)
+// with the field's raise ("fix the unmaximized state having titlebar
+// buttons at 0px instead of 1px and reduce their height by 1px"): rows
+// 1..g_barH-1. The hover still owns row 0 in both states (v7.6.7's split
+// stands -- the rect is the button's, the band is the hover's). MAXIMIZED
+// keeps its rows (top 0, bottom bh-1 -- the one REAL px floor; the +1
+// glyph ride lands native's (cysize-1)/2 at 96/120/144/168 alike).
+struct CwButtonRects { RECT close, maximize, minimize; };
+struct CwBtnRectF { float left, top, right, bottom; };
+struct CwButtonRectsF { CwBtnRectF close, maximize, minimize; };
+
+// the float truth -- the maximized right edges sit on HALF pixels
+inline CwButtonRectsF cwButtonRectsF(int ww) {
+    const bool  maxed  = g_host && cwIsMaximized(g_host);
+    const int   dpi    = (int)cwd::cwDpi();
+    const int   cysize = MulDiv(22, dpi, 96);
+    const int   glyph  = (cysize * 21 + 11) / 22;   // round(cysize*21/22)
+    const int   wMax   = (glyph  * 48 + 11) / 22;   // round(glyph*48/22) -- the stride in BOTH states
+    const int   wClose = (glyph  * 49 + 11) / 22;   // round(glyph*49/22) -- restored close only
+    const float wFill  = (float)wMax - 0.5f;        // the maximized fill: the native half px
+    const int   bh     = maxed ? cwS(kBarHMaxDesign) : g_barH;
+    CwBtnRectF close;
+    if (maxed) {
+        close.right  = (float)ww - 1.5f;            // the 1.5 px right reduction (fixed physical)
+        close.bottom = (float)(bh - 1);             // v7.6.9: one REAL px floor
+        close.left   = close.right - wFill;
+        close.top    = 0.0f;
+    } else {
+        close.right  = (float)ww;
+        close.bottom = (float)bh;                   // the field's raise: rows 1..g_barH-1
+        close.left   = close.right - (float)wClose;
+        close.top    = 1.0f;
+    }
+    CwBtnRectF maximize = close;
+    if (maxed) {
+        maximize.right = close.left - 0.5f;         // the 0.5 px gap (fixed physical)
+        maximize.left  = maximize.right - wFill;
+    } else {
+        maximize.right = close.left;
+        maximize.left  = maximize.right - (float)wMax;
+    }
+    CwBtnRectF minimize = maximize;
+    if (maxed) {
+        minimize.right = maximize.left - 0.5f;
+        minimize.left  = minimize.right - wFill;
+    } else {
+        minimize.right = maximize.left;
+        minimize.left  = minimize.right - (float)wMax;
+    }
+    if (!g_btnMax) minimize = maximize;   // the empty slot collapses
+    return { close, maximize, minimize };
+}
+
+// the integer view -- [left, floor(right)): the FULL columns only. The glyph
+// anchors center on these (the native pixels, both scales) and the title
+// width estimate rides them; the painters take the float view for the tails.
+inline CwButtonRects cwButtonRects(int ww) {
+    const CwButtonRectsF f = cwButtonRectsF(ww);
+    auto zi = [](const CwBtnRectF& r) {
+        RECT q;
+        q.left   = (int)r.left;   q.top    = (int)r.top;
+        q.right  = (int)r.right;  q.bottom = (int)r.bottom;
+        return q;
+    };
+    return { zi(f.close), zi(f.maximize), zi(f.minimize) };
+}
+
+// v7.5.3e: the seam between neighbouring hover patches, in REAL px -- the
+// real DWM's half-a-design-px hairline snapped to whole physical pixels
+// (never 0: a sub-pixel seam is what smeared the patches before). Taken off
+// the LEFT neighbour's right edge, so the right-hand patch stays flush.
+// v7.6.6: the hairline rides the NEW gap metric -- 0.25 design px (the
+// button went 45.5 -> 45.75, the gap 0.5 -> 0.25). Still never 0: at every
+// dpi here it clamps to the same 1 physical px as before.
+// v7.6.9: no active callers inside the bar painter (the gaps live in the
+// rects; restored is contiguous native). Kept for hosts that run abutting
+// patches of their own.
+inline int cwHovSeamPx() {
+    const float s = cwSf(0.25f);
+    return s < 1.0f ? 1 : (int)(s + 0.5f);
+}
+
 inline bool cwFileExists(const std::wstring& p) {
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
-// v7.7.7 THE 254 LAW -- the band's ink must never ride the opaque fast path.
-// Inside the extend band GDI+ routes FULL-ALPHA (255) solid fills through its
-// GDI fast path, which writes alpha=0 into the DIB -- and the DWM composites
-// the band BY ALPHA, so every 255-fill lands as NOTHING. GBand clamps
-// 255 -> 254: a 0.4% sheet bleed, invisible, and every band fill goes through
-// the blend path with its alpha intact.
-inline Gdiplus::Color GBand(COLORREF c, BYTE a) {
-    if (a == 255) a = 254;
-    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+// Accepts a family name or a font file name/path. Files load FR_PRIVATE and
+// render under their embedded family (read back through a private
+// collection). Returns false only when nothing could be resolved, in which
+// case the previous family stays.
+inline bool cwResolveFont(const std::wstring& in) {
+    const bool isPath = in.find(L'\\') != std::wstring::npos
+                     || in.find(L'/')  != std::wstring::npos
+                     || in.find(L'.')  != std::wstring::npos;
+    if (!isPath) { g_fontFamily = in; return true; }
+    std::wstring path = in;
+    if (path.find(L':') == std::wstring::npos && path[0] != L'\\')
+        path = L"C:\\Windows\\Fonts\\" + path;
+    if (!cwFileExists(path)) return false;
+    if (!AddFontResourceExW(path.c_str(), FR_PRIVATE, nullptr)) return false;
+    Gdiplus::PrivateFontCollection coll;
+    if (coll.AddFontFile(path.c_str()) != Gdiplus::Ok) return false;
+    INT found = 0;
+    Gdiplus::FontFamily fam;
+    if (coll.GetFamilies(1, &fam, &found) != Gdiplus::Ok || found < 1) return false;
+    WCHAR name[LF_FACESIZE] = L"";
+    if (fam.GetFamilyName(name, LF_FACESIZE) != Gdiplus::Ok) return false;
+    g_fontFamily = name;
+    return true;
 }
 
-inline std::wstring cwWide(const char* s) {
-    std::wstring w;
-    if (s && *s) {
-        const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
-        if (n > 1) {
-            w.resize(n - 1);
-            MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+inline Gdiplus::Font* cwFont() {
+    const std::wstring key = g_fontFamily + L"|" + std::to_wstring(g_fontPx)
+                           + L"|" + std::to_wstring(g_fontWeight)
+                           + L"|" + std::to_wstring(cwDpi());   // v7.5.3d: the dpi rides the key
+    if (g_font && key == g_fontKey) return g_font;
+    delete g_font; g_font = nullptr;
+    LOGFONTW lf = {0};
+    lf.lfHeight         = -cwS(g_fontPx);
+    lf.lfWeight         = g_fontWeight;
+    lf.lfCharSet        = DEFAULT_CHARSET;
+    lf.lfQuality        = CLEARTYPE_QUALITY;
+    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    lstrcpynW(lf.lfFaceName, g_fontFamily.c_str(), LF_FACESIZE);
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (dc) {
+        g_font = new Gdiplus::Font(dc, &lf);
+        DeleteDC(dc);
+        if (!g_font || g_font->GetLastStatus() != Gdiplus::Ok) {
+            delete g_font; g_font = nullptr;
         }
     }
-    return w;
-}
-// antialiased single-line text; align: 0 center, 1 left, 2 right (the twinspeak
-// renderer, moved with the title that uses it)
-inline void cwDrawStringA(Gdiplus::Graphics& g, HDC dc, const RECT& rc, const char* txt,
-                          COLORREF col, HFONT f, int align) {
-    const std::wstring wt = cwWide(txt);
-    if (wt.empty() || !f || !dc) return;
-    Gdiplus::Font gf(dc, f);
-    Gdiplus::StringFormat sf;
-    sf.SetAlignment(align == 1 ? Gdiplus::StringAlignmentNear :
-                    align == 2 ? Gdiplus::StringAlignmentFar : Gdiplus::StringAlignmentCenter);
-    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoFitBlackBox);
-    sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-    const Gdiplus::SolidBrush br(GBand(col, 254));
-    const Gdiplus::RectF rf((Gdiplus::REAL)rc.left, (Gdiplus::REAL)rc.top,
-                            (Gdiplus::REAL)(rc.right - rc.left), (Gdiplus::REAL)(rc.bottom - rc.top));
-    g.DrawString(wt.c_str(), (INT)wt.size(), &gf, rf, &sf, &br);
+    if (g_font) g_fontKey = key;
+    return g_font;
 }
 
-// ---- v7.7.9 THE uDWM CAPTION FONT -------------------------------------------
-// CWindowData::GetNonClientCaptionFont (0x3dff8) copies the desktop settings
-// singleton's LOGFONTW -- the system NONCLIENTMETRICS lfCaptionFont -- scaled
-// by windowDpi/systemDpi with double math and truncation. There is no
-// per-window font API anywhere in uDWM.dll (decompile notes v2 section 6).
-// The header scales lfHeight by its own S() ratio the same way and re-runs on
-// cwDpiChanged. CText::SetFont (0x2c4bc) memcmp's the LOGFONTW and no-ops on
-// equality -- the header answers the same memcmp.
-inline void cwEnsureTitleFont() {
-    NONCLIENTMETRICSW ncm;
-    ncm.cbSize = sizeof(ncm);
-    LOGFONTW lf = {};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)
-            && ncm.lfCaptionFont.lfHeight != 0) {
-        lf = ncm.lfCaptionFont;
-    } else {   // the belt: the metrics can fail on broken profiles
-        lf.lfHeight = -12; lf.lfWeight = FW_NORMAL;
-        lf.lfCharSet = DEFAULT_CHARSET;
-        lf.lfQuality = CLEARTYPE_QUALITY;
-        lstrcpynW(lf.lfFaceName, L"Segoe UI", LF_FACESIZE);
-    }
-    lf.lfHeight = MulDiv(lf.lfHeight, (int)cwd::cwS(100), 100);
-    if (!g_titleFontDirty && g_titleFont &&
-        memcmp(&lf, &g_titleLf, sizeof(lf)) == 0) return;   // CText::SetFont's law
-    g_titleLf = lf;
-    if (g_titleFont) DeleteObject(g_titleFont);
-    g_titleFont = CreateFontIndirectW(&lf);
-    g_titleFontDirty = false;
+// ---- the painters ----------------------------------------------------------
+// BACKGROUND: the caption face. The fill and brush rects are the twinspeak
+// render verbatim (offset 1px down -- row 0 is the border row; the brush
+// rides the same offset) so a host that sandwiches its own border rows
+// around these calls keeps its exact bytes. Equal col/grad collapses to a
+// solid (a linear gradient between equal colors is exact).
+inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
+    if (!g_enabled) return;
+    // v7.6.3: the fill rides the EFFECTIVE bar height, and on a MAXIMIZED
+    // window it starts at ROW 0 -- the border row does not exist there (the
+    // sheet is withdrawn; cwSheetRowBytes lands the face byte on row 0 and
+    // this fill paints the same face under it for the straight-to-screen
+    // fallback).
+    const bool maxed = g_host && cwIsMaximized(g_host);
+    const int  bh    = maxed ? cwS(kBarHMaxDesign) : g_barH;
+    const int  top   = maxed ? 0 : 1;
+    const int face = active ? g_faceCol : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int grad = active ? g_faceGrad : (g_faceGradIn < 0 ? g_faceGrad : g_faceGradIn);
+    Gdiplus::LinearGradientBrush brush(
+        Gdiplus::Rect(0, top, ww + 1, bh + 1 - top),
+        Gdiplus::Color(cwChannel(face, 24), cwChannel(face, 16),
+                       cwChannel(face, 8), cwChannel(face, 0)),
+        Gdiplus::Color(cwChannel(grad, 24), cwChannel(grad, 16),
+                       cwChannel(grad, 8), cwChannel(grad, 0)),
+        Gdiplus::LinearGradientModeVertical);
+    g.FillRectangle(&brush, -1, top, ww + 2, bh + 1 - top);
 }
 
-// ---- v7.7.9 THE BUTTON RECTS (the 0x21bc0 / 0x222a8 law, whole) -------------
-// glyph = round(SM_CYSIZE * 21/22); stride = round(glyph * 48/22) -- the SAME
-// stride in BOTH states; the restored close = round(glyph * 49/22). bh = the
-// v7.7.13 live-metrics caption: CYCAPTION + CYFRAME + PADDED restored, and
-// CYCAPTION alone maximized (the frame rows hang off-screen -- the maximized
-// captures measure exactly CYCAPTION; the v7.7.9 minus-one-px law is retired).
-//   RESTORED: the contiguous flush-right stack, one px inside the right edge,
-//   one px down (the offset dial's 1), clamped at the caption's floor.
-//   MAXIMIZED: top 0, height one px short, every fill = stride - 0.5 (the
-//   half-px tails are REAL pixels -- the tail column renders at HALF the patch
-//   alpha), 0.5 px seams, the close's right edge 1.5 px inside. The rects are
-//   FLOAT; the contains() is a float compare (x < right holds on the half
-//   column, so no dead pixel exists between the buttons).
-enum { cwBtnNone = 0, cwBtnMin = 1, cwBtnMax = 2, cwBtnClose = 3 };
-struct CwStripRectF { float left, top, right, bottom; };
-inline void cwStripRectsF(CwStripRectF rc[3], float clientRight) {
-    const int cys = cwMetric(SM_CYSIZE);
-    const int glyph = (cys * 21 + 11) / 22;                // round(cys*21/22)
-    const int sW = (glyph * 48 + 11) / 22;                 // the stride 46 at 100%
-    const int cW = (glyph * 49 + 11) / 22;                 // restored close 47
-    const bool maxed = g_host && IsWindow(g_host) && cwIsMaximized(g_host);
-    const int bh = maxed ? cwMetric(SM_CYCAPTION)          // the frame rows hang off
-                         : cwMetric(SM_CYCAPTION) + cwMetric(SM_CYFRAME)
-                         + cwMetric(SM_CXPADDEDBORDER);    // 31 at 100%, the rig's own sum at 175%
-    if (maxed) {
-        const float fill = (float)sW - 0.5f;
-        const float R    = clientRight - 1.5f;
-        rc[2].left = R - fill;                 rc[2].right = R;                     // close
-        rc[1].left = R - 2.0f * fill - 0.5f;   rc[1].right = R - fill - 0.5f;       // max
-        rc[0].left = R - 3.0f * fill - 1.0f;   rc[0].right = R - 2.0f * fill - 1.0f; // min
-        rc[0].top = rc[1].top = rc[2].top = 0.0f;
-        rc[0].bottom = rc[1].bottom = rc[2].bottom = (float)bh - 1.0f;
-    } else {
-        const int top = 1;
-        int bbot = top + bh;
-        if (bbot > g_barH) bbot = g_barH;
-        rc[2].left = clientRight - 1 - cW;  rc[2].right = clientRight - 1;   // close
-        rc[1].left = rc[2].left - sW;       rc[1].right = rc[2].left;        // max
-        rc[0].left = rc[1].left - sW;       rc[0].right = rc[1].left;        // min
-        rc[0].top = rc[1].top = rc[2].top = (float)top;
-        rc[0].bottom = rc[1].bottom = rc[2].bottom = (float)bbot;
+// FOREGROUND: icon, title text, caption buttons -- in that z-order (the
+// buttons paint OVER the host's edge rows, exactly like the twinspeak
+// render). Hover faces + glyphs; the close hover stays vanilla red.
+inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
+    if (!g_enabled) return;
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    const CwButtonRects  br  = cwButtonRects(ww);     // the int view: the glyph anchors
+    const CwButtonRectsF brF = cwButtonRectsF(ww);    // v7.6.10: the float view: the patches
+    // v7.6.3: the icon and the title ride the EFFECTIVE bar height (the
+    // button rects carry their own).
+    const int bhEff = cwEffBarH();
+    // v7.6.7: maxedW now drives the MAXIMIZED GLYPHS only (the 1px shrink
+    // below) -- the hover band is state-independent since v7.6.7 (the band
+    // owns row 0 in both states; the decompile split the two geometries).
+    const bool maxedW = w && cwIsMaximized(w);
+    const int item = active ? (g_glyph < 0 ? g_textCol : g_glyph) : g_textUn;
+    // v7.5.4: the inactive glyphs are HALF there (task manager shows it) --
+    // each button's glyph fades back to full opacity riding the same ramp
+    // that drives its tint (pa = g_hovA[i]); focused windows pass through.
+    // v7.6.1: a live lapse OWNS its glyph outright -- the flash floor (32)
+    // easing back to the half-there rest, timed by the train's tick; the
+    // ramp formula waits until the flash lands or the button re-hovers.
+    auto glyphCol = [&](int base, int pa, int bi) -> int {
+        int a;
+        if (g_lapseOn[bi])    a = g_lapseA[bi];
+        else if (!active)     a = kGlyphInactiveAlpha
+                                  + ((255 - kGlyphInactiveAlpha) * pa + 127) / 255;
+        else                  a = cwChannel(base, 24);
+        return (a << 24) | (base & 0xFFFFFF);
+    };
+    auto fillARGB = [&g](int col, int x, int y, int w2, int h2) {
+        Gdiplus::SolidBrush b(Gdiplus::Color(cwChannel(col, 24), cwChannel(col, 16),
+                                             cwChannel(col, 8), cwChannel(col, 0)));
+        g.FillRectangle(&b, x, y, w2, h2);
+    };
+    // v7.5.3e + f: the hover patch -- a translucent fill on WHOLE pixels. The
+    // sub-pixel seams are gone: the 0.25 px anti-aliased insets smeared the
+    // patch edges into a two-column gradient (the field: "blurred"). The
+    // seam rides in whole physical pixels off the left neighbour's right
+    // edge; the outer edges stay flush (close rides the window edge).
+    // SmoothingMode stays None and every coordinate is an integer, so every
+    // edge renders crisp.
+    // v7.6.10: the ONE sub-pixel feature the reference really carries -- the
+    // maximized fills' half-px right edges -- is back, as a HALF-ALPHA tail
+    // column (one crisp column at 50% the patch alpha: the native
+    // compositor's own 50% coverage, no gradient smear). fillPatch owns it.
+    // v7.5.3f THE BAND: the patch ran ONE real px down from the top (the
+    // button rects start on row 1, under the border row) and THREE real px
+    // shorter than the bar: two px of daylight above the bar's bottom edge.
+    // v7.6.5 THE HOVER AT 0PX -- the field: "I still don't see the titlebar
+    // button hovers being at 0px." The real thing's highlight runs to the
+    // VERY TOP of the frame -- the border row is covered the moment a
+    // button lights. hoverBand pins the patch's top to ROW 0 (restored:
+    // the sheet row is painted over; maximized: row 0 was already the
+    // patch's first row) and keeps the two px of daylight at the bottom.
+    // The byte-direct row writers composite the same bands over row 0
+    // (cwSheetRowFill), so every path -- buffered blit, pre-flip commit,
+    // fade train -- agrees with this one.
+    // v7.6.6 asked the band to follow the field's "y = 1" restored button
+    // request and dropped the RESTORED band to row 1 -- that read the two
+    // geometries as one. The decompile splits them: the native BUTTONS sit
+    // at y = margins.top + 1 (0x21bc0 -- the field's y = 1, kept in the
+    // rects), while the native HOVER fills the whole button rect under the
+    // group rect whose top is 0 (0x6a90) -- the highlight owns the border
+    // row in BOTH states (the reference shot's red runs y 0..20).
+    // v7.6.7 THE BAND OWNS ROW 0, BOTH STATES -- and the byte-direct
+    // writers composite the same rule over the OPAQUE face row
+    // (cwFaceRowBytes), never over the glass key, so the accent can never
+    // blend into the patch. The glass key returns the moment no hover
+    // alpha is standing (the idle border line, the native look).
+    auto hoverBand = [](const CwBtnRectF& r) {
+        CwBtnRectF h = r;
+        h.top    = 0.0f;             // v7.6.7: row 0 in both states
+        h.bottom -= 2.0f;
+        return h;
+    };
+    // v7.6.10 THE HALF-PIXEL TAIL -- a maximized fill's right edge sits on a
+    // HALF pixel (the native compositor leaves that column at 50% coverage;
+    // the field's "gap 0.5px, right reduction 1.5px"). The patch is the full
+    // columns at the patch alpha PLUS the tail column at HALF the alpha --
+    // integer fills only, no AA, no smear, byte-identical to the
+    // cwSheetRowFill path on row 0. Restored fills carry whole-rect integer
+    // right edges and render exactly as before.
+    auto fillPatch = [&](const CwBtnRectF& r, int col) {
+        const int x0 = (int)r.left, x1 = (int)r.right;   // [x0, x1): the full columns
+        const int y0 = (int)r.top,  yb = (int)r.bottom;
+        const int pa = cwChannel(col, 24);
+        if (x1 > x0 && yb > y0) {
+            Gdiplus::SolidBrush b(Gdiplus::Color(pa, cwChannel(col, 16),
+                                                 cwChannel(col, 8), cwChannel(col, 0)));
+            g.FillRectangle(&b, x0, y0, x1 - x0, yb - y0);
+        }
+        if (r.right > (float)x1 && yb > y0 && pa > 1) {  // the half-covered tail column
+            Gdiplus::SolidBrush b(Gdiplus::Color(pa / 2, cwChannel(col, 16),
+                                                 cwChannel(col, 8), cwChannel(col, 0)));
+            g.FillRectangle(&b, x1, y0, 1, yb - y0);
+        }
+    };
+    // minimize
+    if (g_btnMin) {
+        // v7.6.8: the dash is the reference's own 10 design px in BOTH
+        // states (the maximized shot's dash runs 1799..1808 -- v7.6.6's
+        // "one px smaller" line drew 9 and sat a row high), and it centers
+        // on the TRUE middle of its slot: (mw - lineW + 1) / 2 rounds the
+        // half pixel INTO the button the way the reference does. The
+        // v7.6.8 cy (the +1 rounding below) drops the maximized glyphs a
+        // row to the reference's own rows (dash row 10, pair 5..14).
+        const int lineW = cwS(10);
+        const int mw    = br.minimize.right - br.minimize.left;
+        const int dx    = br.minimize.left + (mw - lineW + 1) / 2;
+        const int cy    = br.minimize.top
+                        + (br.minimize.bottom - br.minimize.top + (maxedW ? 1 : 0)) / 2
+                        - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 is the MAXIMIZED fit (native's (cysize-1)/2), restored keeps the v7.6.6-era row at every scale
+        fillARGB(glyphCol(item, g_hovA[0], 0), dx, cy, lineW, 1);
     }
-}
-// the integer view -- the glyph anchors and the invalidator. The half column
-// stays IN (right/bottom rounded up): the painter owns the half coverage.
-inline void cwStripRects(RECT rc[3], int clientRight) {
-    CwStripRectF f[3];
-    cwStripRectsF(f, (float)clientRight);
-    for (int i = 0; i < 3; ++i) {
-        rc[i].left   = (int)f[i].left;
-        rc[i].top    = (int)f[i].top;
-        rc[i].right  = (int)(f[i].right + 0.999f);
-        rc[i].bottom = (int)(f[i].bottom + 0.999f);
-    }
-}
-inline int cwStripBtnAt(HWND w, int x, int y) {
-    RECT crc; CwStripRectF rc[3];
-    GetClientRect(w, &crc);
-    cwStripRectsF(rc, (float)crc.right);
-    for (int i = 0; i < 3; ++i)
-        if ((float)x >= rc[i].left && (float)x < rc[i].right &&
-            (float)y >= rc[i].top  && (float)y < rc[i].bottom)
-            return i + 1;
-    return cwBtnNone;
-}
-inline void cwStripInvalidate(HWND w) {
-    RECT crc, rc[3];
-    GetClientRect(w, &crc);
-    cwStripRects(rc, crc.right);
-    for (int i = 0; i < 3; ++i) InvalidateRect(w, &rc[i], FALSE);
-}
-
-// ---- v7.7.9 THE uDWM TIMELINE (the hover/press glow) ------------------------
-// CButton::ActivateTimeline (0x77b4) constructs the fade with the double at
-// .rdata CC920 = 0.16 s; CButton::ComputeFadeValues (0x7b10) rides it:
-//     incoming = start + 2P(end-start), clamped at end   (full at 80 ms)
-//     outgoing = (end - P) * C                           (gone at 160 ms)
-// RedrawVisual (0x22648) chains fades by snapshotting the running values as
-// the next fade's (start, C) -- the swap keeps the crossfade pop-free. Here:
-// per button, a HOVER channel and a PRESS channel, each with (t0, from)
-// re-snapshotted at every state change -- the same law, one overlay per
-// channel. The v7.5.x linear 100/150 ramps, the tempo brackets and the
-// inactive lapse are retired (the decompile out-answers them).
-inline constexpr UINT kCwFadeTimerId = 0x43485631u;  // the strip's 16 ms clock
-inline constexpr int  kCwHoverFadeMs = 160;          // the .rdata CC920 double
-// the patch strengths (the atlas tint equivalents, v7.7.5's signed values)
-inline constexpr int kBtnFadeHover = 46, kBtnFadePress = 44;    // neutral ink /255
-inline constexpr int kBtnRedHover  = 185, kBtnRedPress = 45;    // close red /255
-inline int   g_btnHover   = cwBtnNone;
-inline int   g_btnPress   = cwBtnNone;
-inline int   g_btnHoverA[4] = { 0, 0, 0, 0 };
-inline int   g_btnPressA[4] = { 0, 0, 0, 0 };
-inline DWORD g_btnHovT0[4]  = { 0, 0, 0, 0 };
-inline int   g_btnHovFrom[4] = { 0, 0, 0, 0 };
-inline DWORD g_btnPrsT0[4]  = { 0, 0, 0, 0 };
-inline int   g_btnPrsFrom[4] = { 0, 0, 0, 0 };
-inline bool  g_btnTrack  = false;       // TRACKMOUSEEVENT is armed
-inline bool  g_btnAnim   = false;       // the 16 ms clock is running
-// v7.7.11 THE INACTIVE TARGETS -- UpdateButtonVisuals (0x25364) picks the
-// button visuals' target opacity with TreatAsActiveWindow: 1.0f active
-// (.rdata CFA0C), 0.4f inactive (.rdata CFA18). 0.4 * 255 = 102 -- the ink's
-// own inactive dial. The hover engages on an inactive window and rides to
-// THIS target on the same 160 ms clock: the field's "different rates".
-inline constexpr int kCwHoverTgtAct   = 255;   // the 1.0f at CFA0C
-inline constexpr int kCwHoverTgtInact = 102;   // the 0.4f at CFA18
-// the activation ledger: g_winActive is the last known state; g_forceInact
-// pins the INACTIVE law across the minimize moment (SC_MINIMIZE dispatch and
-// WM_SIZE SIZE_MINIMIZED) -- the window is still GetActiveWindow() while the
-// frame is presented, and the frame must present the inactive top bar, the
-// inactive face and the retargeted channels anyway. Cleared by WM_ACTIVATE /
-// WM_NCACTIVATE active and by any non-iconic WM_SIZE.
-inline bool  g_winActive  = true;
-inline bool  g_forceInact = false;
-// ONE activation read for the whole header -- the painters, the channel
-// targets and the flip handlers all answer this (the host's `active` paint
-// argument is a hint; this is the law).
-inline bool cwWinActive() {
-    if (g_forceInact) return false;                   // the minimize moment
-    if (!g_host || !IsWindow(g_host)) return true;    // pre-creation: active
-    return GetActiveWindow() == g_host;
-}
-// one eased read of a channel: the 0x7b10 law. (from -> target; P = elapsed /
-// 160 ms. The arriving side rides the 2x ramp clamped at target -- full at
-// 80 ms; a retarget between two NONZERO strengths rides the same 2x ramp down
-// (the fade END synced to the new [0x194], the incoming curve of
-// ComputeFadeValues: start + 2P(end-start)); a TRUE leave (target 0) rides
-// the 1x ramp to zero at the full timeline.)
-inline int cwFadeChannel(DWORD now, DWORD t0, int from, int target) {
-    if (from == target) return target;
-    const DWORD el = now - t0;
-    if (el >= (DWORD)kCwHoverFadeMs) return target;
-    const float P = (float)el / (float)kCwHoverFadeMs;
-    if (target > from) {
-        float a = (float)from + 2.0f * P * (float)(target - from);
-        if (a > (float)target) a = (float)target;
-        return (int)(a + 0.5f);
-    }
-    if (target > 0) {
-        // v7.7.11: the activation retarget (1.0 <-> 0.4) -- the incoming
-        // curve driven DOWN to the new end, arriving at half the timeline.
-        float a = (float)from + 2.0f * P * (float)(target - from);
-        if (a < (float)target) a = (float)target;
-        return (int)(a + 0.5f);
-    }
-    return (int)((float)from * (1.0f - P) + 0.5f);
-}
-inline void cwStripRetargetHov(int i) {
-    if (i < 1 || i > 3) return;
-    g_btnHovFrom[i] = g_btnHoverA[i];
-    g_btnHovT0[i]   = GetTickCount();
-}
-// v7.7.10: defined below the state block -- the fade tick and the leave
-// handlers both re-derive the hover from the cursor's real position.
-inline void cwStripHoverRetarget(HWND w, int cx, int cy);
-inline void cwStripRetargetPrs(int i) {
-    if (i < 1 || i > 3) return;
-    g_btnPrsFrom[i] = g_btnPressA[i];
-    g_btnPrsT0[i]   = GetTickCount();
-}
-inline void cwStripAnimArm() {
-    if (g_btnAnim || !g_host || !IsWindow(g_host)) return;
-    if (SetTimer(g_host, kCwFadeTimerId, 16, nullptr)) g_btnAnim = true;
-}
-inline void cwStripAnimTick() {
-    if (!g_btnAnim) return;
-    const HWND w = g_host;
-    if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w)) {
-        g_btnHoverA[1] = g_btnHoverA[2] = g_btnHoverA[3] = 0;
-        g_btnPressA[1] = g_btnPressA[2] = g_btnPressA[3] = 0;
-        g_btnPress = cwBtnNone;
-        KillTimer(w, kCwFadeTimerId); g_btnAnim = false;
-        return;
-    }
-    const DWORD now = GetTickCount();
-    bool busy = false;
-    // v7.7.11: the channel targets answer the activation ledger -- the hover
-    // (and the press, should one latch before activation lands) rides to
-    // 255 on an active window, 102 on an inactive one: UpdateButtonVisuals'
-    // TreatAsActiveWindow pair, on the shared 160 ms clock.
-    const bool winAct = cwWinActive();
-    const int hTgt = winAct ? kCwHoverTgtAct : kCwHoverTgtInact;
-    // v7.7.10: the sweep rides the cursor's REAL position too -- a leave the
-    // queue never delivered (a menu loop ate it, tracking was consumed) can
-    // no longer strand a lit glow: while the timeline runs, every tick
-    // re-derives the hover and retargets if the cursor is somewhere else.
-    // The system's modal loops (a caption drag, a sizing edge) capture the
-    // mouse and the native buttons stay unlit there -- the re-derive stands
-    // down while GetCapture() answers a window.
-    if (!g_btnPress && !GetCapture()) {
-        POINT pt;
-        if (GetCursorPos(&pt)) {
-            ScreenToClient(w, &pt);
-            cwStripHoverRetarget(w, pt.x, pt.y);
+    // maximize (square outline; double square while maximized)
+    if (g_btnMax) {
+        // v7.6.8 cy: the +1 in the rounding centers on the band the way
+        // the reference does -- the maximized glyphs land on the native
+        // rows exactly (pair 5..14, dash row 10, X tips 5..14); the
+        // restored glyphs keep the row they always sat on (the old rect
+        // ran 1..g_barH, whose center this same rounding answers).
+        const int cx = br.maximize.left
+                     + (br.maximize.right - br.maximize.left) / 2;   // v7.6.2: its own width
+        const int cy = br.maximize.top
+                     + (br.maximize.bottom - br.maximize.top + (maxedW ? 1 : 0)) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 rides the MAXIMIZED band only
+        const int mi = glyphCol(item, g_hovA[1], 1);   // v7.5.4: dimmed while inactive
+        if (maxedW) {
+            // v7.5.3d: the front sheet OCCLUDES the back one -- the real
+            // restore glyph layers the squares, the back square's edges stop
+            // at the front square instead of showing through its interior
+            // (the maximized button used to read as see-through wireframe).
+            // v7.6.5 ONE PX SMALLER -- the field: "doesn't the maximized
+            // state's maximize button icon need to be 1px smaller?" Both
+            // sheets run cwS(7) now (was cwS(8)), each keeping its top-left
+            // anchor and the cwS(2) diagonal offset between them: the whole
+            // icon draws 9x9 design inside the same slot (was 10x10), one
+            // design px smaller on every side that counts. The restored
+            // square keeps its 10 -- only the maximized icon shrinks.
+            // v7.6.8 REVERTED TO cwS(8) -- the maximized reference shot
+            // measures the restore pair at 8 px a sheet (back square top
+            // edge row 5 x 1846..1853, front square top edge row 7 x
+            // 1844..1851): the v7.6.5 shrink was the field's own guess, and
+            // the reference out-answers it.
+            //   v7.6.9 THE NATIVE PAIR, CRISP AND DPI-AGNOSTIC -- the
+            // field's 150% shots measure the native sheets at 12 px a side
+            // (cwS(8) -- 12.0 exact at 144 dpi) while the pen path bled to
+            // 13 (the 1.875 px pen straddles the path); at 96 the same
+            // bleed made 9 of the native 8 -- the changelog's "lands on the
+            // reference" was the PATH, not the paint. The sheets are four
+            // integer 1-real-px fills each now (the restored square's own
+            // crisp recipe), so the painted footprint IS cwS(8). The
+            // anchors ride the 10-design-px pair span (cwS(10)):
+            // front.left = cx - (span+1)/2 puts the front sheet at 1805
+            // @144 / 1844 @96, back.top = cy - span/2 at row 9 @144 / row 5
+            // @96, the diagonal offset is cwS(2) (3 @144, 2 @96) -- the
+            // native anchors at every scale. The front sheet still
+            // OCCLUDES the back one (v7.5.3d): the back strokes draw under
+            // an exclude-clip of the front RECT (the native tail at row 20
+            // x 1817..1819 is exactly this), then the front strokes draw
+            // full.
+            const int pairSpan = cwS(10);
+            const int sheetSz  = cwS(8);
+            const int pairDiag = cwS(2);
+            const int fl = cx - (pairSpan + 1) / 2;      // the front sheet's left
+            const int bt = cy - pairSpan / 2;            // the back sheet's top
+            Gdiplus::Rect frontRect(fl, bt + pairDiag, sheetSz, sheetSz);
+            Gdiplus::Region frontRegion(frontRect);
+            g.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
+            {   // the back sheet, occluded -- four integer fills
+                const int bx = fl + pairDiag, by = bt;
+                fillARGB(mi, bx, by, sheetSz, 1);
+                fillARGB(mi, bx, by + sheetSz - 1, sheetSz, 1);
+                fillARGB(mi, bx, by + 1, 1, sheetSz - 2);
+                fillARGB(mi, bx + sheetSz - 1, by + 1, 1, sheetSz - 2);
+            }
+            g.ResetClip();
+            {   // the front sheet, full
+                const int fy = bt + pairDiag;
+                fillARGB(mi, fl, fy, sheetSz, 1);
+                fillARGB(mi, fl, fy + sheetSz - 1, sheetSz, 1);
+                fillARGB(mi, fl, fy + 1, 1, sheetSz - 2);
+                fillARGB(mi, fl + sheetSz - 1, fy + 1, 1, sheetSz - 2);
+            }
+        } else {
+            // v7.6.3 THE CRISP SQUARE: the pen path at half-pixel
+            // coordinates grew a mitre-joint speck off the top-left corner
+            // (GDI+ pen joins leak a sub-pixel wedge at a non-integer
+            // corner -- the field's "a tiny corner off the top left"). The
+            // iconic square is four INTEGER fills now -- a one-real-px
+            // stroke, outer cwS(9)+1 -- the exact footprint the pen snapped
+            // to at 96 dpi (outer 10, x from cx-5), no pen, no joint,
+            // nothing hanging off any corner. Like the minimize line, the
+            // stroke is the glyph color's own alpha (glyphCol owns it).
+            const int outer = cwS(9) + 1;
+            const int x0 = cx - outer / 2;
+            const int y0 = cy - outer / 2;
+            fillARGB(mi, x0, y0, outer, 1);                       // the top stroke
+            fillARGB(mi, x0, y0 + outer - 1, outer, 1);           // the bottom stroke
+            fillARGB(mi, x0, y0 + 1, 1, outer - 2);               // the left stroke
+            fillARGB(mi, x0 + outer - 1, y0 + 1, 1, outer - 2);   // the right stroke
         }
     }
-    for (int i = 1; i <= 3; ++i) {
-        const int hT = (g_btnHover == i) ? hTgt : 0;
-        const int pT = (g_btnPress == i) ? hTgt : 0;
-        g_btnHoverA[i] = cwFadeChannel(now, g_btnHovT0[i], g_btnHovFrom[i], hT);
-        g_btnPressA[i] = cwFadeChannel(now, g_btnPrsT0[i], g_btnPrsFrom[i], pT);
-        if (g_btnHoverA[i] != hT || g_btnPressA[i] != pT) busy = true;
-    }
-    // the native contract's sweep: a release off-window un-presses
-    if (g_btnPress && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
-        cwStripRetargetPrs(g_btnPress);
-        g_btnPress = cwBtnNone;
-        busy = true;
-    }
-    cwStripInvalidate(w);               // the tick's frame rides the host's paint
-    if (!busy && g_btnAnim) { KillTimer(w, kCwFadeTimerId); g_btnAnim = false; }
-}
-// the pure hover re-derive -- compare the cursor's button and retarget the
-// channels. NO tracking arm: the WM_MOUSELEAVE/WM_NCMOUSELEAVE handlers call
-// this, and re-arming TrackMouseEvent from inside a leave handler races the
-// system's own one-shot tracking into an arm/leave loop.
-inline void cwStripHoverRetarget(HWND w, int cx, int cy) {
-    // v7.7.11: the hover lives on INACTIVE windows too -- UpdateButtonVisuals
-    // (0x25364) re-runs SetVisualStates with TreatAsActiveWindow's target at
-    // every state change (1.0 active / 0.4 inactive): the buttons track the
-    // mouse on an unfocused window and the glow rides to the 0.4 target. The
-    // hit test gains the WindowFromPoint guard: with the inactive law the
-    // tick's re-derive runs while OTHER windows own the cursor -- a window
-    // stacked above ours must not light our buttons through its own pixels.
-    int hit = cwBtnNone;
-    if (g_host && IsWindow(g_host)) {
-        POINT spt;
-        if (GetCursorPos(&spt) && WindowFromPoint(spt) == g_host)
-            hit = cwStripBtnAt(w, cx, cy);
-    }
-    if (g_btnPress && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
-        cwStripRetargetPrs(g_btnPress);
-        g_btnPress = cwBtnNone;
-        cwStripAnimArm();
-    }
-    if (hit != g_btnHover) {
-        if (g_btnHover) cwStripRetargetHov(g_btnHover);   // the leave: the 1x ramp out
-        g_btnHover = hit;
-        if (hit) cwStripRetargetHov(hit);                 // the enter: the 2x ramp in
-        cwStripAnimArm();
-    }
-}
-inline void cwStripHoverUpdate(HWND w, int cx, int cy) {
-    cwStripHoverRetarget(w, cx, cy);
-    if (!g_btnTrack) {
-        // v7.7.10 THE HOVER THAT NEVER LIT: TME_LEAVE alone tracks the
-        // CLIENT. Armed from NC traffic -- the only traffic the band gets --
-        // the cursor was never in the client, so the system answered with
-        // WM_MOUSELEAVE immediately and the leave handler faded the hover
-        // back out the same instant it lit. Hover looked dead; only the
-        // PRESS channel (which no leave touches) ever showed -- the field:
-        // "when I press my mouse down on a titlebar button that it triggers
-        // the animation, when just having the cursor over a titlebar button
-        // should have triggered the animation". BOTH leaves are tracked now
-        // (TME_NONCLIENT rides along) and every leave re-derives from the
-        // cursor's REAL position (cwStripHoverRetarget in the handlers
-        // below): a leave that is only the band's client/NC boundary keeps
-        // the hover, a true departure re-derives hit = none and fades out.
-        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT),
-                                TME_LEAVE | TME_NONCLIENT, w, 0 };
-        if (TrackMouseEvent(&tme)) g_btnTrack = true;
-    }
-}
-// v7.7.11 THE ACTIVATION FLIP -- the SetVisualStates re-run: UpdateButtonVisuals
-// picks the target opacity with TreatAsActiveWindow on EVERY visual-state
-// pass, so the native running fades re-target when the window's activation
-// changes. The from-snapshot is re-taken from the CURRENT alpha (the
-// RedrawVisual crossfade law) so a channel mid-fade crosses 1.0 <-> 0.4
-// smoothly instead of popping or dying. Called from WM_NCACTIVATE /
-// WM_ACTIVATE and from the minimize-moment transaction.
-inline void cwStripActivationFlip() {
-    bool moving = false;
-    for (int i = 1; i <= 3; ++i) {
-        if (g_btnHoverA[i] || g_btnHover == i) {
-            if (g_btnHoverA[i]) { g_btnHovFrom[i] = g_btnHoverA[i]; g_btnHovT0[i] = GetTickCount(); }
-            moving = true;
+    // close (always; the close red -- g_closeHover since v7.6.2, the
+    // setWinCloseBtnColor knob, default the real full red RGB(232,17,35) --
+    // under the white X; both ride the same linear fades, 100 ms in / 150 ms
+    // out focused, the inactive pair tempo-steered v7.6.2; the X stroke is
+    // the real thing's 1 design px, the old 1.25 rendered half again too
+    // thick)
+    {
+        const int pa = g_hovA[2];
+        if (pa > 0) fillPatch(hoverBand(brF.close), (pa << 24) | (int)(g_closeHover & 0xFFFFFF));
+        const int cx = br.close.left
+                     + (br.close.right - br.close.left) / 2;   // v7.6.2: its own width
+        const int cy = br.close.top
+                     + (br.close.bottom - br.close.top + (maxedW ? 1 : 0)) / 2
+                     - kHovGlyphRide;   // v7.5.4: the glyph rides the band; v7.6.9: the +1 rides the MAXIMIZED band only
+        int xc = glyphCol(item, pa, 2);     // v7.5.4: half there while inactive, pa restores it
+        if (pa > 0) {                       // the X whitens with the red (alpha rides glyphCol)
+            const int a = cwChannel(xc, 24);
+            const int r  = cwChannel(item, 16) + ((255 - cwChannel(item, 16)) * pa + 127) / 255;
+            const int gr = cwChannel(item,  8) + ((255 - cwChannel(item,  8)) * pa + 127) / 255;
+            const int b  = cwChannel(item,  0) + ((255 - cwChannel(item,  0)) * pa + 127) / 255;
+            xc = (int)(((unsigned)a << 24) | (unsigned)(r << 16) | (unsigned)(gr << 8) | (unsigned)b);
         }
-        if (g_btnPressA[i] || g_btnPress == i) {
-            if (g_btnPressA[i]) { g_btnPrsFrom[i] = g_btnPressA[i]; g_btnPrsT0[i] = GetTickCount(); }
-            moving = true;
+        // v7.6.9 THE NATIVE X, PIXEL-EXACT AT EVERY DPI -- the field's 150%
+        // shots measure the native X at 15x15 (rows 9..23, cols 1876..1890,
+        // tips ON the box) while the pen path painted 13x13 (cwSf(4.5)
+        // reach, AA'd); at 96 the same pen painted 9x9 of the native 10x10.
+        // The X is two 1-real-px staircases corner to corner of the cwS(10)
+        // span box (15 @144, 10 @96 -- the native span at every scale),
+        // drawn as integer 1x1 fills: no pen, no AA, no sub-pixel drift,
+        // the tips land ON the box exactly like the reference.
+        const int xSpan = cwS(10);
+        const int xL = cx - xSpan / 2, yT = cy - xSpan / 2;
+        const int xR = xL + xSpan - 1;
+        for (int k = 0; k < xSpan; ++k) {
+            fillARGB(xc, xL + k, yT + k, 1, 1);
+            fillARGB(xc, xR - k, yT + k, 1, 1);
         }
     }
-    if (moving) cwStripAnimArm();
-}
-
-// ---- v7.7.5 THE DIAL (moved from the host, v7.7.9) --------------------------
-// The titlebar color's HSL lightness picks the immersive mode; the band's ink
-// (the glyphs and the title) reads the same dial. The host seeds the face
-// through changeWinTitlebarColor -- applyTheme's call lands here on every
-// theme switch, the startup color-change case included, and the band re-inks
-// in the same transaction.
-// (the DWMAPI seam lives below; the dial needs the setter)
-typedef HRESULT (WINAPI *CwDwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
-inline CwDwmSetAttrFn cwDwmSetAttrPtr();
-inline int g_dwmDark = 1;             // the mode the band's ink reads
-inline bool cwWantsLight() {
-    return cwHslLightness(g_faceCol) > 128;   // the field's 128 dial, HSL L
-}
-inline void cwApplyDwmMode() {
-    const int prev = g_dwmDark;
-    g_dwmDark = cwWantsLight() ? 0 : 1;
-    if (prev != g_dwmDark) cwRepaint();       // the band re-inks on the flip
-    if (!g_host || !IsWindow(g_host)) return; // pre-creation: parked; cwAttach lands it
-    if (CwDwmSetAttrFn set = cwDwmSetAttrPtr()) {
-        if (FAILED(set(g_host, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                       &g_dwmDark, sizeof(g_dwmDark))))
-            set(g_host, 19, &g_dwmDark, sizeof(g_dwmDark));
-    }
-}
-
-// ---- v7.7.9 THE REGISTRY BORDER ---------------------------------------------
-// uDWM hardcodes no registry names: it reads uxtheme's
-// GetUserColorPreference / GetColorFromPreference, whose store -- the strings
-// inside uxtheme.dll -- is HKCU\Software\Microsoft\Windows\DWM:
-//     ColorPrevalence (DWORD)   "show accent color on title bars and borders"
-//     AccentColor (DWORD)       0xAABBGGRR (alpha, B, G, R -- the default blue
-//                               accent #0078D7 stores as 0xffd77800)
-//     AccentColorInactive       same layout, optional (1903+) -- in the
-//                               STORE, but v7.7.12 retires the house's read
-//                               of it: the inactive line is always the state
-//                               table's half-transparent 43,43,43
-//     ColorizationColor         0xAARRGGBB, the fallback when AccentColor is
-//                               absent
-// DWM paints the 1px left/right/bottom strips itself (the NCCALCSIZE recipe's
-// own NC area); the house's TOP sheet line mirrors this same law.
-inline bool     g_borderPrevalence  = false;
-inline bool     g_borderHaveAccent  = false;
-inline COLORREF g_borderAccent      = RGB(0, 0, 0);
-// v7.7.12: the AccentColorInactive read is RETIRED with the override -- the
-// inactive sheet line is the uDWM state table's own entry at the sheet's
-// half alpha, in every registry weather (see the always-half law above).
-inline void cwBorderReadColors() {
-    g_borderPrevalence = false;
-    g_borderHaveAccent = false;
-    HKEY k;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\DWM",
-                      0, KEY_READ, &k) != ERROR_SUCCESS) return;
-    DWORD v = 0, type = 0, cb = sizeof(v);
-    if (RegQueryValueExA(k, "ColorPrevalence", nullptr, &type,
-                         (LPBYTE)&v, &cb) == ERROR_SUCCESS && type == REG_DWORD)
-        g_borderPrevalence = (v != 0);
-    // v7.7.10 THE INVERTED VALUE FIX: AccentColor is 0xAABBGGRR -- the RED
-    // byte is the LOW byte. The old decode read the HIGH byte as red, which
-    // shipped the line the accent's R and B swapped (the default blue
-    // #0078D7 painted as #D77800 orange -- the field's "inverted color
-    // value" on the top bar). COLORREF wants red in the low byte too, so
-    // the two LOW bytes map straight across: RGB(v & 0xFF, (v>>8) & 0xFF,
-    // (v>>16) & 0xFF).
-    cb = sizeof(v);
-    if (RegQueryValueExA(k, "AccentColor", nullptr, &type,
-                         (LPBYTE)&v, &cb) == ERROR_SUCCESS && type == REG_DWORD) {
-        g_borderAccent = RGB(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF); // 0xAABBGGRR
-        g_borderHaveAccent = true;
-    }
-    if (!g_borderHaveAccent) {   // the ColorizationColor fallback (0xAARRGGBB)
-        cb = sizeof(v);
-        if (RegQueryValueExA(k, "ColorizationColor", nullptr, &type,
-                             (LPBYTE)&v, &cb) == ERROR_SUCCESS && type == REG_DWORD) {
-            g_borderAccent = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
-            g_borderHaveAccent = true;
+    // the icon: the window class icon -- the same one the taskbar shows
+    if (g_icon && w) {
+        HICON hi = (HICON)GetClassLongPtrW(w, GCLP_HICONSM);
+        if (!hi) hi = (HICON)GetClassLongPtrW(w, GCLP_HICON);
+        if (hi) {
+            Gdiplus::Bitmap* bm = Gdiplus::Bitmap::FromHICON(hi);
+            if (bm) {
+                const int isz = cwS(16);
+                g.DrawImage(bm, Gdiplus::Rect(cwS(8), (bhEff - isz) / 2, isz, isz),
+                            0, 0, bm->GetWidth(), bm->GetHeight(), Gdiplus::UnitPixel);
+                delete bm;
+            }
         }
     }
-    RegCloseKey(k);
+    // the title text: the WINDOW TITLE (what the vanilla bar would draw)
+    if (w) {
+        WCHAR title[256] = L"";
+        GetWindowTextW(w, title, 256);
+        if (title[0]) {
+            Gdiplus::Font* tf = cwFont();
+            if (tf) {
+                const int tx = g_icon ? cwS(8) + cwS(16) + cwS(6) : cwS(12);
+                int bw2 = 1 + (g_btnMax ? 1 : 0) + (g_btnMin ? 1 : 0);
+                const int tw = ww - tx - bw2 * (br.close.right - br.close.left) - cwS(8);
+                if (tw > 0) {
+                    const Gdiplus::RectF tr((Gdiplus::REAL)cwSf((float)tx), cwSf(3.0f),
+                                            (Gdiplus::REAL)tw,
+                                            (Gdiplus::REAL)(bhEff - cwS(7)));
+                    Gdiplus::StringFormat sf;
+                    sf.SetAlignment(Gdiplus::StringAlignmentNear);
+                    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+                    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+                    if (active) {
+                        Gdiplus::LinearGradientBrush gb(
+                            tr, Gdiplus::Color(cwChannel(g_textCol, 24), cwChannel(g_textCol, 16),
+                                               cwChannel(g_textCol, 8), cwChannel(g_textCol, 0)),
+                                Gdiplus::Color(cwChannel(g_textGrad, 24), cwChannel(g_textGrad, 16),
+                                               cwChannel(g_textGrad, 8), cwChannel(g_textGrad, 0)),
+                            Gdiplus::LinearGradientModeVertical);
+                        g.DrawString(title, -1, tf, tr, &sf, &gb);
+                    } else if (g_textUnGrad < 0) {
+                        Gdiplus::SolidBrush nb(Gdiplus::Color(
+                            cwChannel(g_textUn, 24), cwChannel(g_textUn, 16),
+                            cwChannel(g_textUn, 8), cwChannel(g_textUn, 0)));
+                        g.DrawString(title, -1, tf, tr, &sf, &nb);
+                    } else {
+                        Gdiplus::LinearGradientBrush gb(
+                            tr, Gdiplus::Color(cwChannel(g_textUn, 24), cwChannel(g_textUn, 16),
+                                               cwChannel(g_textUn, 8), cwChannel(g_textUn, 0)),
+                                Gdiplus::Color(cwChannel(g_textUnGrad, 24), cwChannel(g_textUnGrad, 16),
+                                               cwChannel(g_textUnGrad, 8), cwChannel(g_textUnGrad, 0)),
+                            Gdiplus::LinearGradientModeVertical);
+                        g.DrawString(title, -1, tf, tr, &sf, &gb);
+                    }
+                }
+            }
+        }
+    }
+    // v7.5.3d..f: the min/max hover tints land LAST -- they overlay
+    // everything in the button (the glyph included), in the band: since
+    // v7.6.5 the band starts at ROW 0 (the hover covers the border row,
+    // like the real thing) and keeps the two real px of daylight at the
+    // bottom. The seams against the right-hand neighbours are whole pixels
+    // (the outer edges stay flush).
+    {
+        // v7.5.5: the tint follows the face BEING PAINTED -- the same face
+        // expression cwPaintBarBackground answers, so the hover reads the
+        // mode actually on screen: dark face -> the white overlay, light
+        // face -> the measured black, kHovTintAlpha either way.
+        const int faceNow = active ? g_faceCol
+                                   : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+        const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
+        const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
+        const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
+        // v7.6.8: the seam insets are GONE -- the gaps are REAL now, they
+        // live in the button rects themselves (cwButtonRects), so the
+        // patches fill their rects flush and the 1 px of daylight between
+        // neighbours shows the face exactly like the reference's own
+        // button gaps. cwHovSeamPx() stays for hosts that run abutting
+        // rects of their own.
+        // v7.6.10: the maximized daylight is the native HALF px -- the tail
+        // columns at half alpha carry it (see fillPatch); restored stays
+        // flush and whole.
+        if (g_btnMin && aMin > 0) fillPatch(hoverBand(brF.minimize), (aMin << 24) | tintCol);
+        if (g_btnMax && aMax > 0) fillPatch(hoverBand(brF.maximize), (aMax << 24) | tintCol);
+    }
 }
 
-// ---- the header's own DWMAPI seam (no dwmapi.h, no link dependency) ---------
+// one-call chrome for fresh consumers (twinspeak sandwiches its own border
+// rows between the two halves, so it calls them separately)
+inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
+    cwPaintBarBackground(g, ww, active);
+    cwPaintBarForeground(g, w, ww, active);
+}
+
+// ---- THE FAKE TOP BORDER BAR (the sheet row; the header's since v7.5.3) -----
+// Row 0 of the caption bar is the window's REAL top border. The host extends
+// the DWM glass sheet exactly 1 px into the client ({0,0,1,0}), and this row
+// is written BYTE-DIRECT into a 32bpp top-down DIB -- GDI+ on an HDC-backed
+// surface cannot be trusted with the alpha byte, and the sheet recipe lives
+// or dies on that byte (the recipe: "the colors needed to be pre-multiplied").
+// The DWM composites the row with the sheet BY THE ALPHA, in the same compose
+// that blends the left/right/bottom NC strips, so the fake row tracks the
+// real frame exactly.
+//
+// THE BYTES (BGRA little-endian u32; the high byte is the alpha):
+//   v7.1.27..v7.5.2  active    BGRA(0,0,0,0)       the glass key: the DWM's
+//                                                   own border showed through.
+//   v7.4.3..         inactive  BGRA(43,43,43,0x80) half-alpha RGB(43,43,43):
+//                                                   the recipe's own source
+//                                                   gray (85 at 50%), the
+//                                                   field's byte -- "43, 43,
+//                                                   43 and that's just it."
+//   v7.5.3           active    BGRA(43,43,43,0x80) THE FIELD'S PICK: the
+//                                                   active row joins the
+//                                                   inactive byte -- the
+//                                                   field: "Gdiplus::Color
+//                                                   (128, 43, 43, 43) would
+//                                                   do it", since the DWM's
+//                                                   border color (the registry
+//                                                   colorization) owns the
+//                                                   frame tint anyway and a
+//                                                   bare glass key delivered
+//                                                   nothing the registry
+//                                                   border did not.
+// With no alpha-0 row anywhere, the transparent-glass flash the field taped
+// on minimize (v7.5.1/v7.5.2) is impossible BY CONSTRUCTION: every frame of
+// every animation -- the press frame, the shrink, the restore -- carries the
+// same composited gray. (The v7.4.0 receipt stands: an alpha-0 row cannot
+// carry a color at all -- the RGB under alpha 0 is invisible and the DWM's
+// own glass shows regardless -- so any recolor fix had to be alpha > 0;
+// this one is the field's own byte.) Both rows being one constant, the
+// activation flip no longer changes row 0 -- only the FACE (dim text, dim
+// glyphs) still flips, which is why the ordered presents stay: their row
+// commit is byte-idempotent now, their face present is not.
+//
+// THE THREE WRITERS (all land the same constant; none ever measures):
+//   * cwPatchSheetRow      -- row 0 of the HOST's bar buffer, inside the
+//                             host's bar paint (before its one blit).
+//   * cwCommitSheetRowFast -- the ROW-FIRST commit (v7.3.1): one row write
+//                             into a PRIVATE 1 px DIB (the host's buffer is
+//                             not touched, so the header is self-contained),
+//                             ONE 1 px blit, GdiFlush -- microseconds -- so
+//                             a flip-carrying compose can no longer sample
+//                             the pre-flip row while the multi-ms face
+//                             render is still running.
+//   * cwFadePresenter      -- the v7.2.15 fade train, a thread. WM_TIMER is
+//                             the queue's lowest-priority message; with the
+//                             engine running the queue is regularly fed and
+//                             timer ticks landed late, freezing the DWM's
+//                             presentation-time sheet blend mid-fade (the
+//                             intermittent deactivation redraw delay). The
+//                             thread re-presents the row from OUTSIDE the
+//                             queue: idling on the kick event, twenty 20 ms
+//                             ticks per kick, each tick a 1 px blit from its
+//                             own private DIB. A kick landing mid-run
+//                             restarts the train, so the LAST activation
+//                             state wins on rapid toggles.
+//
+// Threading: the latch (cwSheetRowLatch, written by the host's WM_NCACTIVATE
+// FIRST, before anything else in the handler) is the frame's own truth,
+// readable INSIDE the activation transaction -- unlike GetActiveWindow,
+// which only catches up when WM_ACTIVATE runs after the transaction closes.
+// The gate (cwSheetRowGate) stands the presenter down while the GUI thread
+// is inside an ordered present (v7.3.1: a tick racing the handler would
+// otherwise re-land the row into the commit window; byte-idempotent now,
+// the gate is the belt it always was). The kick (cwSheetRowKick) restarts
+// the train; the SetEvent still orders the GUI writes before the thread's
+// reads.
+inline unsigned g_sheetRowActive   = 0x802B2B2Bu; // BGRA(43,43,43,0x80): Gdiplus::Color(128,43,43,43)
+inline unsigned g_sheetRowInactive = 0x802B2B2Bu; // half-alpha RGB(43,43,43): the field's gray (v7.4.3)
+inline std::atomic<int>  g_ncActive{-1};     // the NC latch: 1 active, 0 inactive, -1 never seen
+inline std::atomic<bool> g_guiRowCommit{false}; // the GUI-commit gate (the presenter stands down)
+// v7.5.3a THE ANIMATION HOLD -- the focused state's timing gate. The header
+// arms it in its own WM_SYSCOMMAND(SC_MINIMIZE) ordered present (every
+// minimize source rides that message -- the caption button posts it since
+// v7.5.3a); the fade train releases it ~280 ms
+// into a presenting run -- the restore animation is over by then. While it
+// stands, cwSheetRowBytes lands the field's gray for BOTH states: every
+// frame of the shrink and the restore carries the same composited gray (the
+// v7.5.3 construction -- the transparent-glass flash is impossible), and
+// the gray never shows on a focused window that has no animation playing.
+inline std::atomic<bool> g_sheetRowAnim{false};
+// THE FOCUSED & IDLE ROW: the alpha-0 glass key (the v7.1.27..v7.5.2 active
+// byte) -- the DWM's own border, accent-colorized by the registry, shows
+// through untouched. Note the byte is Gdiplus::Color(0,0,0,0), NOT the
+// field's "Color(255,0,0,0)": a literal (255,0,0,0) is an OPAQUE black row
+// that covers the accent exactly like the gray does -- an alpha-0 row is
+// the only way the accent shows (the v7.4.0 receipt).
+inline unsigned g_sheetRowFocusIdle = 0x00000000u;
+// the sheet's own state now (v7.5.3b): the header extends the 1 px glass
+// sheet itself (cwSheetSetup, run from cwAttach and on
+// WM_DWMCOMPOSITIONCHANGED) and records whether row 0 has glass behind it
+// -- the header's writers (the commit and the train) must never land the
+// glass key over a bare row. Hosts that run their own sheet machinery can
+// still mirror theirs through the public cwSheetGlass().
+inline std::atomic<bool> g_sheetHasGlass{false};
+
+// v7.5.3b THE HEADER'S OWN DWMAPI SEAM -- the house trick (no dwmapi.h, no
+// link dependency): the three pointers are fetched once into function-local
+// statics, exactly how the host fetched its own. The sheet setup and
+// DwmFlush live in the header now, so a fresh consumer gets the exact
+// Windows 10 top edge from this file alone: the 1 px glass sheet under row
+// 0 (the DWM's colorized border shows through the focused alpha-0 key) and
+// the immersive dark mode attribute (without it the extended sheet paints
+// WHITE in light mode -- the documented light-mode border bug). Idempotent
+// with a host that runs its own copies (twinspeak does).
 typedef HRESULT (WINAPI *CwDwmFlushFn)();
 typedef HRESULT (WINAPI *CwDwmExtendFn)(HWND, const void*);
 typedef HRESULT (WINAPI *CwDwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
@@ -886,383 +1257,365 @@ inline CwDwmSetAttrFn cwDwmSetAttrPtr() {
                                        "DwmSetWindowAttribute");
     return fn;
 }
-inline void cwDwmFlush() {
+inline void cwDwmFlush() {                     // retire the compose in flight (the v7.3.0 ordering)
     if (CwDwmFlushFn fn = cwDwmFlushPtr()) fn();
 }
-// v7.7.9: the sheet setup -- the dial's dark mode, the square corners, the NC
-// render pin, the registry border read and THE WHOLE-BAND EXTEND CARRIER.
-// The extend's top = cwEffBarH() (33 restored / 32 maximized): every band row
-// composites through the same alpha path, row 0 (the sheet line) through the
-// band's last row -- the top AND the bottom of the strip are the same glass,
-// which is the accuracy the field asked for. Re-run on the maximize flip and
-// on WM_DWMCOMPOSITIONCHANGED (composition can restart under the window).
-inline bool cwSheetSetup(HWND w) {
+inline bool cwSheetSetup(HWND w) {             // the sheet + the dark-mode border, one call
     if (!w || !IsWindow(w)) return false;
-    cwBorderReadColors();
     if (CwDwmSetAttrFn set = cwDwmSetAttrPtr()) {
-        const int corner = 1;   // DWMWCP_DONOTROUND -- square corners
-        set(w, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof(corner));
-        const int ncrp = 2;     // DWMNCRP_ENABLED
-        set(w, 2 /* DWMWA_NCRENDERING_POLICY */, &ncrp, sizeof(ncrp));
+        const int darkOn = 1;                  // attribute 20 since 1903, 19 on the early Insider builds
         if (FAILED(set(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                       &g_dwmDark, sizeof(g_dwmDark))))
-            set(w, 19, &g_dwmDark, sizeof(g_dwmDark));
+                       &darkOn, sizeof(darkOn))))
+            set(w, 19, &darkOn, sizeof(darkOn));
     }
     CwDwmExtendFn ext = cwDwmExtendPtr();
     if (!ext) return false;
-    const CwMargins sheet = { 0, 0, cwEffBarH(), 0 };   // the whole band, both states
-    return SUCCEEDED(ext(w, &sheet));
+    // v7.6.3: the MAXIMIZED window carries NO sheet -- the real thing's
+    // maximized frame has no top border line at all. {0,0,0,0} while
+    // maximized, {0,0,1,0} the moment it is not: the WM_SIZE maximize flip
+    // re-runs this setup, so the sheet follows the window state for free
+    // (and WM_DWMCOMPOSITIONCHANGED re-runs it maximize-aware too).
+    const bool maxed = cwIsMaximized(w);
+    const CwMargins sheet = maxed ? CwMargins{ 0, 0, 0, 0 }   // no glass row on a maximized window
+                                  : CwMargins{ 0, 0, 1, 0 };  // row 0 becomes the DWM's own top border
+    const bool on = SUCCEEDED(ext(w, &sheet));
+    g_sheetHasGlass.store(on && !maxed, std::memory_order_release);
+    return on;
 }
 
-// ---- the painters --------------------------------------------------------
-// BACKGROUND: the face seat at the uDWM GLASS WEIGHTS (v7.7.13: alpha 204
-// active / 102 inactive -- .rdata CCD90 = 0.2 / CCDC0 = 0.6, the face blended
-// OVER the extend glass, the half-transparent top bar) + the registry sheet
-// line on row 0 (restored only -- the maximized clip runs the border off).
-// The seat and the line draw with CompositingModeSourceCopy: the seat must
-// REPLACE the erase's opaque rows in the buffer (a source-over fill at alpha
-// 204 would leave the erase's 255 alpha in the band and the glass could never
-// show), and the line composes over the seat in straight-alpha math first so
-// its own alpha byte lands exact. v7.7.11: BOTH read the header's own
-// activation ledger (cwWinActive -- the host's `active` argument is a hint;
-// the minimize moment MUST present the inactive law while GetActiveWindow()
-// still answers this window).
-inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
-    if (!g_enabled) return;
-    const bool act = cwWinActive();
-    const int bh = cwEffBarH();
-    const int face = act ? g_faceCol : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
-    const int grad = act ? g_faceGrad : (g_faceGradIn < 0 ? g_faceGrad : g_faceGradIn);
-    // the glass weights: the band = the face blended over the glass at
-    // 0.2 (active) / 0.6 (inactive) -- the seat alpha = 255 x (1 - weight).
-    const BYTE seatA = act ? 204 : 102;
-    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);   // raw (color, alpha) writes
-    if (face == grad) {   // the solid collapse (a gradient between equals is exact)
-        const Gdiplus::SolidBrush seat(GBand(
-            RGB(cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)), seatA));
-        g.FillRectangle(&seat, 0, 0, ww, bh);
-    } else {
-        Gdiplus::LinearGradientBrush brush(
-            Gdiplus::Rect(0, 0, ww + 1, bh + 1),
-            Gdiplus::Color(seatA, cwChannel(face, 16), cwChannel(face, 8), cwChannel(face, 0)),
-            Gdiplus::Color(seatA, cwChannel(grad, 16), cwChannel(grad, 8), cwChannel(grad, 0)),
-            Gdiplus::LinearGradientModeVertical);
-        g.FillRectangle(&brush, 0, 0, ww, bh);
-    }
-    // THE REGISTRY SHEET LINE (row 0): the accent when ColorPrevalence says
-    // so, the native idle line (white @ 0.2) otherwise, gone when maximized.
-    // v7.7.12 THE ALWAYS-HALF INACTIVE BORDER: on the inactive state the
-    // line is BGRA(43,43,43,128) in EVERY registry weather -- the uDWM state
-    // table's inactive entry (.rdata CD7E4 = 0xFF2B2B2B) at the sheet's own
-    // 0.5 alpha, no registry override (the field: "the inactive window's
-    // border color is always at a half-transparent 43,43,43"; the v7.7.11
-    // AccentColorInactive branch is retired). dwmcore.dll was scanned for it
-    // and stages no chroma at all; the law is uDWM's own.
-    if (!(g_host && IsWindow(g_host) && cwIsMaximized(g_host))) {
-        COLORREF bc = RGB(255, 255, 255);
-        BYTE a = 51;                       // the sheet's 0.2 (the native measure)
-        if (g_borderPrevalence && g_borderHaveAccent && act) {
-            bc = g_borderAccent;
-            a = 254;
-        } else if (!act) {
-            bc = RGB(43, 43, 43);          // the uDWM inactive base CD7E4
-            a = 128;                       // at the sheet's 0.5 alpha -- ALWAYS
-        }
-        // v7.7.13: the line composes OVER the translucent seat in straight
-        // alpha first, then lands as ONE SourceCopy write -- the alpha byte
-        // is the exact composite (a source-over fill would leave the byte at
-        // the line's own alpha and the border row would go translucent with
-        // the band). seatC = the face the seat painted with.
-        const int seatCr = cwChannel(face, 16), seatCg = cwChannel(face, 8),
-                  seatCb = cwChannel(face, 0);
-        const int lr = cwChannel(bc, 16), lg = cwChannel(bc, 8), lb = cwChannel(bc, 0);
-        const float wa = a / 255.0f, wd = seatA / 255.0f;
-        const int outA = (int)(a + seatA * (255 - a) / 255.0f + 0.5f);
-        const int outR = (int)((wa * lr + (1 - wa) * wd * seatCr) * 255.0f / outA + 0.5f);
-        const int outG = (int)((wa * lg + (1 - wa) * wd * seatCg) * 255.0f / outA + 0.5f);
-        const int outB = (int)((wa * lb + (1 - wa) * wd * seatCb) * 255.0f / outA + 0.5f);
-        const Gdiplus::SolidBrush b(Gdiplus::Color(
-            (BYTE)outA, (BYTE)outR, (BYTE)outG, (BYTE)outB));
-        g.FillRectangle(&b, 0, 0, ww, 1);
-    }
-    g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);   // hand the scope back clean
+inline void cwSheetRowAnimHold(bool on) {      // armed at the minimize present; the train releases it
+    g_sheetRowAnim.store(on, std::memory_order_release);
+}
+inline void cwSheetGlass(bool on) {            // hosts that run their own sheet mirror it here
+    g_sheetHasGlass.store(on, std::memory_order_release);
+}
+inline HANDLE g_fadeKick   = nullptr;        // auto-reset: one SetEvent = one burst
+inline HANDLE g_fadeThread = nullptr;        // created with the window, joined at stop
+inline std::atomic<bool> g_fadeQuit{false};
+// the fast commit's PRIVATE 1 px row DIB (GUI-thread only; the presenter
+// thread keeps its own -- no GDI object is ever shared)
+inline HDC     g_rowDc   = nullptr;
+inline HBITMAP g_rowBm   = nullptr;
+inline void*   g_rowBits = nullptr;
+inline int     g_rowW    = 0;
+
+// v7.6.7: THE OPAQUE FACE ROW -- the maximized row-0 byte, factored out so
+// every hover patch can base on it. Native receipt (uDWM.dll): the button
+// hover is its own DirectComposition visual sitting ON TOP of the frame
+// visuals -- when it lights, it REPLACES the border row, it never blends
+// with the glass under it. So any pixel a hover patch owns must be
+// delivered opaque, over the face, never over the alpha-0 glass key.
+inline unsigned cwFaceRowBytes(bool active) {
+    const int face = active ? g_faceCol
+                            : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int r = cwChannel(face, 16), g2 = cwChannel(face, 8), b = cwChannel(face, 0);
+    // v7.6.8 THE BLUE LINE -- FOUND. This row byte landed as 0xAABBGGRR
+    // (b<<16|r) while the 32bpp top-down DIB speaks 0xAARRGGBB (r<<16|b,
+    // the same packing cwRGB above has always used). Every byte this path
+    // wrote to row 0 had R and B SWAPPED. The gray (43,43,43) and the
+    // glass key (0,0,0,0) are R/B-symmetric -- invisible. The near-white
+    // face swap read (240,247,242) instead of (242,247,240) -- invisible.
+    // The close hover red did not survive it: 232,17,35 delivered as
+    // 35,17,232 -- the field's "blue line at the 0px row", captured live
+    // in the field's own screenshot (row 0 = 35,17,232, rows 1..20 =
+    // 232,17,35). v7.6.6's opaque-always and v7.6.7's face-base were both
+    // real fixes of real problems -- over the WRONG bytes. Packed
+    // 0xAARRGGBB now; the row agrees with the GDI+ rows under it.
+    return 0xFF000000u | ((unsigned)r << 16)
+         | ((unsigned)g2 << 8) | (unsigned)b;
 }
 
-// FOREGROUND: the glow (the uDWM timeline), the glyphs, the uDWM title. The
-// dc rides in for the title's Gdiplus::Font (the host's own buffer DC keeps
-// the exact v7.7.6 look; the wrapper below fetches the window's).
-inline void cwPaintBandForeground(Gdiplus::Graphics& gs, HDC dc, HWND w, int ww,
-                                  bool active) {
-    if (!g_enabled) return;
-    gs.SetSmoothingMode(Gdiplus::SmoothingModeNone);
-    gs.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);   // the glyphs + the title blend
-    CwStripRectF rf[3];
-    cwStripRectsF(rf, (float)ww);
-    RECT rc[3];
-    cwStripRects(rc, ww);
-    const bool maxed = g_host && IsWindow(g_host) && cwIsMaximized(g_host);
-    const bool dark = (g_dwmDark != 0);
-    const bool winActive = cwWinActive();   // v7.7.11: the header's own ledger
-    const int glyphA = winActive ? 254 : 102;   // the 0.4 law (254 * 0.4 = 101.6)
-    // the glow's own backdrop -- the face the patch bakes under its ink. The
-    // CURRENT face: active or the inactive mirror -- the inactive glow rides
-    // at the 0.4 target over the SAME face the seat painted (the patch stays
-    // opaque, matched to the seat underneath it).
-    const int faceSeat = winActive ? g_faceCol
-                                   : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
-    const COLORREF faceC = RGB(cwChannel(faceSeat, 16), cwChannel(faceSeat, 8),
-                               cwChannel(faceSeat, 0));
-    // ---- the glow: the three rects, the animated ink, nothing else. The dark
-    // dial lays white ink under the white glass-ink glyphs; the light dial
-    // black under the dark ones; the close keeps the native red -- the
-    // setWinCloseBtnColor knob's (default the real thing's RGB(232,17,35);
-    // the hardcoded 196,43,28 that ignored the knob is retired).
-    // v7.7.10 THE OPAQUE PATCH, v7.7.13 THE GLASS SEAT: the band now rides
-    // the uDWM glass weights (the seat at 204/102), so the patch rides the
-    // SAME seat alpha -- the hovered button composites EXACTLY like the band
-    // around it (the color is the FACE blended toward the ink at the signed
-    // strength, at the seat's alpha, one SourceCopy write). No hole, no
-    // opaque block: the glass shows through the button exactly as much as
-    // through the band, which is what the field's "hovers are opaque" was
-    // protecting (the v7.7.5 artifact was a bare-ink fill punching the seat
-    // OUT -- alpha 46 next to alpha 254). The half-px tails ride the same
-    // law at their real coverage; the maximized fills' 0.5 px tails stay
-    // real pixels.
-    for (int i = 1; i <= 3; ++i) {
-        if (i == cwBtnMin && !g_btnMin) continue;   // the dead slot is face
-        if (i == cwBtnMax && !g_btnMax) continue;
-        // v7.7.11: the channels are UNGATED -- on an inactive window they
-        // carry the 0.4 target themselves (kCwHoverTgtInact), so the patch
-        // strength lands at 40% of the active values, the UpdateButtonVisuals
-        // law, with no painter-side gate to fight the timeline.
-        const int ha = g_btnHoverA[i];
-        const int pa = g_btnPressA[i];
-        int a = (i == cwBtnClose)
-              ? (ha * kBtnRedHover  + pa * kBtnRedPress)  / 255
-              : (ha * kBtnFadeHover + pa * kBtnFadePress) / 255;
-        if (a <= 0) continue;
-        if (a > 255) a = 255;
-        const CwStripRectF& r = rf[i - 1];
-        const int il = (int)r.left, ir = (int)r.right;
-        const int it = (int)r.top,  ib = (int)r.bottom;
-        const float lf = r.left  - (float)il;   // the left tail's coverage
-        const float rf2 = r.right - (float)ir;  // the right tail's coverage
-        const COLORREF ink = (i == cwBtnClose)
-                           ? RGB((int)((g_closeHover >> 16) & 0xFF),
-                                 (int)((g_closeHover >> 8) & 0xFF),
-                                 (int)(g_closeHover & 0xFF))
-                           : (dark ? RGB(255, 255, 255) : RGB(0, 0, 0));
-        const COLORREF patch = cwLerpRGB(faceC, ink, a / 255.0);
-        const BYTE patchA = winActive ? 204 : 102;   // the seat's own glass weight
-        const int cl = (lf > 0.001f) ? il + 1 : il;      // the full columns
-        if (ir > cl) {
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-            const Gdiplus::SolidBrush br(GBand(patch, patchA));
-            gs.FillRectangle(&br, Gdiplus::Rect(cl, it, ir - cl, ib - it));
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-        }
-        if (lf > 0.001f) {                               // the left half column
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, lf), patchA));
-            gs.FillRectangle(&br, Gdiplus::Rect(il, it, 1, ib - it));
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-        }
-        if (rf2 > 0.001f) {                              // the right half column
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-            const Gdiplus::SolidBrush br(GBand(cwLerpRGB(faceC, patch, rf2), patchA));
-            gs.FillRectangle(&br, Gdiplus::Rect(ir, it, 1, ib - it));
-            gs.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-        }
+inline unsigned cwSheetRowBytes(bool active) {
+    // v7.6.3: MAXIMIZED -- the fake top border does not exist on the real
+    // thing's maximized frame. The sheet is withdrawn ({0,0,0,0}, the
+    // WM_SIZE flip re-runs cwSheetSetup) and row 0 is plain opaque FACE:
+    // every writer answers through here, so no gray, no glass key and no
+    // animation hold can ever paint a top border back onto a maximized
+    // window. The byte is PREMULTIPLIED BGRA like its siblings (the face's
+    // own alpha usually carries it at 255).
+    if (g_host && cwIsMaximized(g_host)) {
+        // v7.6.6: OPAQUE, ALWAYS -- the face's own alpha byte no longer
+        // rides. A sub-255 face alpha made the row byte translucent, and
+        // whatever the DWM keeps behind the client (the accent) blended
+        // INTO the hover patch at row 0 -- the field's "the blue blend I
+        // see at the 0px row that appears when I hover the close button."
+        // The premultiply collapses with a = 255, so row 0 on a maximized
+        // window is the plain opaque face byte and can never blend with
+        // anything behind it again. (v7.6.7: the expression lives in
+        // cwFaceRowBytes now -- the hover patch bases on it in BOTH
+        // states, see cwSheetRowFill.)
+        return cwFaceRowBytes(active);
     }
-    // ---- the glyphs -- the house's own (uDWM's compose retired with
-    // WS_SYSMENU, the button-group gate): dash S(10)x1, square S(9)+1,
-    // restore pair S(8)/S(2) in an S(10) span, X span S(10) -- 1px strokes,
-    // centered in the decompile-formula rects. The close's ink crossfades to
-    // white with its red band (light mode; a no-op on a dark titlebar).
-    const COLORREF gInk = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
-    auto gfill = [&](int x, int y, int w2, int h2, COLORREF c) {
-        const Gdiplus::SolidBrush b(GBand(c, (BYTE)glyphA));   // the 254 law
-        gs.FillRectangle(&b, x, y, w2, h2);
-    };
-    if (g_btnMin) {   // minimize: the dash, centered on the floored float-rect center
-        const CwStripRectF& r = rf[0];
-        const int w2 = cwS(10);
-        const int cx = (int)((r.left + r.right) * 0.5f);
-        const int cy = (int)((r.top + r.bottom) * 0.5f);
-        gfill(cx - w2 / 2, cy, w2, 1, gInk);
+    // v7.5.3a: the gray shows when INACTIVE or while an animation holds the
+    // row; focused & idle (and sheeted) the alpha-0 glass key lands and the
+    // DWM's accent border shows through.
+    if (active && !g_sheetRowAnim.load(std::memory_order_relaxed)
+               && g_sheetHasGlass.load(std::memory_order_relaxed))
+        return g_sheetRowFocusIdle;
+    return active ? g_sheetRowActive : g_sheetRowInactive;
+}
+
+// v7.6.5: THE HOVER REACHES ROW 0 -- the byte-direct twin of the GDI+ patch.
+// v7.5.3e composited the hover tint (and the close red) over row 0 so the
+// highlight reached the window's top edge the way the real DWM's runs behind
+// the border line; v7.5.3f pushed the highlight DOWN one real px (the field's
+// "1px vertical") and the writers carried no patch state at all. The field,
+// now: "I still don't see the titlebar button hovers being at 0px" -- the
+// real thing's highlight covers the border row outright, so the compositing
+// is BACK, rebuilt to match the v7.6.5 painter exactly: the same bands
+// (hoverBand: top pinned to row 0, two real px of daylight at the bottom),
+// the same colors (the white/black face tint for min/max, the red knob for
+// close), the same alphas (kHovTintAlpha * the min/max ramps, the close's
+// own ramp) and the same seams (cwHovSeamPx off the left neighbour's right
+// edge). Every byte-direct writer goes through here -- the host's buffered
+// blit (cwPatchSheetRow after the GDI+ pass), the pre-flip row commit and
+// the fade train -- so row 0 agrees with rows 1+ on every path, hover or
+// not. (The fade train reads the hover alphas from its own thread: plain
+// int reads of GUI-thread state, the same shape as its g_host read -- a
+// stale alpha costs one 20 ms tick of one row, never a crash.)
+// Premultiplied-over of a patch (straight ARGB int) onto a row byte
+// (premultiplied BGRA): out = patch*pa + base*(1-pa), alpha delivered the
+// v7.1.29 way (the alpha IS the delivery -- a semi-transparent row over the
+// focused glass key stays semi-transparent, exactly like the GDI+ fill).
+inline unsigned cwRowPatchOver(unsigned base, int pa, int col) {
+    if (pa <= 0) return base;
+    if (pa > 255) pa = 255;
+    const int ia = 255 - pa;
+    const int pr = ((col >> 16) & 0xFF) * pa / 255;
+    const int pg = ((col >>  8) & 0xFF) * pa / 255;
+    const int pb = ( col        & 0xFF) * pa / 255;
+    // v7.6.8: the base byte is 0xAARRGGBB (DIB order) -- R at bits 16..23,
+    // B at bits 0..7. This compositor read it 0xAABBGGRR, so the patch
+    // landed R/B-swapped on row 0 exactly when a hover was standing (the
+    // red read blue -- the field's line). Same packing fix as
+    // cwFaceRowBytes; premultiply unchanged.
+    const int bA = (int)((base >> 24) & 0xFF), bR = (int)((base >> 16) & 0xFF);
+    const int bG = (int)((base >>  8) & 0xFF), bB = (int)( base        & 0xFF);
+    const int oA = pa + bA * ia / 255;
+    const int oR = pr + bR * ia / 255;
+    const int oG = pg + bG * ia / 255;
+    const int oB = pb + bB * ia / 255;
+    return ((unsigned)oA << 24) | ((unsigned)oR << 16)
+         | ((unsigned)oG << 8)  | (unsigned)oB;
+}
+inline void cwSheetRowFill(unsigned* row, int cw2, bool active) {
+    const unsigned px = cwSheetRowBytes(active);
+    // fast path: no hover anywhere -- the plain sheet bytes, as always
+    if (!g_hovA[0] && !g_hovA[1] && !g_hovA[2]) {
+        for (int x = 0; x < cw2; ++x) row[x] = px;
+        return;
     }
-    if (g_btnMax) {   // maximize: the square; the restore pair while maximized (the front
-        // sheet occludes the back one -- the proven clip recipe)
-        const CwStripRectF& r = rf[1];
-        const int cx = (int)((r.left + r.right) * 0.5f);
-        const int cy = (int)((r.top + r.bottom) * 0.5f);
-        if (maxed) {
-            const int span = cwS(10), sheet = cwS(8), diag = cwS(2);
-            const int fl = cx - (span + 1) / 2, bt = cy - span / 2;
-            const Gdiplus::Rect frontRect(fl, bt + diag, sheet, sheet);
-            Gdiplus::Region frontRegion(frontRect);
-            gs.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
-            {   // the back sheet, occluded
-                const int bx = fl + diag, by = bt;
-                gfill(bx, by, sheet, 1, gInk);
-                gfill(bx, by + sheet - 1, sheet, 1, gInk);
-                gfill(bx, by + 1, 1, sheet - 2, gInk);
-                gfill(bx + sheet - 1, by + 1, 1, sheet - 2, gInk);
+    // the bands, straight off the painter's geometry: the rects of THIS
+    // width, the band top pinned to ROW 0 in BOTH states (v7.6.7 -- the
+    // native group rect's top is 0 and the real thing's hover fills the
+    // whole button rect: the reference shot's red runs y 0..20; v7.6.6's
+    // restored row-1 band left the glass key shining above the red -- the
+    // field's "when I hover the close button that blue line appears"),
+    // the bottom two real px short.
+    const CwButtonRectsF bf = cwButtonRectsF(cw2);
+    // v7.6.10: the float rects -- the maximized fills' half-px tails ride
+    // here too (the tail column at half the patch alpha), so row 0 agrees
+    // with the GDI+ rows under it to the byte. No seam cuts: the gaps live
+    // in the rects (see cwButtonRectsF).
+    const int aMin = (g_hovA[0] * kHovTintAlpha + 127) / 255;
+    const int aMax = (g_hovA[1] * kHovTintAlpha + 127) / 255;
+    const int aClose = g_hovA[2];
+    const int faceNow = active ? g_faceCol
+                               : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
+    const int tintCol = cwHslLightness(faceNow) < kHovDarkFaceL ? 0xFFFFFF : 0x000000;
+    const int closeCol = (int)(g_closeHover & 0xFFFFFF);
+    // v7.6.7: BOTH STATES -- row 0 is inside the band whenever the band's
+    // bottom is past it (it always is: the rects' own bottom runs to the
+    // bar's floor).
+    const bool rowInBand = g_host && ((int)bf.close.bottom - 2) > 0;
+    // v7.6.7: THE PATCH BASE IS THE OPAQUE FACE ROW -- the native hover
+    // visual replaces the border line, it does not blend with the glass
+    // behind it. Over the alpha-0 glass key (restored, focused idle) a
+    // patch delivered sub-255 alpha let the accent blend INTO the red --
+    // the blue line. Over the opaque face the premultiply collapses
+    // (oA = pa + 255*(255-pa)/255 = 255): the fade runs face -> red at a
+    // constant opaque alpha, row 0 ends pure red at full hover, and the
+    // glass key returns the moment the ramps rest at zero (the border
+    // line comes back for the idle look, exactly like the native frame).
+    const unsigned facePx = cwFaceRowBytes(active);
+    for (int x = 0; x < cw2; ++x) {
+        const CwBtnRectF* r = nullptr;
+        int pa = 0, col = 0;
+        if (rowInBand) {
+            if      (aClose > 0 && x >= bf.close.left    && x < bf.close.right)
+                { r = &bf.close;    pa = aClose; col = closeCol; }
+            else if (aMax  > 0 && x >= bf.maximize.left  && x < bf.maximize.right)
+                { r = &bf.maximize; pa = aMax;  col = tintCol;  }
+            else if (aMin  > 0 && x >= bf.minimize.left  && x < bf.minimize.right)
+                { r = &bf.minimize; pa = aMin;  col = tintCol;  }
+            if (r) {
+                const int x1 = (int)r->right;              // the full columns end here
+                if (x == x1 && r->right > (float)x1)
+                    pa /= 2;               // v7.6.10: the half-px tail at half the alpha
             }
-            gs.ResetClip();
-            {   // the front sheet, full
-                const int fy2 = bt + diag;
-                gfill(fl, fy2, sheet, 1, gInk);
-                gfill(fl, fy2 + sheet - 1, sheet, 1, gInk);
-                gfill(fl, fy2 + 1, 1, sheet - 2, gInk);
-                gfill(fl + sheet - 1, fy2 + 1, 1, sheet - 2, gInk);
-            }
-        } else {
-            const int outer = cwS(9) + 1;
-            const int x0 = cx - outer / 2, y0 = cy - outer / 2;
-            gfill(x0, y0, outer, 1, gInk);
-            gfill(x0, y0 + outer - 1, outer, 1, gInk);
-            gfill(x0, y0 + 1, 1, outer - 2, gInk);
-            gfill(x0 + outer - 1, y0 + 1, 1, outer - 2, gInk);
         }
+        row[x] = (pa > 0) ? cwRowPatchOver(facePx, pa, col) : px;
     }
-    {   // close: the X, span S(10); its ink crossfades to white with the
-        // hover alpha (light mode: black ink to white over the red band)
-        const CwStripRectF& r = rf[2];
-        const int cx = r.left + (r.right - r.left) / 2;
-        const int cy = r.top + (r.bottom - r.top) / 2;
-        const int span = cwS(10);
-        const int x0 = cx - span / 2, y0 = cy - span / 2;
-        COLORREF ci = gInk;
-        if (!dark && g_btnHoverA[cwBtnClose] > 0)
-            ci = cwLerpRGB(RGB(0, 0, 0), RGB(255, 255, 255),
-                           g_btnHoverA[cwBtnClose] / 255.0);
-        for (int i = 0; i < span; ++i) {
-            gfill(x0 + i, y0 + i, 1, 1, ci);
-            gfill(x0 + span - 1 - i, y0 + i, 1, 1, ci);
-        }
-    }
-    // ---- the title -- the uDWM caption font, the dial's ink, dimmed toward
-    // the face while the window is inactive, vertically centered right of the
-    // icon slot, ellipsis-clamped before the buttons.
-    if (w && g_titleFont && dc) {
-        char title[192] = "";
-        if (GetWindowTextA(w, title, (int)sizeof(title)) && title[0]) {
-            const int iconW = cwMetric(SM_CXSMICON);
-            const RECT tr = { cwS(8) + iconW + cwS(7), rc[0].top,
-                              rc[0].left - cwS(8), rc[0].bottom };
-            const COLORREF base = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
-            const int face = winActive ? g_faceCol
-                                       : (g_faceColIn < 0 ? g_faceCol : g_faceColIn);
-            const COLORREF faceC = RGB(cwChannel(face, 16), cwChannel(face, 8),
-                                       cwChannel(face, 0));
-            const COLORREF tc = winActive ? base : cwLerpRGB(base, faceC, 0.5);
-            cwDrawStringA(gs, dc, tr, title, tc, g_titleFont, 1);
-        }
-    }
-}
-// the public wrappers -- with the host's own DC (the exact buffered look) or
-// with the window's (a fresh consumer paints without a buffer).
-inline void cwPaintBarForeground(Gdiplus::Graphics& g, HDC dc, HWND w, int ww,
-                                 bool active) {
-    cwPaintBandForeground(g, dc, w, ww, active);
-}
-inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
-    HDC dc = w ? GetDC(w) : nullptr;
-    cwPaintBandForeground(g, dc, w, ww, active);
-    if (dc) ReleaseDC(w, dc);
-}
-// v7.7.6 THE CAPTION ICON -- the small icon in its native slot at the
-// caption's left, vertically centered in the caption block. GDI (DrawIconEx)
-// runs AFTER the GDI+ scope dies -- the house never mixes them on one DC.
-// v7.7.12 THE ICON FADE VERDICT (the field asked for the disassembly of
-// "the titlebar icon fade on the inactive window state"): there is NONE
-// in uDWM.dll -- CImage::SetOpacity (0x8ac00) has ZERO call sites in the
-// whole .text, CVisual::SetOpacity's (0x20a90) 47 call sites all target
-// the layered alpha / show-hide / thumbnails / touch visuals, and the
-// activation flip's UpdateWindowVisuals touches the icon only for its
-// hit-test override (CImage+0xc0 = 0/3 at 0x241e5). The inactive dim the
-// eye reads is the FACE BENEATH the icon re-blending (the glass state
-// weights CCD90 = 0.2 / CCDC0 = 0.6) plus the title's CFA18 0.4 color
-// blend and the buttons' 0.4 glyph dial. The icon therefore draws at FULL
-// opacity in both states here -- the 100%-accurate answer. Full receipts:
-// the header's THE ICON block and the v7.7.12 changelog.
-inline void cwPaintCaptionIcon(HDC dc, int cw) {
-    if (!g_host || !dc) return;
-    HICON hic = (HICON)SendMessageW(g_host, WM_GETICON, ICON_SMALL, 0);
-    if (!hic) hic = (HICON)GetClassLongPtrW(g_host, GCLP_HICONSM);
-    if (!hic) hic = (HICON)GetClassLongPtrW(g_host, GCLP_HICON);
-    if (!hic) return;
-    const int iw = cwMetric(SM_CXSMICON), ih = cwMetric(SM_CYSMICON);
-    RECT rc[3];
-    cwStripRects(rc, cw);
-    const int iy = rc[0].top + (rc[0].bottom - rc[0].top - ih) / 2;
-    DrawIconEx(dc, cwS(8), iy, hic, iw, ih, 0, nullptr, DI_NORMAL);
-}
-// one-call chrome for fresh consumers
-inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
-    cwPaintBarBackground(g, ww, active);
-    cwPaintBarForeground(g, w, ww, active);
 }
 
-// ---- v7.5.3d: the DPI-responsive child ledger --------------------------------
-// Children that ride below the caption (design px in, real px out) register
-// here; on WM_DPICHANGED (and on the maximize flip, v7.7.9) the header
-// re-positions every tracked child, re-seats its font (a pointer into the
-// host's HFONT slot) and runs its per-child fixup (combobox item heights).
-// v7.7.9 THE MAXIMIZED DELTA, v7.7.13 THE LIVE-METRICS LAW: underBar
-// children ride the EFFECTIVE caption height outright -- restored that is
-// CYCAPTION+CYFRAME+PADDED, maximized CYCAPTION alone -- so the whole
-// below-caption story moves the native delta at every scale and state.
-// v7.7.13 THE WINDOW-FIT ZOOM: the seats ride cwKidS (the design x the zoom
-// and the canvas centering offset); w < 0 = the fill-to-right mode (the
-// width = the client right - the seat x - the cwKidS(-w) right pad); and
-// bottomPad > 0 = the fill-to-bottom mode (the height = the client bottom -
-// the seat y - the cwKidS(bottomPad) floor pad -- the log pane grows with
-// the window the way it always visually promised to).
-struct CwTrackedChild {
-    HWND    h;
-    int     x, y, w, ht;        // design px (w < 0: the fill-to-right mode)
-    bool    underBar;           // the y rides the header's bar height
-    HFONT*  font;               // the host's font slot, re-sent after a move
-    int     comboItemH;         // > 0: CB_SETITEMHEIGHT(-1) after the move
-    int     bottomPad;          // > 0: the fill-to-bottom mode (design px)
-};
-inline std::vector<CwTrackedChild> g_kids;
-inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
-                         bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0, int bottomPad = 0) {
-    for (auto& k : g_kids)
-        if (k.h == h) { k.x = x; k.y = y; k.w = w; k.ht = ht;
-                        k.underBar = underBar; k.font = font;
-                        k.comboItemH = comboItemH; k.bottomPad = bottomPad; return; }
-    g_kids.push_back({ h, x, y, w, ht, underBar, font, comboItemH, bottomPad });
+// row 0 of a top-down 32bpp buffer (the host's bar DIB): the sheet byte,
+// hover patches composited (v7.6.5: the hover reaches row 0)
+inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+    if (!bits32 || cw <= 0) return;
+    cwSheetRowFill((unsigned*)bits32, cw, active);   // top-down: row 0 first
 }
-inline void cwRelayoutChildren() {
-    const int barNow = cwEffBarH();
-    const int capDelta = barNow - g_barH;   // 0 restored, the maximized delta
-    RECT crc = {};
-    if (g_host && IsWindow(g_host)) GetClientRect(g_host, &crc);
-    for (auto& k : g_kids) {
-        if (!k.h || !IsWindow(k.h)) continue;
-        const int x  = cwKidX(k.x);
-        const int y  = cwKidS(k.y) + (k.underBar ? barNow : capDelta);
-        int w  = cwKidS(k.w);
-        int ht = cwKidS(k.ht);
-        if (k.w < 0)          w  = crc.right - x - cwKidS(-k.w);   // fill to the right
-        if (k.bottomPad > 0)  ht = crc.bottom - y - cwKidS(k.bottomPad);
-        if (ht < cwKidS(8))   ht = cwKidS(8);                     // the floor
-        SetWindowPos(k.h, nullptr, x, y, w, ht,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        if (k.font && *k.font) SendMessageW(k.h, WM_SETFONT, (WPARAM)*k.font, TRUE);
-        if (k.comboItemH > 0) {
-            SendMessageW(k.h, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)cwKidS(k.comboItemH));
-            InvalidateRect(k.h, nullptr, FALSE);
+
+// the ROW-FIRST COMMIT (v7.3.1): fill the private row DIB, blit 1 px,
+// GdiFlush. Buffer missing (the first frames): grown here -- the private
+// DIB makes the commit self-contained, the host's buffer is not required.
+inline void cwCommitSheetRowFast(HWND w, bool active) {
+    if (!w || !IsWindow(w)) return;
+    RECT cr;
+    if (!GetClientRect(w, &cr) || cr.right <= 0) return;
+    if (cr.right > g_rowW) {                    // (re)grow the private row DIB
+        if (g_rowBm) DeleteObject(g_rowBm);
+        if (g_rowDc) { DeleteDC(g_rowDc); g_rowDc = nullptr; }
+        g_rowBm = nullptr; g_rowBits = nullptr; g_rowW = 0;
+        HDC sdc = GetDC(w);
+        if (sdc) {
+            BITMAPINFO bi;
+            ZeroMemory(&bi, sizeof(bi));
+            bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biPlanes      = 1;
+            bi.bmiHeader.biBitCount    = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            bi.bmiHeader.biHeight      = -1;    // top-down, like the bar DIB
+            bi.bmiHeader.biWidth       = cr.right;
+            g_rowBm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &g_rowBits, nullptr, 0);
+            if (g_rowBm) {
+                g_rowDc = CreateCompatibleDC(sdc);
+                if (g_rowDc) SelectObject(g_rowDc, g_rowBm);
+            }
+            ReleaseDC(w, sdc);
         }
+        if (!g_rowDc) {
+            if (g_rowBm) { DeleteObject(g_rowBm); g_rowBm = nullptr; }
+            g_rowBits = nullptr;
+            return;
+        }
+        g_rowW = cr.right;
     }
+    unsigned* row = (unsigned*)g_rowBits;
+    cwSheetRowFill(row, cr.right, active);         // sheet bytes + hover patches (v7.6.5: row 0 joins the hover)
+    HDC wdc = GetDC(w);
+    if (wdc) {
+        BitBlt(wdc, 0, 0, cr.right, 1, g_rowDc, 0, 0, SRCCOPY);
+        ReleaseDC(w, wdc);
+    }
+    GdiFlush();                                 // the row is in the redirection surface
 }
-inline void cwSetDpiHook(void (*hook)()) { g_dpiHook = hook; }
+
+inline void cwSheetRowLatch(int state) {       // the frame's own truth (WM_NCACTIVATE writes FIRST)
+    g_ncActive.store(state);                   // seq_cst: the presenter reads relaxed, the kick orders
+}
+inline int cwSheetRowLatchValue() {
+    return g_ncActive.load(std::memory_order_relaxed);
+}
+inline void cwSheetRowGate(bool on) {          // TRUE while the GUI thread is inside an ordered present
+    g_guiRowCommit.store(on, std::memory_order_release);
+}
+inline void cwSheetRowKick() {                 // non-blocking; safe from any message
+    if (g_fadeKick) SetEvent(g_fadeKick);
+}
+
+// the fade train (v7.2.15, moved here v7.5.3): re-presents row 0 from
+// OUTSIDE the message queue -- the DWM bakes the sheet blend at presentation
+// time (v7.1.30), and a starved repaint freezes it mid-fade.
+inline DWORD WINAPI cwFadePresenter(LPVOID) {
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bi.bmiHeader.biHeight      = -1;          // top-down, like the bar DIB
+    HDC     dc   = nullptr;
+    HBITMAP bm   = nullptr;
+    void*   bits = nullptr;
+    int     rowW = 0, ticks = 0;
+    for (;;) {
+        // v7.5.3b PERF: the idle wait owns the thread until the next kick
+        // (the old 250 ms poll woke four times a second to present nothing;
+        // the presenting cadence itself is untouched -- 20 ms per tick).
+        const bool kicked =
+            WaitForSingleObject(g_fadeKick, ticks ? 20 : INFINITE) == WAIT_OBJECT_0;
+        if (kicked) ticks = 20;               // every kick restarts the train
+        else if (ticks) --ticks;
+        if (!ticks) continue;                 // idle: the event owns the wait
+        if (g_fadeQuit.load(std::memory_order_acquire)) break;
+        if (g_guiRowCommit.load(std::memory_order_acquire)) {
+            --ticks; continue;                // the GUI commit owns the row this tick
+        }
+        const int nc = g_ncActive.load(std::memory_order_relaxed);
+        if (nc < 0) continue;                 // no activation state latched yet
+        HWND w = g_host;
+        if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+        RECT cr;
+        if (!GetClientRect(w, &cr) || cr.right <= 0) continue;
+        if (cr.right > rowW) {                // (re)grow the private row DIB
+            if (bm) DeleteObject(bm);
+            if (dc) { DeleteDC(dc); dc = nullptr; }
+            bm = nullptr; bits = nullptr; rowW = 0;
+            HDC sdc = GetDC(w);
+            if (sdc) {
+                bi.bmiHeader.biWidth = cr.right;
+                bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (bm) {
+                    dc = CreateCompatibleDC(sdc);
+                    if (dc) SelectObject(dc, bm);
+                }
+                ReleaseDC(w, sdc);
+            }
+            if (!dc) { if (bm) { DeleteObject(bm); bm = nullptr; } bits = nullptr; continue; }
+            rowW = cr.right;
+        }
+        unsigned* row = (unsigned*)bits;
+        cwSheetRowFill(row, cr.right, nc != 0);        // sheet bytes + hover patches (v7.6.5: row 0 joins the hover)
+        HDC wdc = GetDC(w);
+        if (wdc) {
+            BitBlt(wdc, 0, 0, cr.right, 1, dc, 0, 0, SRCCOPY);
+            ReleaseDC(w, wdc);
+        }
+        GdiFlush();                           // the strip is presented before the next tick
+        // v7.5.3a THE HOLD RELEASE: after ~280 ms of presenting ticks the
+        // restore animation is over -- drop the hold and re-kick so a fresh
+        // train bakes the focused glass key (the accent). The iconic guard
+        // above skips the shrink's ticks without presenting, so a minimize
+        // alone can never reach this line and release the hold early.
+        if (ticks <= 7 && g_sheetRowAnim.exchange(false, std::memory_order_acq_rel))
+            cwSheetRowKick();
+        --ticks;
+    }
+    if (bm) DeleteObject(bm);
+    if (dc) DeleteDC(dc);
+    return 0;
+}
+inline void cwSheetPresenterStart(HWND w) {    // once, with the window (after cwAttach)
+    if (g_fadeThread) return;
+    g_fadeQuit.store(false, std::memory_order_release);
+    (void)w;                                   // the train reads g_host (cwAttach) every tick
+    g_fadeKick  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_fadeThread = g_fadeKick ? CreateThread(nullptr, 0, cwFadePresenter,
+                                             nullptr, 0, nullptr) : nullptr;
+}
+inline void cwSheetPresenterStop() {           // signal, wake, join (bounded), dispose
+    g_fadeQuit.store(true, std::memory_order_release);
+    if (g_fadeKick) SetEvent(g_fadeKick);
+    if (g_fadeThread) {
+        WaitForSingleObject(g_fadeThread, 2000);
+        CloseHandle(g_fadeThread);
+        g_fadeThread = nullptr;
+    }
+    if (g_fadeKick) { CloseHandle(g_fadeKick); g_fadeKick = nullptr; }
+    if (g_rowBm) DeleteObject(g_rowBm);
+    if (g_rowDc) DeleteDC(g_rowDc);
+    g_rowBm = nullptr; g_rowDc = nullptr; g_rowBits = nullptr; g_rowW = 0;
+}
 
 // ---- the built-in fallback tray --------------------------------------------
 inline void cwTrayEnsure() {
@@ -1289,296 +1642,368 @@ inline void cwTrayRemove() {
     g_trayUp = false;
 }
 
-// ---- the message hook (forward this FIRST in the host wndproc) --------------
+// ---- the message hook (forward this FIRST in the host wndproc) -------------
 inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
     *out = 0;
     if (!g_enabled) return false;
     switch (msg) {
-    case WM_NCACTIVATE: {
-        // the answer is DefWindowProc with lParam -1 -- never a bare TRUE: the
-        // -1 stops DefWindowProc from repainting the NC area (its border
-        // visuals are uDWM's own at compose time) while the activation
-        // contract stays DefWindowProc's. The band re-inks on BOTH edges of
-        // the flip (the glyphs re-render at the inactive 0.4, the title
-        // re-dims, the sheet line rides its registry law).
-        // v7.7.11: the hover is NOT killed on the flip anymore -- the native
-        // UpdateButtonVisuals re-runs SetVisualStates on the flip and the
-        // running fades RETARGET (1.0 <-> 0.4, the from-snapshot re-taken);
-        // the cursor still over a button keeps its (now 0.4-strength) glow
-        // on the unfocused window, the field's inactive-hover law.
-        const LRESULT r = DefWindowProcW(w, msg, wp, (LPARAM)-1);
-        const bool act = (wp != 0);
-        if (act) g_forceInact = false;
-        if (act != g_winActive) { g_winActive = act; cwStripActivationFlip(); }
-        cwRepaint();
-        *out = r; return true; }
-    case WM_ACTIVATE:
-        // v7.7.11: the activation ledger's second edge (WM_NCACTIVATE's
-        // sibling -- ShowWindow/SetForegroundOrder paths can deliver one
-        // without the other). WA_INACTIVE == 0; any nonzero low word is
-        // WA_ACTIVE / WA_CLICKACTIVE. The flip retargets the running
-        // channels and re-inks the band, exactly like WM_NCACTIVATE.
-        if (LOWORD(wp) != WA_INACTIVE) g_forceInact = false;
-        if ((LOWORD(wp) != WA_INACTIVE) != g_winActive) {
-            g_winActive = (LOWORD(wp) != WA_INACTIVE);
-            cwStripActivationFlip();
-            cwRepaint();
-        }
-        return false;
-    case WM_SYSCOMMAND:
-        // v7.7.11 THE MINIMIZE MOMENT: the frame presented as the window goes
-        // iconic -- and the taskbar's live preview after it -- must carry the
-        // INACTIVE top bar (the uDWM state table's inactive entry at the
-        // sheet's 0.5 alpha), the inactive face and the retargeted channels.
-        // The flip lands BEFORE the default flow takes the command: the
-        // ledger pins the inactive law, the channels re-target, and ONE
-        // synchronous band repaint + DwmFlush present the inactive frame so
-        // the minimize animation samples it, not the stale active one.
-        // SC_RESTORE releases the pin; the activation contract re-lands the
-        // active law on the WM_NCACTIVATE(TRUE) that follows.
-        if ((wp & 0xFFF0) == SC_MINIMIZE) {
-            g_forceInact = true;
-            g_winActive = false;
-            cwStripActivationFlip();
-            if (IsWindowVisible(w) && !IsIconic(w)) {
-                cwRepaint();                     // the band into the update region
-                // ONE synchronous present, no erase pass (the v7.0.9 law):
-                // the host's buffered WM_PAINT lands the inactive frame and
-                // DWM is told the frame is there before the animation runs.
-                RedrawWindow(w, nullptr, nullptr, RDW_NOERASE | RDW_UPDATENOW);
-                cwDwmFlush();
-            }
-        } else if ((wp & 0xFFF0) == SC_RESTORE) {
-            g_forceInact = false;
-        }
+    case WM_NCACTIVATE:
+        // v7.5.3b: the NC latch is latched HERE now, at the very top of
+        // the dispatch -- the frame's own truth (wParam carries the state
+        // the frame is flipping to), readable by every painter inside the
+        // activation transaction. The message itself keeps flowing to the
+        // host's own case and DefWindowProc.
+        if (!wp && g_hover != cwHovNone) { g_hover = cwHovNone; cwHovAnimEnsure(); }
+        cwHovLapseClearAll();         // v7.6.1: no flash crosses an activation change
+        g_hovInactive = (wp == 0);    // v7.5.4: the inactive ramps (v7.6.1: 75 ms pre and post)
+        cwSheetRowLatch(wp ? 1 : 0);
         return false;
     case WM_DWMCOMPOSITIONCHANGED:
-        // composition can restart under the window (driver reset, an RDP
-        // session) -- the extend is a geometry commitment to a DWM that no
-        // longer exists. Re-run the whole setup (registry border, the dial's
-        // dark mode, the band carrier) and re-land the band. The host's own
-        // case, if any, still runs after -- idempotent.
+        // v7.5.3b: composition can restart under the window (driver reset,
+        // an RDP session) -- the {0,0,1,0} sheet is a geometry commitment
+        // to a DWM that no longer exists. The header re-runs its own sheet
+        // setup (re-extend + the dark-mode border; the glass flag follows
+        // the result), re-lands the bar and re-kicks the train. A host's
+        // own case, if it has one, still runs after this -- idempotent.
         cwSheetSetup(w);
-        if (IsWindowVisible(w) && !IsIconic(w)) cwRepaint();
+        if (IsWindowVisible(w) && !IsIconic(w)) { cwRepaint(); cwSheetRowKick(); }
         return false;
     case WM_SIZE: {
-        // v7.7.11: the iconic edge pins the inactive law (ShowWindow(SW_MINIMIZE)
-        // can reach WM_SIZE without riding WM_SYSCOMMAND); any real size
-        // (SIZE_RESTORED / the restore path) releases it -- the activation
-        // contract re-lands the active law the moment the window is focused.
-        if (wp == SIZE_MINIMIZED) {
-            g_forceInact = true;
-            g_winActive = false;
-            cwStripActivationFlip();
-            return false;
-        }
-        g_forceInact = false;
-        // THE MAXIMIZE FLIP -- the extend carrier, the caption height and the
-        // children. cwEffBarH() answers SM_CYCAPTION while maximized (the
-        // frame rows hang off-screen, v7.7.13's live-metrics law); the flip
-        // re-runs the sheet setup (the carrier
-        // follows the band) and re-seats the tracked children at the new
-        // delta. v7.7.12 THE SINGLE-PRESENT FLIP: ONE synchronous whole-frame
-        // RedrawWindow (the band rows INCLUDED -- the client rect covers
-        // them) lands the flip; the trailing cwRepaint() the older rounds
-        // queued after the synchronous pass is retired -- a second queued
-        // paint behind RDW_UPDATENOW is exactly the kind of stray frame the
-        // compositor can sample mid-animation (the field's "temporarily
-        // corrupt" on maximize/restore). RDW_FRAME rides along so the NC
-        // border strips re-dress in the same present. Iconic transitions are
-        // skipped.
+        // v7.6.3 THE MAXIMIZE FLIP -- the sheet AND the geometry. The real
+        // thing's maximized frame has no top border line: the sheet is
+        // withdrawn ({0,0,0,0} -- cwSheetSetup is maximize-aware now) and
+        // row 0 renders plain face (cwSheetRowBytes answers the face for a
+        // maximized host); on unmaximizing the {0,0,1,0} sheet comes back
+        // and the top bar with it. The caption rides cwEffBarH() (24 design
+        // px maximized, the buttons one design px shorter, the close two
+        // narrower), so the flip re-seats the tracked children and re-lands
+        // the bar. Iconic transitions are skipped -- a minimize from a
+        // maximized window must not flip the latch (the placement reads
+        // SW_SHOWMINIMIZED mid-flight); the restore returns to the same
+        // state and nothing moves. The message itself keeps flowing to the
+        // host and DefWindowProc.
         if (!IsIconic(w)) {
             const bool maxed = cwIsMaximized(w);
             if (maxed != g_wasMax) {
                 g_wasMax = maxed;
-                cwSheetSetup(w);
-                cwRelayoutChildren();
+                cwSheetSetup(w);          // {0,0,0,0} maximized / {0,0,1,0} restored
+                cwRelayoutChildren();     // the children ride the bar height
                 if (IsWindowVisible(w)) {
+                    // v7.6.4 THE WHOLE-FRAME FLIP REPAINT -- the field's
+                    // "have it so maximizing ... doesn't corrupt the window
+                    // render for a split second." The flip used to re-land
+                    // the BAR alone (cwRepaint), so every band of the panel
+                    // below -- just moved by the 9 design px the bar gave
+                    // up -- kept its PRE-flip pixels until the queue's async
+                    // WM_PAINT wandered by: one to two composes of stale,
+                    // misplaced content on every maximize/unmaximize. One
+                    // synchronous full-window repaint (RDW_UPDATENOW) lands
+                    // the buffered frame at the new geometry in a single
+                    // write BEFORE the flip's compose can sample anything
+                    // stale; the bar re-lands with it and the sheet train
+                    // re-kicks after.
                     RECT cr; GetClientRect(w, &cr);
                     RedrawWindow(w, &cr, nullptr,
-                                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME
+                                 RDW_INVALIDATE | RDW_ERASE
                                  | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                    cwRepaint();          // the bar re-lands with it (belt)
+                    cwSheetRowKick();
                 }
             }
         }
         return false; }
     case WM_NCCALCSIZE: {
-        // THE uDWM RECIPE: the client hands the frame a 1px strip on
-        // left/right/bottom -- PHYSICAL px, the native border art is 1px at
-        // every DPI -- and uDWM draws its own border line in them (the active
-        // and inactive border colors are uDWM's, by construction; the accent
-        // tint when colorization is on). Maximized keeps the full frame
-        // giveback (the maximized clip runs the native border off).
+        // main.c verbatim: the client is the whole window MINUS the frame
+        // insets on left/right/bottom (top only when maximized). The DWM
+        // border + drop shadow own a real NC strip; the top stays
+        // client-covered on purpose (a top gap makes the DWM paint a ghost
+        // caption OUTSIDE the window rect -- the real top border belongs to
+        // the host's sheet/border row).
         if (!wp) return false;
-        NCCALCSIZE_PARAMS* ncp = (NCCALCSIZE_PARAMS*)lp;
-        if (cwIsMaximized(w)) {
-            const int fx = cwMetric(SM_CXFRAME) + cwMetric(SM_CXPADDEDBORDER);
-            const int fy = cwMetric(SM_CYFRAME) + cwMetric(SM_CXPADDEDBORDER);
-            ncp->rgrc[0].left   += fx;   ncp->rgrc[0].top    += fy;
-            ncp->rgrc[0].right  -= fx;   ncp->rgrc[0].bottom -= fy;
-        } else {
-            ncp->rgrc[0].left   += 1;    ncp->rgrc[0].right  -= 1;
-            ncp->rgrc[0].bottom -= 1;
+        const int frame_x = cwMetric(SM_CXFRAME);       // v7.5.3d: per-dpi metrics
+        const int frame_y = cwMetric(SM_CYFRAME);
+        const int padding = cwMetric(SM_CXPADDEDBORDER);
+        NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
+        RECT* requested_client_rect = params->rgrc;
+        requested_client_rect->right  -= frame_x + padding;
+        requested_client_rect->left   += frame_x + padding;
+        requested_client_rect->bottom -= frame_y + padding;
+        if (cwIsMaximized(w)) requested_client_rect->top += frame_y + padding;
+        return true; }
+    case WM_NCHITTEST: {
+        // main.c: DefWindowProc owns the resize edges (with WS_THICKFRAME +
+        // resize allowed they resize; with resize refused they end where
+        // they started), then the manual HTTOP re-answer for the band the
+        // inset confuses, then HTCAPTION across the bar, HTCLIENT below.
+        LRESULT hit = DefWindowProcW(w, msg, wp, lp);
+        // v7.5.1 THE HONEST BORDER. A refused resize must not advertise
+        // itself: WS_THICKFRAME is the style (the DWM shadow lives on it),
+        // so DefWindowProc answers the edge bands the sizing codes and the
+        // mouse treated a fixed window as wanting to resize -- sizing
+        // arrows on a window whose drags end where they started. With
+        // setCanWinResize(false) in force every edge answer downgrades to
+        // HTBORDER: the arrow stays an arrow, there is nothing to grab,
+        // the drag never starts. The frame style itself is untouched --
+        // only the intent goes.
+        if (!g_resizable) {
+            switch (hit) {
+                case HTLEFT: case HTRIGHT:
+                case HTTOPLEFT: case HTTOP: case HTTOPRIGHT:
+                case HTBOTTOMLEFT: case HTBOTTOM: case HTBOTTOMRIGHT:
+                    hit = HTBORDER; break;
+            }
+        }
+        switch (hit) {
+            case HTNOWHERE: case HTBORDER: case HTRIGHT: case HTLEFT:
+            case HTTOPLEFT: case HTTOP: case HTTOPRIGHT:
+            case HTBOTTOMRIGHT: case HTBOTTOM: case HTBOTTOMLEFT:
+                *out = hit; return true;
+        }
+        POINT cursor_point = {0};
+        cursor_point.x = GET_X_PARAM(lp);
+        cursor_point.y = GET_Y_PARAM(lp);
+        ScreenToClient(w, &cursor_point);
+        if (!cwIsMaximized(w) && cursor_point.y > 0 &&
+            cursor_point.y < cwMetric(SM_CYFRAME) + cwMetric(SM_CXPADDEDBORDER)) {
+            *out = g_resizable ? HTTOP : HTBORDER;   // v7.5.1: the honest border
+            return true;
+        }
+        if (cursor_point.y < cwEffBarH()) { *out = HTCAPTION; return true; }
+        *out = HTCLIENT; return true; }
+    case WM_NCMOUSEMOVE: {
+        // which button the mouse is over -- hover state lives here; the
+        // host's repaint callback lands the pixels synchronously
+        POINT cursor_point;
+        GetCursorPos(&cursor_point);
+        ScreenToClient(w, &cursor_point);
+        // v7.6.2: the tempo sample -- instantaneous (px/ms)^2, EMA 60/40.
+        // A pause longer than 200 ms reads as stillness (the next flash
+        // runs at the floor); a 2 px/ms flick pins the ceiling.
+        const DWORD mvNow = GetTickCount();
+        if (g_hovMoveLast && mvNow > g_hovMoveLast) {
+            const DWORD mdt = mvNow - g_hovMoveLast;
+            if (mdt >= 200) g_hovSpeed2 = 0.0f;
+            else {
+                const float dx = (float)(cursor_point.x - g_hovMovePt.x);
+                const float dy = (float)(cursor_point.y - g_hovMovePt.y);
+                const float inst2 = (dx * dx + dy * dy) / ((float)mdt * (float)mdt);
+                g_hovSpeed2 = g_hovSpeed2 * 0.6f + inst2 * 0.4f;
+            }
+        }
+        g_hovMoveLast = mvNow;
+        g_hovMovePt   = cursor_point;
+        RECT cr; GetClientRect(w, &cr);
+        const CwButtonRectsF bf = cwButtonRectsF(cr.right);
+        // v7.6.10: the hover rides the float rects -- a half-px tail column
+        // still hovers its button (the cursor is inside the native fill)
+        auto ptInBtn = [](const CwBtnRectF& r, const POINT& p) {
+            return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+        };
+        int nh = cwHovNone;
+        if (ptInBtn(bf.close, cursor_point)) nh = cwHovClose;
+        else if (g_btnMax && ptInBtn(bf.maximize, cursor_point)) nh = cwHovMax;
+        else if (g_btnMin && ptInBtn(bf.minimize, cursor_point)) nh = cwHovMin;
+        if (nh != g_hover) {
+            const int was = g_hover;
+            g_hover = nh;
+            // v7.6.1: leaving ANY button on an INACTIVE window sets that
+            // button's glyph to 12.5% for its fade-back -- moving onto
+            // a neighbouring button unhovered the first one all the same.
+            // v7.6.2: the leave's tempo steers the out ramp AND the flash
+            // (cwHovTempoMs, inside the bracket -- v7.6.4: [100, 300]); the
+            // arrival's tempo steers the IN ramp, and re-hover cancels
+            // that button's flash.
+            if (was != cwHovNone && g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();
+                cwHovLapse(was - 1);
+            }
+            if (nh != cwHovNone) {
+                g_lapseOn[nh - 1] = false;
+                if (g_hovInactive) kHovInactiveInMs = cwHovTempoMs();
+            }
+            cwHovAnimEnsure();             // the fade owns the repaints
+        }
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT, w, 0 };
+        TrackMouseEvent(&tme);          // the leave that starts the tempo-steered fade-out
+        *out = DefWindowProcW(w, msg, wp, lp); return true; }
+    case WM_NCLBUTTONDOWN:
+        // the DOWN must not count as a drag start when a button is hovered
+        if (g_hover != cwHovNone) { *out = 0; return true; }
+        return false;
+    case WM_NCLBUTTONUP:
+        // the dispatch: close posts WM_CLOSE (the host decides hide or
+        // destroy), minimize minimizes, maximize toggles (refused while
+        // setCanWinResize(false) -- a dead button for a host that asked)
+        if (g_hover == cwHovClose)      { PostMessageW(w, WM_CLOSE, 0, 0); *out = 0; return true; }
+        // v7.5.3a: the click rides WM_SYSCOMMAND(SC_MINIMIZE) now, not a
+        // raw ShowWindow -- the header's ordered present (the WM_SYSCOMMAND
+        // case below: the hold, DwmFlush, the row-first gray commit, the
+        // face, the kick) arms BEFORE DefWindowProc flips anything. A raw ShowWindow skipped
+        // all of it: the surface kept the focused glass key and the shrink
+        // flew transparent (the v7.5.4..v7.5.10 flash).
+        if (g_hover == cwHovMin)        { PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0); *out = 0; return true; }
+        if (g_hover == cwHovMax && g_btnMax) {
+            if (g_resizable) ShowWindow(w, cwIsMaximized(w) ? SW_RESTORE : SW_MAXIMIZE);
+            *out = 0; return true;
+        }
+        return false;
+    case WM_NCRBUTTONUP:
+        // the caption right-click system menu, with the item states the
+        // resize policy actually honors (a dead item is the same lie as a
+        // dead button). Return 0: DefWindowProc would stack its own
+        // SC_MOUSEMENU on top. Appended items survive -- the menu object is
+        // the host's (GetSystemMenu), only the states are set here.
+        if (wp == HTCAPTION) {
+            const BOOL isMax = cwIsMaximized(w) ? TRUE : FALSE;
+            MENUITEMINFO mii;
+            memset(&mii, 0, sizeof(mii));
+            mii.cbSize = sizeof(mii);
+            mii.fMask  = MIIM_STATE;
+            HMENU sys = GetSystemMenu(w, FALSE);
+            auto state = [&](UINT item, bool enabled) {
+                mii.fState = enabled ? MF_ENABLED : MF_DISABLED;
+                SetMenuItemInfo(sys, item, FALSE, &mii);
+            };
+            state(SC_RESTORE,  isMax != FALSE);
+            state(SC_MOVE,     true);
+            state(SC_SIZE,     g_resizable);
+            state(SC_MINIMIZE, true);
+            state(SC_MAXIMIZE, g_resizable);
+            state(SC_CLOSE,    true);
+            const BOOL result = TrackPopupMenu(sys, TPM_RETURNCMD,
+                                               GET_X_PARAM(lp), GET_Y_PARAM(lp),
+                                               0, w, nullptr);
+            if (result != 0) PostMessageW(w, WM_SYSCOMMAND, (WPARAM)result, 0);
+            *out = 0; return true;
+        }
+        return false;
+    case WM_NCMOUSELEAVE:
+        // the cursor left the window: the fade-out owns what is on screen now
+        if (g_hover != cwHovNone) {
+            const int was = g_hover;
+            g_hover = cwHovNone;
+            if (g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();      // v7.6.2: the leave's tempo
+                cwHovLapse(was - 1);                      // v7.6.1: every button lapses
+            }
+            cwHovAnimEnsure();                        // the fade owns the repaints
+        }
+        return false;
+    case WM_TIMER:
+        // the hover fade train's own tick; every other timer is the host's
+        if (wp == kHovTimerId && g_hovTimerOn) { cwHovAnimTick(); *out = 0; return true; }
+        return false;
+    case WM_DPICHANGED: {
+        // v7.5.3d: the scale moved under the window (a system scale change, a
+        // dock, a drag across monitors). The header re-derives its own
+        // geometry (dpi, bar height, title font), applies the DWM's suggested
+        // rect, hands the host its hook (constants + fonts), then re-seats
+        // the tracked children at the new scale. Handled HERE -- the host's
+        // switch never sees it.
+        const UINT nd = HIWORD(wp);
+        if (nd && nd != cwDpi()) {
+            cwDpiChanged(nd);
+            g_barH = cwS(kBarHDesign);
+            const LPRECT r = (LPRECT)lp;
+            if (r) SetWindowPos(w, nullptr, r->left, r->top,
+                                r->right - r->left, r->bottom - r->top,
+                                SWP_NOZORDER | SWP_NOACTIVATE);
+            if (g_dpiHook) g_dpiHook();
+            cwRelayoutChildren();
+            if (IsWindowVisible(w) && !IsIconic(w)) {
+                // v7.6.4 THE WHOLE-FRAME DPI REPAINT -- the field's "have it
+                // so ... DPI reaction doesn't corrupt the window render for
+                // a split second." The reaction used to re-land the BAR
+                // alone (cwRepaint) and leave the host's own full repaint
+                // ASYNC (RDW_INVALIDATE without RDW_UPDATENOW): between the
+                // suggested-rect SetWindowPos and the queue's paint, the DWM
+                // could compose the resized window with the OLD scale's
+                // pixels -- the split-second garbage on every scale change.
+                // One synchronous full-window repaint at the new scale,
+                // AFTER the hook re-derived the constants and the children
+                // are re-seated, lands the whole frame in a single write;
+                // the bar re-lands with it and the sheet train re-kicks.
+                RECT cr; GetClientRect(w, &cr);
+                RedrawWindow(w, &cr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE
+                             | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                cwRepaint();              // the bar re-lands with it (belt)
+                cwSheetRowKick();
+            }
         }
         *out = 0; return true; }
-    case WM_NCHITTEST: {
-        // THE HOUSE'S OWN WALK: the three buttons answer HTMINBUTTON /
-        // HTMAXBUTTON / HTCLOSE over the exact float rects (float contains():
-        // the half columns hit, no dead pixel) -- the codes win32k's own
-        // caption-button machinery eats -- with the buttons AHEAD of every
-        // resize edge (the native order). The resize edges are hand-rolled
-        // and DPI-correct, corners first, all four. The rest of the band
-        // answers HTCAPTION (drag, Aero snap, double-click maximize and
-        // Win+arrows stay the system's own); below it, HTCLIENT.
-        const POINT spt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
-        RECT wrc; GetWindowRect(w, &wrc);
-        const int ww = wrc.right - wrc.left, wh = wrc.bottom - wrc.top;
-        const int x = spt.x - wrc.left, y = spt.y - wrc.top;
-        POINT cpt = spt;
-        ScreenToClient(w, &cpt);
-        const int btn = cwStripBtnAt(w, cpt.x, cpt.y);
-        // the layout knobs gate their buttons: a dead slot is face, like the
-        // native stack missing a button
-        if (btn == cwBtnMin && g_btnMin)   { *out = HTMINBUTTON; return true; }
-        if (btn == cwBtnMax && g_btnMax)   { *out = HTMAXBUTTON; return true; }
-        if (btn == cwBtnClose)             { *out = HTCLOSE; return true; }  // 20
-        int hit = -1;
-        if (!cwIsMaximized(w)) {
-            const int fx = cwMetric(SM_CXFRAME) + cwMetric(SM_CXPADDEDBORDER);
-            const int fy = cwMetric(SM_CYFRAME) + cwMetric(SM_CXPADDEDBORDER);
-            const bool lf = x < fx, rg = x >= ww - fx;
-            const bool tp = y < fy, bt = y >= wh - fy;
-            if (tp && lf)      hit = HTTOPLEFT;
-            else if (tp && rg) hit = HTTOPRIGHT;
-            else if (bt && lf) hit = HTBOTTOMLEFT;
-            else if (bt && rg) hit = HTBOTTOMRIGHT;
-            else if (tp)       hit = HTTOP;
-            else if (bt)       hit = HTBOTTOM;
-            else if (lf)       hit = HTLEFT;
-            else if (rg)       hit = HTRIGHT;
-        }
-        if (hit >= 0) {
-            // v7.5.1 THE HONEST BORDER: a refused resize must not advertise
-            // itself -- every sizing code downgrades to HTBORDER (the arrow
-            // stays an arrow, the drag never starts)
-            if (!g_resizable) hit = HTBORDER;
-            *out = hit; return true;
-        }
-        *out = (cpt.y >= 0 && cpt.y < cwEffBarH()) ? HTCAPTION : HTCLIENT;
-        return true; }
-    case WM_NCMOUSEMOVE: {
-        // the hover lives here; the host's repaint callback lands the pixels
-        POINT cpt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
-        ScreenToClient(w, &cpt);
-        cwStripHoverUpdate(w, cpt.x, cpt.y);
-        return false; }
-    case WM_NCMOUSELEAVE:
-    case WM_MOUSELEAVE:
-        // v7.7.10: the tracking is one-shot -- mark it dead so the next
-        // mousemove re-arms it. The hover itself re-derives from the
-        // cursor's REAL position, NOT from the leave's assumption: armed
-        // from NC traffic, WM_MOUSELEAVE fires the instant it is armed (the
-        // cursor sits over the band, outside the client), and the old blind
-        // cancel faded the hover out the same moment it lit -- hover looked
-        // dead while press was the only visible glow. A leave that is just
-        // that boundary keeps the hover; a true departure re-derives
-        // hit = none and rides the 1x ramp out. No re-arm HERE: re-arming
-        // inside a leave handler would race the one-shot tracking into an
-        // arm/leave loop.
-        g_btnTrack = false;
-        {   POINT pt;
-            if (GetCursorPos(&pt)) {
-                ScreenToClient(w, &pt);
-                cwStripHoverRetarget(w, pt.x, pt.y);
-            }
-        }
-        return false;
-    case WM_NCLBUTTONDOWN: {
-        POINT cpt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
-        ScreenToClient(w, &cpt);
-        // no active gate here: the native first click on an INACTIVE window's
-        // button still acts (win32k activates on the down -- WM_MOUSEACTIVATE
-        // lands before the NC down, so the press latches on the now-active
-        // window at the full strength; the HOVER's own inactive law is the
-        // 0.4 target, v7.7.11).
-        const int hit = cwStripBtnAt(w, cpt.x, cpt.y);
-        if (hit) {
-            cwStripRetargetPrs(hit);
-            g_btnPress = hit;
-            cwStripAnimArm();
-            *out = 0; return true;            // the house's own press-and-release
+    case WM_SYSCOMMAND: {
+        const UINT sc = (UINT)(wp & 0xFFF0);
+        if (!g_resizable && (sc == SC_MAXIMIZE || sc == SC_SIZE)) { *out = 0; return true; }
+        // v7.5.3b THE ORDERED MINIMIZE PRESENT -- the header's now (the
+        // host's copy retired with the move). Every minimize source -- the
+        // caption button (posts this message since v7.5.3a), the taskbar,
+        // the system menu, the keyboard -- presents through this one
+        // recipe BEFORE DefWindowProc flips the placement iconic: the
+        // animation hold arms (the gray may show only while an animation
+        // plays), the gate stands the train down, the latch flips FIRST
+        // (the frame's own truth -- the repaint below answers through it
+        // and lands the INACTIVE face, the same bytes the
+        // WM_NCACTIVATE(FALSE) present would), DwmFlush retires the
+        // compose in flight, the row lands (the half-alpha gray,
+        // byte-idempotent -- the FACE is what this present orders), then
+        // the gate clears and the train kicks. The restore's own
+        // activation re-kicks; ~280 ms into that presenting run the train
+        // releases the hold and the focused glass key -- the DWM's accent
+        // border -- bakes once no animation is playing.
+        if (sc == SC_MINIMIZE && IsWindowVisible(w) && !IsIconic(w)) {
+            // v7.5.4 THE RELEASE PRESENT DROPS THE HOVER -- the strip's half
+            // of the recipe. The field: "do the same type of thing as the
+            // window border's top bar where the moment you release the
+            // minimize button and have pressed it the titlebar's buttons go
+            // half-transparent for that period." The release IS this
+            // message: the WM_NCLBUTTONUP dispatch posts it (the caption
+            // button since v7.5.3a), and the taskbar, the system menu and
+            // the keyboard land here too. At this instant the cursor is
+            // still ON the button -- the hover is armed and its ramp sits
+            // at 255 -- so the untouched present would land that glyph FULL
+            // (glyphCol lifts it, the tint band on it), and nothing could
+            // ever correct the flight: the shrink shows whatever THIS
+            // present lands (the iconic freeze), and the hover fade-out the
+            // WM_NCACTIVATE clear starts dies on the same freeze. Zeroed
+            // before the repaint, every glyph lands the inactive half
+            // (glyphCol at pa = 0 = kGlyphInactiveAlpha), the band and the
+            // red go with it, and the ride down shows the settled inactive
+            // caption -- the exact frames the top bar's gray has ridden
+            // since v7.5.3, now with the strip on it. Every OTHER
+            // deactivation keeps its animated fade-out (WM_NCACTIVATE's
+            // clear, the 75 ms inactive ramps); only the minimize handoff
+            // drops instantly, because only this present is the last paint
+            // the animation will ever sample. The restore's activation
+            // lands the active face and the full strip as before.
+            g_hover = cwHovNone;
+            g_hovA[0] = g_hovA[1] = g_hovA[2] = 0;
+            cwHovLapseClearAll();          // v7.6.1: the flight paints the settled caption, no flash
+            cwSheetRowAnimHold(true);
+            cwSheetRowGate(true);
+            cwSheetRowLatch(0);
+            cwDwmFlush();
+            cwCommitSheetRowFast(w, false);
+            cwRepaint();                   // the inactive face + the half strip, through the latch answer
+            cwSheetRowGate(false);
+            cwSheetRowKick();
         }
         return false; }
-    case WM_NCLBUTTONUP: {
-        POINT cpt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
-        ScreenToClient(w, &cpt);
-        const int hit = cwStripBtnAt(w, cpt.x, cpt.y);
-        if (g_btnPress) {
-            if (hit == g_btnPress) {
-                // the dispatch: close rides SC_CLOSE (the host's WM_CLOSE
-                // decides hide-or-destroy), minimize minimizes, maximize
-                // toggles (refused while setCanWinResize(false) -- a dead
-                // button for a host that asked)
-                if (hit == cwBtnMin)        PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-                else if (hit == cwBtnMax)   PostMessageW(w, WM_SYSCOMMAND,
-                                                          cwIsMaximized(w) ? SC_RESTORE
-                                                                           : SC_MAXIMIZE, 0);
-                else if (hit == cwBtnClose) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
-            }
-            cwStripRetargetPrs(g_btnPress);
-            g_btnPress = cwBtnNone;
-            cwStripAnimArm();
-            if (hit) { *out = 0; return true; }
-        }
-        return false; }
-    case WM_LBUTTONUP:
-        // a drag-off release can land on the CLIENT (the up re-routes);
-        // the press un-latches either way (the tick sweeps too)
-        if (g_btnPress) {
-            cwStripRetargetPrs(g_btnPress);
-            g_btnPress = cwBtnNone;
-            cwStripAnimArm();
-        }
-        return false;
-    case WM_CANCELMODE:
-        if (g_btnPress) {
-            cwStripRetargetPrs(g_btnPress);
-            g_btnPress = cwBtnNone;
-            cwStripAnimArm();
-        }
-        return false;
-    case WM_MOUSEMOVE: {
-        // the belt-and-suspenders client path (the band is NC traffic now;
-        // this only fires from odd transitional states)
-        POINT cpt = { GET_X_PARAM(lp), GET_Y_PARAM(lp) };
-        cwStripHoverUpdate(w, cpt.x, cpt.y);
-        return false; }
-    case WM_TIMER:
-        // the fade timeline's own tick; every other timer is the host's
-        if (wp == kCwFadeTimerId && g_btnAnim) { cwStripAnimTick(); *out = 0; return true; }
-        return false;
-    case WM_SETTINGCHANGE:
-        // the accent / theme broadcast: re-read the registry border, re-run
-        // the dial, re-ink the band. The host keeps flowing (its own reaction
-        // rides after).
-        if (lp && lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
-            cwBorderReadColors();
-            cwApplyDwmMode();
-            cwRepaint();
-        }
-        return false;
-    case WM_DWMCOLORIZATIONCOLORCHANGED:
-        // the colorization flip (0x0320): the same one-transaction refresh --
-        // the registry border, the dial, the band. This is the "changing the
-        // titlebar color updates EVERY object" law, from the system side.
-        cwBorderReadColors();
-        cwApplyDwmMode();
-        cwRepaint();
-        return false;
     case WM_SETCURSOR:
-        // the arrow instead of the busy cursor (main.c); the host's
-        // DefWindowProc finishes the protocol
+        // the arrow instead of the busy cursor (main.c)
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return false;   // the host's DefWindowProc finishes the protocol
+    case WM_MOUSEMOVE:
+        // into the client = no caption button hovered
+        if (g_hover != cwHovNone) {
+            const int was = g_hover;
+            g_hover = cwHovNone;
+            if (g_hovInactive) {
+                kHovInactiveOutMs = cwHovTempoMs();      // v7.6.2: the leave's tempo
+                cwHovLapse(was - 1);                      // v7.6.1: every button lapses
+            }
+            cwHovAnimEnsure();                        // the fade owns the repaints
+        }
         return false;
     default:
         if (g_trayUp && g_trayMsg && msg == g_trayMsg) {
@@ -1595,59 +2020,10 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
     }
 }
 
-// ---- the legacy seed font (changeWinTextFont consumers) ---------------------
-inline Gdiplus::Font* g_font = nullptr;
-inline std::wstring g_fontKey;             // face|px|weight|dpi of the cached font
-inline std::wstring g_fontFamily = L"Segoe UI";   // the family the LOGFONT uses
-inline bool cwResolveFont(const std::wstring& in) {
-    const bool isPath = in.find(L'\\') != std::wstring::npos
-                     || in.find(L'/')  != std::wstring::npos
-                     || in.find(L'.')  != std::wstring::npos;
-    if (!isPath) { g_fontFamily = in; return true; }
-    std::wstring path = in;
-    if (path.find(L':') == std::wstring::npos && path[0] != L'\\')
-        path = L"C:\\Windows\\Fonts\\" + path;
-    if (!cwFileExists(path)) return false;
-    if (!AddFontResourceExW(path.c_str(), FR_PRIVATE, nullptr)) return false;
-    Gdiplus::PrivateFontCollection coll;
-    if (coll.AddFontFile(path.c_str()) != Gdiplus::Ok) return false;
-    INT found = 0;
-    Gdiplus::FontFamily fam;
-    if (coll.GetFamilies(1, &fam, &found) != Gdiplus::Ok || found < 1) return false;
-    WCHAR name[LF_FACESIZE] = L"";
-    if (fam.GetFamilyName(name, LF_FACESIZE) != Gdiplus::Ok) return false;
-    g_fontFamily = name;
-    return true;
-}
-inline Gdiplus::Font* cwFont() {
-    const std::wstring key = g_fontFamily + L"|" + std::to_wstring(g_fontPx)
-                           + L"|" + std::to_wstring(g_fontWeight)
-                           + L"|" + std::to_wstring(cwDpi());
-    if (g_font && key == g_fontKey) return g_font;
-    delete g_font; g_font = nullptr;
-    LOGFONTW lf = {0};
-    lf.lfHeight         = -cwS(g_fontPx);
-    lf.lfWeight         = g_fontWeight;
-    lf.lfCharSet        = DEFAULT_CHARSET;
-    lf.lfQuality        = CLEARTYPE_QUALITY;
-    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
-    lstrcpynW(lf.lfFaceName, g_fontFamily.c_str(), LF_FACESIZE);
-    HDC dc = CreateCompatibleDC(nullptr);
-    if (dc) {
-        g_font = new Gdiplus::Font(dc, &lf);
-        DeleteDC(dc);
-        if (!g_font || g_font->GetLastStatus() != Gdiplus::Ok) {
-            delete g_font; g_font = nullptr;
-        }
-    }
-    if (g_font) g_fontKey = key;
-    return g_font;
-}
-
 } // namespace cwd
 
 // =====================================================================
-// THE PUBLIC API -- global, inline, one file.
+// THE PUBLIC API (the eleven) -- global, inline, one file.
 // =====================================================================
 
 inline void enableCustomWin(bool enable) {
@@ -1672,31 +2048,31 @@ inline void cwApplyFace(bool active, int col, int grad) {
     else        { cwd::g_faceColIn = col; cwd::g_faceGradIn = grad; }
 }
 
-// v7.7.5/v7.7.9: the titlebar color changed -- the dial re-runs INSIDE the
-// setter (the HSL law: L > 128 light, <= 128 dark), the band re-inks, and the
-// host's repaint callback lands the pixels. One transaction, every object.
-inline void changeWinTitlebarColor(int col) {
-    cwd::g_faceCol = col; cwd::g_faceGrad = col;
-    cwd::g_faceColIn = -1; cwd::g_faceGradIn = -1;
-    cwd::cwApplyDwmMode();
-    cwd::cwRepaint();
-}
-inline void changeWinTitlebarColor(int col, int gradColor) {
-    cwd::g_faceCol = col; cwd::g_faceGrad = gradColor;
-    cwd::cwApplyDwmMode();
-    cwd::cwRepaint();
-}
-// v7.5.5: the inactive face. One argument: solid. Two: the inactive gradient.
-// -1 restores the default: mirror the focused color.
+inline void changeWinTitlebarColor(int col)                      { cwd::g_faceCol = col; cwd::g_faceGrad = col; cwd::g_faceColIn = -1; cwd::g_faceGradIn = -1; cwd::cwRepaint(); }
+inline void changeWinTitlebarColor(int col, int gradColor)       { cwd::g_faceCol = col; cwd::g_faceGrad = gradColor; cwd::cwRepaint(); }
+// v7.5.5: the inactive face, the field's call -- the real Windows 10 dark
+// mode turns the bar GRAY on inactive and keeps it black on focused, and
+// that needs a distinct inactive face. One argument: solid (a gradient
+// between equal colors is exact). Two: the inactive gradient. -1 restores
+// the default: mirror the focused color (cwPaintBarBackground's rule).
 inline void setWinInactiveColor(int col)                         { cwd::g_faceColIn = col; cwd::g_faceGradIn = col; cwd::cwRepaint(); }
 inline void setWinInactiveColor(int col, int gradColor)          { cwd::g_faceColIn = col; cwd::g_faceGradIn = gradColor; cwd::cwRepaint(); }
-// v7.6.2: the close button's hover red is a knob. One ARGB int (0xAARRGGBB);
-// the alpha channel is ignored (the timeline owns the fade, the color rides
-// it). Default: the real thing's full red, RGB(232,17,35).
+// v7.6.2: the close button's hover red is a knob -- the field's call. One
+// ARGB int (0xAARRGGBB); the alpha channel is ignored (the hover ramp owns
+// the fade, the color rides it). Default: the real thing's full red,
+// RGB(232,17,35) -- the old fixed 0xCC0000 was a step dark.
 inline void setWinCloseBtnColor(int col)                         { cwd::g_closeHover = (DWORD)col; cwd::cwRepaint(); }
 
 inline void setWinTitleTextColor(int color, int gradientCol,
                                  int inactiveColor, int gradientInactiveCol) {
+    // v7.5.3c: ONE setter for both states (the changeWinTextColor /
+    // changeWinTextUnfocusedColor pair retired). The requested defaults --
+    // inactiveColor = color, gradientInactiveCol = gradientCol -- are
+    // spelled as overloads below (C++ function default arguments may not
+    // reference the parameters to their left; template defaults may, and
+    // the first draft leaned on that -- clang threw it right back).
+    // A gradientInactiveCol >= 0 paints the inactive gradient, < 0 paints
+    // inactiveColor solid (the painter's rule -- pass -1 for solid).
     cwd::g_textCol = color;  cwd::g_textGrad = gradientCol;
     cwd::g_textUn  = inactiveColor;
     cwd::g_textUnGrad = gradientInactiveCol;
@@ -1708,6 +2084,11 @@ inline void setWinTitleTextColor(int color, int gradientCol, int inactiveColor) 
 inline void setWinTitleTextColor(int color, int gradientCol) {
     setWinTitleTextColor(color, gradientCol, color, gradientCol);
 }
+
+// v7.5.3d: changeWinMinimizeHoverColor / changeWinMaximizeHoverColor are
+// retired -- the hover is the fixed 10% tint now (the real thing's look is
+// not a color knob); v7.5.5: the tint's channel follows the face's HSL
+// lightness (white on a dark face, black on a light one) -- still no knob.
 
 inline void changeWinTextFont(const std::string& font = "Segoe UI") {
     std::wstring wide(font.begin(), font.end());
@@ -1740,38 +2121,27 @@ inline void putWindowinTray(bool hide) {
 
 // ---- host plumbing (twinspeak's adoption seams; fresh consumers skip) ------
 
-// v7.7.9: the attach -- the host's one call. Lands the caption contract (the
-// bar height at the window's DPI), the uDWM caption font, the square-corner +
-// NC-render pins, the dial's dark-mode attribute, the registry border read
-// and the whole-band extend carrier. A fresh consumer needs NOTHING else.
 inline void cwAttach(HWND w, void (*repaint)(HWND)) {
     cwd::g_host = w; cwd::g_repaint = repaint;
-    cwd::g_barH = cwd::cwMetric(SM_CYCAPTION) + cwd::cwMetric(SM_CYFRAME)
-                + cwd::cwMetric(SM_CXPADDEDBORDER);   // the live-metrics caption
-    cwd::cwEnsureTitleFont();
-    cwd::cwSheetSetup(w);   // the registry border + the dial + the band carrier
+    cwd::cwSheetSetup(w);   // v7.5.3b: the sheet + the dark-mode border -- the header's own
 }
 inline void cwSetBarHeight(int px)                  { cwd::g_barH = px; }
-// v7.7.13: the bar height is the header's own -- the live-metrics caption at
-// the header's dpi (CYCAPTION + CYFRAME + PADDED). A host adopts this as its
-// caption-height layout contract.
-inline int  cwBarHeight()                           { return cwd::g_barH; }
-// v7.7.13: the EFFECTIVE caption height -- SM_CYCAPTION alone while the
-// window is maximized (the frame rows hang off-screen). The host's content
-// viewport and every below-caption coordinate answer through this.
+// v7.5.3d: the bar height is the header's own -- 33 design px at the header's
+// dpi. A host adopts this as its caption-height layout contract (the buffer
+// height, the content y offset) instead of deriving its own S(31).
+inline int  cwBarHeight()                           { return cwd::cwS(cwd::kBarHDesign); }
+// v7.6.3: the EFFECTIVE caption height -- 24 design px while the window is
+// maximized, cwBarHeight() otherwise. A host adopts this for its own bar
+// strip (buffer height, blit rows, the bottom edge, the content offsets)
+// so the maximized style lands whole.
 inline int  cwBarHeightNow()                        { return cwd::cwEffBarH(); }
-inline UINT cwDpi()                                 { return cwd::cwDpi(); }
-inline void cwDpiChanged(UINT dpi)                  { cwd::cwDpiChanged(dpi); }
+inline UINT cwDpi()                                 { return cwd::cwDpi(); }   // v7.5.3d
 inline void cwTrackChild(HWND h, int x, int y, int w, int ht,
                          bool underBar = true, HFONT* font = nullptr,
-                         int comboItemH = 0, int bottomPad = 0) {
-    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH, bottomPad);
+                         int comboItemH = 0) {   // v7.5.3d
+    cwd::cwTrackChild(h, x, y, w, ht, underBar, font, comboItemH);
 }
 inline void cwRelayoutChildren()                    { cwd::cwRelayoutChildren(); }
-inline void cwSetUiZoom(int pct)                    { cwd::cwSetUiZoom(pct); }
-inline void cwSetKidOffsetX(int x)                  { cwd::cwSetKidOffsetX(x); }
-inline int  cwKidX(int designX)                     { return cwd::cwKidX(designX); }
-inline int  cwKidY(int designY)                     { return cwd::cwKidY(designY); }
 inline void cwSetDpiHook(void (*hook)())            { cwd::cwSetDpiHook(hook); }
 inline void cwSetTrayHost(void (*hide)(HWND), void (*show)(HWND)) {
     cwd::g_trayHide = hide; cwd::g_trayShow = show;
@@ -1781,9 +2151,9 @@ inline void cwSeedTitleFont(const std::string& face, int px, int weight) {
     cwd::g_fontFace = wide; cwd::g_fontPx = px; cwd::g_fontWeight = weight;
     cwd::g_fontKey.clear();
 }
-// per-theme seed of every chrome color. inactive face defaults to mirroring
-// the active one. (twinspeak drives changeWinTitlebarColor directly now; the
-// seed stays for the API's own consumers.)
+// per-theme seed of every chrome color (twinspeak's applyTheme re-seeds on
+// every theme switch). inactive face defaults to mirroring the active one.
+// v7.5.3d: the hover-color pair is gone from the seed -- the tint owns it.
 inline void cwSeedChrome(int faceCol, int faceGrad,
                          int faceColIn, int faceGradIn,
                          int textCol, int textGrad, int textUn,
@@ -1793,14 +2163,10 @@ inline void cwSeedChrome(int faceCol, int faceGrad,
     cwd::g_faceGradIn = faceGradIn < 0 ? faceGrad : faceGradIn;
     cwd::g_textCol = textCol;   cwd::g_textGrad = textGrad;
     cwd::g_textUn = textUn;     cwd::g_glyph = glyphCol;
-    cwd::cwApplyDwmMode();
     cwd::cwRepaint();
 }
-// v7.7.9: WS_SYSMENU stays OUT (the button-group gate, the v7.6.6 decode) --
-// the uDWM stack is the house's own glyphs, not the compose's.
 inline DWORD cwFrameStyle() {
-    return WS_OVERLAPPED | WS_CAPTION | WS_THICKFRAME
-         | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+    return WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX;
 }
 inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
     return cwd::cwWndProc(w, msg, wp, lp, out);
@@ -1808,21 +2174,35 @@ inline bool cwWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT* out) {
 inline void cwPaintBarBackground(Gdiplus::Graphics& g, int ww, bool active) {
     cwd::cwPaintBarBackground(g, ww, active);
 }
-inline void cwPaintBarForeground(Gdiplus::Graphics& g, HDC dc, HWND w, int ww,
-                                 bool active) {
-    cwd::cwPaintBarForeground(g, dc, w, ww, active);
-}
 inline void cwPaintBarForeground(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
     cwd::cwPaintBarForeground(g, w, ww, active);
 }
 inline void cwPaintChrome(Gdiplus::Graphics& g, HWND w, int ww, bool active) {
     cwd::cwPaintChrome(g, w, ww, active);
 }
-inline void cwPaintCaptionIcon(HDC dc, int ww) {
-    cwd::cwPaintCaptionIcon(dc, ww);
-}
 inline bool cwIsMaximized(HWND w) { return cwd::cwIsMaximized(w); }
 inline DWORD cwArgbOf(COLORREF c) { return cwd::cwArgbOf(c); }   // COLORREF -> ARGB
+
+// ---- the fake top border bar (the sheet row; see the essay above) ----------
+inline void cwSeedSheetRow(unsigned activeBgra, unsigned inactiveBgra) {
+    cwd::g_sheetRowActive   = activeBgra;      // BGRA u32, premultiplied
+    cwd::g_sheetRowInactive = inactiveBgra;
+}
+inline void cwPatchSheetRow(void* bits32, int cw, bool active) {
+    cwd::cwPatchSheetRow(bits32, cw, active);
+}
+inline void cwCommitSheetRowFast(HWND w, bool active) {
+    cwd::cwCommitSheetRowFast(w, active);
+}
+inline void cwSheetRowGate(bool on)    { cwd::cwSheetRowGate(on); }
+inline void cwSheetRowKick()           { cwd::cwSheetRowKick(); }
+inline void cwSheetRowLatch(int state) { cwd::cwSheetRowLatch(state); }
+inline int  cwSheetRowLatchValue()     { return cwd::cwSheetRowLatchValue(); }
+inline void cwSheetPresenterStart(HWND w) { cwd::cwSheetPresenterStart(w); }
+inline void cwSheetPresenterStop()        { cwd::cwSheetPresenterStop(); }
+// v7.5.3a: the animation hold + the sheet mirror (see the essay above)
+inline void cwSheetRowAnimHold(bool on)   { cwd::cwSheetRowAnimHold(on); }
+inline void cwSheetGlass(bool on)         { cwd::cwSheetGlass(on); }
 
 #else  /* !_WIN32 -- the stub target: the API exists, does nothing ---------- */
 
@@ -1840,15 +2220,22 @@ inline void enableWinIcon(bool)                                        {}
 inline void setWinTitlebarButtonLayout(bool, bool)                     {}
 inline void setCanWinResize(bool)                                      {}
 inline void putWindowinTray(bool)                                      {}
-inline int  cwBarHeight()                                              { return 31; }
-inline int  cwBarHeightNow()                                           { return 31; }
-inline void cwTrackChild(void*, int, int, int, int, bool, void*, int, int)  {}
+inline int  cwBarHeight()                                              { return 33; }
+inline int  cwBarHeightNow()                                           { return 33; }
+inline void cwTrackChild(void*, int, int, int, int, bool, void*, int)  {}
 inline void cwRelayoutChildren()                                       {}
-inline void cwSetUiZoom(int)                                           {}
-inline void cwSetKidOffsetX(int)                                       {}
-inline int  cwKidX(int)                                                { return 0; }
-inline int  cwKidY(int)                                                { return 0; }
 inline void cwSetDpiHook(void (*)())                                   {}
+inline void cwSeedSheetRow(unsigned, unsigned)                         {}
+inline void cwPatchSheetRow(void*, int, bool)                          {}
+inline void cwCommitSheetRowFast(void*, bool)                          {}
+inline void cwSheetRowGate(bool)                                       {}
+inline void cwSheetRowKick()                                           {}
+inline void cwSheetRowLatch(int)                                       {}
+inline int  cwSheetRowLatchValue()                                     { return -1; }
+inline void cwSheetPresenterStart(void*)                               {}
+inline void cwSheetPresenterStop()                                     {}
+inline void cwSheetRowAnimHold(bool)                                   {}
+inline void cwSheetGlass(bool)                                         {}
 
 #endif /* _WIN32 */
 

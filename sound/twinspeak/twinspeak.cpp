@@ -4850,7 +4850,12 @@ enum {
 // ---- gui state -------------------------------------------------------------
 static HWND      g_hwnd          = nullptr;
 static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
-                 g_fSml = nullptr, g_fMono = nullptr;
+                 g_fSml = nullptr, g_fMono = nullptr,
+                 g_fTitle = nullptr;   // v7.7.6: the slot is back -- uDWM's own
+// v7.7.3 retired it with the custom strip; v7.7.6 re-enlists it for the
+// uDWM-accurate caption title. NOT the old customWindow.h seed: the font is
+// the system NONCLIENTMETRICS lfCaptionFont (the binary's only caption font,
+// decompile notes v2 section 6), DPI-scaled like uDWM scales it.
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
 static std::string g_guiIniPath;
@@ -4990,18 +4995,8 @@ static const char* kTabNames[5] = {
 // the named constants below are mutable and re-derived in guiInitDpi()
 // -- call sites keep their literal, design-space meaning.
 static UINT g_dpi96 = 96;
-// v7.7.13 THE WINDOW-FIT ZOOM: S() = the design px x the DPI x the zoom
-// (cwd::g_zoomPct, per-mille) in ONE MulDiv -- the identical formula the
-// header's ledger rides (cwd::cwKidS), so creation and relayout land the
-// same pixel at every scale. S0() = the PURE dpi scale (no zoom) -- the
-// zoom's own derivation needs it (the fit ratio is measured against the
-// unscaled design). The zoom derives from the REAL client in guiApplyZoom:
-// the Explorer-rect window is smaller in dip terms than the design at 175%,
-// and the whole UI scales to fit whatever window it is given.
-static int  S0(int v)         { return MulDiv(v, (int)g_dpi96, 96); }
-static int  S(int v)          { return cwd::cwKidS(v); }
-static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f
-                                     * ((float)cwd::g_zoomPct / 1000.0f); }
+static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
+static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
 static int KCLI_W     = 880, KCLI_H      = 620;        // designed client size
@@ -5010,49 +5005,18 @@ static int KLOG_BOTTOM= 594;                            // log pane bottom
 static int kTabW[5]   = { 166, 166, 166, 166, 166 };   // tab face widths
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // v7.7.3: THE BAND, NOT THE STRIP -- the strip object is retired (the
-// field: remove the old custom window). v7.7.13: the layout contract is the
-// REAL band now -- the children ride cwKidY/underBar seats (no design lead),
-// the content body renders from cwBarHeightNow(), the caption hit band spans
-// rows 0..cwBarHeightNow()-1 (HTCAPTION -- drag/snap stay Windows' own), and
-// the extend carrier's sheet rides under the header's face seat. The names
-// are the house's pre-7.6.12 caption names, revived; the tab strip's GPU
-// buffer keeps its own g_stripW/g_stripH -- unrelated.
-// (kCapHDesign is retired with the 33-design-px caption law: the caption is
-// the live-metrics law now -- customWindow.h: CYCAPTION+CYFRAME+PADDED
-// restored, CYCAPTION alone maximized.)
-static int       g_capH      = 31;   // real px, guiApplyDpi re-derives from the
-                             // header's live-metrics law (cwBarHeightNow)
-// v7.7.13 THE WINDOW-FIT ZOOM -- the design canvas (880 wide, 620 content)
-// scales by min(clientW/S0(880), (clientH - band - 1)/S0(620)), clamped to
-// [400..1000] per-mille: shrink-only (a window BIGGER than the design keeps
-// the exact design scale -- the extra width centers the canvas and the extra
-// height flows into the log pane), floored where the layout would garble.
-// Returns true when the percentage OR the canvas offset changed (the caller
-// re-seats the children and presents only then). clientW/H = the CLIENT
-// rect (the window minus the 1px native border strips). No window yet = the
-// design scale.
-static bool guiApplyZoom(int clientW, int clientH) {
-    const int band = (int)cwd::cwBarHeightNow();
-    const int designW = S0(880), designH = S0(620);
-    int pct = 1000;
-    if (designW > 0 && designH > 0 && clientW > 0 && clientH > 0) {
-        const int zw = MulDiv(clientW, 1000, designW);
-        const int zh = MulDiv(clientH - band - 1, 1000, designH);
-        pct = zw < zh ? zw : zh;
-        if (pct > 1000) pct = 1000;             // shrink-only: the design look
-        if (pct < 400)  pct = 400;              // the readability floor
-    }
-    const int oldPct = cwd::g_zoomPct, oldOff = cwd::g_kidOffX;
-    if (pct != oldPct) cwd::cwSetUiZoom(pct);
-    // the canvas centers in the slack EVERY call -- a resize can move the
-    // offset while the binding zoom stays put (a width-only stretch under an
-    // h-bound zoom), and the children must re-seat for the centering too.
-    const int canvasW = cwd::cwKidS(880);
-    int offX = (clientW - canvasW) / 2;
-    if (offX < 0) offX = 0;
-    cwd::cwSetKidOffsetX(offX);
-    return pct != oldPct || offX != oldOff;
-}
+// field: remove the old custom window), but the 33 design px stay as the
+// LAYOUT CONTRACT: the children keep their +kCapHDesign seats (the ledger
+// coords ride the same number, so cwRelayoutChildren lands them identically
+// at every DPI), the content body still renders from g_capH, the caption
+// hit band spans rows 0..g_capH-1 (HTCAPTION -- drag/snap stay Windows'
+// own), and the extend carrier's sheet rides under the band's plain face.
+// v7.6.14: 33 design px, customWindow.h's kBarHDesign (the house-measured
+// caption height; the old 31 was two px short). Real px re-derived in
+// guiApplyDpi. The names are the house's pre-7.6.12 caption names, revived;
+// the tab strip's GPU buffer keeps its own g_stripW/g_stripH -- unrelated.
+static const int kCapHDesign = 33;   // the caption strip, design px
+static int       g_capH      = 33;   // real px, guiApplyDpi re-derives
 // guiInitDpi runs FIRST in guiMain -- before guiMakeGdi (fonts) and before
 // any window exists. v7.5.3d: the manifest is PerMonitorV2 now and the
 // WM_DPICHANGED hook re-runs the derivation at the new scale -- the
@@ -5068,29 +5032,23 @@ static void guiApplyDpi() {
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
     KSTRIP_FACE_Y = S(6);
-    g_capH    = (int)cwd::cwBarHeightNow();   // v7.7.13: the live-metrics band
+    g_capH    = S(kCapHDesign);   // v7.6.14: the caption strip rides the scale
 }
 static void guiInitDpi() {
-    // v7.7.12 THE UXTHEME BOOT SEED: the primary-DC LOGPIXELSX for a
-    // DPI-aware process is uxtheme.dll's own DPI source (0x135e8:
-    // IsProcessDPIAware() ? GetDeviceCaps(GetDC(nullptr), 0x58) : 96, fed
-    // to GetThemeSysSize's MulDiv(value, dpi, 96) through 0x4abfc). The
-    // in-client UI's S() boots from the same source -- the reference
-    // binary's law; WM_DPICHANGED then corrects the scale per monitor
-    // (the scale-first handler below).
     HDC sdc = GetDC(nullptr);
     if (sdc) {
         const int d = GetDeviceCaps(sdc, LOGPIXELSX);
         if (d > 0) g_dpi96 = (UINT)d;
         ReleaseDC(nullptr, sdc);
     }
-    cwd::cwDpiChanged(g_dpi96);   // v7.7.13: the band first (the zoom's h-budget)
-    // v7.7.13: the boot zoom -- the CREATION rect is the fixed Explorer size
-    // (1130 x 683 outer; the client = outer - 2 side strips - 1 bottom row),
-    // so the fit percentage derives from those numbers before any window
-    // exists. guiApplyDpi AFTER it so the constants answer at the boot zoom.
-    guiApplyZoom(1130 - 2, 683 - 1);
     guiApplyDpi();
+    // v7.7.1: cwd's metric DPI rides the same boot derivation. The
+    // WM_NCCALCSIZE insets and the NCHITTEST bands read cwd::cwMetric
+    // (GetSystemMetricsForDpi at cwd's dpi), which would otherwise answer
+    // the 96-dpi defaults until the first WM_DPICHANGED, while S() already
+    // scales at the primary's sign-in DPI -- the insets would disagree with
+    // the creation size at every scale above 100%.
+    cwd::cwDpiChanged(g_dpi96);
 }
 
 // v7.6.12 THE NATIVE RESTART -- the field: "I would just start over and not
@@ -5140,6 +5098,27 @@ static void guiMakeFonts() {
     g_fMono = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+    {   // v7.7.6 THE UDW CAPTION FONT: uDWM draws the title with the system
+        // NONCLIENTMETRICS lfCaptionFont, DPI-scaled (CWindowData::
+        // GetNonClientCaptionFont 0x3dff8 -- decompile notes v2 section 6:
+        // "the native caption font IS the system NONCLIENTMETRICS
+        // lfCaptionFont, DPI-scaled -- there is no per-window font API").
+        // The house scales the height by its own S() the same way uDWM
+        // scales by windowDpi/systemDpi.
+        NONCLIENTMETRICSW ncm;
+        ncm.cbSize = sizeof(ncm);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)
+                && ncm.lfCaptionFont.lfHeight != 0) {
+            LOGFONTW lf = ncm.lfCaptionFont;
+            lf.lfHeight = MulDiv(lf.lfHeight, S(100), 100);
+            g_fTitle = CreateFontIndirectW(&lf);
+        }
+        if (!g_fTitle)   // the belt: the metrics can fail on broken profiles
+            g_fTitle = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    }
 }
 
 static void guiMakeGdi() {
@@ -5158,6 +5137,9 @@ static void guiMakeGdi() {
 // there:
 static void guiStripGpuRelease();   // v7.0.7 (defined with the tab strip)
 
+// (v7.0.6's DWM dark-mode caption helper is retired with the DWM caption
+// itself -- v7.0.9 paints the bar from the live guic:: colors instead.)
+static void guiApplyDwmMode();   // v7.7.5: THE DIAL -- defined with the band machinery
 
 // v7.6.14: guiApplyDwmCaption is RETIRED -- there is no native caption left
 // to tint. Its two calls were Windows 11-only: on the field's Windows 10
@@ -5187,12 +5169,10 @@ static void applyTheme(int i) {
     TSREBR(g_brPanel2, guic::cPanel2);
     TSREBR(g_brLog,    guic::cLogBg);
     #undef TSREBR
-    // v7.7.5/v7.7.9 THE DIAL: the titlebar color changed (the band's face
-    // IS this theme's background) -- changeWinTitlebarColor re-picks the
-    // immersive mode from the HSL lightness right here (L > 128 light,
-    // <= 128 dark), re-inks the band and lands the host repaint -- the
-    // startup color-change case included, every object in one call.
-    changeWinTitlebarColor(cwArgbOf(guic::cBg));
+    // v7.7.5 THE DIAL: the titlebar color changed (the band's face IS this
+    // theme's background) -- its HSL lightness re-picks the immersive mode
+    // right here, in the same transaction as the colors and the brushes.
+    guiApplyDwmMode();
     // v7.6.14: no caption re-seed call -- the strip IS client pixels and
     // reads guic:: live; the RDW repaint below lands the new colors on it.
     if (g_hwnd) {
@@ -5228,6 +5208,21 @@ static Gdiplus::Color GCol(COLORREF c, BYTE a) {
     return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
 }
 
+// v7.7.7 THE 254 LAW -- the band's ink must never ride the opaque fast path.
+// The v7.7.6 field capture proved it pixel by pixel: inside the extend band
+// (the sheet rows) GDI+ routes FULL-ALPHA (255) solid fills through its GDI
+// fast path, which writes alpha=0 into the DIB -- so the glyphs, the row-0
+// border stroke and the close crossfade ink never composited (the screen
+// showed the raw sheet there: band rows pure white, row 0 white, while the
+// left/right/bottom strokes BELOW the band rendered black). Partial-alpha
+// fills take GDI+'s own blend path, which writes the real alpha byte -- that
+// is exactly why v7.7.5's 18% hover bands were visible while v7.7.6's opaque
+// glyphs were not. GBand clamps 255 -> 254: a 0.4% sheet bleed, invisible,
+// and every band fill lands through the blend path with its alpha intact.
+static Gdiplus::Color GBand(COLORREF c, BYTE a) {
+    if (a == 255) a = 254;
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+}
 
 // rounded-rect path out of four arcs -- the AA replacement for guiRoundRect
 static Gdiplus::GraphicsPath* guiRoundPathInset(const Gdiplus::Rect& rin, int rad, int inset) {
@@ -5289,7 +5284,7 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     if (wt.empty() || !g_hwnd) return;
     RECT crc = { 0, 0, 880, 620 };
     GetClientRect(g_hwnd, &crc);
-    crc.bottom -= cwd::cwBarHeightNow();   // v7.7.9: CONTENT space rides the effective caption (the band between the log pane and the CONTENT bottom, not the window bottom)
+    crc.bottom -= g_capH;   // v7.6.14: the paint runs in CONTENT space (the
                               // viewport origin rides the strip) -- the band
                               // between the log pane and the CONTENT bottom,
                               // not the window bottom, or the watermark lands
@@ -5308,31 +5303,17 @@ static void guiWatermark(Gdiplus::Graphics& g) {
     // is fixed-size; measure ONCE, reuse forever.
     static Gdiplus::RectF mrCached(0, 0, 0, 0);
     static bool measured = false;
-    static int  measuredZoom = 0;          // v7.7.13: the zoom rides the font
-    if (!measured || measuredZoom != cwd::g_zoomPct) {
+    if (!measured) {
         const Gdiplus::RectF lay(0, 0, (Gdiplus::REAL)crc.right, (Gdiplus::REAL)crc.bottom);
         g.MeasureString(wt.c_str(), (INT)wt.size(), &f, lay, &sf, &mrCached);
         measured = true;
-        measuredZoom = cwd::g_zoomPct;
     }
     const Gdiplus::RectF& mr = mrCached;
     if (mr.Width <= 0) return;
     // centered in the strip below the log pane; right edge 14px off the client edge
-    // v7.7.13: the strip below the pane = the pane's REAL bottom (the
-    // fill-to-bottom child) to the content bottom -- the same anchor the
-    // console frame reads -- and the cached measure re-runs when the zoom
-    // changes (the watermark font rides S(13) = the zoom now).
-    int paneBottom = KLOG_BOTTOM;
-    if (g_hwnd) {
-        HWND logc = GetDlgItem(g_hwnd, IDC_LOG);
-        if (logc) { RECT wr; GetWindowRect(logc, &wr);
-                    POINT tl = { wr.left, wr.top };
-                    ScreenToClient(g_hwnd, &tl);
-                    paneBottom = tl.y + (wr.bottom - wr.top); }
-    }
     const Gdiplus::REAL x = (Gdiplus::REAL)(crc.right - S(14)) - mr.Width;
-    const Gdiplus::REAL y = (Gdiplus::REAL)paneBottom
-                          + ((Gdiplus::REAL)(crc.bottom - paneBottom) - mr.Height) / 2.0f;
+    const Gdiplus::REAL y = (Gdiplus::REAL)KLOG_BOTTOM
+                          + ((Gdiplus::REAL)(crc.bottom - KLOG_BOTTOM) - mr.Height) / 2.0f;
     const Gdiplus::RectF tr(x, y, mr.Width, mr.Height);
     Gdiplus::LinearGradientBrush lb(tr, GCol(RGB(255, 138, 42)),
                                     GCol(RGB(0, 229, 238)), Gdiplus::LinearGradientModeVertical);
@@ -5401,27 +5382,31 @@ static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
 
 static HWND mkLabel(HWND w, int id, int x, int y, int cw, const char* txt, HFONT f, int ch = 20) {
     // v7.1.20: design px in, real px out (DPI scale).
-    // v7.7.13: the seats ride cwKidX/cwKidY (the zoom + the canvas offset +
-    // the REAL band) and the ledger re-derives the identical pixel.
-    const int dx = x, dy = y, dw2 = cw, dh = ch;
-    x = cwd::cwKidX(x); y = cwd::cwKidY(y); cw = S(cw); ch = S(ch);   // v7.7.13: the zoom + the live band
+    // v7.6.14: the caption strip leads -- every child shifts down
+    // kCapHDesign design px, in BOTH the creation coords and the ledger
+    // coords (the ledger re-derives S(dy + kCapHDesign) identically, so
+    // creation and relayout land the same pixel at every DPI). The first
+    // child pixel sits directly below the strip: the field's "draw something
+    // just below the titlebar buttons" is the layout contract now.
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);
     HWND h = CreateWindowExA(0, "STATIC", txt, WS_CHILD | WS_VISIBLE,
                              x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)(f ? f : g_fUI), TRUE);
-    cwTrackChild(h, dx, dy, dw2, dh, true, (f == g_fUIb) ? &g_fUIb : &g_fUI);   // v7.7.13: underBar = the real band
+    cwTrackChild(h, dx, dy, dw2, dh, false, (f == g_fUIb) ? &g_fUIb : &g_fUI);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
 
 static HWND mkEdit(HWND w, int id, int x, int y, int cw, int ch, const char* val) {
-    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.7.13: no design lead
-    x = cwd::cwKidX(x); y = cwd::cwKidY(y); cw = S(cw); ch = S(ch);
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "EDIT", val,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     guiDarkCtl(h);
-    cwTrackChild(h, dx, dy, dw2, dh, true, &g_fUI);   // v7.7.13: underBar = the real band
+    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUI);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
@@ -5430,19 +5415,19 @@ static HWND mkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt)
     // NOTE: deliberately NOT regPage()d here -- the tab strip and the
     // START/APPLY/SAVE bar live on every page. Page-bound buttons (toggles,
     // presets, REFRESH) are registered by their builders (v6.6.2).
-    const int dx = x, dy = y, dw2 = cw, dh = ch;   // v7.7.13: no design lead
-    x = cwd::cwKidX(x); y = cwd::cwKidY(y); cw = S(cw); ch = S(ch);
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw, dh = ch;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw); ch = S(ch);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "BUTTON", txt,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUIb, TRUE);
-    cwTrackChild(h, dx, dy, dw2, dh, true, &g_fUIb);   // v7.7.13: underBar = the real band
+    cwTrackChild(h, dx, dy, dw2, dh, false, &g_fUIb);   // v7.6.14: design px + the strip lead
     return h;
 }
 
 static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
-    const int dx = x, dy = y;   // v7.7.13: no design lead
-    x = cwd::cwKidX(x); y = cwd::cwKidY(y);
+    const int dx = x, dy = y + kCapHDesign;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign);   // v7.1.20: DPI scale
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_AUTOHSCROLL |
         (listOnly ? CBS_DROPDOWNLIST : CBS_DROPDOWN),
@@ -5450,7 +5435,7 @@ static HWND mkCombo(HWND w, int id, int x, int y, bool listOnly) {
     SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, S(16));
     guiDarkCtl(h);
-    cwTrackChild(h, dx, dy, CTL_W, 220, true, &g_fUI, 16);   // v7.7.13: underBar = the real band
+    cwTrackChild(h, dx, dy, CTL_W, 220, false, &g_fUI, 16);   // v7.6.14: design px + the strip lead
     regPage(h);
     return h;
 }
@@ -5590,8 +5575,8 @@ static LRESULT CALLBACK sldProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
-    const int dx = x, dy = y, dw2 = cw;   // v7.7.13: no design lead
-    x = cwd::cwKidX(x); y = cwd::cwKidY(y); cw = S(cw);
+    const int dx = x, dy = y + kCapHDesign, dw2 = cw;   // v7.6.14: the strip lead
+    x = S(x); y = S(y + kCapHDesign); cw = S(cw);   // v7.1.20: DPI scale
     static bool sldClass = false;      // registered once
     if (!sldClass) {
         WNDCLASSA wc = {};
@@ -5603,7 +5588,7 @@ static HWND mkSlider(HWND w, int id, int x, int y, int cw, int lo, int hi) {
     }
     HWND h = CreateWindowExA(0, "ts_slider", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP,   // v7.1.4: a tab stop
                              x, y, cw, S(28), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
-    cwTrackChild(h, dx, dy, dw2, 28, true);   // v7.7.13: the dpi ledger, underBar = the real band
+    cwTrackChild(h, dx, dy, dw2, 28, false);   // v7.6.14: the dpi ledger (no font; the strip lead rides dy)
     g_sld[h] = { lo, hi, lo, false };
     InvalidateRect(h, nullptr, FALSE);   // paint with the REAL range once set
     regPage(h);
@@ -6044,8 +6029,7 @@ static void guiSetStatus(HWND w, const char* s) {
     // v7.1.20: MUST mirror guiPaintFrame's scaled status band exactly.
     // v7.6.14: the band renders below the caption strip -- the invalidate
     // rect rides the same strip offset the paint's viewport shift applies.
-    const RECT sr = { cwd::cwKidX(14), cwd::cwKidY(458), cwd::cwKidX(14) + S(852),
-                      cwd::cwKidY(458) + S(18) };   // v7.7.13: the zoomed seat + the canvas offset
+    const RECT sr = { S(14), S(458) + g_capH, S(866), S(476) + g_capH };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -6472,28 +6456,15 @@ static bool guiStripGpuEnsure(HWND w, int cw, int ch) {
     if (ok && !g_dwfTab) {               // DirectWrite: Segoe UI Semibold in
         if (SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,   // GDI px semantics
                                           kTSIID_IDWriteFactory, (IUnknown**)&g_dwf))) {
-            // v7.7.12 THE WINDOW'S DPI, NOT THE MONITOR'S: the tab-label px
-            // rode GetDeviceCaps(GetDC(nullptr), LOGPIXELSY) -- the PRIMARY
-            // monitor's scale at rebuild time. guiStripGpuRelease() runs on
-            // every WM_DPICHANGED and the stack rebuilds here on the strip's
-            // next paint -- so after the panel moved to (or across) a monitor
-            // whose scale differs from the primary's, the labels rebuilt at
-            // the WRONG dpi: the in-client tab strip was the visible half of
-            // the field's "dpi scaling affects the ui of the twinspeak.cpp
-            // side". cwd::cwDpi() is the window's own scale (the host's
-            // WM_DPICHANGED keeps it current through cwDpiChanged, the
-            // uxtheme MulDiv law), and it is what the label px rides now.
-            const UINT wdpi = cwd::cwDpi();
+            HDC sdc = GetDC(nullptr);
+            const int dpi = GetDeviceCaps(sdc, LOGPIXELSY);
+            ReleaseDC(nullptr, sdc);
             // v7.1.20: the render target draws DIPs == pixels (SetDpi 96
             // above), so the 13 design px must arrive as PHYSICAL px:
             // 13 * dpi/96. (The old 96/dpi form was a no-op under the
             // DPI-unaware build -- dpi was always 96 -- and would have
             // SHRUNK the labels under the manifest's awareness.)
-            // v7.7.13: the WINDOW-FIT ZOOM rides too -- the tab strip is
-            // in-client UI and scales with the canvas, not with the system
-            // metrics alone.
-            const float px = 13.0f * (float)wdpi / 96.0f
-                           * ((float)cwd::g_zoomPct / 1000.0f);
+            const float px = 13.0f * (float)(dpi > 0 ? dpi : 96) / 96.0f;
             ok = SUCCEEDED(g_dwf->CreateTextFormat(
                     L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
@@ -6762,12 +6733,12 @@ static void guiMakeTabStrip(HWND w) {
         reg = true;
     }
     // v7.1.20: the design-px strip constants scale at the creation site.
-    // v7.7.13: the seats ride cwKidX/cwKidY (the zoom + the live band) and
-    // the ledger re-derives the identical pixel; underBar = the real band.
+    // v7.6.14: the caption strip leads -- the tab strip lands one strip below
+    // the buttons (S(y + kCapHDesign), the ledger rides the same number).
     HWND ts = CreateWindowExA(0, "TidyTabStrip4", nullptr, WS_CHILD | WS_VISIBLE,
-                    cwd::cwKidX(KSTRIP_X), cwd::cwKidY(KSTRIP_Y), S(KSTRIP_W), S(KSTRIP_H), w,
+                    S(KSTRIP_X), S(KSTRIP_Y + kCapHDesign), S(KSTRIP_W), S(KSTRIP_H), w,
                     (HMENU)(INT_PTR)IDC_TABSTRIP, nullptr, nullptr);
-    cwTrackChild(ts, KSTRIP_X, KSTRIP_Y, KSTRIP_W, KSTRIP_H, true);   // v7.7.13: underBar = the real band
+    cwTrackChild(ts, KSTRIP_X, KSTRIP_Y + kCapHDesign, KSTRIP_W, KSTRIP_H, false);   // v7.6.14: design px + the strip lead
 }
 
 static void guiBuildControls(HWND w) {
@@ -6786,21 +6757,17 @@ static void guiBuildControls(HWND w) {
     // v7.1.20: the direct creations scale too (the factories do it for the
     // rest).
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              cwd::cwKidX(14), cwd::cwKidY(458), S(852), S(16),
+                              S(14), S(458 + kCapHDesign), S(852), S(16),
                               w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    cwTrackChild(st, 14, 458, 852, 16, true, &g_fMono);   // v7.7.13: underBar = the real band
+    cwTrackChild(st, 14, 458 + kCapHDesign, 852, 16, false, &g_fMono);   // v7.6.14: design px + the strip lead
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
-    // v7.7.13: the log pane is the FILL-TO-BOTTOM child (w < 0 = the width
-    // spans the client to the 14-design right pad; bottomPad 26 = the keys
-    // row stays visible below it) -- the pane grows with the window the way
-    // it always visually promised to.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        cwd::cwKidX(14), cwd::cwKidY(480), S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), S(480 + kCapHDesign), S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    cwTrackChild(log, 14, 480, -14, 114, true, &g_fMono, 0, 26);   // v7.7.13: fill-to-bottom
+    cwTrackChild(log, 14, 480 + kCapHDesign, 852, 114, false, &g_fMono);   // v7.6.14: design px + the strip lead
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -7076,15 +7043,6 @@ static void guiCaptureWindowPos(HWND w) {
 // so nothing takes a taskbar slot; the moment the panel opens it gets its
 // taskbar button (and Alt-Tab entry) so it can be seen and reached like any
 // window; closing hides it and the button goes away -- the tray icon remains.
-// v7.7.9: the chrome's repaint callback -- the band (rows 0..capEff-1)
-// invalidates; the host's buffered WM_PAINT lands it as one blit.
-static void tsChromeRepaint(HWND w) {
-    RECT crc;
-    if (!GetClientRect(w, &crc)) return;
-    const RECT band = { 0, 0, crc.right, cwd::cwBarHeightNow() };
-    InvalidateRect(w, &band, FALSE);
-}
-
 static bool guiCreateRealWindow() {
     if (g_hwnd && g_hwnd != g_trayWnd) return true;   // already built
     HINSTANCE hi = GetModuleHandleA(nullptr);
@@ -7122,19 +7080,8 @@ static bool guiCreateRealWindow() {
     // (left/right/bottom -- WM_NCCALCSIZE's own strips), so the CLIENT
     // lands at exactly the designed 880 x (620 + band) and uDWM draws its
     // native border in the strips around it.
-    const int kww = 1130;   // v7.7.13 THE EXPLORER RECT -- the field's four
-    const int kwh = 683;    // captures: the reference Explorer window measures
-                            // 1130 x 683 PHYSICAL px on the 175% rig (the
-                            // restored capture's accent border corners) and
-                            // 1138 x 687 on the 100% one -- the same window
-                            // at the same PHYSICAL size on both machines.
-                            // The panel opens at that exact rect on every
-                            // machine (outer px; the in-client UI zooms to
-                            // fit -- guiApplyZoom -- and the caption band is
-                            // the live-metrics law at whatever DPI the
-                            // window lands on). The designed
-                            // KCLI_W+2 / KCLI_H+g_capH+1 creation size and
-                            // its scale math retire with this round.
+    const int kww = KCLI_W + 2;
+    const int kwh = KCLI_H + g_capH + 1;
     g_hwnd = CreateWindowExW(0, L"twinspeak.control",
                              L"TidyVision TwinSpeak",     // v7.2.1: the brand the taskbar,
                                                           // Alt-Tab and Task Manager read
@@ -7143,25 +7090,81 @@ static bool guiCreateRealWindow() {
                              CW_USEDEFAULT, CW_USEDEFAULT, kww, kwh,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return false;
-    // v7.7.9: THE CHROME GOES HOME -- cwAttach (below) is the one call: it
-    // lands the extend carrier, the dial, the registry border read and the
-    // uDWM caption font. The header is the custom window; the host feeds it.
+    // v7.6.12: NO chrome attach -- the native caption is the whole
+    // titlebar and there is nothing for the header to answer. The header
+    // stays included for the child ledger (cwTrackChild /
+    // cwRelayoutChildren); its tray delegation (cwSetTrayHost) is retired
+    // with its last caller, and WM_CLOSE keeps answering guiHideToTray
+    // directly.
     // v7.4.9: the per-window System.AppUserModel.ID (v7.1.25) is RETIRED --
     // the panel is a fully vanilla window again (see the retirement note
     // where the setter used to live). The process AUMID (v7.1.23, below in
     // guiMain) still owns the grouping, the label, the jumplist and the
     // balloons; the button birth now rides the default window path every
     // normal app uses, plus the v7.4.9 name-change re-announce.
-    // v7.7.9: THE CHROME GOES HOME -- cwAttach is the one call. It lands the
-    // square corners, the NC render pin, the dial's immersive dark mode,
-    // the registry border read, the whole-band extend carrier and the uDWM
-    // caption font. The three-button stack and the resize policy ride the
-    // API's own knobs. WM_CLOSE keeps answering guiHideToTray directly
-    // (the tray gesture is the host's).
-    cwAttach(g_hwnd, tsChromeRepaint);
-    setWinTitlebarButtonLayout(true, true);   // min + max + close
-    setCanWinResize(true);                    // the uDWM window resizes
-
+    {   // v7.6.12: the DWM attributes that do not fight the native frame --
+        // the square corners the field asked for (v7.1.23) and immersive
+        // dark mode (the light-mode border bug, v7.1.27). DWMNCRP_ENABLED
+        // stays pinned so no theme engine can claim the edge. The glass
+        // sheet extend ({0,0,1,0}, the fake top border's carrier) is
+        // RETIRED: the real top border is drawn by the DWM above the real
+        // caption, and an extend would only paint a stray line between it
+        // and the content. DwmFlush goes with the present machinery it
+        // ordered. (dwmapi.h is not included -- the house spelled-out
+        // typedefs.)
+        typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+        const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+            LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+        if (dwmSet) {
+            const int corner = 1;   // DWMWCP_DONOTROUND -- square corners
+            dwmSet(g_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                   &corner, sizeof(corner));
+            const int ncrp = 2;     // DWMNCRP_ENABLED
+            dwmSet(g_hwnd, 2 /* DWMWA_NCRENDERING_POLICY */,
+                   &ncrp, sizeof(ncrp));
+            // v7.7.5: the always-on dark-mode pin retires (v7.1.27's
+            // standing order is superseded) -- the dial owns the attribute
+            // now: guiApplyDwmMode reads the titlebar color's HSL lightness
+            // ("whenever the titlebar color's hsl lightness is over 128 it
+            // switches to light mode and vice versa") and programs 20 with
+            // the 19 fallback itself. applyTheme parked the mode pre-
+            // creation; this call lands it on the live window.
+            guiApplyDwmMode();
+        }
+        // v7.6.14: guiApplyDwmCaption is retired with the native caption --
+        // there is nothing left for DWMWA_CAPTION_COLOR to tint (no NC area
+        // exists); the strip is born in the live guic:: colors because it is
+        // painted from them on every frame.
+    }
+    {   // v7.7.0 (report section 9c) -- THE ONE CALL THAT KEEPS THE FRAME.
+        // WM_NCCALCSIZE 0 makes client == window, which zeroes the kernel's
+        // four frame metrics in CWindowData; with the sheet margins zero
+        // too, uDWM's GetCurrentStyle loses digest bit 2 ("framed") and
+        // s_ChooseWindowFrameFromStyle downgrades the window to the BASIC
+        // frame -- no 1px border, no shadow, no caption parts. That is the
+        // exact v7.6.14 symptom ("a borderless window without shadow nor
+        // even a titlebar"), decoded to the instruction in
+        // download/uDWM-decompile-notes-v2.txt. A 1px top sheet keeps the
+        // CWindowData margins nonzero, the digest bit alive, and FRAME[1]
+        // -- the standard themed frame, native border + shadow -- attached
+        // to the window. The band itself never shows: the strip paints
+        // row 0 opaquely (the house's own border line), and the extend is
+        // the frame CARRIER, not a visible pixel. tao/Tauri and WinUI 3
+        // carry the identical call for the identical Win10 reason.
+        typedef HRESULT (WINAPI *TS_DWMEF)(HWND, LPCVOID);
+        const TS_DWMEF dwmExtend = (TS_DWMEF)GetProcAddress(
+            LoadLibraryA("dwmapi.dll"), "DwmExtendFrameIntoClientArea");
+        if (dwmExtend) {
+            // v7.7.2 THE FIELD'S 32: "Try to extend to 0,0,32,0." The sheet
+            // band grows from the 1px carrier to the full 32px strip band.
+            // Inside the band the DWM composites by alpha: the strip's GDI
+            // face (alpha 0) reads as the sheet and the GDI+ ink (the row-0
+            // border, the glyphs, the title, the separator) rides opaque on
+            // top of it. The shadow stays attached either way.
+            const int sheet[4] = { 0, 0, 32, 0 };  // MARGINS l, r, t, b
+            dwmExtend(g_hwnd, (LPCVOID)sheet);
+        }
+    }
     // v7.1.20: keyboard-reachable quit in the system menu + UIPI openings.
     tsAddSysExit(g_hwnd);
     tsAllowUiMessages(g_hwnd);
@@ -7461,41 +7464,49 @@ static void guiHideToTray(HWND w) {
 // The frame face is rendered into this memory surface and lands on the screen
 // as ONE blit -- no erase pass, no partial updates, nothing for DWM to sample
 // mid-build. (Same technique as the button buffer below.)
+//
+// v7.7.9 THE ALPHA-CAPABLE BUFFER. The buffer was CreateCompatibleBitmap -- a
+// DDB, whose memory has NO alpha storage: GDI+'s blend path "writes" the
+// alpha byte and the DDB throws it away. Inside the extend band ({0,0,32,0},
+// the v7.7.2 carrier) the DWM composites BY ALPHA, so the v7.7.7 face seat's
+// 254 never landed and the RAW SHEET was the top bar the whole time: the
+// black/white mode glass -- the field's "inverted color" -- and, wherever
+// the registry colorization tints it, the accent glass itself -- the field's
+// "slight transparent blue". The v7.6.8 lore already held the verdict
+// ("GDI+ on an HDC-backed surface cannot be trusted with the alpha byte");
+// v7.7.7 re-committed the exact crime on the exact surface class. The buffer
+// is a 32bpp TOP-DOWN DIB SECTION now (the g_stripBm recipe), every byte
+// addressable, and guiPaintFrame's byte-direct pass owns the band's alpha.
 static HDC     g_frmDc = nullptr;
 static HBITMAP g_frmBm = nullptr, g_frmBmOld = nullptr;
 static int     g_frmW = 0, g_frmH = 0;
+static void*   g_frmBits = nullptr;          // v7.7.9: the DIB's bytes
 static void guiFrameBufRelease() {
     if (g_frmBmOld) { SelectObject(g_frmDc, g_frmBmOld); g_frmBmOld = nullptr; }
     if (g_frmBm)    { DeleteObject(g_frmBm);             g_frmBm    = nullptr; }
     if (g_frmDc)    { DeleteDC(g_frmDc);                 g_frmDc    = nullptr; }
+    g_frmBits = nullptr;                        // v7.7.9
     g_frmW = 0; g_frmH = 0;
 }
 static bool guiFrameBufEnsure(int w, int h) {
     if (g_frmDc && w == g_frmW && h == g_frmH) return true;
     guiFrameBufRelease();
-    // v7.7.13 THE ALPHA-CORRECT BUFFER: a 32bpp top-down DIB section, not a
-    // DDB. The band's glass weights (the header's SourceCopy seat at 204/102)
-    // ride the buffer's alpha bytes into the DWM redirect, and GDI+ honors
-    // premultiplied ARGB in/out only on a DIB section -- on a plain DDB the
-    // alpha semantics are the interop wild west (the very quirk the 254 law
-    // was bred around: the opaque fast path wrote alpha 0). The DIB makes the
-    // whole story documented: GDI+ writes premultiplied, BitBlt copies the
-    // raw 32bpp, DWM composites the band over the extend glass. The content
-    // rows below the band stay alpha-irrelevant (the extend sheet is the top
-    // band only -- outside it the window composites opaque, the standard
-    // redirection contract).
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = w;
-    bi.bmiHeader.biHeight      = -h;          // top-down: the DC origin = top-left
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
     HDC sdc = GetDC(nullptr);
     g_frmDc = CreateCompatibleDC(sdc);
+    BITMAPV5HEADER bi = {};                     // v7.7.9: the g_stripBm recipe
+    bi.bV5Size        = sizeof(bi);
+    bi.bV5Width       = w;
+    bi.bV5Height      = -h;                     // top-down
+    bi.bV5Planes      = 1;
+    bi.bV5BitCount    = 32;
+    bi.bV5Compression = BI_BITFIELDS;           // BGRA -- alpha byte lands
+    bi.bV5RedMask     = 0x00FF0000;
+    bi.bV5GreenMask   = 0x0000FF00;
+    bi.bV5BlueMask    = 0x000000FF;
+    bi.bV5AlphaMask   = 0xFF000000;
+    g_frmBm = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+                               &g_frmBits, nullptr, 0);
     ReleaseDC(nullptr, sdc);
-    g_frmBm = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!g_frmDc || !g_frmBm) { guiFrameBufRelease(); return false; }
     g_frmBmOld = (HBITMAP)SelectObject(g_frmDc, g_frmBm);
     g_frmW = w; g_frmH = h;
@@ -7526,16 +7537,419 @@ static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
 // border lives in them), the top client-covered, the extend carrier
 // {0,0,32,0}, WM_NCHITTEST DefWindowProc-first + the caption band
 // HTCAPTION, WM_NCACTIVATE DefWindowProc(wp,-1), the buffered face with
-// the never-black erase belt. v7.7.13: the children ride the REAL band
-// (cwKidY/underBar) and the content body renders from cwBarHeightNow();
-// the content pass also shifts by the canvas centering offset, so the
-// design-space content sits centered in whatever width the window has.
+// the never-black erase belt. The layout contract does not move: the
+// children keep their +kCapHDesign seats and the content body still
+// renders from g_capH; the band rows 0..g_capH-1 are plain theme face.
 #ifndef GET_X_LPARAM
 #define GET_X_LPARAM(lp)   ((int)(short)LOWORD(lp))
 #endif
 #ifndef GET_Y_LPARAM
 #define GET_Y_LPARAM(lp)   ((int)(short)HIWORD(lp))
 #endif
+// ---- v7.7.5 THE CAPTION GLOW -- the hover animations, the house's own ------
+// The field: "Now it just needs the hovering animations like I want, and it's
+// truly alive, just without the icon and title text." The buttons keep the
+// v7.7.4 geometry (the decompile's 0x222a8 formula, capture-verified to
+// 1.5px) but answer HTCLIENT again: an animated glow cannot live under
+// uDWM's instant native fill (any native hit code lights it). So the house
+// runs the whole state machine -- TRACKMOUSEEVENT tracks the band, a 16 ms
+// timer eases the per-button hover/press alphas, guiPaintBtns lays the ink
+// over the sheet through GDI+ alpha (the v7.1.27 mechanism: partial alpha
+// over the face's alpha-0 rows composites as translucent ink on the glass).
+// uDWM's idle glyphs keep composing on top (they compose regardless of the
+// hit codes -- the v7.7.2 capture proved it): the fill is the house's, the
+// glyph ink is the dial's below. No icon, no title text -- untouched.
+enum { kBtnNone = 0, kBtnMin = 1, kBtnMax = 2, kBtnClose = 3 };
+static int  g_btnHover  = kBtnNone;    // the button under the cursor (0 = none)
+static int  g_btnPress  = kBtnNone;    // the button held down
+static int  g_btnHoverA[4] = { 0, 0, 0, 0 };   // hover alpha 0..255 per button
+static int  g_btnPressA[4] = { 0, 0, 0, 0 };   // press alpha 0..255 per button
+static bool g_btnTrack  = false;       // TRACKMOUSEEVENT is armed
+static bool g_btnAnim   = false;       // the 16 ms clock (timer 4) is running
+static bool g_bandZoomed = false;      // v7.7.6: the offset dial's zoom state
+// v7.7.6 THE BORDER LAW (the field: "make sure the focused windows' borders
+// are always at black unless an accent is added. This means the border's
+// color must not follow the titlebar color at all. It must remain black.")
+// The house's own 1px frame paints black on all four client edges; a future
+// accent feature flips g_borderUseAccent (g_borderAccent is the ink). The
+// titlebar color NEVER reaches the border.
+static bool     g_borderUseAccent = false;
+static COLORREF g_borderAccent    = RGB(0, 0, 0);
+enum { kBtnFadeHover = 46, kBtnFadePress = 44,    // neutral ink strength /255
+       kBtnRedHover  = 185, kBtnRedPress  = 45 }; // close-red strength  /255
+
+// the buttons' rects -- the decompile formula verbatim (0x222a8/0x21bc0),
+// BOTH window states now. RESTORED: cysize = SM_CYSIZE, glyph =
+// floor(cys*21/22+0.5), close = glyph*49/22, minmax = glyph*48/22 --
+// 47/46/46 at 100%, contiguous, right-to-left, the close's right edge one
+// px inside the client's right, top = 1 (the caption's own offset), height
+// = the caption block (SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER = 31
+// at 100%) -- the v7.7.4 geometry the field signed off, untouched.
+//   v7.7.8 THE MAXIMIZED LAW (the field: "the maximized state where the
+// titlebar button widths, height, and even the close button's position are
+// different ... 100% completely accurate to uDWM"). 0x21bc0's maximized
+// branch rides the SAME 48/22 stride for all three buttons with the last
+// HALF pixel of every fill left to the face, the seams at half a px and
+// the close's right edge 1.5 px inside (the v7.6.10 decode; the field's
+// own native captures -- 1920 px maximized: close 1873..1917, gap 1872,
+// max 1827..1871, gap 1826, min 1781..1825, inset 1918..1919; at 150%:
+// close 1849..1917, max 1779..1847, min 1709..1777 and the glyph centers
+// 1883/1813/1743 -- every number reproduced exactly by the law below).
+// The offset dial flips to 0 (flush top), the height loses one px ("0px
+// vs 1px and height reduced by 1px" -- the field's own native reading).
+// The half pixel is a REAL pixel: the tail column renders at HALF the
+// patch alpha (the v7.6.10 paint law). The rects are FLOAT now; the hit
+// test, the mouse side and the painter share the exact same numbers --
+// the native contains() is a float compare (x < right holds on the half
+// column, so no dead pixel exists between the buttons).
+struct STRIPRECTF { float left, top, right, bottom; };
+static void stripBtnRectsF(STRIPRECTF rc[3], float clientRight) {
+    const int cys = cwd::cwMetric(SM_CYSIZE);
+    const int glyph = (cys * 21 + 11) / 22;                // floor(cys*0.9545+0.5)
+    const int sW = (glyph * 48 + 11) / 22;                 // the stride 46 at 100%
+    const int cW = (glyph * 49 + 11) / 22;                 // restored close 47
+    const int bh = cwd::cwMetric(SM_CYCAPTION)
+                 + cwd::cwMetric(SM_CYFRAME)
+                 + cwd::cwMetric(SM_CXPADDEDBORDER);       // 31 at 100%
+    if (g_hwnd && IsZoomed(g_hwnd)) {
+        // maximized: top 0, one px shorter, the 48/22 stride minus the
+        // half px per fill, 0.5 px seams, the close 1.5 px inside.
+        const float fill = (float)sW - 0.5f;
+        const float R    = clientRight - 1.5f;
+        rc[2].left = R - fill;                 rc[2].right = R;                    // close
+        rc[1].left = R - 2.0f * fill - 0.5f;   rc[1].right = R - fill - 0.5f;      // max
+        rc[0].left = R - 3.0f * fill - 1.0f;   rc[0].right = R - 2.0f * fill - 1.0f; // min
+        rc[0].top = rc[1].top = rc[2].top = 0.0f;
+        rc[0].bottom = rc[1].bottom = rc[2].bottom = (float)bh - 1.0f;
+    } else {
+        // restored: the signed-off stack -- contiguous 46/46/47, one px
+        // inside the right edge, one px down (the offset dial's 1).
+        const int top = 1;
+        int bbot = top + bh;
+        if (bbot > g_capH) bbot = g_capH;
+        rc[2].left = clientRight - 1 - cW;  rc[2].right = clientRight - 1;   // close
+        rc[1].left = rc[2].left - sW;       rc[1].right = rc[2].left;        // max
+        rc[0].left = rc[1].left - sW;       rc[0].right = rc[1].left;        // min
+        rc[0].top = rc[1].top = rc[2].top = (float)top;
+        rc[0].bottom = rc[1].bottom = rc[2].bottom = (float)bbot;
+    }
+}
+// the integer view -- the title clamp, the icon slot, the invalidator.
+static void stripBtnRects(RECT rc[3], int clientRight) {
+    STRIPRECTF f[3];
+    stripBtnRectsF(f, (float)clientRight);
+    for (int i = 0; i < 3; ++i) {
+        rc[i].left   = (int)f[i].left;
+        rc[i].top    = (int)f[i].top;
+        rc[i].right  = (int)(f[i].right + 0.999f);   // the half column stays in
+        rc[i].bottom = (int)(f[i].bottom + 0.999f);
+    }
+}
+static int stripBtnAt(HWND w, int x, int y) {
+    RECT crc; STRIPRECTF rc[3];
+    GetClientRect(w, &crc);
+    stripBtnRectsF(rc, (float)crc.right);
+    for (int i = 0; i < 3; ++i)
+        if ((float)x >= rc[i].left && (float)x < rc[i].right &&
+            (float)y >= rc[i].top  && (float)y < rc[i].bottom)
+            return i + 1;
+    return kBtnNone;
+}
+static void stripInvalidate(HWND w) {
+    RECT crc, rc[3];
+    GetClientRect(w, &crc);
+    stripBtnRects(rc, crc.right);
+    for (int i = 0; i < 3; ++i) InvalidateRect(w, &rc[i], FALSE);
+}
+// one eased step of an alpha toward its target: x num/8 per 16 ms tick, a
+// one-unit nudge when the step rounds to zero, clamped -- no overshoot.
+static int stripEase(int a, int t, int num) {
+    if (a == t) return a;
+    int d = ((t - a) * num) / 8;
+    if (d == 0) d = (t > a) ? 1 : -1;
+    a += d;
+    if ((d > 0 && a > t) || (d < 0 && a < t)) a = t;
+    return a;
+}
+static void stripAnimArm(HWND w) {
+    if (!g_btnAnim) { SetTimer(w, 4, 16, nullptr); g_btnAnim = true; }
+}
+static void stripAnimStep(HWND w) {
+    if (g_btnPress && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        g_btnPress = kBtnNone;              // released off-window: un-press
+        stripAnimArm(w);
+    }
+    bool busy = false;
+    for (int i = 1; i <= 3; ++i) {
+        const int hT = (g_btnHover == i) ? 255 : 0;
+        const int pT = (g_btnPress == i) ? 255 : 0;
+        g_btnHoverA[i] = stripEase(g_btnHoverA[i], hT, 3);
+        g_btnPressA[i] = stripEase(g_btnPressA[i], pT, 5);
+        if (g_btnHoverA[i] != hT || g_btnPressA[i] != pT) busy = true;
+    }
+    stripInvalidate(w);                     // the tick's frame rides the blit
+    if (!busy && g_btnAnim) { KillTimer(w, 4); g_btnAnim = false; }
+}
+static void stripHoverUpdate(HWND w, int cx, int cy) {
+    // v7.7.8: the uDWM rule -- an inactive window's buttons do not light
+    // (the native buttons only track the mouse on an active window).
+    int hit = kBtnNone;
+    if (!g_hwnd || GetActiveWindow() == g_hwnd) hit = stripBtnAt(w, cx, cy);
+    if (g_btnPress && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        g_btnPress = kBtnNone;              // the button came up elsewhere
+        stripAnimArm(w);
+    }
+    if (hit != g_btnHover) { g_btnHover = hit; stripAnimArm(w); }
+    if (!g_btnTrack) {
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, w, 0 };
+        if (TrackMouseEvent(&tme)) g_btnTrack = true;
+    }
+}
+
+// ---- v7.7.5 THE DIAL -- the immersive mode rides the titlebar color --------
+// The field: "make it so the whenever the titlebar color's hsl lightness is
+// over 128 it switches to light mode and vice versa." The titlebar color is
+// the band's own face -- guic::cBg, the live theme's background (the v7.7.4
+// changelog, section 1: "the band is the theme's own face -- the field's
+// titlebar color, confirmed"). The dial is the HSL lightness
+//         L = (max(r,g,b) + min(r,g,b)) / 2     -- 0..255, NOT the luma
+// and the switch is DWMWA_USE_IMMERSIVE_DARK_MODE (20, fallback 19) -- the
+// attribute v7.1.27 pinned always-on and the field guessed at in v7.7.2:
+//     L > 128  -> light mode (0): the sheet composes white glass, the
+//                 caption ink turns dark -- a light titlebar on light themes
+//     L <= 128 -> dark mode (1): the dark sheet, the white glass-ink glyphs
+//                 -- the exact look the field signed off on
+// applyTheme calls this on every theme click ("whenever" the color changes),
+// creation lands the parked mode once the window exists.
+static int  g_dwmDark = 1;             // the mode the glow's ink reads
+static bool guiStripWantsLight() {
+    const COLORREF c = guic::cBg;
+    const int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    const int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    return (mx + mn) / 2 > 128;        // the field's 128 dial, HSL L, 0..255
+}
+static void guiApplyDwmMode() {
+    const int prev = g_dwmDark;
+    g_dwmDark = guiStripWantsLight() ? 0 : 1;
+    // v7.7.6: "ensure that on titlebar color change that the uDWM window
+    // always changes" -- when the dial flips, the band's own ink follows
+    // (the glyphs and the title read g_dwmDark); the band re-inks right
+    // here so every caller gets the repaint for free.
+    if (g_hwnd && prev != g_dwmDark) {
+        RECT crc; GetClientRect(g_hwnd, &crc);
+        const RECT band = { 0, 0, crc.right, g_capH };
+        InvalidateRect(g_hwnd, &band, FALSE);
+    }
+    if (!g_hwnd) return;               // pre-creation: parked; creation lands it
+    typedef HRESULT (WINAPI *TS_DWMSA)(HWND, DWORD, LPCVOID, DWORD);
+    const TS_DWMSA dwmSet = (TS_DWMSA)GetProcAddress(
+        LoadLibraryA("dwmapi.dll"), "DwmSetWindowAttribute");
+    if (dwmSet) {
+        if (FAILED(dwmSet(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                          &g_dwmDark, sizeof(g_dwmDark)))) {
+            dwmSet(g_hwnd, 19, &g_dwmDark, sizeof(g_dwmDark));
+        }
+    }
+}
+
+// the glow pass -- the three rects, the animated ink, nothing else. Dark
+// mode lays white ink under the white glass-ink glyphs; light mode lays
+// black under the dark ones; the close keeps the native red (196,43,28)
+// both ways -- the one colored affordance udwm itself has. GDI+ writes the
+// ALPHA, the DWM composites the ink over the sheet by it: the fade IS the
+// alpha.
+//   v7.7.8: the rects are FLOAT (the maximized law); every band fill lays
+// its whole columns at the patch alpha and each half-covered tail column
+// at HALF the patch alpha (the v7.6.10 paint law -- the maximized fills'
+// 0.5 px tails are real pixels). And the inactive law: the glyph ink rides
+// uDWM's own dial -- 1.0 active, 0.4 inactive (UpdateButtonVisuals
+// 0x25364 -> TreatAsActiveWindow -> the float pair at .rdata 0xcfa0c /
+// 0xcfa18, read out of uDWM.dll byte-exact) -- the field's "the titlebar
+// buttons' inactive state".
+static void guiPaintBtns(Gdiplus::Graphics& gs, int cw) {
+    STRIPRECTF rc[3];
+    stripBtnRectsF(rc, (float)cw);
+    const bool dark = (g_dwmDark != 0);
+    const bool winActive = !g_hwnd || (GetActiveWindow() == g_hwnd);
+    const int glyphA = winActive ? 254 : 102;          // 254 * 0.4 = 101.6
+    for (int i = 1; i <= 3; ++i) {
+        const int ha = winActive ? g_btnHoverA[i] : 0;
+        const int pa = winActive ? g_btnPressA[i] : 0;
+        int a = (i == kBtnClose)
+              ? (ha * kBtnRedHover  + pa * kBtnRedPress)  / 255
+              : (ha * kBtnFadeHover + pa * kBtnFadePress) / 255;
+        if (a <= 0) continue;
+        if (a > 255) a = 255;
+        const STRIPRECTF& r = rc[i - 1];
+        const int il = (int)r.left, ir = (int)r.right;
+        const int it = (int)r.top,  ib = (int)r.bottom;
+        const float lf = r.left  - (float)il;   // the left tail's coverage
+        const float rf = r.right - (float)ir;   // the right tail's coverage
+        const COLORREF ink = (i == kBtnClose) ? RGB(196, 43, 28)
+                           : (dark ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        const int cl = (lf > 0.001f) ? il + 1 : il;      // the full columns
+        if (ir > cl) {
+            const Gdiplus::SolidBrush br(GBand(ink, (BYTE)a));
+            gs.FillRectangle(&br, Gdiplus::Rect(cl, it, ir - cl, ib - it));
+        }
+        if (lf > 0.001f) {                               // the left half column
+            const int ha2 = (int)(a * (1.0f - lf));
+            if (ha2 > 0) {
+                const Gdiplus::SolidBrush br(GBand(ink, (BYTE)ha2));
+                gs.FillRectangle(&br, Gdiplus::Rect(il, it, 1, ib - it));
+            }
+        }
+        if (rf > 0.001f) {                               // the right half column
+            const int ha2 = (int)(a * rf);
+            if (ha2 > 0) {
+                const Gdiplus::SolidBrush br(GBand(ink, (BYTE)ha2));
+                gs.FillRectangle(&br, Gdiplus::Rect(ir, it, 1, ib - it));
+            }
+        }
+    }
+    // v7.7.6 THE GLYPHS -- the house's own now (uDWM's compose retired with
+    // WS_SYSMENU, the button-group gate -- the v7.6.6 decode: "WS_SYSMENU
+    // (0x80000) gates the group"). The proven native recipes (v7.6.14's
+    // capture-verified shapes): dash S(10)x1, square S(9)+1, restore pair
+    // S(8)/S(2) in an S(10) span, X span S(10) -- 1px strokes, centered in
+    // the decompile-formula rects. The ink is the dial's own pair at full
+    // strength, and the icons' hover fade the field ordered rides the same
+    // 16 ms clock as the bands: the close's ink crossfades to white as its
+    // red band fades in (the native hover ink; a no-op on a dark titlebar,
+    // where the ink is already white), min/max keep their ink while the
+    // band fades under them -- uDWM's own hover behavior, now ours.
+    const COLORREF gInk = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    // v7.7.8: the glyph ink rides the inactive dial (the 0.4 law above).
+    auto gfill = [&](int x, int y, int w2, int h2, COLORREF c) {
+        const Gdiplus::SolidBrush b(GBand(c, (BYTE)glyphA));   // the 254 law,
+        // now dialed: 254 active, 102 inactive (uDWM's 1.0 / 0.4).
+        gs.FillRectangle(&b, x, y, w2, h2);
+    };
+    {   // minimize: the dash, centered on the floored float-rect center
+        // (the v7.6.10 anchor law -- the same law at both states)
+        const STRIPRECTF& r = rc[0];
+        const int w2 = S(10);
+        const int cx = (int)((r.left + r.right) * 0.5f);
+        const int cy = (int)((r.top + r.bottom) * 0.5f);
+        gfill(cx - w2 / 2, cy, w2, 1, gInk);
+    }
+    {   // maximize: the square; the restore pair while maximized (the front
+        // sheet occludes the back one -- the proven clip recipe)
+        const STRIPRECTF& r = rc[1];
+        const int cx = (int)((r.left + r.right) * 0.5f);
+        const int cy = (int)((r.top + r.bottom) * 0.5f);
+        if (g_hwnd && IsZoomed(g_hwnd)) {
+            const int span = S(10), sheet = S(8), diag = S(2);
+            const int fl = cx - (span + 1) / 2, bt = cy - span / 2;
+            const Gdiplus::Rect frontRect(fl, bt + diag, sheet, sheet);
+            Gdiplus::Region frontRegion(frontRect);
+            gs.SetClip(&frontRegion, Gdiplus::CombineModeExclude);
+            {   // the back sheet, occluded
+                const int bx = fl + diag, by = bt;
+                gfill(bx, by, sheet, 1, gInk);
+                gfill(bx, by + sheet - 1, sheet, 1, gInk);
+                gfill(bx, by + 1, 1, sheet - 2, gInk);
+                gfill(bx + sheet - 1, by + 1, 1, sheet - 2, gInk);
+            }
+            gs.ResetClip();
+            {   // the front sheet, full
+                const int fy2 = bt + diag;
+                gfill(fl, fy2, sheet, 1, gInk);
+                gfill(fl, fy2 + sheet - 1, sheet, 1, gInk);
+                gfill(fl, fy2 + 1, 1, sheet - 2, gInk);
+                gfill(fl + sheet - 1, fy2 + 1, 1, sheet - 2, gInk);
+            }
+        } else {
+            const int outer = S(9) + 1;
+            const int x0 = cx - outer / 2, y0 = cy - outer / 2;
+            gfill(x0, y0, outer, 1, gInk);
+            gfill(x0, y0 + outer - 1, outer, 1, gInk);
+            gfill(x0, y0 + 1, 1, outer - 2, gInk);
+            gfill(x0 + outer - 1, y0 + 1, 1, outer - 2, gInk);
+        }
+    }
+    {   // close: the X, span S(10); its ink crossfades to white with the
+        // hover alpha -- the icon's own hover fade (light mode: black ink
+        // to white over the red band, exactly the native close hover)
+        const STRIPRECTF& r = rc[2];
+        const int cx = r.left + (r.right - r.left) / 2;
+        const int cy = r.top + (r.bottom - r.top) / 2;
+        const int span = S(10);
+        const int x0 = cx - span / 2, y0 = cy - span / 2;
+        COLORREF ci = gInk;
+        if (!dark && g_btnHoverA[kBtnClose] > 0)
+            ci = guiLerpRGB(RGB(0, 0, 0), RGB(255, 255, 255),
+                            g_btnHoverA[kBtnClose] / 255.0);
+        for (int i = 0; i < span; ++i) {
+            gfill(x0 + i, y0 + i, 1, 1, ci);
+            gfill(x0 + span - 1 - i, y0 + i, 1, 1, ci);
+        }
+    }
+}
+
+// v7.7.6 THE CAPTION TITLE -- uDWM's text side. The font is the system
+// NONCLIENTMETRICS lfCaptionFont (the binary's only caption font -- decompile
+// notes v2 section 6), the ink is the dial's own pair (white on a dark
+// titlebar, black on a light one) dimmed toward the face while the window is
+// inactive, drawn vertically centered in the caption block to the right of
+// the icon slot, ellipsis-clamped before the buttons.
+static void guiPaintTitleText(Gdiplus::Graphics& gs, HDC dc, int cw) {
+    if (!g_fTitle || !g_hwnd) return;
+    RECT rc[3];
+    stripBtnRects(rc, cw);
+    char title[192] = "";
+    if (!GetWindowTextA(g_hwnd, title, (int)sizeof(title))) return;
+    const int iconW = cwd::cwMetric(SM_CXSMICON);
+    const RECT tr = { S(8) + iconW + S(7), rc[0].top,
+                      rc[0].left - S(8), rc[0].bottom };
+    const bool active = (GetActiveWindow() == g_hwnd);
+    const COLORREF base = (g_dwmDark != 0) ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    const COLORREF tc = active ? base : guiLerpRGB(base, guic::cBg, 0.5);
+    guiAAString(gs, dc, tr, title, tc, g_fTitle, 1);
+}
+
+// v7.7.8 THE BORDER LAW, uDWM EDITION (the field: "ensure the border color
+// (active and inactive) ... and even the border style are 100% completely
+// accurate to uDWM. Right now, the border color is black"). The black law
+// retires. The native border is DWM's own again: WM_NCCALCSIZE hands the
+// frame the 1px left/right/bottom strips and uDWM draws its border line in
+// them -- the field's own v7.7.3/v7.7.4 captures measured it (a
+// translucent white atlas line, ~#7D7D7D over the dark face, near-
+// invisible over light, dimmed on an inactive window, the accent tint when
+// colorization is on) -- so the house paints NOTHING on the three strips.
+// What is left to the house is the TOP row only: the sheet line (the
+// extend's own row-0 glass line -- v7.6.7's "the idle border line -- the
+// native look"), white at the sheet's 0.2 alpha over the face seat (the
+// field's native captures: 62 over the 0e0808 face = exactly 0.2), the
+// accent solid when g_borderUseAccent is armed, and GONE when maximized --
+// the native maximized clip runs the border off (the field's captures: no
+// border rows on a maximized window).
+static void guiPaintBorder(Gdiplus::Graphics& gs, int cw, int ch) {
+    if (g_hwnd && IsZoomed(g_hwnd)) return;        // maximized: no border
+    (void)ch;
+    const COLORREF bc = g_borderUseAccent ? g_borderAccent : RGB(255, 255, 255);
+    const int a = g_borderUseAccent ? 254 : 51;    // the sheet line: white @ 0.2
+    const Gdiplus::SolidBrush b(GBand(bc, (BYTE)a));   // the 254 law
+    gs.FillRectangle(&b, 0, 0, cw, 1);             // the top sheet line
+}
+
+// v7.7.6 THE CAPTION ICON -- the small icon in its native slot at the
+// caption's left, vertically centered in the caption block. GDI (DrawIconEx)
+// runs AFTER the GDI+ scope dies -- the house never mixes them on one DC.
+static void guiPaintCaptionIcon(HDC dc, int cw) {
+    if (!g_hwnd) return;
+    HICON hic = (HICON)SendMessageW(g_hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (!hic) hic = (HICON)GetClassLongPtrW(g_hwnd, GCLP_HICONSM);
+    if (!hic) hic = (HICON)GetClassLongPtrW(g_hwnd, GCLP_HICON);
+    if (!hic) return;
+    const int iw = cwd::cwMetric(SM_CXSMICON), ih = cwd::cwMetric(SM_CYSMICON);
+    RECT rc[3];
+    stripBtnRects(rc, cw);
+    const int iy = rc[0].top + (rc[0].bottom - rc[0].top - ih) / 2;
+    DrawIconEx(dc, S(8), iy, hic, iw, ih, 0, nullptr, DI_NORMAL);
+}
+
 // The complete frame face -- background, page panel, log frame, version line,
 // watermark -- into ANY dc (the memory buffer normally, the screen directly
 // as the no-buffer fallback).
@@ -7556,27 +7970,81 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // still owns every pixel and the band is plain theme face.
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
-    {   // v7.7.9: THE CHROME LIVES IN customWindow.H -- the host paints
-        // the API's two halves in the documented sandwich (background =
-        // the face seat + the registry sheet line; foreground = the
-        // uDWM-timeline glow, the glyphs, the uDWM title), then runs
-        // the icon pass (GDI) after the scope dies. The scope's DC
-        // state restores at its end (the Graphics dtor).
+    {   // v7.7.5: the caption glow -- device space, BEFORE the shift. The
+        // scoped Graphics dies here, restoring the DC to the state it saved
+        // at construction (identity) -- the shift below cannot be eaten.
+        // v7.7.6: the scope carries the whole caption now -- bands, glyphs,
+        // the uDWM font title, and the black frame (the border law).
+        // v7.7.7 THE FACE SEAT (the field: "there's also the issue of object
+        // layering too") -- the layering is now explicit: face, then glow,
+        // then glyphs/title/icon, then the border. The band's own pixels
+        // were alpha=0 (the glass sheet showed through: the capture proved
+        // it -- band rows pure 255-white while the face is f2f7f0), so the
+        // sheet, not the titlebar color, was the backdrop everything
+        // composited against. The seat fills rows 0..g_capH-1 with the
+        // theme's own face THROUGH the blend path (GBand, alpha 254): the
+        // band becomes the field's confirmed titlebar color (guic::cBg, the
+        // v7.7.4 confirmation) in both modes, the glyphs and the border can
+        // no longer be layered under the sheet, and the extend {0,0,32,0}
+        // stays underneath as the pure FRAME[1] carrier (bit 2 + shadow).
+        // v7.7.7 THE TITLE'S INK (the field: "when on the theme's dark mode,
+        // the title text crumbles") -- the scope never set a text hint, so
+        // DrawString rode GDI+'s SystemDefault = ClearType: subpixel fringes
+        // (the capture: 501 fringe pixels, orange samples) baked against the
+        // alpha-0 backdrop, and on a dark theme the mismatch tore the text
+        // apart. AntiAliasGridFit is grayscale AA with true per-pixel alpha
+        // -- the same hint every other string in the house renders with --
+        // clean white-on-dark / black-on-light in both modes.
         Gdiplus::Graphics gs(dc);
         gs.SetSmoothingMode(Gdiplus::SmoothingModeNone);
         gs.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        const bool winActive = !g_hwnd || (GetActiveWindow() == g_hwnd);
-        cwPaintBarBackground(gs, cw, winActive);
-        cwPaintBarForeground(gs, dc, g_hwnd, cw, winActive);
+        {   // the face seat -- the band IS the titlebar color now
+            // v7.7.9: the seat fills at FULL alpha (GCol -- the EXACT face
+            // RGB). The old GBand(cBg, 254) rode the blend path, which
+            // premultiplies: the delivered byte was r*254/255 -- one LSB
+            // dark on every band pixel (242 -> 241), and the field measures
+            // pixels. With the byte-direct pass below owning the band's
+            // alpha, the seat's own alpha byte is irrelevant -- the fast
+            // path's alpha-0 and the blend path's 254 both die there -- so
+            // the seat takes the exact-RGB road and the pass makes it
+            // opaque. The translucent inks (glow fades, glyph strokes, the
+            // row-0 line) keep GBand: they are alpha SEMANTICS at draw
+            // time, blended over this seat, and the pass delivers their
+            // pre-baked result verbatim.
+            const Gdiplus::SolidBrush face(GCol(guic::cBg));
+            gs.FillRectangle(&face, 0, 0, cw, g_capH);
+        }
+        guiPaintBtns(gs, cw);
+        guiPaintTitleText(gs, dc, cw);
+        guiPaintBorder(gs, cw, ch);
     }
-    cwPaintCaptionIcon(dc, cw);                 // v7.7.9: the header's icon pass (GDI, after the scope)
-    // v7.7.13: the content body rides the EFFECTIVE caption (the live-metrics
-    // band: CYCAPTION+CYFRAME+PADDED restored, CYCAPTION maximized) AND the
-    // canvas centering offset -- the design-space content sits centered in
-    // the width the window actually has (the Explorer-rect window is wider
-    // than the zoomed canvas at every scale). guiSetStatus's invalidate rect
-    // mirrors this same offset through cwKidX/cwKidY.
-    SetViewportOrgEx(dc, cwd::g_kidOffX, cwd::cwBarHeightNow(), nullptr);
+    guiPaintCaptionIcon(dc, cw);                // v7.7.6: GDI after the scope
+    // v7.7.9 THE OPAQUE-BAND PASS -- the byte-direct law. Every pixel the
+    // caption scope painted (the face seat, the glow fades, the glyphs, the
+    // title, the row-0 sheet line) and every pixel GDI touched after it (the
+    // icon's DrawIconEx) carries its blend result pre-baked over the face;
+    // the ONLY thing a sub-255 alpha byte still admits is THE SHEET -- the
+    // black/white mode glass or the colorization accent -- i.e. the field's
+    // "inverted color" and "slight transparent blue", one mechanism. With the
+    // alpha-capable DIB under the buffer, the band's alpha bytes are forced
+    // to 255 here, so the DWM composites the band's RGB VERBATIM: the sheet
+    // -- whatever the registry, the mode, or the desktop would tint it --
+    // shows nowhere in the band, on any machine, in any window state, active
+    // or inactive, restored or maximized. The band IS the titlebar color,
+    // byte-exact, the way the field's v7.7.4 capture signed it. The seat's
+    // 254 keeps doing its job (the blend path that lands the RGB); the pass
+    // closes the 1/255 door behind it. GDI's icon writes -- which zero or
+    // stale the alpha byte inside the icon slot -- are healed by the same
+    // walk, so the icon finally delivers opaque too.
+    if (g_frmBits && dc == g_frmDc) {           // the buffered path only
+        BYTE* rows = (BYTE*)g_frmBits;
+        const int capH = (g_capH < g_frmH) ? g_capH : g_frmH;
+        for (int y = 0; y < capH; ++y) {
+            BYTE* px = rows + (size_t)y * (size_t)cw * 4 + 3;   // the A of BGRA
+            for (int x = 0; x < cw; ++x, px += 4) *px = 0xFF;
+        }
+    }
+    SetViewportOrgEx(dc, 0, g_capH, nullptr);   // v7.6.14: the content body rides below the band
     const RECT panel = { S(12), KPANEL_T, S(866), KPANEL_B };
     FillRect(dc, &panel, g_brPanel);
     FrameRect(dc, &panel, g_brPanel2);
@@ -7584,30 +8052,22 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
-    // v7.7.1 THE CONSOLE FRAME HUGS THE PANE, v7.7.13 the pane moves: the
-    // rect is the LOG CHILD's OWN device rect expanded 1px on every side --
-    // the pane is the fill-to-bottom child now (its height answers the real
-    // client through the ledger's bottomPad), so the frame reads its live
-    // rect instead of recomputing the design math. The pane is the anchor;
-    // the frame cannot miss it at any scale, any zoom, any window size.
-    {   RECT lr = {};
-        if (g_hwnd) {
-            HWND logc = GetDlgItem(g_hwnd, IDC_LOG);
-            if (logc) { RECT wr; GetWindowRect(logc, &wr);
-                        POINT tl = { wr.left, wr.top };
-                        ScreenToClient(g_hwnd, &tl);
-                        lr.left = tl.x; lr.top = tl.y;
-                        lr.right = tl.x + (wr.right - wr.left);
-                        lr.bottom = tl.y + (wr.bottom - wr.top); }
-        }
-        if (!lr.right && g_hwnd) { RECT cr; GetClientRect(g_hwnd, &cr); lr = cr; }
-        g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)lr.left - 0.5f,
-                                            (Gdiplus::REAL)lr.top - 0.5f,
-                                            (Gdiplus::REAL)(lr.right - lr.left) + 1.0f,
-                                            (Gdiplus::REAL)(lr.bottom - lr.top) + 1.0f));
-    }
+    // v7.7.1 THE CONSOLE FRAME HUGS THE PANE: the rect is the pane's OWN
+    // device rect (the creation numbers, S(y + kCapHDesign)) expanded 1px on
+    // every side. The old independent S(13)/S(479) derivation rounded the
+    // frame and the pane separately (two roundings vs the child's one), and
+    // at 150% the drift showed: S(479)+S(33) = 769 while the pane sits at
+    // S(513) = 770, and the bottom edge hung 2px loose (S(115) != S(114)+1)
+    // -- the console frame floated off the pane at odd scales. The pane is
+    // the anchor now; the frame cannot miss it. At 100% the numbers are
+    // identical to the old ones (13.5, 479.5, 853, 115).
+    g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(14) - 0.5f,
+                                        (Gdiplus::REAL)S(480 + kCapHDesign)
+                                            - (Gdiplus::REAL)g_capH - 0.5f,
+                                        (Gdiplus::REAL)S(852) + 1.0f,
+                                        (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.7.13 |  %s",   // v7.7.13 THE GLASS BAND AND THE EXPLORER RECT -- the field: "I think the top bar had this glass that made it so it looked half-transparent. Also, these are the exact window dimensions I want. To be more precise, the 175% version." -- two asks, and the four attached Explorer captures decided both. In customWindow.h: THE GLASS BAND (the face seat leaves the opaque 254 law for the uDWM glass-blend weights -- .rdata CCD90 = 0.2 active / CCDC0 = 0.6 -- so the seat rides alpha 204 active / 102 inactive through CompositingModeSourceCopy writes that REPLACE the erase's opaque rows in the buffer, and the extend glass finally shows through the band: the half-transparent top bar, the inactive side noticeably more translucent, exactly the state pair the disassembly named; the hover/press patches and their half-px tails ride the SAME seat alpha so the hovered button composites exactly like the band around it -- no hole, the v7.7.10 opaque-hover law kept by uniformity -- and the registry sheet line composes over the translucent seat in straight-alpha math first, one SourceCopy write, so the border row keeps its exact color at every weight), and THE LIVE-METRICS CAPTION (the four captures measured it whole: RESTORED the band = SM_CYCAPTION + SM_CYFRAME + SM_CXPADDEDBORDER at the window's own DPI -- 31 at 96, 52 at the field's 175% rig, read LIVE through GetSystemMetricsForDpi so a customized WindowMetrics border entry is followed the way Explorer follows it -- and MAXIMIZED the band = SM_CYCAPTION alone (23 at 96, 40 at 168: both maximized captures are restore-glyph windows whose bands measure exactly CYCAPTION -- the frame rows hang off-screen); the 33-design-px law and the v7.7.9 minus-one-px maximized delta retire -- they answered 33/32 at 96 and 57/56 at 168 against the captures' 31/23 and 52/40; the button rects ride the same law, maximized bottom = CYCAPTION - 1), and THE WINDOW-FIT ZOOM + LEDGER (the child ledger gains the per-mille zoom, the canvas centering offset and the fill-to-bottom mode -- cwKidS/cwKidX/cwKidY answer the creation pixel and the relayout pixel from ONE formula, cwS stays pure for the band internals so the native caption metrics never zoom). HERE in twinspeak.cpp: THE EXPLORER RECT (the window opens at 1130 x 683 PHYSICAL px on every machine -- the capture's exact outer rect; at 175% that is the reference window to the pixel, and the UI inside zooms to fit), THE WINDOW-FIT ZOOM (guiApplyZoom derives min(clientW/S0(880), (clientH - band - 1)/S0(620)) clamped 400..1000 per-mille -- shrink-only, so a window bigger than the design keeps the exact design look -- from the REAL client at WM_SIZE, from the SUGGESTED rect inside the scale-first WM_DPICHANGED, and from the creation rect at boot; a changed zoom re-runs the constants, the fonts and the strip GPU stack and re-seats every child in one synchronous present), THE UNDERBAR CHILDREN (every child seat drops the +33 design lead for the REAL band -- restored 31 at 96 dpi, not 33: the two-px gap between the band and the first child is gone at every scale), and THE FILL-TO-BOTTOM LOG (the log pane grows with the window through the ledger's bottomPad, its frame reads the child's own live rect, and the keyboard map row is bottom-anchored -- the pane behaves the way it always visually promised to). Reference captures: 1130x683@175 restored (border corners accent, 1px), 1138x687@100 restored, 1920x1050@100 maximized (restore glyph, band 23 = CYCAPTION), 1920x1028@175 maximized (restore glyph, band 40 = CYCAPTION) -- v7.7.12 THE STEADY TRANSITIONS -- the field: "make sure that when maximizing or responding to dpi scale that it doesn't corrupt the rendering temporarily. And also ensure you find the disassembly for the titlebar icon fade on the inactive window state. And also ensure that the inactive window's border color is always at a half-transparent 43,43,43. Btw, for this point on, use uxtheme.dll as the reference. Also, fix the issue that dpi scaling affects the ui of the twinspeak.cpp side where the in-client UI is." -- all in customWindow.h + three fixes here: THE SINGLE-PRESENT MAXIMIZE FLIP (the header's WM_SIZE flip lands ONE synchronous whole-frame RDW -- carrier, children and frame in one present; the stray trailing repaint the older rounds queued behind RDW_UPDATENOW is retired, RDW_FRAME rides along for the NC strips), THE DPI CARRIER RE-LAND (cwDpiChanged re-runs cwSheetSetup: the extend carrier is a real-px geometry commitment and rode the OLD scale's height after every DPI change -- the band's glass sheet stayed wrong for the window's whole life at the new scale: the top-bar corruption), THE ALWAYS-HALF INACTIVE BORDER (the inactive sheet line is BGRA(43,43,43,128) in every registry weather -- uDWM's state table entry CD7E4 at the sheet's 0.5 alpha; the v7.7.11 AccentColorInactive override is retired), and THE ICON FADE VERDICT (the disassembly the field asked for, found and closed: there is NO titlebar icon fade on the inactive state in uDWM.dll -- the icon is the CImage visual at window+0x210 (UpdateIcon 0x3cfd8, created in UpdateWindowVisuals 0x23ad0 at 0x2435e), CImage::SetOpacity (0x8ac00) has ZERO call sites in the whole .text, CVisual::SetOpacity (0x20a90) has 47 and none targets the icon (they are CWindowList::AlphaChange 0x112f0's layered byte/255, ShowHide 0x1a20c, the iconic thumbnails, the touch visuals), and the activation flip's UpdateWindowVisuals touches the icon ONLY for its hit-test override (CImage+0xc0 = 0/3 at 0x241e5 -- CVisual's ctor dials the same field to -2, DoHitTest compares it to -1); the inactive dim the eye reads is the FACE BENEATH the icon re-blending (the glass state weights .rdata CCD90 = 0.2 active / CCDC0 = 0.6 inactive) plus the title's BlendColors at the CFA18 0.4 weight and the buttons' 0.4 glyph dial -- so the house draws the icon at FULL opacity in both states, 100% accurate; dwmcore.dll stages no chroma and uxtheme's DrawThemeIcon (0x4f2c0) is a caller-driven forwarder with no inactive machinery); HERE in twinspeak.cpp: THE SCALE-FIRST WM_DPICHANGED (the uxtheme law -- GetThemeSysSize 0x50840 + 0x4abfc + the DPI source 0x135e8 give MulDiv(value, processDpi, 96) -- applied at the moment the resize asks: the scale, the carrier, the fonts and the strip's GPU stack re-derive BEFORE SetWindowPos, so the NCCALCSIZE insets, the erase and the child seats answer at the NEW scale; ONE synchronous RDW_UPDATENOW present closes the switch -- the mixed-scale frame is gone), and THE WINDOW-DPI STRIP FONT (the tab labels' DirectWrite px rode GetDeviceCaps(GetDC(nullptr), LOGPIXELSY) -- the PRIMARY monitor -- at every rebuild; it rides cwd::cwDpi(), the window's own scale, now). uxtheme.dll is the reference for the in-client UI from this round on -- the boot seed already matched its law; the two order fixes make the live path match it too -- v7.7.11 THE INACTIVE HALF -- all in customWindow.h: THE INACTIVE HOVER (the field: "make sure even on the inactive state the titlebar buttons can still be hovered over (triggering the animation except this time with different rates)" -- UpdateButtonVisuals 0x25364 loads the button visuals' target opacity from TreatAsActiveWindow: 1.0f active at .rdata CFA0C, 0.4f inactive at .rdata CFA18, and SetVisualStates stores it as the fade's END; the header's hover gate is RETIRED, the channels ride the SAME 160 ms CC920 clock and the same ComputeFadeValues curves to the 102/255 target on an unfocused window -- the "different rates" is the 0.4 target on the shared clock -- and an activation flip RETARGETS the running fades 1.0 <-> 0.4 on the incoming 2x curve (the fade END synced to the new [0x194]) instead of killing them, the SetVisualStates re-run law; the tick's re-derive gains a WindowFromPoint guard so a window stacked above cannot light our buttons through its own pixels), and THE INACTIVE TOP BAR (the field: "on the inactive window state, and even the moment you minimize, the window border's top bar must be updated to use the inactive color (which I believe is 0.5 alpha of 43,43,43 but check in disassembly of dwmcore.dll)" -- the dwmcore.dll re-scan answers the check: 3,589,632 bytes, every 2B 2B 2B byte run, every 0x80/0x7F-alpha DWORD, the 43/255 float: ZERO chroma, dwmcore stages nothing colored and renders what uDWM sends; uDWM.dll holds the law: the state table at .rdata CD7E0 indexed by the active flag (0x18001E787) carries entry[0] = 0xFF171717 active / entry[1] = 0xFF2B2B2B inactive -- the 43,43,43 confirmed -- and the glass blend weights at CCD90/CCDC0 are 0.2/0.6; the sheet line now answers AccentColorInactive when present, else BGRA(43,43,43,128) -- half-alpha #2B2B2B -- and the flip lands on WM_NCACTIVATE/WM_ACTIVATE AND at the minimize moment: SC_MINIMIZE pins the ledger, retargets the channels, and ONE synchronous band repaint + DwmFlush present the inactive frame before the animation samples it -- WM_SIZE SIZE_MINIMIZED pins it for the ShowWindow path, SC_RESTORE releases), -- v7.7.10 THE FIELD'S THREE RECEIPTS, all in customWindow.h: OPAQUE HOVERS (the glow patch bakes the face under its ink and rides alpha 254 -- the band composites BY ALPHA, a bare-ink fill punched the face seat out and the glass showed through the hovered button: "make sure that the titlebar button hovers are opaque"), THE INVERTED VALUE FIX (the top bar's sheet line decoded AccentColor's 0xAABBGGRR with R and B swapped -- the default blue #0078D7 painted as #D77800 orange: "fix the top bar (inverted color value)"; the ColorizationColor fallback 0xAARRGGBB was already right), and THE HOVER THAT NEVER LIT ("when I press my mouse down on a titlebar button that it triggers the animation, when just having the cursor over a titlebar button should have triggered the animation" -- TME_LEAVE alone tracks the CLIENT, armed from NC traffic the WM_MOUSELEAVE fired instantly and the leave handler killed the hover the moment it lit; BOTH leaves are tracked now (TME_LEAVE | TME_NONCLIENT), every leave + every fade tick re-derives the hover from the cursor's real position, and re-arming never happens inside a leave handler so the one-shot tracking cannot loop; the close patch's red now rides the setWinCloseBtnColor knob, default RGB(232,17,35)) -- v7.7.9 THE CHROME GOES HOME (the field: "Have all the custom window related stuff go to customWindow.h, which is the reason why my API exists" + "the top bar still isn't accurate to top and bottom, and the window tabbar's maximized state is still inaccurate, along with the fact there are no animations for when hovering the titlebar buttons" + "when opening the window and immediately changing the titlebar color, every object of the window has to update") -- THE MOVE: the whole uDWM-law chrome (the band, the 0x21bc0/0x222a8 button rects, the glyphs, the uDWM title, the icon, the hit codes, the NC mouse contract, the dial, the extend carrier) now LIVES in customWindow.h behind the eleven-function API; the host creates the window, calls cwAttach once, forwards every message through cwWndProc FIRST and paints the two chrome halves inside its buffered frame -- THE DWCORE VERDICT: the field's dwmcore.dll upload (PDB dwmcore.pdb, six Mil* exports) is the COMPOSITOR -- the rendering engine uDWM.dll drives; it hardcodes no caption geometry, no accent colors, no hover law (the strings are render targets and pointer-input routing), so the titlebar laws stay uDWM's and the header keeps citing them -- THE HOVER TIMELINE: CButton::ActivateTimeline (0x77b4) feeds CTimelineBase the .rdata CC920 double = 0.16 SECONDS and CButton::ComputeFadeValues (0x7b10) rides it (incoming = start + 2P(end-start) clamped -- full at 80 ms; outgoing = (end-P)*C -- gone at 160 ms; RedrawVisual 0x22648 chains the fades pop-free); the header runs the same law per button (a hover channel and a press channel, each with its own t0/from snapshot) and the old linear 100/150 ramps retire -- THE REGISTRY BORDER: uDWM hardcodes no registry names (it reads uxtheme's GetUserColorPreference, whose store -- the strings inside uxtheme.dll -- is HKCU\Software\Microsoft\Windows\DWM: ColorPrevalence, AccentColor 0xAABBGGRR, AccentColorInactive, ColorizationColor 0xAARRGGBB); DWM still paints the 1px left/right/bottom strips itself, and the house's TOP sheet line now mirrors the same registry law (the accent at ColorPrevalence, the native white @ 0.2 idle line otherwise, gone maximized) -- THE TOP AND BOTTOM: the extend carrier covers the WHOLE band ({0,0,cwEffBarH(),0}) so every band row composites through the same alpha path from row 0 to the band's last row; the face seat rides cwEffBarH -- THE MAXIMIZED CAPTION: one physical px shorter (the border row vanishes), the buttons at top 0 and one px short (the v7.7.8 law, unmoved), and EVERY tracked child lands the same one-row-higher delta in cwRelayoutChildren -- the tabbar's maximized state is the ledger's law now -- THE STARTUP PROPAGATION: changeWinTitlebarColor re-runs the dial + re-inks the band + the host's full-tree RDW in one transaction, and WM_DWMCOLORIZATIONCOLORCHANGED / WM_SETTINGCHANGE(ImmersiveColorSet) re-read the registry border and re-ink from the system side
+    snprintf(vbuf, sizeof(vbuf), "v7.7.9 |  %s",   // v7.7.9 THE OPAQUE BAND (the field: "Now ensure that the slight transparent blue isn't apparent anymore and fix the top bar still having that inverted color") -- THE ROOT CAUSE: the frame render buffer was CreateCompatibleBitmap -- a DDB, which has NO alpha storage -- while the extend band {0,0,32,0} composites BY ALPHA, so the v7.7.7 face seat's 254 never landed and the RAW DWM SHEET was the top bar the whole time: the black/white mode glass = the "inverted color", and under registry colorization the accent glass itself = the "slight transparent blue" -- exactly what the v7.6.8 lore already convicted ("GDI+ on an HDC-backed surface cannot be trusted with the alpha byte"); THE FIX: the buffer is a 32bpp TOP-DOWN DIB SECTION now (the g_stripBm recipe, BI_BITFIELDS with the alpha mask) and THE OPAQUE-BAND PASS walks rows 0..g_capH-1 byte-direct after the caption scope and the icon, forcing every alpha byte to 255 -- the DWM composites the band's RGB VERBATIM, the sheet (black glass, white glass, or the accent) shows NOWHERE in the band on any machine in any state, the band IS the theme face byte-exact, the seat's 254 keeps landing the RGB through the blend path, and DrawIconEx's GDI alpha pokes heal in the same walk  // v7.7.8 THE UDW LAW, WHOLE (the field: "ensure the border color (active and inactive), the hit tests of the three titlebar buttons, the maximized state where the titlebar button widths, height, and even the close button's position are different, the titlebar buttons' inactive state, and even the border style are 100% completely accurate to uDWM. Right now, the border color is black and maximized state still shows the titlebar button positions from the unmaximized output" + "on tab menu change, the uDWM window flickers on redraw") -- THE MAXIMIZED LAW: 0x21bc0's maximized branch rides the SAME 48/22 stride for all three buttons with the last HALF pixel of each fill left to the face (fill = stride - 0.5, seams 0.5 px, the close's right edge 1.5 px inside, top 0, height one px short) -- the field's own native captures reproduce exactly (1920: close 1873..1917, gap 1872, max 1827..1871, gap 1826, min 1781..1825, inset 1918..1919; 150%: 1849/1779/1709 and centers 1883/1813/1743); the half pixel is REAL: the tail column renders at half the patch alpha -- THE NATIVE HIT CODES: the buttons answer HTMINBUTTON/HTMAXBUTTON/HTCLOSEBUTTON over the exact rects (float contains()), the band mouse arrives as NC traffic (WM_NCMOUSEMOVE/NCLBUTTONDOWN/UP), the house runs the native press-release-cancel contract itself -- THE INACTIVE LAW: uDWM's UpdateButtonVisuals (0x25364) picks the glyph opacity with TreatAsActiveWindow: 1.0 active, 0.4 inactive (the floats at .rdata 0xcfa0c/0xcfa18, read byte-exact out of uDWM.dll); the glyph ink dials 254/102, hover/press never engage inactive, the band re-inks on the WM_NCACTIVATE flip -- THE BORDER, uDWM EDITION: the black law retires; WM_NCCALCSIZE hands the frame the 1px left/right/bottom strips back (the v7.7.1 shape) and uDWM draws its own border line in them (the field's captures: ~#7D7D7D over the dark face, dimmed inactive, the accent tint when colorization is on), the house paints only the TOP sheet line (white @ 0.2 -- the native 62-over-0e0808 measure), nothing when maximized -- THE TAB FLICKER: the page switch dropped RDW_ERASE for RDW_NOERASE (the erase belt's flat intermediate frame was what the DWM sampled on every click; the buffered face lands as one blit now)  // v7.7.7 THE FACE SEAT + THE 254 LAW + THE TITLE'S INK (the field: "On the light mode, this actually works. But when on the theme's dark mode, the title text crumbles. There's also the issue of object layering too") -- the v7.7.6 capture diagnosed both from pixels: the band rows rendered PURE WHITE (the DWM sheet) while the theme face is f2f7f0, row 0 showed white while the left/right/bottom border strokes (which live BELOW the band) rendered black, and the title area carried 501 ClearType subpixel-fringe pixels -- THE MECHANISM: GDI+ routes full-alpha (255) solid fills through its GDI fast path, which writes alpha=0 into the DIB; inside the extend band the DWM composites BY ALPHA, so every 255-fill in the band (the glyphs, the row-0 stroke, the close crossfade ink) composited as NOTHING -- the "object layering": the buttons were literally layered under the sheet; the v7.7.5 hover fades were visible precisely because partial-alpha fills take GDI+'s blend path, which writes the real alpha byte -- THE FACE SEAT: the caption scope now fills rows 0..g_capH-1 with the theme's own face guic::cBg through the blend path (GBand, alpha 254), so the band IS the field's confirmed titlebar color in both modes and every caption part composites ON it (the extend {0,0,32,0} stays underneath as the pure FRAME[1] carrier -- bit 2 + the shadow); the layering is explicit: face -> glow -> glyphs -> title -> icon -> border -- THE 254 LAW: every band fill (glow bands, glyph strokes, the crossfade ink, the border) rides GBand (255 clamps to 254 -- a 0.4% sheet bleed, invisible, and the alpha byte lands) -- THE TITLE'S INK: the caption scope sets TextRenderingHintAntiAliasGridFit (grayscale AA, true per-pixel alpha -- the hint every other string in the house already renders with); the old SystemDefault path was ClearType, whose subpixel fringes baked against the alpha-0 backdrop and tore the text apart on dark themes
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7620,11 +8080,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
-    // v7.7.13: BOTTOM-ANCHORED -- the row rides the real client bottom (the
-    // log pane is the fill-to-bottom child now; at any zoom or window size
-    // the keys stay the last row, above the client edge by their own height).
-    const int contentH = ch - cwd::cwBarHeightNow();
-    const RECT kbr = { S(14), contentH - S(26), S(552), contentH };
+    const RECT kbr = { S(14), KLOG_BOTTOM, S(552), KCLI_H };
     guiAAString(g, dc, kbr,
                 "tab = next ctl   ctrl+tab = page   +shift = backwards   space = on/off   arrows = sliders",
                 guic::cDim, g_fSml, 1);
@@ -7654,15 +8110,14 @@ static bool guiIsToggle(int id) {
 }
 
 static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
-    // v7.7.9: THE CHROME CONTRACT -- customWindow.h owns the whole custom
-    // window now, so its hook answers FIRST (NCCALCSIZE, NCHITTEST, the NC
-    // mouse, the activation flip, the fade timer, the colorization
-    // broadcasts); unhandled messages keep flowing to this switch and
-    // DefWindowProcW. The taskbarCreated handling below stays host-side
-    // (the tray is the host's gesture).
-    {   LRESULT cwr = 0;
-        if (cwWndProc(w, msg, wp, lp, &cwr)) return cwr; }
-
+    // v7.6.12: NO chrome first-answer anymore -- customWindow.h is not
+    // attached, every message flows to this switch and DefWindowProcW.
+    // The native caption answers its own NC messages inside the default
+    // proc: drag, snap, the buttons, the sysmenu, the resize edges.
+    // v6.6.1: explorer restarted -- the tray icon vanished; re-add it. v7.1.6
+    // TRAY-FIRST: re-add ALWAYS (trayRemove + trayAdd): the icon owner may be
+    // the invisible tray window (no control window exists yet), and explorer
+    // lost every icon anyway -- a fresh NIM_ADD is the only thing that works.
     if (g_taskbarCreated && msg == g_taskbarCreated) {
         // v7.2.12: the OWNER window re-adds, once. The broadcast reaches
         // every top-level window of the class (the tray surrogate AND the
@@ -7680,79 +8135,199 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_DPICHANGED: {
-        // v7.7.12 THE SCALE-FIRST ORDER (the uxtheme law): the in-client UI
-        // scales by MulDiv(value, dpi, 96) -- uxtheme.dll's own GetThemeSysSize
-        // (0x50840 + the helper 0x4abfc + the DPI source 0x135e8: IsProcessDPIAware
-        // ? LOGPIXELSX : 96) -- and the MulDiv must answer the NEW dpi at the
-        // moment the resize asks for it. The old order moved the window FIRST
-        // and re-derived the scale SECOND, so every geometry decision inside
-        // the resize -- the header's maximized NCCALCSIZE insets, the erase,
-        // the child seats the move itself computes -- answered at the OLD
-        // scale and stayed there (no second NCCALCSIZE until the next frame
-        // change): the mixed-scale frame the field filmed as "dpi scaling
-        // affects the ui of the twinspeak.cpp side". The scale now re-derives
-        // BEFORE SetWindowPos: g_dpi96, cwd's dpi (whose cwDpiChanged
-        // re-lands the extend carrier at the new band height -- the v7.7.12
-        // carrier fix), the caption font, the design constants, the fonts
-        // and the strip's GPU stack -- then the suggested rect, the child
-        // re-seat, and ONE synchronous whole-tree present (RDW_UPDATENOW) so
-        // no intermediate frame can reach the compositor mid-switch (the
-        // v7.0.9 law, now on the DPI path too). The strip's swap chain
-        // rebuilds lazily on its next WM_PAINT -- inside this same
-        // synchronous pass -- at its final client size.
-        const UINT dpi = (UINT)HIWORD(wp);
-        g_dpi96 = dpi;
-        cwd::cwDpiChanged(dpi);
-        cwd::cwEnsureTitleFont();   // v7.7.9: the uDWM caption font rides the scale
+        // v7.6.12: the boring, standard path -- the native frame owns the
+        // DPI story now ("forget about the dpi issue entirely"). The DWM's
+        // suggested rect is applied, the scale re-derives, the fonts remake
+        // and the tracked children re-seat. No guards, no deferrals, no
+        // zoomed-host special cases -- the whole v7.6.11 machinery is
+        // retired with the chrome. cwd's dpi rides too so the child
+        // ledger's cwS() scales with the same numbers S() uses.
         const RECT* sug = (const RECT*)lp;
-        const int sugRight = sug->right, sugBottom = sug->bottom,
-                  sugLeft = sug->left, sugTop = sug->top;
-        // v7.7.13: the WINDOW-FIT ZOOM answers at the SUGGESTED rect (the
-        // client = the outer minus the 1px native side strips and the bottom
-        // row) BEFORE the design constants re-derive -- the same scale-first
-        // law this handler already established for the DPI itself.
-        guiApplyZoom(sugRight - sugLeft - 2, sugBottom - sugTop - 1);
-        guiApplyDpi();
-        guiMakeFonts();
-        guiStripGpuRelease();
         SetWindowPos(w, nullptr, sug->left, sug->top,
                      sug->right - sug->left, sug->bottom - sug->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        g_dpi96 = (UINT)HIWORD(wp);
+        cwd::cwDpiChanged((UINT)HIWORD(wp));
+        guiApplyDpi();
+        guiMakeFonts();
+        guiStripGpuRelease();
         cwRelayoutChildren();
         RedrawWindow(w, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN
-                     | RDW_UPDATENOW);
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         return 0; }
+    // ---- v7.7.3 THE UDW RECIPE, WHOLE ----------------------------------------
+    // The old custom window (the strip object) is gone; these handlers are
+    // the decompiled recipe and the whole window now. The plain
+    // WS_OVERLAPPEDWINDOW shell stays; WM_NCCALCSIZE keeps real NC insets on
+    // left/right/bottom (v7.7.1: the frame's own strips -- the native border
+    // lives in them), WM_NCHITTEST hands the resize edges and the drag to
+    // the system, the caption band answers HTCAPTION.
+    case WM_NCCALCSIZE: {
+        // v7.7.8 THE NATIVE BORDER IS DWM'S OWN AGAIN (the field: "ensure
+        // the border color (active and inactive) ... and even the border
+        // style are 100% completely accurate to uDWM. Right now, the border
+        // color is black"). The v7.7.1 shape returns: the client hands the
+        // frame a 1px strip on left/right/bottom -- PHYSICAL px, the native
+        // border art is 1px at every DPI -- and uDWM draws its own border
+        // line in them: the translucent white atlas line the field's own
+        // v7.7.3/v7.7.4 captures measured (~#7D7D7D over the dark face,
+        // near-invisible over light), dimmed on an inactive window, the
+        // accent tint when colorization is on. The house paints NOTHING on
+        // those strips -- the active and inactive border colors are
+        // uDWM's, exactly, by construction. The black law retires.
+        // Maximized keeps the full frame giveback (and the maximized clip
+        // runs the native border off -- the native look: no border on a
+        // maximized window).
+        if (!wp) break;
+        NCCALCSIZE_PARAMS* ncp = (NCCALCSIZE_PARAMS*)lp;
+        if (IsZoomed(w)) {
+            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            ncp->rgrc[0].left   += fx;   ncp->rgrc[0].top    += fy;
+            ncp->rgrc[0].right  -= fx;   ncp->rgrc[0].bottom -= fy;
+        } else {
+            ncp->rgrc[0].left   += 1;    ncp->rgrc[0].right  -= 1;
+            ncp->rgrc[0].bottom -= 1;
+        }
+        return 0; }
+    case WM_NCHITTEST: {
+        // v7.7.6 THE HOUSE'S OWN WALK (recipe 9d, the v7.6.14 proven order
+        // with the corner answers v7.7.1 taught). The client is the window
+        // again (NCCALCSIZE 0 above), so the resize edges are hand-rolled
+        // and DPI-correct, corners first -- all four (HTTOPLEFT up to
+        // HTBOTTOMRIGHT; the v7.6.14 flaw that answered HTBOTTOM straight
+        // across the bottom edge is fixed) -- then the edges. The BUTTONS
+        // come before every edge (the native order: a button owns its whole
+        // rect, the top resize band and the right edge included) and answer
+        // HTCLIENT -- their clicks are client messages riding the v7.7.5
+        // glow state machine (TRACKMOUSEEVENT + the 16 ms timer 4 + GDI+
+        // ink). uDWM composes NO caption parts anymore (WS_SYSMENU, the
+        // button-group gate, left the style at creation), so the house's
+        // glyphs are THE glyphs. The rest of the band answers HTCAPTION --
+        // drag, Aero snap, double-click maximize and Win+arrows stay the
+        // system's own.
+        const POINT spt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT wrc; GetWindowRect(w, &wrc);
+        const int ww = wrc.right - wrc.left, wh = wrc.bottom - wrc.top;
+        const int x = spt.x - wrc.left, y = spt.y - wrc.top;
+        // v7.7.8 THE NATIVE HIT CODES (the field: "the hit tests of the
+        // three titlebar buttons ... 100% completely accurate to uDWM").
+        // The three buttons answer HTMINBUTTON / HTMAXBUTTON /
+        // HTCLOSEBUTTON over the exact uDWM rects (float contains() -- the
+        // half columns hit, no dead pixel), the resize edges keep the
+        // hand-rolled DPI-correct bands, the band answers HTCAPTION. The
+        // point rides CLIENT coords for the rects (the 1px border strips).
+        POINT cpt = spt;
+        ScreenToClient(w, &cpt);
+        const int btn = stripBtnAt(w, cpt.x, cpt.y);
+        if (btn == kBtnMin)   return HTMINBUTTON;
+        if (btn == kBtnMax)   return HTMAXBUTTON;
+        if (btn == kBtnClose) return HTCLOSE;      // 20 -- the close code's
+                                                   // winuser.h name
+        if (!IsZoomed(w)) {
+            const int fx = cwd::cwMetric(SM_CXFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            const int fy = cwd::cwMetric(SM_CYFRAME) + cwd::cwMetric(SM_CXPADDEDBORDER);
+            const bool lf = x < fx, rg = x >= ww - fx;
+            const bool tp = y < fy, bt = y >= wh - fy;
+            if (tp && lf) return HTTOPLEFT;
+            if (tp && rg) return HTTOPRIGHT;
+            if (bt && lf) return HTBOTTOMLEFT;
+            if (bt && rg) return HTBOTTOMRIGHT;
+            if (tp) return HTTOP;
+            if (bt) return HTBOTTOM;
+            if (lf) return HTLEFT;
+            if (rg) return HTRIGHT;
+        }
+        return (cpt.y >= 0 && cpt.y < g_capH) ? HTCAPTION : HTCLIENT; }
+    case WM_NCACTIVATE: {
+        // v7.7.0 (report section 9e): the answer is DefWindowProc with
+        // lParam -1 -- never a bare TRUE. The -1 stops DefWindowProc from
+        // repainting the NC area on every activation flip (v7.7.1: the area
+        // exists again -- the frame's border strips -- and its visuals are
+        // uDWM's own at compose time; a classic repaint here would only
+        // fight them); riding DefWindowProc's own return keeps the
+        // activation contract so the DWM frame state never fights the
+        // frame. v7.7.3: no strip re-face anymore -- there is no strip.
+        // v7.7.8: the band re-inks on BOTH edges of the flip -- the glyphs
+        // re-render at the inactive 0.4 (or back to 1.0), the title re-dims,
+        // the native border strips re-opacity themselves (DWM's own).
+        const LRESULT r = DefWindowProcW(w, msg, wp, (LPARAM)-1);
+        RECT crc; GetClientRect(w, &crc);
+        const RECT band = { 0, 0, crc.right, g_capH };
+        InvalidateRect(w, &band, FALSE);
+        return r; }
+    // ---- v7.7.5 THE GLOW'S MOUSE SIDE: the four client cases are BACK ----
+    // v7.7.3 retired them with the strip object; v7.7.5 re-enlists them for
+    // the animated buttons. The band's HTCLIENT answers route the traffic
+    // here; the children never lose a message (their mouse goes to their
+    // own wndprocs -- the window-level cases only ever see the band).
+    // ---- v7.7.8 THE NC MOUSE: the buttons answer the native codes, so the
+    // band's mouse traffic arrives as NC messages (WM_NCMOUSEMOVE with
+    // SCREEN coords). The uDWM rule holds: an inactive window's buttons
+    // neither light nor press. The house runs the click itself (press on
+    // NCLBUTTONDOWN, release fires over the same rect, drag-off cancels --
+    // the native contract); DefWindowProc's own NC button loop is not
+    // trusted with the WS_SYSMENU-less style.
+    case WM_NCMOUSEMOVE: {
+        POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(w, &cpt);
+        stripHoverUpdate(w, cpt.x, cpt.y);
+        break; }
+    case WM_NCMOUSELEAVE:
+    case WM_MOUSELEAVE:
+        g_btnTrack = false;
+        if (g_btnHover) { g_btnHover = kBtnNone; stripAnimArm(w); }
+        break;
+    case WM_NCLBUTTONDOWN: {
+        POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(w, &cpt);
+        // no active gate here: the native first click on an INACTIVE
+        // window's button still acts (win32k activates on the down) -- only
+        // the HOVER refuses to light on an unfocused window (the 0.4 law).
+        const int hit = stripBtnAt(w, cpt.x, cpt.y);
+        if (hit) {
+            g_btnPress = hit;
+            stripAnimArm(w);
+            return 0;               // the house's own press-and-release
+        }
+        break; }
+    case WM_NCLBUTTONUP: {
+        POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(w, &cpt);
+        const int hit = stripBtnAt(w, cpt.x, cpt.y);
+        if (g_btnPress) {
+            if (hit == g_btnPress) {
+                // SC_CLOSE lands in WM_CLOSE (hide to tray, engine keeps
+                // running) -- the same gesture the native close delivered.
+                if (hit == kBtnMin)        PostMessageW(w, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+                else if (hit == kBtnMax)   PostMessageW(w, WM_SYSCOMMAND,
+                                                          IsZoomed(w) ? SC_RESTORE : SC_MAXIMIZE, 0);
+                else if (hit == kBtnClose) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
+            }
+            g_btnPress = kBtnNone;
+            stripAnimArm(w);
+            if (hit) return 0;
+        }
+        break; }
+    case WM_LBUTTONUP:
+        // a drag-off release can land on the CLIENT (the up re-routes);
+        // the press un-latches either way (stripHoverUpdate also sweeps).
+        if (g_btnPress) { g_btnPress = kBtnNone; stripAnimArm(w); }
+        break;
+    case WM_CANCELMODE:
+        if (g_btnPress) { g_btnPress = kBtnNone; stripAnimArm(w); }
+        break;
+    case WM_MOUSEMOVE: {
+        // the belt-and-suspenders client path (the band is NC traffic now;
+        // this only fires from odd transitional states)
+        POINT cpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        stripHoverUpdate(w, cpt.x, cpt.y);
+        break; }
     // v7.5.3c: WM_WINDOWPOSCHANGING (the size lock's second belt -- it
     // pinned every sizing pass to the designed 880x620+insets) stands down
     // for the resize test. The shell may size the window freely now; the
     // header's WM_NCCALCSIZE owns the insets and WM_PAINT regrows the
     // frame + bar buffers at whatever client size results.
-    case WM_SIZE: {
-        // v7.7.13 THE WINDOW-FIT REFLOW: the zoom re-derives from the REAL
-        // client at every size change (the header's cwWndProc already handled
-        // its own flip duties ahead of this -- the maximize band delta and
-        // the single present -- and falls through with return false). A
-        // changed zoom re-runs the design constants, the fonts and the
-        // strip's GPU stack (the strip's DirectWrite px rides the zoom),
-        // re-seats every tracked child at the new scale + canvas offset, and
-        // lands ONE synchronous whole-tree present. An unchanged zoom (the
-        // common WM_SIZE: the fixed Explorer rect, maximize toggles below
-        // the fit threshold) costs one client-rect read and nothing else.
-        if (wp == SIZE_MINIMIZED) break;   // the header pinned the inactive law
-        if (IsIconic(w)) break;
-        RECT cr;
-        if (!GetClientRect(w, &cr)) break;
-        if (guiApplyZoom(cr.right, cr.bottom)) {
-            guiApplyDpi();
-            guiMakeFonts();
-            guiStripGpuRelease();
-            cwRelayoutChildren();
-            RedrawWindow(w, nullptr, nullptr,
-                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN
-                         | RDW_UPDATENOW);
-        }
-        break; }
     case WM_SYSCOMMAND: {
         // v7.6.12: the built-in SC_ values ride DefWindowProc now -- the
         // native caption buttons, Win+arrows and SC_CLOSE are the system's
@@ -7760,6 +8335,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // running). IDM_TRAY_EXIT from the appended system-menu item is
         // the real quit; the custom menu id is compared against the FULL
         // wParam (the 0xFFF0 mask is only for the built-in SC_ values).
+        g_btnPress = kBtnNone;   // v7.7.8: the action consumed the press
         if ((int)wp == IDM_TRAY_EXIT) {
             trayRemove();
             if (g_engState.load() != 0) guiStopEngine();
@@ -7768,6 +8344,20 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break; }
+    case WM_SIZE:
+        // v7.7.6: the caption offset dial (1px floating, 0 maximized -- the
+        // decompile's captionOffset 0/1) and the restore glyph ride the
+        // zoom state; the band re-inks on the flip so they land even when
+        // the size pass alone would not have repainted the top rows.
+        {   const bool z = (IsZoomed(w) != FALSE);
+            if (z != g_bandZoomed) {
+                g_bandZoomed = z;
+                RECT crc; GetClientRect(w, &crc);
+                const RECT band = { 0, 0, crc.right, g_capH };
+                InvalidateRect(w, &band, FALSE);
+            }
+        }
+        break;
     case WM_SYSKEYDOWN:
         // v7.7.6: WS_SYSMENU left the style (the button-group gate), which
         // retires the Alt+Space system menu with it -- but Alt+F4 belongs
@@ -8240,8 +8830,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_trayVisible) KillTimer(w, 3);
             return 0;
         }
-        // v7.7.9: the caption glow's 16 ms clock lives in customWindow.h now
-        // (kCwFadeTimerId, the uDWM timeline) -- timer 4 is retired again.
+        // v7.7.5: timer 4 is BACK -- v7.2.15 retired the wp == 4 tick, the
+        // id is re-enlisted as the caption glow's clock: 16 ms eased steps
+        // of the per-button hover/press alphas; it kills itself when every
+        // alpha sits on its target (see stripAnimStep).
+        if (wp == 4) { stripAnimStep(w); return 0; }
         // v7.0.3: timer 2 drives the tab fade-in; ONLY the strip repaints
         // each tick. When the run completes the timer kills itself and lands
         // one final full-strength pass -- no fractional-alpha frame remains.
