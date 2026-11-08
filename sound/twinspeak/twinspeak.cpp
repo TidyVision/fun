@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.4.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.8.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,6 +23,32 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.8.2 THE BOOT YIELD. Field: "when twinspeak starts while roblox is
+//            playing, it literally corrupts roblox's output driver list and
+//            it results in a NoSoundDriver glitch"; also "fl studio's own
+//            asio driver stops working until you click on the configurations
+//            which is what makes it work again". Root cause: the boot
+//            sequence opened BOTH legs WASAPI-EXCLUSIVE first and let the
+//            yield_default tick release the default-matching leg a second
+//            later -- but the damage is done inside that window. An
+//            exclusive IAudioClient::Initialize attempt on an endpoint the
+//            Windows engine is actively mixing to comes back
+//            AUDCLNT_E_DEVICE_IN_USE, and on Realtek the REFUSED ATTEMPT
+//            itself cycles the endpoint/pin state: every live shared-mode
+//            client on that endpoint (FMOD inside Roblox, FL Studio ASIO's
+//            WASAPI wrapper) eats AUDCLNT_E_DEVICE_INVALIDATED. FMOD parks
+//            in its NoSoundDriver state and neither it nor FL-ASIO
+//            re-initializes on its own -- the field workaround (switch the
+//            default playback device away and back) worked only because the
+//            default change forces those stacks to re-open. Fix: a leg whose
+//            device IS the current default render endpoint, or that has
+//            ACTIVE foreign audio sessions on it, now boots STRAIGHT INTO
+//            THE YIELDED STATE -- its DAC is never touched at boot. The
+//            existing per-tick yield block re-grabs it under the v6.5.16
+//            quiet rule (default moved away AND foreignActiveSessions ==
+//            0), so no live stream is ever invalidated again, by boot or
+//            re-grab. A boot-yielded leg re-grabs on the WASAPI path (the
+//            generated ini's recommended backend anyway).
 //    v7.8.1 THE CAPTION PING. Field: "when I press the theme button, the
 //            window's dark mode property doesn't update visually until
 //            you change the window state." The attribute WAS landing (a
@@ -4741,6 +4767,15 @@ static void printLegDevice(int idx) {
     Leg& L = g_leg[idx];
     const double burst = (double)g_capBurstFrames * 1000.0 / (double)kSampleRate;
     const double ring  = (double)L.targetFrames * 1000.0 / (double)kSampleRate;
+    // v7.8.2: a released leg (boot yield / default-device yield) holds no
+    // device -- print the release state instead of a zeroed device line.
+    if (L.yielded.load(std::memory_order_relaxed)) {
+        tlog("[twinspeak] leg%d device     : RELEASED (yield) -- \"%s\" is not held by twinspeak right now;\n"
+             "            the quiet re-grab opens it (exclusive first) once the Windows default has\n"
+             "            moved away from it and no foreign session is active\n",
+             idx + 1, L.name.c_str());
+        return;
+    }
     if (L.backend == 1) {
         // v6.3: WDM-KS leg -- the device bite is ks_period_frames and the
         // transport latency is the write lead (+ the DAC's hardware FIFO).
@@ -8998,29 +9033,82 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // below, so a leg is never left without a device. The align_modes dance
     // then applies to the WASAPI legs only (KS pins live under the endpoint
     // layer and do not participate in shared-mode buffering).
+    // ---- v7.8.2 BOOT YIELD -- the Roblox "NoSoundDriver" / FL-ASIO fix ----
+    // The old boot order opened both legs exclusive FIRST and let the
+    // yield_default tick release the default-matching leg a second later.
+    // That open -- even a REFUSED exclusive attempt, which on Realtek still
+    // cycles the endpoint pin out from under the Windows engine --
+    // invalidated every live shared-mode client on the endpoint (FMOD in
+    // Roblox fell into NoSoundDriver; FL Studio ASIO sat on a dead stream
+    // until its config was clicked). A leg whose device IS the current
+    // default render endpoint, or that has ACTIVE foreign sessions, now
+    // boots straight into the yielded state: the DAC is never touched at
+    // boot, and the per-tick yield block re-grabs it under the v6.5.16
+    // quiet rule (default moved away AND foreignActiveSessions == 0).
+    bool bootYield[2] = { false, false };
+    {
+        std::string defNm;
+        const bool haveDef = defaultRenderName(&defNm);
+        for (int i = 0; i < 2; ++i) {
+            const char* yn = (i == 0) ? g_cfg.outputDevice1.c_str()
+                                      : g_cfg.outputDevice2.c_str();
+            if (!yn[0]) continue;
+            if (haveDef && containsCI(defNm, yn)) {
+                bootYield[i] = true;
+                g_leg[i].yielded.store(true, std::memory_order_relaxed);
+                g_leg[i].isExclusive = g_cfg.exclusive;   // the quiet re-grab opens exclusive first
+                g_leg[i].backend = 0;
+                g_leg[i].lastReopenMs = GetTickCount64();
+                tlog("[twinspeak] leg%d BOOT-YIELD : the Windows default render device (\"%s\") matches\n"
+                     "                            this leg's needle -- starting the leg RELEASED (the DAC is\n"
+                     "                            never touched at boot); it reopens when the default moves\n"
+                     "                            away and the device is quiet\n",
+                     i + 1, defNm.c_str());
+                continue;
+            }
+            const int busy = foreignActiveSessions(yn);
+            if (busy > 0) {
+                bootYield[i] = true;
+                g_leg[i].yielded.store(true, std::memory_order_relaxed);
+                g_leg[i].isExclusive = g_cfg.exclusive;
+                g_leg[i].backend = 0;
+                g_leg[i].lastReopenMs = GetTickCount64();
+                tlog("[twinspeak] leg%d BOOT-YIELD : %d foreign audio session(s) ACTIVE on this leg's device\n"
+                     "                            (not the default) -- starting the leg RELEASED so those live\n"
+                     "                            streams are not invalidated; it reopens when they finish\n",
+                     i + 1, busy);
+            } else if (busy < 0) {
+                tlog("[twinspeak] leg%d BOOT-YIELD : session probe unavailable -- opening normally (fail-open)\n", i + 1);
+            }
+        }
+    }
     const bool wantKS1 = (g_cfg.backend1 == "ks");
     const bool wantKS2 = (g_cfg.backend2 == "ks");
     bool ok2 = false, ok1 = false;
-    if (wantKS2) ok2 = ksOpenLeg(1, g_cfg.outputDevice2);
-    if (wantKS1) ok1 = ksOpenLeg(0, g_cfg.outputDevice1);
-    if (wantKS2 && !ok2)
+    if (bootYield[1]) ok2 = true;                       // released by choice, not broken
+    else if (wantKS2) ok2 = ksOpenLeg(1, g_cfg.outputDevice2);
+    if (bootYield[0]) ok1 = true;
+    else if (wantKS1) ok1 = ksOpenLeg(0, g_cfg.outputDevice1);
+    if (wantKS2 && !ok2 && !bootYield[1])
         tlog("[twinspeak] leg2 KS        : refused -- falling back to the WASAPI exclusive path\n");
-    if (wantKS1 && !ok1)
+    if (wantKS1 && !ok1 && !bootYield[0])
         tlog("[twinspeak] leg1 KS        : refused -- falling back to the WASAPI exclusive path\n");
-    g_leg[1].backend = (ok2 && wantKS2) ? 1 : 0;
-    g_leg[0].backend = (ok1 && wantKS1) ? 1 : 0;
-    if (!ok2) ok2 = initLegDevice(1, &ctx, &id2, periodMs2, g_cfg.exclusive);
+    g_leg[1].backend = (ok2 && wantKS2 && !bootYield[1]) ? 1 : 0;
+    g_leg[0].backend = (ok1 && wantKS1 && !bootYield[0]) ? 1 : 0;
+    if (!ok2 && !bootYield[1]) ok2 = initLegDevice(1, &ctx, &id2, periodMs2, g_cfg.exclusive);
     // v3: legs go exclusive TOGETHER or shared TOGETHER (v2 let one leg win
     // and the buffering mismatch skewed them ~10 ms). A driver refusal on
     // either WASAPI leg reopens BOTH shared so device buffering stays
     // identical; KS legs are committed to their pin and stay as-is.
-    if (!ok1) ok1 = initLegDevice(0, &ctx, &id1, periodMs1, g_cfg.exclusive);
+    if (!ok1 && !bootYield[0]) ok1 = initLegDevice(0, &ctx, &id1, periodMs1, g_cfg.exclusive);
     if ((!ok1 || !ok2) && g_cfg.exclusive) {
         if (g_cfg.alignModes) {
             // Only WASAPI legs participate in the dance; a KS leg is already
-            // committed to its pin and stays as-is.
-            const bool dance1 = (g_leg[0].backend == 0);
-            const bool dance2 = (g_leg[1].backend == 0);
+            // committed to its pin and stays as-is. v7.8.2: a boot-yielded
+            // leg holds no device at all -- the dance must never uninit or
+            // reopen it (ok stays true; it is released by choice).
+            const bool dance1 = (g_leg[0].backend == 0 && !bootYield[0]);
+            const bool dance2 = (g_leg[1].backend == 0 && !bootYield[1]);
             tlog( "[twinspeak] align_modes: exclusive %s -- reopening the WASAPI legs shared so device buffering stays identical\n",
                     (!ok1 && !ok2) ? "refused by both drivers" : "refused on one leg");
             if (ok1 && dance1) {
@@ -9197,6 +9285,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 tlog("[twinspeak] out%d: WDM-KS pin -- endpoint pinning not applicable (KS bypasses endpoint volume)\n", i + 1);
                 continue;
             }
+            // v7.8.2: a boot-yielded leg holds no endpoint (its id was never
+            // resolved) -- nothing to pin; the quiet re-grab re-pins with
+            // the default-device guard (tryRestartLeg).
+            if (g_leg[i].yielded.load(std::memory_order_relaxed)) {
+                tlog("[twinspeak] out%d: leg RELEASED (boot yield) -- endpoint pin not applicable until it reopens\n", i + 1);
+                continue;
+            }
             // v7.6.3 THE DEFAULT-DEVICE GUARD: when a leg's endpoint IS the
             // current default playback device, its volume slider belongs to
             // the user -- engine start must never slam it to 100%/unmuted
@@ -9267,16 +9362,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v6.3: a KS leg "starts" by creating its pacing thread (the thread
     // flips the pin to RUN itself); ma_device_start applies to WASAPI legs.
     // out2_first ordering is honored for both backends.
+    // v7.8.2: a boot-yielded leg has no device to start -- count it as
+    // success; the quiet re-grab (tryRestartLeg) starts it when it reopens.
+    const bool by0 = g_leg[0].yielded.load(std::memory_order_relaxed);
+    const bool by1 = g_leg[1].yielded.load(std::memory_order_relaxed);
     if (g_cfg.out2First) {
         if (g_leg[1].backend == 1) {                       // out2 (center) FIRST
             g_leg[1].ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)1, 0, nullptr);
             if (!g_leg[1].ks.thread) sA = MA_ERROR;
+        } else if (by1) {
+            sA = MA_SUCCESS;                              // released (boot yield)
         } else {
             sA = ma_device_start(&g_leg[1].dev);
         }
         if (g_leg[0].backend == 1) {
             g_leg[0].ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)0, 0, nullptr);
             if (!g_leg[0].ks.thread) sB = MA_ERROR;
+        } else if (by0) {
+            sB = MA_SUCCESS;                              // released (boot yield)
         } else {
             sB = ma_device_start(&g_leg[0].dev);
         }
@@ -9284,12 +9387,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         if (g_leg[0].backend == 1) {
             g_leg[0].ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)0, 0, nullptr);
             if (!g_leg[0].ks.thread) sA = MA_ERROR;
+        } else if (by0) {
+            sA = MA_SUCCESS;                              // released (boot yield)
         } else {
             sA = ma_device_start(&g_leg[0].dev);
         }
         if (g_leg[1].backend == 1) {
             g_leg[1].ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)1, 0, nullptr);
             if (!g_leg[1].ks.thread) sB = MA_ERROR;
+        } else if (by1) {
+            sB = MA_SUCCESS;                              // released (boot yield)
         } else {
             sB = ma_device_start(&g_leg[1].dev);
         }
@@ -9319,8 +9426,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_cfg.clockSync) {
         const unsigned long long alignT0 = GetTickCount64();
         for (;;) {
-            const bool sw0 = g_leg[0].popped.load(std::memory_order_acquire) > 0;
-            const bool sw1 = g_leg[1].popped.load(std::memory_order_acquire) > 0;
+            // v7.8.2: a boot-yielded leg never pops by design -- count it in.
+            const bool sw0 = by0 || g_leg[0].popped.load(std::memory_order_acquire) > 0;
+            const bool sw1 = by1 || g_leg[1].popped.load(std::memory_order_acquire) > 0;
             if (sw0 && sw1) break;
             if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
             Sleep(1);
@@ -9328,8 +9436,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const unsigned long long au0 = g_leg[0].firstSwitchUs.load(std::memory_order_acquire);
         const unsigned long long au1 = g_leg[1].firstSwitchUs.load(std::memory_order_acquire);
         if (!au0 || !au1) {
-            tlog("[twinspeak] start align  : a leg never handed in its first buffer switch --\n"
-                 "                            alignment skipped (the watchdog owns a dead leg)\n");
+            // v7.8.2: a released leg has no switch to hand in -- say which.
+            if (by0 || by1) {
+                tlog("[twinspeak] start align  : a leg is RELEASED (boot yield) --\n"
+                     "                            alignment skipped (the leg aligns itself on its quiet reopen;\n"
+                     "                            the warden owns it from there)\n");
+            } else {
+                tlog("[twinspeak] start align  : a leg never handed in its first buffer switch --\n"
+                     "                            alignment skipped (the watchdog owns a dead leg)\n");
+            }
         } else {
             const long long gapUs  = (long long)au0 - (long long)au1;   // > 0: out1 began eating first
             const long long gapAbs = gapUs < 0 ? -gapUs : gapUs;
@@ -9449,6 +9564,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] leg1 (mains)   : \"%s\" | %s | period %u ms x2\n",
            n1.c_str(),
            g_leg[0].backend == 1 ? "WDM-KS (kernel streaming)" :
+           g_leg[0].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
            g_leg[0].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs1);
     if (g_cfg.lfeFold)
         tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
@@ -9461,6 +9577,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
            n2.c_str(),
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
+           g_leg[1].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
            g_leg[1].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs2);
     tlog("[twinspeak] route out2     : L = R = %.2f*ch3(center) ONLY -- ch1/ch2/ch4..ch8 EXPLICITLY MUTED in the out2 path\n"
            "[twinspeak] route out2     : (out2 is NOT a clone of the program audio) + %.0f Hz @ %.2f%% keep-alive\n",
