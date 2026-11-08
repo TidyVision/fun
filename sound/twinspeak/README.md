@@ -2,13 +2,11 @@ Disclaimer: This tool was made for free, bypassing the requirement of paying for
 
 A GUI should come with twinspeak.exe. And there should be a built-in E.Q. setting to use instead of utilizing Equalizer APO, as that software uses shared-mode, where as this software bypasses all of that by WASAPI Exclusive/KS.
 
-### How is the custom window made? I'm curious
+### What happened to the custom window?
 
-I had GLM 5.3 flash learn about the code from [this github repository](https://github.com/grassator/win32-window-custom-titlebar/tree/main), which demonstrates this perfectly, with faking the windows 10 dwm title bar and borders.
+v7.5.0 through v7.7.9 faked the whole Windows 10 title bar and borders in-client (learned from [this github repository](https://github.com/grassator/win32-window-custom-titlebar/tree/main)) — an entire one-file window API, a decompiled-uDWM button replica, glass-sheet byte patching, the works.
 
-I think it's just beautiful to be honest, like 5 years ago was that a thing. I'm glad to shift to that instead of manual DWM stuff.
-
-I'll be using this fully-polished custom window titlebar and borders for my next projects like this, because it should define how the iconic windows 10 window can be manipulated into looking just as beautiful as this.
+v7.8.0 retires ALL of it. The panel is now a stock `WS_OVERLAPPEDWINDOW`: the flat default Windows 10 frame with the native caption, icon, title, min/max/close buttons, system menu and resize edges, exactly as Windows draws them. The only DWM touches left are a square-corner preference and one attribute: `DWMWA_USE_IMMERSIVE_DARK_MODE`, which the app re-dials from the active theme's background lightness on every theme click — so the dark themes (DARK CYAN, DARK BLUE, DARK YELLOW, DARK GREEN, DARK RED, DARK ORANGE) flip the native title bar to dark with white ink, and the light themes flip it back. The DPI child ledger (the one piece worth keeping) moved into twinspeak.cpp itself; there is no window header to include anymore.
 
 ## Overview & Metadata
 

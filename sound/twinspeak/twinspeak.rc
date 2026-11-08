@@ -1,172 +1,16 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3: version bump; v7.5.4: version bump; v7.5.5: version bump; v7.6.0: version bump; v7.6.1: version bump; v7.6.2: version bump; v7.6.3: version bump; v7.6.4: version bump; v7.6.5: version bump; v7.6.6: version bump; v7.6.7: version bump; v7.6.8: version bump; v7.6.9: version bump; v7.6.10: version bump; v7.6.11: version bump; v7.6.12: version bump; v7.6.13: version bump; v7.6.14: version bump; v7.7.0: version bump; v7.7.1: version bump; v7.7.2: version bump; v7.7.3: version bump; v7.7.4: version bump; v7.7.5: version bump; v7.7.6: version bump (the numeric FILEVERSION slipped -- it stayed 7,7,5,0); v7.7.7: version bump (numeric + strings aligned); v7.7.8: version bump; v7.7.9: version bump (numeric + strings aligned)
-// (maximized, the CLOSE button runs 2px thinner AND 2px more to the left --
-// its right edge two design px off the window edge, the min/max pair and
-// the stack's total anchor kept: 46/45/44 + the 2px gap at 96 dpi, the
-// maximize button left as is; the HOVERS reach row 0 on every path -- the
-// GDI+ band pins its top to row 0 and the byte-direct row writers
-// composite the same patches over the sheet byte; the maximized restore
-// icon runs one design px smaller (cwS(7) sheets, was cwS(8)); and an
-// unhover slower than 250 ms gets no fade-back flash at all)
-// (the hover tint reads the face's HSL lightness -- white on a dark face,
-// the measured 10% black on a light one -- and setWinInactiveColor arrives;
-// twinspeak's dark themes take the real Win10 dark-mode inactive gray
-// #323232 in applyTheme)
-// (the uniform sheet row: the ACTIVE row joins the INACTIVE byte --
-// Gdiplus::Color(128,43,43,43), the field's pick -- so no alpha-0 row exists
-// anywhere and the minimize glass flash is impossible by construction; and
-// the fake top border bar engine -- the row constants, the byte-direct
-// patch, the row-first commit, the NC latch, the gate, the kick and the
-// fade presenter thread -- moves into customWindow.h behind the API:
-// cwSeedSheetRow, cwPatchSheetRow, cwCommitSheetRowFast, cwSheetRowGate,
-// cwSheetRowKick, cwSheetRowLatch/cwSheetRowLatchValue,
-// cwSheetPresenterStart/Stop. v7.5.2: version bump
-// (the one-file window: customWindow.h arrives -- the whole Windows chrome
-// (WM_NCCALCSIZE insets, WM_NCHITTEST, the caption button stack, the hover,
-// the sysmenu, the face/title/icon/button painting, the built-in fallback
-// tray, putWindowinTray) moves behind an eleven-function API:
-// enableCustomWin, changeWinTitlebarColor, changeWinTextColor,
-// changeWinTextUnfocusedColor, changeWinTextFont, enableWinIcon,
-// setWinTitlebarButtonLayout, setCanWinResize, changeWinMinimizeHoverColor,
-// changeWinMaximizeHoverColor, putWindowinTray -- Windows-real with no-op
-// stubs for every other target. twinspeak stays consumer #1, byte-identical:
-// applyTheme re-seeds the chrome from the live theme, guiRenderBar keeps the
-// sheet row + edge sandwich, guiWndProc forwards through cwWndProc first.
-// v7.4.11: version bump
-// (the forced replay: the tray-icon come-up -- tray click, tray menu,
-// second-instance come-up -- now runs the same second activation the plain
-// start runs, FORCED past its foreground guard: the click on the tray icon
-// grants the foreground to the tray (Explorer) and this process holds no
-// grant of its own, so the guard-only replay exited every time and the
-// button waited for a manual unfocus + refocus. Forced, the replay takes
-// the foreground with the v7.4.8 attach dance -- the user asked for this
-// window -- then runs the blip unchanged. Plain start stays byte for byte
-// v7.4.10: unforced arm, guard intact. v7.4.10: version bump
-// (the plain process + the second activation: the v7.1.23 process
-// AppUserModelID is RETIRED too -- the panel window has been vanilla since
-// v7.4.9 but the process still carried the AUMID, so every button was
-// still born into the AUMID group's lifecycle instead of the plain window
-// path, with the windowless sign-in --tray twin as the group's claimant;
-// grouping, jumplist, balloons and the label all run on the default path
-// now. And tsReplayActivation replays the field machine's one proven
-// birth trigger -- the user's own unfocus + refocus pair -- ~500 ms after
-// every first show: a 1x1 off-screen toolwindow proxy takes the
-// foreground for 40 ms and hands it straight back, only while the panel
-// still owns the foreground. v7.4.9: version bump
-// (the vanilla window + the name-change channel: the per-window
-// System.AppUserModel.ID property (v7.1.25) is retired -- it never fixed
-// what it was added for and it routed the labeled taskbar's button birth
-// out of the default window path; the panel is a vanilla window again and
-// tsEnsureTaskbarButton now re-announces the window title (the
-// EVENT_OBJECT_NAMECHANGE channel) immediately after every first show plus
-// a 250 ms nag budget for the sign-in race. The double-clicked duplicate
-// hands its foreground grant to the running instance before forwarding
-// "come up" (AllowSetForegroundWindow). v7.4.8: version bump
-// (the button audit: the activating show of v7.4.7 was still not enough --
-// the taskbar button stayed unborn until an activation change. After every
-// first show tsEnsureTaskbarButton now takes the foreground with the
-// thread-input attach dance when the launch activation was suppressed and
-// asserts WS_EX_APPWINDOW -- a button-worthiness style change on a channel
-// that depends on neither the show nor the foreground event; a native
-// button, not an ITaskbarList tab. v7.4.7: version bump
-// (the button ride: a plain launch showed the panel with SW_SHOWNA -- a
-// no-activate show -- and the taskbar button stayed unborn until an
-// activation change (the field: "'TidyVision TwinSpeak' will not show up
-// anywhere on the taskbar until I unfocus and refocus the window"). The
-// first show is ShowWindow(SW_SHOW) now: show AND activate in one shell
-// transaction, the transaction the button birth rides. v7.4.6: version bump
-// (the legacy shadow, retired: the class carried CS_DROPSHADOW next to the
-// DWM shadow -- win32k's legacy shadow is a separate "SysShadow" sprite
-// drawn OFFSET DOWN-RIGHT of the owner window, and its show/hide lifecycle
-// around a hide-to-tray + reopen cycle is exactly where the tray-reopen
-// ghost came from; the v7.4.4 frame nudge re-anchored the sprite, the
-// v7.4.5 sheet re-commit cannot touch it. CS_DROPSHADOW is gone from the
-// class style -- no SysShadow window can exist, no ghost can. The
-// Windows-default shadow stays: WS_THICKFRAME + the default border color
-// + the glass sheet own it under composition. Also in v7.4.6: a plain
-// (no --tray) launch adds the tray icon at startup -- it used to ride the
-// first close-to-tray. v7.4.5: version bump
-// (the sheet re-commit: the v7.4.4 frame-change nudge recomputes the
-// win32 side of the frame but DWM's own shadow projection can still
-// resurrect stale -- the right/bottom tray-reopen ghost; guiRestoreWindow
-// re-commits the glass sheet after the nudge, RAD-style, twice --
-// {0,0,0,0} then the real {0,0,1,0} -- so DWM cannot filter the unchanged
-// margins and must rebuild frame + shadow against the live rect. The
-// settled state is the exact v7.1.27 sheet. v7.4.4: version bump
-// (the shadow rebuild: SW_HIDE retires the window's DWM visual and SW_SHOW
-// rebuilds it from cached frame metadata -- the drop shadow lands at the
-// stale bounds, detached from the real rect on tray reopen;
-// guiRestoreWindow fires the WM_CREATE nudge (v7.1.24, RAD main.c) once per
-// restore -- SWP_FRAMECHANGED|NOMOVE|NOSIZE|NOZORDER|NOACTIVATE, geometry
-// only, the glass sheet and the recipe rows untouched. v7.4.3: version bump
-// (the inactive row, the field's gray: kSheetRowInactive 0x80000000 ->
-// 0x802B2B2B -- BGRA(43,43,43,0x80), half-alpha RGB(43,43,43), the
-// recipe's own source gray, now one pinned constant. v7.4.2: version bump
-// (the inactive row, half-alpha black: kSheetRowInactive 0x80696969 ->
-// 0x80000000 -- BGRA(0,0,0,0x80), the glass itself dimmed 50%, which is
-// what the DWM's own inactive border is; a gray source byte dims AND
-// tints. v7.4.1: version bump
-// (the inactive row, pinned: on unfocus row 0 is the half-alpha #696969
-// the classic inactive border rides -- the DWM's own recipe, composited
-// by the same DWM over the same glass as the left/right/bottom strips --
-// while the glass key BGRA(0,0,0,0) stays the active row. The v7.3.0
-// backdrop estimator and the v7.3.2 hold latch are retired whole;
-// v7.4.0's alpha-0-both-states row went BLACK on unfocus over a
-// (252,252,252) backdrop -- the field's tape; Discord's custom-frame
-// build carries the same hole). v7.3.2: version bump
-// (the hold that does not expire: the deactivation hold is a LATCH --
-// g_holdLive -- spanning the whole inactive period; the 240 ms
-// wall-clock stamp, the clock checks in all three row writers and the
-// presenter's handover present are retired -- the field caught the
-// handover as "a transparency issue on the top border itself" and
-// asked for the timer's head). v7.3.1: version bump
-// (the row-first commit, the RAD
-// contract: WM_NCACTIVATE lands the 1 px border row alone FIRST --
-// guiCommitSheetRowFast -- before the full GDI+ face render, and answers
-// the flip with DefWindowProcW's documented lParam -1, the RAD
-// debugger's "without this result, stuff flickers").
-// v7.3.0: version bump
-// (the Chrome contract, tracked: on deactivation row 0 is OPAQUE at the
-// settled recipe composite over the CURRENT backdrop -- computed live from
-// the desktop strip above the window, v7.2.13's estimator -- stamped 240 ms
-// and handed back to the recipe's half-alpha row by the fade presenter's
-// own train [the stamp and the handover retired in v7.3.2]; DwmFlush() is
-// back before the pre-flip present so a compose in flight can never carry
-// the flip off a stale snapshot).
-// v7.2.12: version bump
-// (the hook thread goes quiet + the tray audit: the settle burst renders
-// only when it must -- with a measured cache one tail tick replaces the
-// twenty 50 Hz re-renders; the measure-retry tick is a bare re-measure;
-// guiMeasureInstantRow reads the row with ONE BitBlt instead of up to 36
-// GetPixel screen readbacks -- all on the GUI thread that answers the
-// system-wide WH_MOUSE_LL hook, which is what the field felt as mouse
-// lag; g_lastHealth rides its lock). Tray: the close-hint balloon works
-// again (dead code since v7.1.20), the tooltip re-syncs after a delayed
-// sign-in add, the icon loads at the tray's small size, TaskbarCreated is
-// answered once by the owner window, the retry timer cannot orphan, and
-// a tray-menu Start with unset devices says so in a balloon).
-// v7.2.11: version bump
-// (the latch answers for every path: the v7.2.9 NC latch moves into
-// guiPaintBar, so no painter -- WM_PAINT, the bar hover paths, the
-// settle-burst ticks, applyTheme -- can re-land the stale ACTIVE face and
-// the alpha-0 bare-glass row in the transaction window between
-// WM_NCACTIVATE and WM_ACTIVATE anymore; that stale face was the black
-// caption + vanished top border the field's second tape catches on every
-// unfocus). v7.2.10: version bump
-// (the ever-seeded cache: the standalone seeder timer owns the initial
-// g_instantInactive seed -- the burst-tail measure can lose the race against
-// the quick-toggle test loop and the cache stayed empty for whole sessions,
-// so every deactivation rode the DWM's transition and the top border
-// flashed the pre-input blend until the second frame). v7.2.9: version bump
-// (the one-frame row traced and killed: scan+median measure, NC-latched
-// NCPAINT, symmetric activation present). v7.2.8: version bump
-// (back to the 7.2.3 base + the post-flip NCPAINT). v7.2.3: version bump
-// (the NC-flip present). v7.2.2: version bump
-// + the name split: FileDescription stays the PROCESS name Task Manager
-// reads ("TwinSpeak Control Panel"); ProductName takes the brand
-// ("TidyVision TwinSpeak") -- the same split the windows carry (the taskbar
-// window is "TidyVision TwinSpeak", the hidden tray surrogate is "TwinSpeak
-// Control Panel").
-// (v7.1.21: the manifest; v7.1.22..v7.2.0: window-side fixes only).
+// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3..v7.7.9: version
+// bumps (the full per-version notes live in CHANGELOG.txt).
+// v7.8.0: THE ONE-FILE WINDOW HEADER RETIRES, WHOLE -- no include, no stub
+// file, no external chrome API. The window is the flat default Windows 10
+// frame (a stock WS_OVERLAPPEDWINDOW: native caption, icon, title, min/max/
+// close, sysmenu, resize, shadow), and every dark theme re-dials
+// DWMWA_USE_IMMERSIVE_DARK_MODE from the theme's background lightness so
+// the native titlebar follows the app's dark/light themes (attribute 20
+// with the 19 fallback, re-applied on every applyTheme and at creation).
+// The DPI child ledger lives in twinspeak.cpp now. Version steps to 7.8.0.
+// (the historical v7.5.x..v7.7.x window work -- the one-file window
+// header's arrival and every uDWM byte-chase it bought -- is retired with
+// it; the notes are preserved in CHANGELOG.txt)
 // No windows.h include needed -- the VERSIONINFO and
 // RT_MANIFEST forms used here are RC syntax, not C macros, so both windres
 // and zig rc accept this file as-is.
@@ -179,8 +23,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,7,9,0
-PRODUCTVERSION  7,7,9,0
+FILEVERSION     7,8,0,0
+PRODUCTVERSION  7,8,0,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -191,12 +35,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.7.9.0"
+            VALUE "FileVersion",      "7.8.0.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.7.9.0"
+            VALUE "ProductVersion",   "7.8.0.0"
         END
     END
     BLOCK "VarFileInfo"
