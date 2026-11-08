@@ -23,6 +23,24 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.8.1 THE CAPTION PING. Field: "when I press the theme button, the
+//            window's dark mode property doesn't update visually until
+//            you change the window state." The attribute WAS landing (a
+//            state change proved it) -- what never landed was the paint:
+//            Windows 10's DWM re-renders its caption only when the
+//            caption's RENDER STATE changes (activation flip, text,
+//            geometry); a new DWMWA_USE_IMMERSIVE_DARK_MODE value alone
+//            dirties nothing, and the SWP_FRAMECHANGED nudge (no
+//            geometry change behind it) is not enough on 10 (it is on
+//            11). The state change that always worked -- minimize /
+//            restore -- is really the WM_NCACTIVATE(FALSE) /
+//            WM_NCACTIVATE(TRUE) pair crossing the caption, so
+//            guiApplyDwmMode now pings that pair directly after the
+//            attribute set: the opposite-state pass re-renders the
+//            caption against the NEW mode, the live-state pass lands
+//            back on the true activation; both synchronous inside
+//            DefWindowProcW, no focus/z-order touched, the two paints
+//            compose as one frame (no flash). Version steps to 7.8.1.
 //    v7.8.0 THE ONE-FILE WINDOW HEADER RETIRES, WHOLE. Field: "Remove any
 //            references of the one-file window header (leaving me with
 //            just the flat-style default windows 10 window) and make sure
@@ -7461,8 +7479,11 @@ static std::string tsMidTrunc(const std::string& s, size_t maxChars) {
 //     L <= 128 -> dark mode (1): the dark titlebar, white caption ink
 // applyTheme calls this on every theme click ("whenever" the color
 // changes), creation lands the parked mode once the window exists, and the
-// SWP_FRAMECHANGED nudge re-renders the native caption the moment the mode
-// flips -- no theme click ever shows a stale titlebar.
+// flip lands in the same breath: the SWP_FRAMECHANGED nudge (all Windows
+// 11 needs) plus, since v7.8.1, the WM_NCACTIVATE caption ping -- the
+// pair a minimize/restore really rides; Windows 10's DWM repaints its
+// caption only on a render-state CHANGE, so the ping supplies one -- no
+// theme click ever shows a stale titlebar.
 static int  g_dwmDark = 1;             // the mode the native caption reads
 static bool guiThemeWantsLight() {
     const COLORREF c = guic::cBg;
@@ -7484,14 +7505,35 @@ static void guiApplyDwmMode() {
             dwmSet(g_hwnd, 19, &g_dwmDark, sizeof(g_dwmDark));   // 1809's id
         }
     }
-    // the flip lands in the same breath: the frame-change nudge makes
-    // win32k re-run the NC calc and the DWM re-render the native caption
-    // against the new mode (a no-op when the mode did not flip).
-    if (prev != g_dwmDark) {
-        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
+    if (prev == g_dwmDark) return;     // no flip: the caption already reads right
+    // pass 1: the frame-change nudge -- win32k re-runs the NC calc. On
+    // Windows 11 this alone repaints the caption; on 10 it is necessary
+    // but (as the field proved) not sufficient.
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    // pass 2, v7.8.1 THE CAPTION PING. The field report: on Windows 10 the
+    // theme click landed the attribute (a state change proved it) but the
+    // native titlebar kept the old mode until minimize/restore. The Win10
+    // DWM re-renders its caption only when the caption's RENDER STATE
+    // changes -- an activation flip, a text change, a geometry change; a
+    // new attribute value alone dirties nothing, and a frame change with
+    // no geometry behind it does not reach the caption on 10. The state
+    // change that always worked is really the WM_NCACTIVATE(FALSE) /
+    // WM_NCACTIVATE(TRUE) pair crossing the caption, so ping that pair
+    // directly: the opposite-state pass re-renders the caption against
+    // the NEW attribute, the live-state pass lands back where the window
+    // truly is. Both synchronous inside DefWindowProcW (this wndproc owns
+    // no NC cases since v7.8.0); no focus, no z-order, no activation
+    // state is touched, and the two paints compose as one frame -- no
+    // flash. lParam 0 = draw normally (the -1 skip-paint form is exactly
+    // what must NOT ride here). Hidden window (tray-mode theme flips):
+    // the paints land in the redirection surface and the next show
+    // composes the new mode -- still correct.
+    const bool live = (GetActiveWindow() == g_hwnd ||
+                       GetForegroundWindow() == g_hwnd);
+    SendMessageW(g_hwnd, WM_NCACTIVATE, live ? FALSE : TRUE, 0);
+    SendMessageW(g_hwnd, WM_NCACTIVATE, live ? TRUE : FALSE, 0);
 }
 
 // The content face -- background, page panel, log frame, version line,

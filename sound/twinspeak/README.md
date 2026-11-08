@@ -8,6 +8,8 @@ v7.5.0 through v7.7.9 faked the whole Windows 10 title bar and borders in-client
 
 v7.8.0 retires ALL of it. The panel is now a stock `WS_OVERLAPPEDWINDOW`: the flat default Windows 10 frame with the native caption, icon, title, min/max/close buttons, system menu and resize edges, exactly as Windows draws them. The only DWM touches left are a square-corner preference and one attribute: `DWMWA_USE_IMMERSIVE_DARK_MODE`, which the app re-dials from the active theme's background lightness on every theme click — so the dark themes (DARK CYAN, DARK BLUE, DARK YELLOW, DARK GREEN, DARK RED, DARK ORANGE) flip the native title bar to dark with white ink, and the light themes flip it back. The DPI child ledger (the one piece worth keeping) moved into twinspeak.cpp itself; there is no window header to include anymore.
 
+v7.8.1 fixes the one gap that remained: on Windows 10 the theme click set the attribute but the title bar kept the old mode until the window state changed (minimize/restore) — the Win10 DWM only repaints its caption when the caption's render state actually changes. The flip now lands in the same click: `guiApplyDwmMode` pings the `WM_NCACTIVATE(FALSE)`/`WM_NCACTIVATE(TRUE)` pair (the pair a minimize/restore really rides) right after the attribute set, so the caption re-renders against the new mode immediately — no flash, no focus or z-order side effects.
+
 ## Overview & Metadata
 
 PROPERTY OF TIDYVISION, GENERATED FROM GLM 5.3 FLASH

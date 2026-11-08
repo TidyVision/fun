@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# twinspeak v7.8.0 build -- llvm-mingw when present, pip zig otherwise.
+# twinspeak v7.8.1 build -- llvm-mingw when present, pip zig otherwise.
 #
 # v7.8.0: the link line grows the GUI's real import set -- the shipped script
 # was still the v6.5.1 engine-only list (no GDI+/D2D/D3D/DWrite/comctl32/
@@ -32,6 +32,9 @@ elif ls -d /home/z/my-project/work/toolchain/llvm-mingw*/bin >/dev/null 2>&1; th
 elif [ -x /home/z/my-project/venv-zig/bin/python ]; then
     echo "[build] resources: zig rc"
     /home/z/my-project/venv-zig/bin/python -m ziglang rc twinspeak.rc
+elif [ -x /home/z/my-project/venv-zig-check/bin/python ]; then
+    echo "[build] resources: zig rc (venv-zig-check)"
+    /home/z/my-project/venv-zig-check/bin/python -m ziglang rc twinspeak.rc
     RESOBJ="twinspeak.res"
 else
     echo "[build] FATAL: no resource compiler (windres / llvm-mingw / venv-zig)" >&2
@@ -66,7 +69,14 @@ else
     # NOTE: no -flto on the zig path -- zig 0.17 + lld-link + static mingw-w
     # CRT leaves the long-double math stubs (lrintl, frexpl, ...) undefined
     # under LTO. -O3 + x86_64_v3 carries the pass; llvm-mingw keeps LTO.
-    /home/z/my-project/venv-zig/bin/python -m ziglang c++ $CXXFLAGS -march=x86_64_v3 \
+    # v7.8.1: venv-zig-check (the sandbox's surviving pip-zig venv) rides
+    # the same path when venv-zig is absent.
+    if [ -x /home/z/my-project/venv-zig/bin/python ]; then
+        ZP=/home/z/my-project/venv-zig/bin/python
+    else
+        ZP=/home/z/my-project/venv-zig-check/bin/python
+    fi
+    "$ZP" -m ziglang c++ $CXXFLAGS -march=x86_64_v3 \
         -target x86_64-windows-gnu \
         -o twinspeak.exe twinspeak.cpp "$RESOBJ" \
         $TS_LIBS \

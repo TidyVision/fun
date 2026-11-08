@@ -1,5 +1,12 @@
 // twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3..v7.7.9: version
 // bumps (the full per-version notes live in CHANGELOG.txt).
+// v7.8.1: THE CAPTION PING -- the theme click landed
+// DWMWA_USE_IMMERSIVE_DARK_MODE but Windows 10's DWM repaints its caption
+// only on a render-state CHANGE, so the titlebar stayed stale until
+// minimize/restore; guiApplyDwmMode now pings WM_NCACTIVATE(FALSE)/
+// WM_NCACTIVATE(TRUE) after the attribute set and the flip lands in the
+// same click. (Details in twinspeak.cpp's changelog.) Version steps to
+// 7.8.1.
 // v7.8.0: THE ONE-FILE WINDOW HEADER RETIRES, WHOLE -- no include, no stub
 // file, no external chrome API. The window is the flat default Windows 10
 // frame (a stock WS_OVERLAPPEDWINDOW: native caption, icon, title, min/max/
@@ -23,8 +30,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,8,0,0
-PRODUCTVERSION  7,8,0,0
+FILEVERSION     7,8,1,0
+PRODUCTVERSION  7,8,1,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -35,12 +42,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.8.0.0"
+            VALUE "FileVersion",      "7.8.1.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.8.0.0"
+            VALUE "ProductVersion",   "7.8.1.0"
         END
     END
     BLOCK "VarFileInfo"
