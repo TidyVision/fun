@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.8.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.8.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -23,25 +23,6 @@
 //    yield_default, center_gate, center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v7.8.3 THE RING/CAP RETIREMENT + THE VERSION HONESTY PASS. Field: "I'd
-//            simply remove the ring1/2ms and capture_burst features, only
-//            leaving in the out1/2ms." Analysis first: on every real config
-//            the ring floor (device buffer + burst + margin) already exceeds
-//            the requested ring1_ms/ring2_ms -- the keys were no-ops that
-//            could only ever ADD manual headroom nobody used; ring depth is
-//            memory, not cycles, so no CPU change either. cap_ms retired the
-//            same way: the request is hard-wired at 1 ms (v3.6's decoupling
-//            from the out periods is preserved -- deriving it from outXms
-//            would recouple what v3.6 fixed); the driver negotiates the real
-//            burst regardless. The ring target IS the floor + the delay.
-//            Old ini lines (ring1_ms/ring2_ms/cap_ms) load cleanly and are
-//            ignored, pin_outputs-style; the GUI rows, ini template, ini key
-//            list and clamps are gone. Boot-yielded legs now size their ring
-//            from the REQUESTED period (outXms) instead of the 480-frame
-//            fallback, so the quiet re-grab lands on an exactly-sized ring.
-//            And the version strings that were still lying (the banner and
-//            the ini template header said v7.1.19 since the v7.1 era) now
-//            read v7.8.3 everywhere the UI can see them.
 //    v7.8.2 THE BOOT YIELD. Field: "when twinspeak starts while roblox is
 //            playing, it literally corrupts roblox's output driver list and
 //            it results in a NoSoundDriver glitch"; also "fl studio's own
@@ -1722,10 +1703,10 @@ static constexpr unsigned kFastTierSpacingMs = 500;   // minimum spacing between
 struct Config {
     float       out1Ms         = 5.0f;
     float       out2Ms         = 5.0f;
+    float       ring1Ms        = 10.0f;   // v7.0.0: default 10 ms (was -1 = follow outXms)
+    float       ring2Ms        = 10.0f;   // v7.0.0: keep EQUAL to ring1 for alignment
     float       legacyBufferMs = 10.0f;   // only used if outXms absent from ini
-    // v7.8.3: ring1Ms / ring2Ms / capMs RETIRED -- the ring target IS the
-    // floor (device buffer + burst + margin + delay); the capture burst
-    // request is hard-wired at 1 ms (the driver negotiates the real burst).
+    float       capMs          = 5.0f;    // v3.6: capture burst period (decoupled)
     bool        captureExclusive = true;  // v6.6.8: INTEGRATED -- always on
     bool        haveOut1       = false;
     bool        haveOut2       = false;
@@ -2167,7 +2148,7 @@ static ma_device g_capDev = {};
 static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
-static float   g_capPeriodMsF = 1.0f;   // v7.8.3: fixed 1 ms request (cap_ms retired)
+static float   g_capPeriodMsF = 5.0f;
 
 // MMCSS boost for the pump threads (v3.8): at 10 ms targets a normal-
 // priority thread that loses one scheduling quantum can miss a refill
@@ -3960,7 +3941,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.8.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.1.19 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -3971,13 +3952,26 @@ static void writeTemplate(const char* path) {
         "out1ms = 5\n"
         "out2ms = 5\n"
         "\n"
-        "; v7.8.3: cap_ms / ring1_ms / ring2_ms are RETIRED -- old ini lines are\n"
-        "; read and ignored. The capture burst request is fixed at 1 ms (the\n"
-        "; banner prints the real negotiated burst; on a WaveCyclic Line 1 port\n"
-        "; the shared clamp doubles it -- the WaveRT port driver in the VAC\n"
-        "; Control Panel unlocks the real burst). The ring target IS the floor:\n"
-        "; FULL device buffer (2 periods) + one capture burst + 4 ms margin (a\n"
-        "; KS leg: one bite + burst + 1 ms) + the alignment delay.\n"
+        "; CAPTURE burst period -- decoupled from the out periods above. Smaller =\n"
+        "; finer capture granularity = lower and more stable leg latency. 5 ms is\n"
+        "; the sweet spot. In shared mode the Windows engine clamps this to ~10 ms\n"
+        "; -- the banner prints the REAL negotiated burst. On a WaveCyclic Line 1\n"
+        "; port that clamp doubles every window; the WaveRT port driver (VAC\n"
+        "; Control Panel) unlocks the real 5 ms.\n"
+        "cap_ms = 5\n"
+        "\n"
+        "; Out RING depth per leg, in ms. The ring target is FLOORED at the FULL\n"
+        "; device buffer (2 periods) + a FULL capture burst + 4 ms regardless of\n"
+        "; this -- the ring must survive the device's worst legitimate bite (a\n"
+        "; late/merged pop asks for both periods at once). At 5/5/cap5 the floor\n"
+        "; is ~19 ms; raise ring1_ms/ring2_ms only for extra glitch headroom\n"
+        "; (each ms costs 1 ms latency, legs stay aligned if kept equal).\n"
+        "; v6.3.1: a backend = ks leg floors LOWER -- one KS bite + one capture\n"
+        "; burst + 1 ms -- because its only pull is twinspeak's own pacing thread\n"
+        "; (exactly one bite, never merged). At ks_period_frames 96 + cap_ms 1\n"
+        "; that floor is 5 ms and the leg's est path prints ~10 ms.\n"
+        "ring1_ms = 10\n"
+        "ring2_ms = 10\n"
         "\n"
         "; ALIGNMENT DELAY (v6.1): delay1_ms / delay2_ms push ONE leg's output\n"
         "; later by whole milliseconds -- a BIT-EXACT ring delay: the leg's ring\n"
@@ -4338,10 +4332,13 @@ static void cfgSanitize() {
     if (!g_cfg.haveOut2) g_cfg.out2Ms = g_cfg.legacyBufferMs;
     g_cfg.out1Ms = clampMs(g_cfg.out1Ms);
     g_cfg.out2Ms = clampMs(g_cfg.out2Ms);
+    g_cfg.capMs  = clampMs(g_cfg.capMs);
     if (g_cfg.delay1Ms < 0.0f)   g_cfg.delay1Ms = 0.0f;
     if (g_cfg.delay1Ms > 1000.0f) g_cfg.delay1Ms = 1000.0f;
     if (g_cfg.delay2Ms < 0.0f)   g_cfg.delay2Ms = 0.0f;
     if (g_cfg.delay2Ms > 1000.0f) g_cfg.delay2Ms = 1000.0f;
+    if (g_cfg.ring1Ms >= 0.0f) g_cfg.ring1Ms = clampMs(g_cfg.ring1Ms);
+    if (g_cfg.ring2Ms >= 0.0f) g_cfg.ring2Ms = clampMs(g_cfg.ring2Ms);
     if (g_cfg.driftIntervalMs < 2000)  g_cfg.driftIntervalMs = 2000;   // v6.5.12: was 5000
     if (g_cfg.driftIntervalMs > 60000) g_cfg.driftIntervalMs = 60000;
     if (g_cfg.deepResyncMin > 0 && g_cfg.deepResyncMin < 5) g_cfg.deepResyncMin = 5;
@@ -4402,20 +4399,19 @@ static bool loadIni(const char* path) {
         std::string val = trim(s.substr(eq + 1));
         if      (key == "out1ms")       { g_cfg.out1Ms = (float)atof(val.c_str()); g_cfg.haveOut1 = true; }
         else if (key == "out2ms")       { g_cfg.out2Ms = (float)atof(val.c_str()); g_cfg.haveOut2 = true; }
+        else if (key == "ring1_ms")     { g_cfg.ring1Ms = (float)atof(val.c_str()); }
+        else if (key == "ring2_ms")     { g_cfg.ring2Ms = (float)atof(val.c_str()); }
+        else if (key == "cap_ms")            { g_cfg.capMs = (float)atof(val.c_str()); }
         else if (key == "buffer_size")  { g_cfg.legacyBufferMs = (float)atof(val.c_str()); }
         // v6.6.8: ten switches are now part of the engine itself -- always on,
-        // no ini override, no UI pill. v7.8.3: the ring/cap timing keys join
-        // them (the ring target IS the floor; the burst request is fixed at
-        // 1 ms). Old inis that still carry any of these keys load cleanly:
-        // the lines are read and deliberately ignored.
+        // no ini override, no UI pill. Old inis that still carry the keys load
+        // cleanly: the lines are read and deliberately ignored.
         else if (key == "capture_exclusive" || key == "exclusive" ||
                  key == "align_modes"       || key == "clock_sync" ||
                  key == "auto_resync"       || key == "drift_guard" ||
                  key == "power_guard"       || key == "yield_default" ||
                  key == "center_gate"       || key == "center_upmix_guard" ||
-                 key == "background"        || key == "pin_outputs" ||
-                 key == "ring1_ms"          || key == "ring2_ms" ||
-                 key == "cap_ms") { }
+                 key == "background"        || key == "pin_outputs") { }
         else if (key == "lfe_fold")     { g_cfg.lfeFold = !isOff(val); }
         else if (key == "input_device")   g_cfg.inputDevice = val;
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
@@ -4909,8 +4905,8 @@ enum {
     IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
     IDC_TGL_LFEFOLD,
-    // page: timing (v7.8.3: IDC_CAPMS / IDC_RING1 / IDC_RING2 retired)
-    IDC_OUT1MS, IDC_OUT2MS,
+    // page: timing
+    IDC_OUT1MS, IDC_OUT2MS, IDC_CAPMS, IDC_RING1, IDC_RING2,
     IDC_DELAY1, IDC_DELAY2, IDC_TGL_OUT2FIRST,   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
     // page: transport
     IDC_KSPF, IDC_KSPD,         // v7.1.7: IDC_BE1/IDC_BE2 retired -- the backend
@@ -5800,6 +5796,9 @@ static std::string cfgValueText(const std::string& key) {
     char b[512];
     if      (key == "out1ms")            { snprintf(b, 64, "%g", g_cfg.out1Ms);  return b; }
     else if (key == "out2ms")            { snprintf(b, 64, "%g", g_cfg.out2Ms);  return b; }
+    else if (key == "cap_ms")            { snprintf(b, 64, "%g", g_cfg.capMs);   return b; }
+    else if (key == "ring1_ms")          { snprintf(b, 64, "%g", g_cfg.ring1Ms); return b; }
+    else if (key == "ring2_ms")          { snprintf(b, 64, "%g", g_cfg.ring2Ms); return b; }
     else if (key == "delay1_ms")         { snprintf(b, 64, "%g", g_cfg.delay1Ms); return b; }
     else if (key == "delay2_ms")         { snprintf(b, 64, "%g", g_cfg.delay2Ms); return b; }
     else if (key == "gain_l")            { snprintf(b, 64, "%g", g_cfg.gainL);     return b; }
@@ -5846,7 +5845,7 @@ static std::string cfgValueText(const std::string& key) {
 
 // every key the window can write, in canonical order (for appending)
 static const char* kIniKeys[] = {
-    "out1ms", "out2ms",                       // v7.8.3: cap_ms / ring1_ms / ring2_ms retired
+    "out1ms", "out2ms", "cap_ms", "ring1_ms", "ring2_ms",
     "delay1_ms", "delay2_ms", "lfe_fold",
     "input_device", "output_device1", "output_device2",
     "gain_l", "gain_r", "gain_lfe", "gain_center",
@@ -5948,8 +5947,9 @@ static void cfgFromControls(HWND w) {
     // struct defaults (all on) are final; no control can change them.
     g_cfg.out1Ms   = editFloat(w, IDC_OUT1MS, 1.0f);
     g_cfg.out2Ms   = editFloat(w, IDC_OUT2MS, 1.0f);
-    // v7.8.3: cap_ms / ring1_ms / ring2_ms rows are gone -- the ring target
-    // IS the floor; the capture request is hard-wired at 1 ms.
+    g_cfg.capMs    = editFloat(w, IDC_CAPMS,  1.0f);
+    g_cfg.ring1Ms  = editFloat(w, IDC_RING1, -1.0f);
+    g_cfg.ring2Ms  = editFloat(w, IDC_RING2, -1.0f);
     g_cfg.delay1Ms = editFloat(w, IDC_DELAY1, 0.0f);
     g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
     g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
@@ -5984,6 +5984,9 @@ static void controlsFromCfg(HWND w) {
     g_tog[IDC_TGL_LFEFOLD]    = g_cfg.lfeFold;
     snprintf(b, 64, "%g", g_cfg.out1Ms);  SetDlgItemTextA(w, IDC_OUT1MS, b);
     snprintf(b, 64, "%g", g_cfg.out2Ms);  SetDlgItemTextA(w, IDC_OUT2MS, b);
+    snprintf(b, 64, "%g", g_cfg.capMs);   SetDlgItemTextA(w, IDC_CAPMS, b);
+    if (g_cfg.ring1Ms >= 0.0f) { snprintf(b, 64, "%g", g_cfg.ring1Ms); SetDlgItemTextA(w, IDC_RING1, b); }
+    if (g_cfg.ring2Ms >= 0.0f) { snprintf(b, 64, "%g", g_cfg.ring2Ms); SetDlgItemTextA(w, IDC_RING2, b); }
     snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
@@ -6202,12 +6205,9 @@ static void guiBuildPages(HWND w) {
     header(w, COLA_X, KHDR_Y, "DEVICE PERIODS (ms)");
     row(w, COLA_X, KROW0, "out1ms", IDC_OUT1MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out1Ms); return std::string(b); }().c_str());
     row(w, COLA_X, 154, "out2ms", IDC_OUT2MS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.out2Ms); return std::string(b); }().c_str());
-    // v7.8.3: the cap_ms / ring1_ms / ring2_ms rows are RETIRED (see note).
-    note(w, COLA_X, 196,
-         "v7.8.3: cap_ms / ring1_ms / ring2_ms are retired -- old ini lines are\n"
-         "ignored. The ring target IS the floor (device buffer + capture burst +\n"
-         "4 ms margin + the delay); the capture request is fixed at 1 ms (the\n"
-         "banner prints the real negotiated burst).", 4);
+    row(w, COLA_X, 188, "cap_ms (capture burst)", IDC_CAPMS, []{ char b[32]; snprintf(b,32,"%g",g_cfg.capMs); return std::string(b); }().c_str());
+    row(w, COLA_X, 222, "ring1_ms", IDC_RING1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring1Ms); return std::string(b); }().c_str());
+    row(w, COLA_X, 256, "ring2_ms", IDC_RING2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.ring2Ms); return std::string(b); }().c_str());
     header(w, COLB_X, KHDR_Y, "TIMING");
     row(w, COLB_X, KROW0, "delay1_ms", IDC_DELAY1, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay1Ms); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "delay2_ms", IDC_DELAY2, []{ char b[32]; snprintf(b,32,"%g",g_cfg.delay2Ms); return std::string(b); }().c_str());
@@ -9003,14 +9003,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // per-leg periods, targets, rings -- fully independent. v7.8.3: cap_ms is
-    // RETIRED -- the burst request is hard-wired at 1 ms (the v3.6 decoupling
-    // from the out periods is preserved: deriving it from outXms would
-    // recouple what v3.6 fixed; the driver negotiates the real burst anyway).
+    // per-leg periods, targets, rings -- fully independent. v3.6: the
+    // capture burst no longer inherits min(out1ms, out2ms) -- cap_ms owns it.
     const ma_uint32 periodMs1 = (ma_uint32)(g_cfg.out1Ms + 0.5f);
     const ma_uint32 periodMs2 = (ma_uint32)(g_cfg.out2Ms + 0.5f);
-    const ma_uint32 capPeriodMs = 1;
-    g_capPeriodMsF = 1.0f;                 // v3.8: watchdog restart state
+    const ma_uint32 capPeriodMs = (ma_uint32)(g_cfg.capMs + 0.5f);
+    g_capPeriodMsF = g_cfg.capMs;          // v3.8: watchdog restart state
     g_capNeedle    = g_cfg.inputDevice;
     g_capWantExcl  = g_cfg.captureExclusive;
 
@@ -9191,26 +9189,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // reaches the overwrite line. This target is the LATENCY ANCHOR.
     for (int i = 0; i < 2; ++i) {
         Leg& L = g_leg[i];
-        const float reqMs = (i == 0) ? g_cfg.out1Ms : g_cfg.out2Ms;
+        const float ms = (i == 0) ? g_cfg.out1Ms : g_cfg.out2Ms;
+        float ringMs = (i == 0) ? g_cfg.ring1Ms : g_cfg.ring2Ms;
         const float delayMs = (i == 0) ? g_cfg.delay1Ms : g_cfg.delay2Ms;
+        if (ringMs < 0.0f) ringMs = ms;   // v3.2: ring1_ms/ring2_ms default to outXms
+        const size_t cfgFrames    = (size_t)((double)kSampleRate * ringMs / 1000.0);
         // v6.3/v6.3.1: a KS leg's bite is one period exactly, and its pull is
         // our own paced thread -- so its margin is 1 ms over (bite + burst);
         // a WASAPI leg keeps the 4 ms (exclusive event mode pops the whole
         // buffer as two back-to-back callbacks).
-        // v7.8.3 (1): ring1_ms/ring2_ms RETIRED -- the target IS the floor.
-        // v7.8.3 (2): a boot-yielded leg holds no device, so there is no
-        // negotiated period -- size its ring from the REQUESTED one (outXms)
-        // instead of the 480-frame fallback, so the quiet re-grab lands on an
-        // exactly-sized ring (the fallback overshot by the difference).
-        size_t devPeriodFr;
-        if (L.backend == 1) {
-            devPeriodFr = (size_t)g_cfg.ksPeriodFrames;
-        } else if (L.yielded.load(std::memory_order_relaxed)) {
-            devPeriodFr = (size_t)((double)kSampleRate * reqMs / 1000.0 + 0.5);
-        } else {
-            devPeriodFr = L.dev.playback.internalPeriodSizeInFrames
-                        ? (size_t)L.dev.playback.internalPeriodSizeInFrames : 480;
-        }
+        const size_t devPeriodFr  = (L.backend == 1)
+                                  ? (size_t)g_cfg.ksPeriodFrames
+                                  : (L.dev.playback.internalPeriodSizeInFrames
+                                     ? L.dev.playback.internalPeriodSizeInFrames : 480);
         const size_t marginFr     = (L.backend == 1) ? kKsMarginFrames
                                                      : kPeriodMarginFrames;
         // v6.1: the alignment delay IS extra ring depth -- the samples leave
@@ -9218,8 +9209,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // target so the delay cannot cause false drops; prefill covers it.
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
-        L.targetFrames = devPeriodFr + g_capBurstFrames + marginFr
-                       + L.delayFrames;   // v7.8.3: floor + delay -- no user override
+        L.targetFrames = std::max<size_t>(cfgFrames,
+                            devPeriodFr + g_capBurstFrames + marginFr)
+                         + L.delayFrames;
         L.raw.init(L.targetFrames * 4, kInCh);
         L.out.init(L.targetFrames + kRingSpareFrames, L.outCh);
         L.out.pushSilence(L.targetFrames);   // prefill so playbacks start smooth
@@ -9528,7 +9520,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.8.3       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v7.1.19       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
