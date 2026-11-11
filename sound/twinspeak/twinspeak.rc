@@ -14,6 +14,18 @@
 // original latency. New ini key drop_correct (default on; GUI pill on the
 // SETTINGS page), logged as 'drop corr', counted in the devbuf line.
 // Version steps to 7.8.3.
+// v7.9.0: THE SPIN PACER. The v6.1 line had demoted the MAINS pump from
+// TIME_CRITICAL (31) to HIGHEST (10) -- at 100% CPU the mains pump starved.
+// Both pumps stay time-critical now and rank INSIDE MMCSS (center =
+// AvrtPriorityCritical, mains = AvrtPriorityNormal). New pump spin pacer:
+// when an out ring falls under 2 device periods + 1 capture burst of
+// headroom the pump busy-waits with _mm_pause for a bounded 1.5 ms and
+// drains the instant capture lands. KS pacers spin through the last period
+// + 0.5 ms of slack against the DAC's position register. New device-switch
+// lateness meter logs "the DAC grazed the buffer edge" -- evidence for any
+// residual device-side static. The banner prints the real TWS_VERSION (the
+// old v7.1.19 literal is gone).
+// Version steps to 7.9.0.
 // v7.8.4: THE SHALLOW-STAIRCASE FIX + THE CENTER FADE. A SUSTAINED run of
 // shallow shortfalls (7 of the last 16 switches short -- the ring hovering
 // just above empty at 100% CPU) now escalates to the same clean restart a
@@ -46,8 +58,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,8,4,0
-PRODUCTVERSION  7,8,4,0
+FILEVERSION     7,9,0,0
+PRODUCTVERSION  7,9,0,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -58,12 +70,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.8.4.0"
+            VALUE "FileVersion",      "7.9.0.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.8.4.0"
+            VALUE "ProductVersion",   "7.9.0.0"
         END
     END
     BLOCK "VarFileInfo"

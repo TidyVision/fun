@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.8.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.9.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -26,6 +26,32 @@
 //    center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.9.0 THE SPIN PACER. The v7.8.4 escalation cured the replay-tile
+//            static, but a ring can only clean up AFTER a late refill: the
+//            static that survives is the device buffer itself running dry
+//            when a deadline thread does not get scheduled. Three fixes, no
+//            new ini keys:
+//            1) PRIORITY INVERSION FIX: the v6.1 line demoted the MAINS pump
+//               (idx 0) from TIME_CRITICAL (31) to HIGHEST (10) so the center
+//               pump would "outrank" it -- at 100% CPU the mains pump starved
+//               (leg1's underruns in the field log). Both pumps stay time-
+//               critical now; the ranking happens INSIDE MMCSS: center =
+//               AvrtPriorityCritical, mains = AvrtPriorityNormal (both far
+//               above every normal thread; without avrt.dll they are equal).
+//            2) PUMP SPIN PACER: when a leg's out ring falls under 2 device
+//               periods + 1 capture burst of headroom (the danger zone), the
+//               pump stops sleeping and busy-waits with _mm_pause for a
+//               bounded 1.5 ms, draining the instant capture lands -- a late
+//               tick can no longer compound into a second late tick. KS
+//               pacers spin through the last period + 0.5 ms of slack against
+//               the DAC's own position register (at the default switch size
+//               that is the whole inter-switch window).
+//            3) DEVICE-SWITCH LATENESS METER: the playback callback now
+//               measures its own inter-switch interval; beyond period + 1 ms
+//               it logs "the DAC grazed the buffer edge" -- the ground truth
+//               no ring logic can see, so a residual device-side crackle
+//               finally has evidence. The banner also stops claiming v7.1.19:
+//               it prints the real TWS_VERSION now.
 //    v7.8.4 THE SHALLOW-STAIRCASE FIX + THE CENTER FADE. Field evidence: a
 //            phone recording of the speaker at 100% CPU showed the remaining
 //            "static-ey" crackle is NOT the deep-collapse replay (that died
@@ -1597,7 +1623,13 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstdarg>
+#include <immintrin.h>      // v7.9.0: _mm_pause -- the spin pacer's pause instruction
 #include <objbase.h>
+
+// v7.9.0: ONE version constant. The startup banner used to carry a stale
+// hard-coded "v7.1.19" string no matter the real build -- every version-
+// bearing string now quotes this (banner, ini template header).
+#define TWS_VERSION "7.9.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2126,6 +2158,16 @@ struct Leg {
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
     bool                centerWasSilent = false; // for state-change logging
+    // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
+    // The playback callback IS the deadline: the exclusive buffer holds two
+    // periods and the event fires with one period left to play, so a switch
+    // interval beyond period + 1 ms means the thread was served late and the
+    // DAC is eating into its last buffer margin -- the device-side static no
+    // ring logic can ever see. Metered, logged, and counted.
+    LARGE_INTEGER       lastSwQpc = {};          // previous switch stamp (QPC)
+    bool                haveSwQpc = false;       // armed after switch #2
+    unsigned long long  lastLateLogMs = 0;       // rate limit: one line / 10 s / leg
+    std::atomic<unsigned long long> lateSwitches{0}; // late device switches since boot
     // v6.3: which device layer this leg runs on. 0 = WASAPI (miniaudio),
     // 1 = WDM-KS (direct pin; L.ks holds the state). The ini asks for it
     // (backend1/backend2); a KS open failure leaves the WASAPI path in place.
@@ -2244,7 +2286,7 @@ static float   g_capPeriodMsF = 5.0f;
 // priority thread that loses one scheduling quantum can miss a refill
 // window. "Pro Audio" role + time-critical priority keeps the pumps ahead.
 // avrt.dll is loaded dynamically -- no new import-lib dependency.
-static void boostAudioThread() {
+static void boostAudioThreadEx(int mmcssSubPrio) {
     // v6.5: FTZ/DAZ on every realtime thread -- the standard RT denormal
     // guard. Only touches f32 values below ~-370 dBFS; what it buys is that
     // a 100+ cycle denormal microcode assist can never stall the path when
@@ -2255,10 +2297,26 @@ static void boostAudioThread() {
     if (av) {
         typedef HANDLE (WINAPI *AvSetMmFn)(LPCWSTR, LPDWORD);
         AvSetMmFn set = (AvSetMmFn)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
-        if (set) { DWORD idx = 0; set(L"Pro Audio", &idx); }
+        if (set) {
+            DWORD idx = 0;
+            HANDLE h = set(L"Pro Audio", &idx);
+            // v7.9.0: sub-priority INSIDE the "Pro Audio" task. Within one
+            // task every registered thread shares the same base priority and
+            // MMCSS round-robins them -- twinspeak's center pump and, say,
+            // Chrome's own Pro Audio threads were equals at 100% CPU.
+            // AvSetMmThreadPriority raises a thread above its task mates:
+            // the center pump takes CRITICAL, the mains pump NORMAL. Values
+            // are the AVRT_PRIORITY enum (NORMAL = 0, CRITICAL = 2).
+            if (h && mmcssSubPrio >= 0) {
+                typedef HRESULT (WINAPI *AvPrioFn)(HANDLE, int);
+                AvPrioFn prio = (AvPrioFn)GetProcAddress(av, "AvSetMmThreadPriority");
+                if (prio) prio(h, mmcssSubPrio);
+            }
+        }
     }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
+static void boostAudioThread() { boostAudioThreadEx(-1); }   // no sub-priority hint
 
 // v4.0: miniaudio's own device threads (capture + both playback callbacks)
 // only get THREAD_PRIORITY from miniaudio -- no MMCSS registration. Register
@@ -2849,6 +2907,37 @@ static void sumLeg2Extras(float* out, ma_uint32 frameCount) {
 
 static void playCore(int idx, float* out, ma_uint32 frameCount) {
     boostDeviceThread();
+    // v7.9.0: DEVICE-SWITCH LATENESS METER -- the ground truth the ring
+    // cannot see. The event fires with one period still to play, so a
+    // service interval beyond period + 1 ms means this thread was scheduled
+    // late and the DAC is into its buffer margin; beyond 2 periods it has
+    // already crossed into stale audio (device-side static). Logged
+    // rate-limited; counted for the record.
+    {
+        Leg& L = g_leg[idx];
+        LARGE_INTEGER qn;
+        QueryPerformanceCounter(&qn);
+        if (g_qpf > 0.0 && L.haveSwQpc) {
+            const double periodMs = (double)frameCount * 1000.0 / (double)kSampleRate;
+            const double gapMs    = (double)(qn.QuadPart - L.lastSwQpc.QuadPart) * 1000.0 / g_qpf;
+            if (gapMs > periodMs + 1.0) {
+                L.lateSwitches.fetch_add(1, std::memory_order_relaxed);
+                const unsigned long long nowMs = GetTickCount64();
+                if (nowMs - L.lastLateLogMs >= 10000) {
+                    L.lastLateLogMs = nowMs;
+                    tlog("[twinspeak] leg%d device    : switch served %.2f ms after the previous one (%.2f ms period)\n"
+                         "                            -- %.2f ms of device-buffer margin left%s (%llu late switch(es) since boot)\n",
+                         idx + 1, gapMs, periodMs, 2.0 * periodMs - gapMs,
+                         gapMs > 2.0 * periodMs
+                             ? " -- the DAC crossed into stale audio"
+                             : "",
+                         (unsigned long long)L.lateSwitches.load(std::memory_order_relaxed));
+                }
+            }
+        }
+        L.lastSwQpc = qn;
+        L.haveSwQpc = true;
+    }
     hbOut(idx);   // v3.8 watchdog heartbeat
     bufferSwitchFill(idx, out, (size_t)frameCount);
 }
@@ -3203,11 +3292,20 @@ static constexpr long long kTick500us = -5000;   // 0.5 ms, negative = relative 
 static DWORD WINAPI pumpThread(LPVOID p) {
     const int idx = (int)(INT_PTR)p;
     Leg& L = g_leg[idx];
-    boostAudioThread();   // v3.8: MMCSS "Pro Audio" + time-critical priority
-    // v6.1: with out2_first on, the CENTER pump outranks the mains pump by
-    // one priority notch. Device threads stay equal: both are deadline-bound.
-    if (idx == 0 && g_cfg.out2First)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    // v7.9.0 PRIORITY INVERSION FIX. The v6.1 line demoted the MAINS pump
+    // (idx 0) from THREAD_PRIORITY_TIME_CRITICAL (base 31) to
+    // THREAD_PRIORITY_HIGHEST (base 10) so the center pump would "outrank"
+    // it -- at 100% CPU the mains pump was the one starving (leg1's shallow
+    // underruns in the field log), the demo derby it never should have
+    // joined. Now BOTH pumps stay time-critical, and the ranking happens
+    // INSIDE MMCSS: the center pump takes AvrtPriorityCritical, the mains
+    // pump AvrtPriorityNormal -- both far above every normal thread, the
+    // center still ahead when they contend. Without avrt.dll both fall back
+    // to plain TIME_CRITICAL (equal -- out2_first already hands the center
+    // leg the freshest capture, and the spin pacer below guards both).
+    const bool centerFirst = (idx == 1 && g_cfg.out2First);
+    boostAudioThreadEx(centerFirst ? 2 /*AVRT_PRIORITY_CRITICAL*/
+                                   : 0 /*AVRT_PRIORITY_NORMAL*/);
 
     // SYNCHRONIZATION timer (no MANUAL_RESET flag!) -- a manual-reset timer
     // stays signaled and silently turns this loop into a 100%-core spin
@@ -3235,6 +3333,55 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f)
         : (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f);
 
+    // v7.9.0: the drain body, factored out (it existed twice, the main tick
+    // and the final flush -- and the spin pacer needs it a third time):
+    // raw -> master volume -> center gates -> mute/mix -> out ring.
+    // Returns true if it moved a chunk.
+    auto drainOnce = [&]() -> bool {
+        const size_t avail = L.raw.count();
+        if (avail == 0) return false;
+        const size_t n = avail < (size_t)kScratchFrames ? avail : (size_t)kScratchFrames;
+        const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
+        L.raw.pop(sc, n);
+        L.raw.seqTailAdvance(seqBefore + n);   // v6.4: consume the seqs with the frames
+        // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint
+        // volume -- applied to the raw 8ch block BEFORE the per-leg mix.
+        // Both legs track the same knob; the ini gains still stack on it.
+        {
+            const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
+                           : g_vol.load(std::memory_order_relaxed);
+            if (vg != 1.0f) {
+                const size_t tot = n * (size_t)kInCh;
+                for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
+            }
+        }
+        if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
+        // v6.6.9: silence compression -- a bit-zero block needs no mix
+        // (see the gate above): same bytes out, none of the FP work.
+        if (L.zeroFast && bitZero8(sc, n)) {
+            if (idx == 1 && g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
+            memset(chunk, 0, (size_t)n * (idx == 0 ? (size_t)kOutCh1
+                                                   : (size_t)kOutCh2) * sizeof(float));
+        } else {
+            mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
+        }
+        if (g_tickOn.load(std::memory_order_relaxed))
+            tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, both legs
+        const size_t dropped = L.out.pushOverwrite(chunk, n);
+        if (dropped && L.streamSeeded)         // v6.4: passive evict = a seq skip
+            L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
+        if (dropped) L.outDrop.fetch_add(dropped);
+        // v6.4: arm the out ring's sequence space ONCE -- the seed is the
+        // capture seq of the oldest real frame now in the ring. From here
+        // on the DEVICE thread owns the boundary (pops/drops/skips); the
+        // pump never advances it again.
+        if (!L.streamSeeded) {
+            L.out.seqTailAdvance(seqBefore);
+            L.streamSeeded = true;
+        }
+        return true;
+    };
+
     while (g_run.load()) {
         if (timerOK) {
             due.QuadPart = kTick500us;   // v6.5.7: re-arm one-shot every cycle
@@ -3254,86 +3401,40 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         // drain raw -> master volume -> mute/mix -> out ring (push all); the
         // ring headroom absorbs the pop/burst sawtooth, so this push can only
         // passively evict under a pathological flood (counted in outDrop).
-        for (;;) {
-            const size_t avail = L.raw.count();
-            if (avail == 0) break;
-            const size_t n = avail < (size_t)kScratchFrames ? avail : (size_t)kScratchFrames;
-            const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
-            L.raw.pop(sc, n);
-            L.raw.seqTailAdvance(seqBefore + n);   // v6.4: consume the seqs with the frames
-            // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint
-            // volume -- applied to the raw 8ch block BEFORE the per-leg mix.
-            // Both legs track the same knob; the ini gains still stack on it.
-            {
-                const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
-                               : g_vol.load(std::memory_order_relaxed);
-                if (vg != 1.0f) {
-                    const size_t tot = n * (size_t)kInCh;
-                    for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
+        while (drainOnce()) {}
+        // ---- v7.9.0 SPIN PACER: the ring must never graze the device bite ----
+        // Normally the 500 us tick outruns the device by orders of magnitude.
+        // Under a 100% CPU storm the tick itself arrives late, and one more
+        // sleep after a short drain can be one sleep too many: the out ring
+        // grazes EMPTY and the device switch misses in slivers (the static-ey
+        // crackle the phone recording caught). So when the ring is inside the
+        // danger zone -- under 2 device periods + 1 capture burst of headroom
+        // -- the pump BUSY-WAITS with _mm_pause for a bounded 1.5 ms and
+        // drains the instant capture lands, with no scheduler round-trip in
+        // between. Bounded: if capture is genuinely dead the spin exits after
+        // 1.5 ms and the normal cadence (plus the v7.8.4 escalation) takes
+        // over. This is the "resort to busy-wait at 100% CPU" guarantee: a
+        // late refill can no longer compound into a second late refill.
+        {
+            const size_t dangerFr = (size_t)g_periodFrames[idx] * 2
+                                  + g_capBurstFrames + 16;
+            if (L.out.count() < dangerFr) {
+                LARGE_INTEGER qpf, t0, t1;
+                QueryPerformanceFrequency(&qpf);
+                QueryPerformanceCounter(&t0);
+                for (;;) {
+                    while (drainOnce()) {}
+                    if (L.out.count() >= dangerFr) break;
+                    QueryPerformanceCounter(&t1);
+                    if ((double)(t1.QuadPart - t0.QuadPart) / (double)qpf.QuadPart >= 0.0015) break;
+                    for (int i = 0; i < 60; ++i) _mm_pause();   // ~1-2 us granularity
                 }
-            }
-            if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
-            // v6.6.9: silence compression -- a bit-zero block needs no mix
-            // (see the gate above): same bytes out, none of the FP work.
-            if (L.zeroFast && bitZero8(sc, n)) {
-                if (idx == 1 && g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
-                memset(chunk, 0, (size_t)n * (idx == 0 ? (size_t)kOutCh1
-                                                       : (size_t)kOutCh2) * sizeof(float));
-            } else {
-                mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
-            }
-            if (g_tickOn.load(std::memory_order_relaxed))
-                tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, raw, both legs
-            const size_t dropped = L.out.pushOverwrite(chunk, n);
-            if (dropped && L.streamSeeded)         // v6.4: passive evict = a seq skip
-                L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
-            if (dropped) L.outDrop.fetch_add(dropped);
-            // v6.4: arm the out ring's sequence space ONCE -- the seed is the
-            // capture seq of the oldest real frame now in the ring. From here
-            // on the DEVICE thread owns the boundary (pops/drops/skips); the
-            // pump never advances it again.
-            if (!L.streamSeeded) {
-                L.out.seqTailAdvance(seqBefore);
-                L.streamSeeded = true;
             }
         }
     }
     // final drain so the tail reaches the speaker: raw -> gain -> mix -> out.
     // (Same center gates -- the guarantee holds to the very last frame.)
-    for (;;) {
-        const size_t avail = L.raw.count();
-        if (avail == 0) break;
-        const size_t n = avail < (size_t)kScratchFrames ? avail : (size_t)kScratchFrames;
-        const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
-        L.raw.pop(sc, n);
-        L.raw.seqTailAdvance(seqBefore + n);           // v6.4
-        {
-            const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
-                           : g_vol.load(std::memory_order_relaxed);
-            if (vg != 1.0f) {
-                const size_t tot = n * (size_t)kInCh;
-                for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
-            }
-        }
-        if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
-        if (L.zeroFast && bitZero8(sc, n)) {   // v6.6.9: silence compression
-            if (idx == 1 && g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
-            memset(chunk, 0, (size_t)n * (idx == 0 ? (size_t)kOutCh1
-                                                   : (size_t)kOutCh2) * sizeof(float));
-        } else {
-            mixBlock(idx, sc, chunk, n);       // v6.5: hoisted bulk mix
-        }
-        if (g_tickOn.load(std::memory_order_relaxed))
-            tickSum(idx, chunk, n, seqBefore); // v7.0.0: the sync tick, stream-aligned
-        const size_t dropped = L.out.pushOverwrite(chunk, n);
-        if (dropped && L.streamSeeded)
-            L.out.seqTailAdvance(L.out.seqTail.load(std::memory_order_relaxed) + dropped);
-        if (dropped) L.outDrop.fetch_add(dropped);
-        if (!L.streamSeeded) {                         // v6.4: arm once (see main loop)
-            L.out.seqTailAdvance(seqBefore);
-            L.streamSeeded = true;
-        }
-    }
+    while (drainOnce()) {}   // v7.9.0: the body lives in drainOnce() now
     if (hTimer) { CancelWaitableTimer(hTimer); CloseHandle(hTimer); }
     return 0;
 }
@@ -4097,7 +4198,17 @@ static DWORD WINAPI ksThread(LPVOID p) {
                         std::memory_order_relaxed);   // v6.5.9: live device pad
         if (ahead >= (long long)leadFr) {
             const long long slackFr = ahead - (long long)leadFr;
-            if (slackFr > (long long)(kSampleRate / 2000)) {      // > 0.5 ms of slack
+            // v7.9.0 SPIN PACER: the danger zone is the last full period +
+            // 0.5 ms of slack above the write line. Inside it the pacer
+            // BUSY-WAITS on the DAC's own position register (_mm_pause
+            // between polls) -- a thread that sleeps can be woken late; a
+            // thread that spins on the register it obeys cannot. At the
+            // default ks_period_frames the inter-switch slack never exceeds
+            // one period, so a KS pacer is a spinner by design now: one core
+            // per KS leg is the price of a deadline the scheduler cannot
+            // move. (WASAPI legs get the same guarantee from the pump-side
+            // spin pacer + the MMCSS sub-priority ranking.)
+            if (slackFr > (long long)periodFr + (long long)(kSampleRate / 2000)) {
                 if (timerOK) {
                     due.QuadPart = kTick500us;                    // v6.5.7: re-arm one-shot 500 us
                     SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
@@ -4105,7 +4216,7 @@ static DWORD WINAPI ksThread(LPVOID p) {
                 } else
                     Sleep(1);
             } else {
-                YieldProcessor();   // final stretch: spin, no scheduler round-trip
+                _mm_pause();   // final stretch: spin, no scheduler round-trip
             }
             continue;
         }
@@ -4149,7 +4260,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.8.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.9.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4463,6 +4574,10 @@ static void writeTemplate(const char* path) {
         "; on every 500 us poll and re-pins the write cursor to play+lead on\n"
         "; any loss (bit-exact skip, logged as 'KS lapse', counted in the\n"
         "; devbuf line). KS legs also self-heal cleanly across suspend now.\n"
+        "; v7.9.0: the KS pacer busy-waits on the DAC's position register\n"
+        "; through the last period + 0.5 ms of slack (at the default switch\n"
+        "; size that is the whole inter-switch window) -- one core per KS leg\n"
+        "; is the price of a deadline the scheduler cannot move.\n"
         "\n"
         "; DEEP RESYNC (v6.5.12, optional): the S5's below-packetizer layer\n"
         "; (endpoint FIFO + amp silicon) can deepen silently over a long\n"
@@ -9750,7 +9865,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] background    : on in the ini, overridden by --foreground -- keeping the console\n");
     }
 
-    tlog("[twinspeak] v7.1.19       : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n");
+    tlog("[twinspeak] v%s         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n",
+           TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | burst %u fr (~%.1f ms)\n",
