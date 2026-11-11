@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.8.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.8.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -16,8 +16,9 @@
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
 //             + 40 Hz @ 0.5% keep-alive at the device layer
 //    playback callbacks = the ASIO buffer switch: gated excess drop +
-//    underrun handling (v7.8.3 drop_correct: clean dropout + ring restart;
-//    off = the classic last-buffer replay). WASAPI exclusive is INTEGRATED
+//    underrun handling (v7.8.4 drop correction: a DEEP shortfall or a
+//    SUSTAINED run of shallow ones = clean dropout + ring restart; built
+//    in, always on). WASAPI exclusive is INTEGRATED
 //    (v6.6.8): both legs open exclusive together (shared fallback reopens
 //    BOTH), capture pin exclusive with logged fallback. Exclusive bypasses
 //    the volume slider -- hence volume_follow + pin_outputs. clock_sync,
@@ -25,6 +26,27 @@
 //    center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.8.4 THE SHALLOW-STAIRCASE FIX + THE CENTER FADE. Field evidence: a
+//            phone recording of the speaker at 100% CPU showed the remaining
+//            "static-ey" crackle is NOT the deep-collapse replay (that died
+//            in v7.8.3): it is SUSTAINED SHALLOW shortfalls -- the out ring
+//            hovers just above empty, EVERY switch misses a few frames, and
+//            the legacy path still tile-REPLAYED the last buffer for those
+//            (a seam every switch, 187.5 Hz at 256-frame switches, bursty at
+//            the ~20 ms scheduler quantum -- 50 Hz chop in the recording).
+//            Fix: each switch shifts a bit into a 16-switch miss history;
+//            7+ short switches out of 16 escalates to the SAME clean
+//            restart a deep shortfall gets (silence hold-off, rebuild to
+//            the anchor, resume at the freshest capture). An isolated
+//            shallow miss still replays in place -- sample-continuous with
+//            the buffer just played, inaudible; only SUSTAINED starvation
+//            restarts. Also: the center upmix guard stops crackling --
+//            engage after 2 consecutive fingerprint hits, release after 8
+//            consecutive misses, and every engage/release fades ch3 over
+//            2.5 ms instead of hard-zeroing at a block boundary (the old
+//            hit/miss flicker chopped dialogue into 10-20 ms slices). And
+//            drop_correct is INTEGRATED: always on, the ini key is read
+//            and ignored, the GUI pill is gone.
 //    v7.8.3 DROP CORRECTION -- the ring restarts instead of crackling.
 //            Field: "I feel like the ring system isn't stable enough, I
 //            still sometimes get crackling even on buffer size 256 with 4
@@ -1832,6 +1854,9 @@ struct Config {
     // target anchor, then skips the silent gap oldest-first and resumes at
     // the freshest capture with the original latency. Default ON; off = the
     // legacy replay path, bit-for-bit.
+    // v7.8.4: INTEGRATED -- always on. No ini key (a stray drop_correct
+    // line in an old ini is read and ignored), no GUI pill, no writer
+    // anywhere: the field is born true and nothing can flip it.
     bool        dropCorrect    = true;
 };
 static Config g_cfg;
@@ -2087,7 +2112,17 @@ struct Leg {
     size_t              delayFrames = 0;         // extra ring depth = delay_ms * 48
     float               delayMs     = 0.0f;      // as configured (banner)
     std::atomic<unsigned long long> cmUpmix{0}; // blocks muted by the upmix guard
-    size_t              upmixHoldFrames = 0;     // keep muting small blocks after a hit
+    // v7.8.4: the upmix guard is a STATE MACHINE now -- engage after 2
+    // consecutive full-test fingerprint hits, release after 8 consecutive
+    // misses (a definitive real-center verdict counts 4 toward release),
+    // and the ch3 mute is a 2.5 ms per-frame FADE, never a block-boundary
+    // hard zero: the old hit/miss flicker chopped the center into 10-20 ms
+    // slices -- the static-ey center gate crackle. Pump-2 thread owned
+    // (single writer, no atomics needed).
+    bool                cgMuted = false;         // guard engaged: ch3 fades toward 0
+    float               cgGain  = 1.0f;          // current ch3 fade gain (1 = pass)
+    int                 cgHits  = 0;             // consecutive full-test hits
+    int                 cgMiss  = 0;             // consecutive full-test misses
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
     bool                centerWasSilent = false; // for state-change logging
@@ -2129,6 +2164,15 @@ struct Leg {
                                                  // emit silence, pop nothing
     std::atomic<unsigned long long> dropRestarts{0}; // hold-off entries since boot
     std::atomic<long long> dropEntryMs{0};           // last entry log time (rate limit)
+    // v7.8.4 SHALLOW ESCALATION: a 16-switch miss history (bit = that switch
+    // came up short). 7+ short switches out of the last 16 = SUSTAINED
+    // starvation -- the ring hovering just above empty under CPU pressure,
+    // every switch missing a few frames, the legacy replay tiling at the
+    // switch rate (187.5 Hz at 256-frame switches -- the static-ey crackle
+    // the phone recording caught). That now escalates to the same clean
+    // restart a deep shortfall gets. Playback-callback owned.
+    unsigned            missHist  = 0;               // bit i = switch (n-1-i) was short
+    unsigned            missCount = 0;               // popcount(missHist)
 };
 static Leg g_leg[2];
 
@@ -2588,6 +2632,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             const size_t excess = level - L.targetFrames;
             if (excess) L.out.discardOldest(excess);   // the gap, skipped bit-exact
             L.dropHold.store(false, std::memory_order_relaxed);
+            L.missHist = 0; L.missCount = 0;   // v7.8.4: fresh window after a restart
             tlog("[twinspeak] leg%d drop corr : ring rebuilt to the %.1f ms anchor -- skipped %llu fr (%.1f ms)\n"
                  "                            of the silent gap; playback resumed at the freshest capture,\n"
                  "                            latency back at target (restart #%llu this run)\n",
@@ -2670,15 +2715,27 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     }
     if (n < frameCount - padFront) {
         L.und.fetch_add(1);
-        const size_t miss = (size_t)frameCount - padFront - n;
+        const size_t want = frameCount - padFront;
+        const size_t miss = want - n;
         // v7.8.3 DROP CORRECTION: a DEEP shortfall (at least half the switch
         // is hole -- the ring collapsed under CPU pressure) silence-fills and
         // restarts the ring instead of tiling the last buffer (the periodic
-        // replay reads as crackle). A shallow miss (< half the switch) stays
-        // a sub-ms silence sliver with no hold-off: the stream slides by a
-        // few frames, far below the warden's trigger, and the next switch is
-        // normally whole again.
-        if (g_cfg.dropCorrect && miss * 2 >= frameCount - padFront) {
+        // replay reads as crackle).
+        // v7.8.4 SHALLOW ESCALATION: the switch also shifts a bit into a
+        // 16-switch miss history. The field evidence (a phone recording of
+        // the speaker at 100% CPU) showed the remaining "static-ey" crackle
+        // is the ring hovering JUST above empty: every switch misses a few
+        // frames, no single miss is deep, and the legacy path tiles the last
+        // buffer at the switch rate -- 187.5 Hz at 256-frame switches,
+        // bursty at the ~20 ms scheduler quantum. 7+ short switches out of
+        // the last 16 = SUSTAINED starvation -> the SAME clean restart a
+        // deep shortfall gets. An isolated shallow miss still replays in
+        // place (sample-continuous with the buffer just played, inaudible).
+        L.missCount += 1u - ((L.missHist >> 15) & 1u);
+        L.missHist   = ((L.missHist << 1) | 1u) & 0xFFFFu;
+        const bool deep      = miss * 2 >= want;
+        const bool sustained = L.missCount >= 7;
+        if (g_cfg.dropCorrect && (deep || sustained)) {
             memset(out + (padFront + n) * L.outCh, 0, miss * L.outCh * sizeof(float));
             if (!L.dropHold.exchange(true, std::memory_order_relaxed)) {
                 L.dropRestarts.fetch_add(1, std::memory_order_relaxed);
@@ -2686,16 +2743,27 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 const long long lastLog = L.dropEntryMs.load(std::memory_order_relaxed);
                 if (lastLog < 0 || nowMs - (unsigned long long)lastLog >= 1000) {
                     L.dropEntryMs.store((long long)nowMs, std::memory_order_relaxed);
-                    tlog("[twinspeak] leg%d drop corr : underrun -- %llu of %llu frames short -- clean dropout,\n"
-                         "                            the ring RESTARTS: silence while it rebuilds to the %.1f ms anchor,\n"
-                         "                            then the stream jumps to the freshest capture (no replay crackle)\n",
-                         idx + 1, (unsigned long long)miss, (unsigned long long)(frameCount - padFront),
-                         (double)L.targetFrames * 1000.0 / (double)kSampleRate);
+                    if (deep)
+                        tlog("[twinspeak] leg%d drop corr : underrun -- %llu of %llu frames short -- clean dropout,\n"
+                             "                            the ring RESTARTS: silence while it rebuilds to the %.1f ms anchor,\n"
+                             "                            then the stream jumps to the freshest capture (no replay crackle)\n",
+                             idx + 1, (unsigned long long)miss, (unsigned long long)want,
+                             (double)L.targetFrames * 1000.0 / (double)kSampleRate);
+                    else
+                        tlog("[twinspeak] leg%d drop corr : %u of the last 16 switches came up short -- the ring is\n"
+                             "                            starving in slivers, so it RESTARTS on the clean rule: silence\n"
+                             "                            while it rebuilds to the %.1f ms anchor, then resume fresh\n",
+                             idx + 1, L.missCount,
+                             (double)L.targetFrames * 1000.0 / (double)kSampleRate);
                 }
             }
         } else {
             replayFill(out + (padFront + n) * L.outCh, miss);   // legacy ASIO convention
         }
+    } else if (frameCount > padFront) {
+        // v7.8.4: a whole switch shifts a 0 into the miss history.
+        L.missCount -= (unsigned)((L.missHist >> 15) & 1u);
+        L.missHist    = (L.missHist << 1) & 0xFFFFu;
     }
     if (padFront)
         replayFill(out, padFront);
@@ -2927,9 +2995,12 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 //      fingerprint is exact: per block, least-squares fit ch3 ~ a*ch1 +
 //      b*ch2; residual < -30 dB with the gains inside the upmix band and
 //      the fronts active -> the block is engine upmix, not center -> muted.
-//      Genuine 5.1 dialogue is an INDEPENDENT track and always passes. A
-//      hit arms a 50 ms hold over the sub-analysis blocks; any full-test
-//      failure disarms it immediately (a false hit costs one block).
+//      Genuine 5.1 dialogue is an INDEPENDENT track and always passes.
+//      v7.8.4: the verdict is a hysteresis state machine -- engage after 2
+//      consecutive hits, release after 8 consecutive misses -- and the
+//      mute is a 2.5 ms fade, so a decision that flickers near the
+//      threshold can no longer chop the center into slices (that was the
+//      static-ey center gate crackle).
 static void centerGuard(Leg& L, float* sc, size_t n) {
     // ---- gate 1: ch3 digital zero for the whole block ----------------------
     bool allZero = true;
@@ -2951,67 +3022,98 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
     }
     L.centerWasSilent = false;
 
-    // ---- gate 2: engine upmix fingerprint ----------------------------------
+    // ---- gate 2: engine upmix fingerprint (v7.8.4: hysteresis + fade) ------
+    // The old guard hard-zeroed ch3 at a block boundary on every hit and
+    // disarmed on every miss -- a decision that flickers near the threshold
+    // chopped the center into 10-20 ms slices, which reads as a static-ey
+    // crackle. Now it is a state machine: ENGAGE after 2 consecutive
+    // full-test hits, RELEASE after 8 consecutive full-test misses (a
+    // definitive real-center verdict counts 4 toward release), and the ch3
+    // mute itself is a 2.5 ms per-frame fade -- never a hard on/off. The
+    // fade advances on EVERY block size, so the ramp never stalls.
     if (!g_cfg.centerUpmixGuard) return;
-    if (L.upmixHoldFrames > 0 && n < 64) {
-        // sub-analysis-size block inside an armed hold: stay muted
-        const size_t m = n < L.upmixHoldFrames ? n : L.upmixHoldFrames;
-        for (size_t i = 0; i < m; ++i) sc[i * kInCh + 2] = 0.0f;
-        L.upmixHoldFrames -= m;
-        L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (n < 64) return;              // too few frames for a meaningful fit
-
-    double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
-    for (size_t i = 0; i < n; ++i) {
-        const float* f = sc + i * kInCh;
-        const double x = f[0], y = f[1], z = f[2];
-        S11 += x * x; S22 += y * y; S12 += x * y;
-        S31 += z * x; S32 += z * y; S33 += z * z;
-    }
-    const double nD = (double)n;
-    const double ms1 = S11 / nD, ms2 = S22 / nD, ms3 = S33 / nD;
-    if (ms3 < 1e-8) return;          // ch3 ~ -80 dBFS: effectively silent
-    if (0.5 * (ms1 + ms2) < 4e-8) return; // fronts ~ -74 dBFS: nothing to attribute against
-
-    double a = 0.0, b = 0.0, res2 = 0.0;
-    const double det = S11 * S22 - S12 * S12;
-    if (det > 1e-6 * (S11 * S22 + 1e-30)) {
-        a = (S31 * S22 - S32 * S12) / det;
-        b = (S32 * S11 - S31 * S12) / det;
-        res2 = S33 - a * S31 - b * S32;
-        if (a < 0.05 || a > 2.0 || b < 0.05 || b > 2.0) {
-            L.upmixHoldFrames = 0;   // gains outside any upmix matrix: real center
-            return;
+    constexpr float kCgFadeFr = 120.0f;             // 2.5 ms @ 48 kHz
+    float target = L.cgMuted ? 0.0f : 1.0f;         // this block's fade goal
+    if (n >= 64) {
+        // full test (the fit is verbatim v6.1)
+        double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * kInCh;
+            const double x = f[0], y = f[1], z = f[2];
+            S11 += x * x; S22 += y * y; S12 += x * y;
+            S31 += z * x; S32 += z * y; S33 += z * z;
         }
-    } else {
-        // collinear fronts (mono content): 1-D fit on the dominant front
-        const bool useCh1 = (S11 >= S22);
-        const double Suu = useCh1 ? S11 : S22;
-        const double S3u = useCh1 ? S31 : S32;
-        if (Suu <= 0.0) return;
-        a = S3u / Suu;
-        res2 = S33 - a * S3u;
-        if (a < 0.05 || a > 2.0) {
-            L.upmixHoldFrames = 0;
-            return;
+        const double nD = (double)n;
+        const double ms1 = S11 / nD, ms2 = S22 / nD, ms3 = S33 / nD;
+        if (ms3 >= 1e-8 && 0.5 * (ms1 + ms2) >= 4e-8) {
+            double a = 0.0, b = 0.0, res2 = 0.0;
+            bool outside = false;                    // definitive real center
+            const double det = S11 * S22 - S12 * S12;
+            if (det > 1e-6 * (S11 * S22 + 1e-30)) {
+                a = (S31 * S22 - S32 * S12) / det;
+                b = (S32 * S11 - S31 * S12) / det;
+                res2 = S33 - a * S31 - b * S32;
+                if (a < 0.05 || a > 2.0 || b < 0.05 || b > 2.0) outside = true;
+            } else {
+                // collinear fronts (mono content): 1-D fit on the dominant front
+                const bool useCh1 = (S11 >= S22);
+                const double Suu = useCh1 ? S11 : S22;
+                const double S3u = useCh1 ? S31 : S32;
+                if (Suu > 0.0) {
+                    a = S3u / Suu;
+                    res2 = S33 - a * S3u;
+                    if (a < 0.05 || a > 2.0) outside = true;
+                } else outside = true;
+            }
+            if (res2 < 0.0) res2 = 0.0;  // float noise below the fit
+            if (!outside && res2 / S33 < 1e-3) {         // HIT: exact upmix fingerprint
+                if (!L.cgMuted) {
+                    if (++L.cgHits >= 2) {               // engage: 2 consecutive hits
+                        L.cgMuted = true;
+                        L.cgMiss = 0;
+                        L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                        const unsigned long long now = GetTickCount64();
+                        if (now - L.lastUpmixLogMs >= 5000) {
+                            L.lastUpmixLogMs = now;
+                            tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                 "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
+                                 a, b);
+                        }
+                    }
+                } else {
+                    L.cgMiss = 0;                        // stays engaged
+                    L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                }
+                target = 0.0f;
+            } else {                                     // miss or definitive real center
+                L.cgHits = 0;
+                if (L.cgMuted) {
+                    L.cgMiss += outside ? 4 : 1;         // real center releases 4x faster
+                    if (L.cgMiss >= 8) {
+                        L.cgMuted = false;               // release: ch3 fades back in
+                        L.cgMiss = 0;
+                        const unsigned long long now = GetTickCount64();
+                        if (now - L.lastUpmixLogMs >= 5000) {
+                            L.lastUpmixLogMs = now;
+                            tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
+                                 "                            (ch3 fades back in over 2.5 ms)\n");
+                        }
+                    }
+                }
+            }
         }
     }
-    if (res2 < 0.0) res2 = 0.0;      // float noise below the fit
-    if (res2 / S33 < 1e-3) {         // < -30 dB residual: exact mix = engine upmix
-        for (size_t i = 0; i < n; ++i) sc[i * kInCh + 2] = 0.0f;
-        L.upmixHoldFrames = 2400;    // 50 ms of small-block cover
-        L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
-        const unsigned long long now = GetTickCount64();
-        if (now - L.lastUpmixLogMs >= 5000) {
-            L.lastUpmixLogMs = now;
-            tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 (residual < -30 dB) -- block muted\n"
-                 "                            (stereo source: the Windows engine fills FC = a*FL + b*R at the cable)\n",
-                 a, b);
+    // apply the fade to the block (any size -- the ramp never stalls)
+    if (target < 1.0f || L.cgGain < 1.0f) {
+        const float step = 1.0f / kCgFadeFr;
+        for (size_t i = 0; i < n; ++i) {
+            float g = L.cgGain;
+            if (g < target) { g += step; if (g > target) g = target; }
+            else if (g > target) { g -= step; if (g < target) g = target; }
+            L.cgGain = g;
+            if (g > 0.0f) sc[i * kInCh + 2] *= g;
+            else          sc[i * kInCh + 2]  = 0.0f;
         }
-    } else {
-        L.upmixHoldFrames = 0;       // independent center content: disarm
     }
 }
 
@@ -4047,7 +4149,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.8.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.8.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4266,11 +4368,10 @@ static void writeTemplate(const char* path) {
         "; is no resampler and no pitch control anywhere in twinspeak. Clock\n"
         "; drift between the cable's virtual clock and each device crystal is\n"
         "; absorbed by two device-master rules at the buffer switch:\n"
-        ";   * a buffer switch the ring cannot fill is an UNDERRUN: with\n"
-        ";     drop_correct = on (v7.8.3, the default) it is a clean dropout --\n"
-        ";     the leg goes silent while the ring restarts from the freshest\n"
-        ";     capture (see the drop_correct block below). off = the classic\n"
-        ";     ASIO replay: the last played buffer tiles over the hole.\n"
+        ";   * a buffer switch the ring cannot fill is an UNDERRUN: it is a\n"
+        ";     clean dropout (v7.8.4, built in): the leg goes\n"
+        ";     silent while the ring restarts from the freshest capture (see\n"
+        ";     the UNDERRUN RULE block below) -- never a replay tile.\n"
         ";   * ring excess above the natural sawtooth (cable faster than device)\n"
         ";     is dropped OLDEST-first, at most once per 5 s per leg, logged.\n"
         "; The health line shows the measured offset ('off +N ppm'). At crystal\n"
@@ -4329,23 +4430,19 @@ static void writeTemplate(const char* path) {
         "; baseline went stale against exactly those events.\n"
         "drift_interval_ms = 5000\n"
         "\n"
-        "; DROP CORRECTION (v7.8.3) -- the ring-restart rule for underruns. A\n"
-        "; buffer switch the out ring cannot fill used to tile-replay the last\n"
-        "; played buffer (the ASIO convention); under real CPU pressure that\n"
-        "; repeats every switch and reads as CRACKLE -- the fragment-loop buzz.\n"
-        "; With drop_correct = on a DEEP shortfall (half the switch or more is\n"
-        "; hole) instead: (1) silence-fills the hole -- no duplicated audio, no\n"
-        "; crackle; (2) holds the leg on silence while the pump rebuilds the\n"
-        "; ring to its target anchor (your delay1_ms/delay2_ms depth included,\n"
-        "; so a delayed leg comes back with its calibration intact); (3) skips\n"
-        "; the silent gap oldest-first and resumes at the FRESHEST capture with\n"
-        "; the original latency. One clean dropout you notice, instead of a\n"
-        "; buzz you cannot un-hear. A shallow miss (under half a switch) stays\n"
-        "; a sub-millisecond sliver with no restart. The restarts are logged\n"
-        "; ('drop corr') and counted in the devbuf line; a hold-off that lasts\n"
-        "; 3 s feeds the stall resync and reopens the leg, same as before.\n"
-        "; off = the legacy replay path, bit-for-bit.\n"
-        "drop_correct = on\n"
+        "; UNDERRUN RULE (v7.8.4, built in -- no key, no switch): a buffer\n"
+        "; switch the out ring cannot fill never tiles the last buffer back.\n"
+        "; A DEEP shortfall (half the switch or more is hole) -- or a SUSTAINED\n"
+        "; run of shallow ones (7 of the last 16 switches short: the ring\n"
+        "; hovering just above empty under 100%% CPU, which reads as a fine\n"
+        "; static-ey crackle) -- starts the ring OVER: silence while the pump\n"
+        "; rebuilds to the target anchor (your delay1_ms/delay2_ms depth\n"
+        "; included, so a delayed leg comes back with its calibration intact),\n"
+        "; then the silent gap is skipped oldest-first and playback resumes at\n"
+        "; the FRESHEST capture with the original latency. One clean dropout\n"
+        "; you notice, instead of a buzz you cannot un-hear. Restarts are\n"
+        "; logged ('drop corr') and counted in the devbuf line; a hold-off\n"
+        "; that lasts 3 s feeds the stall resync and reopens the leg.\n"
         "\n"
         "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
         "; thread starves (an interrupt storm, a 100%% CPU hog) the leg falls\n"
@@ -4539,6 +4636,7 @@ static bool loadIni(const char* path) {
                  key == "auto_resync"       || key == "drift_guard" ||
                  key == "power_guard"       || key == "yield_default" ||
                  key == "center_gate"       || key == "center_upmix_guard" ||
+                 key == "drop_correct"      ||    // v7.8.4: integrated, read-and-ignored
                  key == "background"        || key == "pin_outputs") { }
         else if (key == "lfe_fold")     { g_cfg.lfeFold = !isOff(val); }
         else if (key == "input_device")   g_cfg.inputDevice = val;
@@ -4576,7 +4674,6 @@ static bool loadIni(const char* path) {
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
-        else if (key == "drop_correct")      g_cfg.dropCorrect     = !isOff(val);               // v7.8.3
         else if (key == "gui_theme") {
             g_themeSaved = atoi(val.c_str());      // v7.0.4: theme persistence
             if (g_themeSaved < 0 || g_themeSaved > 10) g_themeSaved = 0;   // v7.1.8: 11 themes
@@ -5043,7 +5140,6 @@ enum {
     // page: settings (v7.1.7: sync + startup + chime/keepalive, one page)
     IDC_TGL_STARTUP,            // v6.6.6: Run-key pill
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
-    IDC_TGL_DROPCORR,           // v7.8.3: underrun = clean dropout + ring restart
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
     IDC_CHIMGAIN,               // v7.1.7: IDC_KAHZ/IDC_KAGAIN retired (keepalive built in)
     // page: center eq
@@ -5950,7 +6046,6 @@ static std::string cfgValueText(const std::string& key) {
         else if (t == "_q")    { snprintf(b, 64, "%g", g_cfg.eqSlotQ[n]); return b; }
     }
     else if (key == "drift_correct_ms")  { snprintf(b, 64, "%g", g_cfg.driftCorrectMs); return b; }
-    else if (key == "drop_correct")       return boolText(g_cfg.dropCorrect);   // v7.8.3
     else if (key == "ks_period_frames")  { snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); return b; }
     else if (key == "ks_periods")        { snprintf(b, 64, "%u", g_cfg.ksPeriods); return b; }
     else if (key == "drift_interval_ms") { snprintf(b, 64, "%u", g_cfg.driftIntervalMs); return b; }
@@ -5991,7 +6086,6 @@ static const char* kIniKeys[] = {
     "backend1", "backend2", "ks_period_frames", "ks_periods",
     "drift_correct_ms", "drift_interval_ms",
     "deep_resync_min",
-    "drop_correct",             // v7.8.3: underrun = clean dropout + ring restart
     "gui_theme",                // v7.0.4: the GUI theme persists
     "startup_engine",           // v7.1.2: the startup launch auto-starts the engine
     "gui_window_x",             // v7.1.20: the panel's last position (-99999 = default)
@@ -6093,7 +6187,6 @@ static void cfgFromControls(HWND w) {
     g_cfg.driftCorrectMs  = editFloat(w, IDC_DCORR, 5.0f);
     g_cfg.driftIntervalMs = (unsigned)editFloat(w, IDC_DINTERVAL, 5000);
     g_cfg.deepResyncMin   = (unsigned)editFloat(w, IDC_DEEPRESYNC, 0);
-    g_cfg.dropCorrect     = g_tog[IDC_TGL_DROPCORR];   // v7.8.3
     // v6.6.8: centerGate / centerUpmixGuard / background integrated.
     g_cfg.volumeFollow    = g_tog[IDC_TGL_VOLFOLLOW];
     g_cfg.chimes          = g_tog[IDC_TGL_CHIMES];
@@ -6129,7 +6222,6 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.driftCorrectMs);   SetDlgItemTextA(w, IDC_DCORR, b);
     snprintf(b, 64, "%u", g_cfg.driftIntervalMs);  SetDlgItemTextA(w, IDC_DINTERVAL, b);
     snprintf(b, 64, "%u", g_cfg.deepResyncMin);    SetDlgItemTextA(w, IDC_DEEPRESYNC, b);
-    g_tog[IDC_TGL_DROPCORR]   = g_cfg.dropCorrect;   // v7.8.3
     g_tog[IDC_TGL_VOLFOLLOW]  = g_cfg.volumeFollow;
     g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
     snprintf(b, 64, "%g", g_cfg.chimeGain);      SetDlgItemTextA(w, IDC_CHIMGAIN, b);
@@ -6383,13 +6475,12 @@ static void guiBuildPages(HWND w) {
     row(w, COLA_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
     row(w, COLA_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
     row(w, COLA_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
-    tglRow(w, COLA_X, 222, "drop_correct (ring restarts)", IDC_TGL_DROPCORR, g_cfg.dropCorrect);
-    note(w, COLA_X, 254,
+    note(w, COLA_X, 222,
          "drift_correct_ms: trigger distance from the calibrated baseline.\n"
          "drift_interval_ms: correction spacing (2000..60000). deep_resync_min:\n"
-         "scheduled center reopen (0 = off). drop_correct: a deep underrun now\n"
-         "restarts the ring -- one clean dropout instead of replay crackle.", 4);
-    tglRow(w, COLA_X, 324, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+         "scheduled center reopen (0 = off). Underruns are self-healing: the\n"
+         "ring restarts cleanly (built in, v7.8.4 -- no switch needed).", 4);
+    tglRow(w, COLA_X, 292, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
     header(w, COLB_X, KHDR_Y, "CHIME/KEEPALIVE");
     tglRow(w, COLB_X, KROW0, "volume_follow", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
@@ -7737,7 +7828,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(852) + 1.0f,
                                         (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.8.3 |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.8.4 |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7772,7 +7863,6 @@ static bool guiIsToggle(int id) {
         case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
         case IDC_TGL_STARTUP:   // v6.6.6: the startup pill
         case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES:
-        case IDC_TGL_DROPCORR:    // v7.8.3: the ring-restart pill
         case IDC_TGL_EQ:
             return true;
     }
