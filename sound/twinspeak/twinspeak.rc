@@ -7,6 +7,13 @@
 // WM_NCACTIVATE(TRUE) after the attribute set and the flip lands in the
 // same click. (Details in twinspeak.cpp's changelog.) Version steps to
 // 7.8.1.
+// v7.8.3: DROP CORRECTION -- the ring restarts instead of crackling. A deep
+// underrun (>= half the buffer switch is hole) silence-fills, holds the leg
+// while the pump rebuilds the ring to its target anchor, then skips the
+// silent gap oldest-first and resumes at the freshest capture with the
+// original latency. New ini key drop_correct (default on; GUI pill on the
+// SETTINGS page), logged as 'drop corr', counted in the devbuf line.
+// Version steps to 7.8.3.
 // v7.8.0: THE ONE-FILE WINDOW HEADER RETIRES, WHOLE -- no include, no stub
 // file, no external chrome API. The window is the flat default Windows 10
 // frame (a stock WS_OVERLAPPEDWINDOW: native caption, icon, title, min/max/
@@ -30,8 +37,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,8,1,0
-PRODUCTVERSION  7,8,1,0
+FILEVERSION     7,8,3,0
+PRODUCTVERSION  7,8,3,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -42,12 +49,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.8.1.0"
+            VALUE "FileVersion",      "7.8.3.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.8.1.0"
+            VALUE "ProductVersion",   "7.8.3.0"
         END
     END
     BLOCK "VarFileInfo"

@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.8.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v7.8.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -16,13 +16,41 @@
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
 //             + 40 Hz @ 0.5% keep-alive at the device layer
 //    playback callbacks = the ASIO buffer switch: gated excess drop +
-//    last-buffer replay. WASAPI exclusive is INTEGRATED (v6.6.8): both legs
-//    open exclusive together (shared fallback reopens BOTH), capture pin
-//    exclusive with logged fallback. Exclusive bypasses the volume slider --
-//    hence volume_follow + pin_outputs. clock_sync, drift_guard, power_guard,
-//    yield_default, center_gate, center_upmix_guard, background: always on.
+//    underrun handling (v7.8.3 drop_correct: clean dropout + ring restart;
+//    off = the classic last-buffer replay). WASAPI exclusive is INTEGRATED
+//    (v6.6.8): both legs open exclusive together (shared fallback reopens
+//    BOTH), capture pin exclusive with logged fallback. Exclusive bypasses
+//    the volume slider -- hence volume_follow + pin_outputs. clock_sync,
+//    drift_guard, power_guard, yield_default, center_gate,
+//    center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v7.8.3 DROP CORRECTION -- the ring restarts instead of crackling.
+//            Field: "I feel like the ring system isn't stable enough, I
+//            still sometimes get crackling even on buffer size 256 with 4
+//            buffers -- it's related to how high CPU usage is. I want a
+//            drop correction system integrated into it that makes the ring
+//            system just start over instead of doing this crackling
+//            thing." Diagnosis: under CPU pressure the pump/capture side
+//            loses scheduling windows, the out ring drains, and the legacy
+//            shortfall path tile-replayed the last played buffer EVERY
+//            switch -- the ASIO underrun convention read as a fragment-loop
+//            crackle. New ini key drop_correct (default ON, GUI pill on the
+//            SETTINGS page): a DEEP shortfall (>= half the switch is hole)
+//            (1) silence-fills the hole -- no duplicated audio, ever; (2)
+//            holds the leg on silence while the pump rebuilds the ring to
+//            its full target anchor (delay_ms depth included, so a delayed
+//            leg returns with its calibration intact); (3) discards the
+//            silent gap oldest-first (a bit-exact skip -- discardOldest
+//            advances the sequence ledger) and resumes at the FRESHEST
+//            capture with the ORIGINAL latency: the drift ledger returns to
+//            its pre-drop value by itself, no warden correction, no latency
+//            creep. A shallow miss (< half a switch) stays a sub-ms silence
+//            sliver with no restart. Restarts are logged ('drop corr') and
+//            counted in the devbuf line; a hold-off lasting 3 s feeds the
+//            stall resync and reopens the leg, exactly like the old storm
+//            path -- the safety net keeps working while the buzz is gone.
+//            drop_correct = off restores the legacy replay bit-for-bit.
 //    v7.8.2 THE BOOT YIELD. Field: "when twinspeak starts while roblox is
 //            playing, it literally corrupts roblox's output driver list and
 //            it results in a NoSoundDriver glitch"; also "fl studio's own
@@ -1796,6 +1824,15 @@ struct Config {
     // half-alive post-sleep stream ticks at a bogus rate with a FRESH
     // heartbeat the silence watchdog cannot see). v6.6.8: INTEGRATED.
     bool        powerGuard     = true;
+    // v7.8.3 DROP CORRECTION: a buffer switch the out ring cannot fill used
+    // to tile-replay the last played buffer (the ASIO convention) -- under
+    // CPU pressure that repeats every switch and reads as crackle. With
+    // drop_correct the shortfall is silence-filled instead and the ring
+    // RESTARTS: the leg holds off on silence until the ring rebuilds to its
+    // target anchor, then skips the silent gap oldest-first and resumes at
+    // the freshest capture with the original latency. Default ON; off = the
+    // legacy replay path, bit-for-bit.
+    bool        dropCorrect    = true;
 };
 static Config g_cfg;
 
@@ -2083,6 +2120,15 @@ struct Leg {
     std::atomic<unsigned long long> firstSwitchUs{0};
     bool                streamSeeded = false;        // pump: out ring's seq space armed
     unsigned long long  lastReopenMs = 0;            // warden pauses 10 s after a reopen
+    // ---- v7.8.3 DROP CORRECTION state --------------------------------------
+    // dropHold is OWNED by this leg's playback thread (the WASAPI callback
+    // or ksThread -- never both at once) but READ by the health loop's stall
+    // resync, so it is atomic. dropRestarts counts hold-off entries for the
+    // devbuf telemetry line.
+    std::atomic<bool>   dropHold{false};             // ring restart in progress:
+                                                 // emit silence, pop nothing
+    std::atomic<unsigned long long> dropRestarts{0}; // hold-off entries since boot
+    std::atomic<long long> dropEntryMs{0};           // last entry log time (rate limit)
 };
 static Leg g_leg[2];
 
@@ -2492,8 +2538,12 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 //   1) EXCESS -> GATED DROP: level a full period past the sawtooth top
 //      (target + burst) means the cable clock is faster -- discard the
 //      OLDEST excess, at most once per kCorrMinIntervalMs, logged.
-//   2) the switch: pop the ring; a shortfall REPLAYS the last buffer (ASIO
-//      convention), never a silence hole, never a rate change.
+//   2) the switch: pop the ring; a shortfall SILENCE-FILLS and (v7.8.3
+//      drop_correct) RESTARTS the ring: the leg holds off on silence while
+//      the pump rebuilds the ring to its target anchor, then the silent gap
+//      is skipped oldest-first and playback resumes at the freshest capture
+//      with the original latency. No replay tile, no crackle. (drop_correct
+//      = off restores the legacy ASIO last-buffer replay.)
 //   3) remember the buffer just played; leg2 sums the keep-alive at the
 //      device layer. frameCount = the REAL device bite (period or KS bite).
 static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
@@ -2518,6 +2568,38 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                               std::memory_order_release);
     }
     L.popped.fetch_add((unsigned long long)frameCount, std::memory_order_relaxed);    // device clock
+
+    // ---- v7.8.3 DROP CORRECTION: the hold-off (the ring restarting) --------
+    // A shortfall armed this state: the leg now plays SILENCE and pops
+    // NOTHING, so the pump can rebuild the ring all the way to its target
+    // anchor (the same depth the boot prefill establishes -- the alignment
+    // delay included, so a delayed leg comes back with its delay intact).
+    // The first switch at or above target discards the excess oldest-first
+    // -- exactly the silent gap's frames, the ones the DAC never received --
+    // and falls through to the normal pop: the stream jumps to the freshest
+    // capture, the sequence ledger stays truthful (discardOldest advances
+    // it), the latency is back at the anchor, and the drift ledger returns
+    // to its pre-drop value on its own (no warden correction needed). A
+    // hold-off that somehow lasts >= 3 s is starvation the stall resync
+    // sees (it reads dropHold) and reopens the leg, same as before.
+    if (L.dropHold.load(std::memory_order_relaxed)) {
+        const size_t level = L.out.count();
+        if (L.targetFrames && level >= L.targetFrames) {
+            const size_t excess = level - L.targetFrames;
+            if (excess) L.out.discardOldest(excess);   // the gap, skipped bit-exact
+            L.dropHold.store(false, std::memory_order_relaxed);
+            tlog("[twinspeak] leg%d drop corr : ring rebuilt to the %.1f ms anchor -- skipped %llu fr (%.1f ms)\n"
+                 "                            of the silent gap; playback resumed at the freshest capture,\n"
+                 "                            latency back at target (restart #%llu this run)\n",
+                 idx + 1, (double)L.targetFrames * 1000.0 / (double)kSampleRate,
+                 (unsigned long long)excess, (double)excess * 1000.0 / (double)kSampleRate,
+                 (unsigned long long)L.dropRestarts.load(std::memory_order_relaxed));
+        } else {
+            if (frameCount)
+                memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
+            return;   // silence this switch; the pump keeps rebuilding behind us
+        }
+    }
 
     // v6.4: a deliberate warden pad repeats the last played buffer IN PLACE
     // (the ASIO replay convention) -- the stream slides later, no ring frame
@@ -2589,7 +2671,31 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     if (n < frameCount - padFront) {
         L.und.fetch_add(1);
         const size_t miss = (size_t)frameCount - padFront - n;
-        replayFill(out + (padFront + n) * L.outCh, miss);
+        // v7.8.3 DROP CORRECTION: a DEEP shortfall (at least half the switch
+        // is hole -- the ring collapsed under CPU pressure) silence-fills and
+        // restarts the ring instead of tiling the last buffer (the periodic
+        // replay reads as crackle). A shallow miss (< half the switch) stays
+        // a sub-ms silence sliver with no hold-off: the stream slides by a
+        // few frames, far below the warden's trigger, and the next switch is
+        // normally whole again.
+        if (g_cfg.dropCorrect && miss * 2 >= frameCount - padFront) {
+            memset(out + (padFront + n) * L.outCh, 0, miss * L.outCh * sizeof(float));
+            if (!L.dropHold.exchange(true, std::memory_order_relaxed)) {
+                L.dropRestarts.fetch_add(1, std::memory_order_relaxed);
+                const unsigned long long nowMs = GetTickCount64();
+                const long long lastLog = L.dropEntryMs.load(std::memory_order_relaxed);
+                if (lastLog < 0 || nowMs - (unsigned long long)lastLog >= 1000) {
+                    L.dropEntryMs.store((long long)nowMs, std::memory_order_relaxed);
+                    tlog("[twinspeak] leg%d drop corr : underrun -- %llu of %llu frames short -- clean dropout,\n"
+                         "                            the ring RESTARTS: silence while it rebuilds to the %.1f ms anchor,\n"
+                         "                            then the stream jumps to the freshest capture (no replay crackle)\n",
+                         idx + 1, (unsigned long long)miss, (unsigned long long)(frameCount - padFront),
+                         (double)L.targetFrames * 1000.0 / (double)kSampleRate);
+                }
+            }
+        } else {
+            replayFill(out + (padFront + n) * L.outCh, miss);   // legacy ASIO convention
+        }
     }
     if (padFront)
         replayFill(out, padFront);
@@ -3941,7 +4047,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.1.19 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v7.8.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4160,8 +4266,11 @@ static void writeTemplate(const char* path) {
         "; is no resampler and no pitch control anywhere in twinspeak. Clock\n"
         "; drift between the cable's virtual clock and each device crystal is\n"
         "; absorbed by two device-master rules at the buffer switch:\n"
-        ";   * a buffer switch the ring cannot fill REPLAYS the last played\n"
-        ";     buffer (the ASIO underrun convention) instead of a silence hole;\n"
+        ";   * a buffer switch the ring cannot fill is an UNDERRUN: with\n"
+        ";     drop_correct = on (v7.8.3, the default) it is a clean dropout --\n"
+        ";     the leg goes silent while the ring restarts from the freshest\n"
+        ";     capture (see the drop_correct block below). off = the classic\n"
+        ";     ASIO replay: the last played buffer tiles over the hole.\n"
         ";   * ring excess above the natural sawtooth (cable faster than device)\n"
         ";     is dropped OLDEST-first, at most once per 5 s per leg, logged.\n"
         "; The health line shows the measured offset ('off +N ppm'). At crystal\n"
@@ -4220,14 +4329,33 @@ static void writeTemplate(const char* path) {
         "; baseline went stale against exactly those events.\n"
         "drift_interval_ms = 5000\n"
         "\n"
+        "; DROP CORRECTION (v7.8.3) -- the ring-restart rule for underruns. A\n"
+        "; buffer switch the out ring cannot fill used to tile-replay the last\n"
+        "; played buffer (the ASIO convention); under real CPU pressure that\n"
+        "; repeats every switch and reads as CRACKLE -- the fragment-loop buzz.\n"
+        "; With drop_correct = on a DEEP shortfall (half the switch or more is\n"
+        "; hole) instead: (1) silence-fills the hole -- no duplicated audio, no\n"
+        "; crackle; (2) holds the leg on silence while the pump rebuilds the\n"
+        "; ring to its target anchor (your delay1_ms/delay2_ms depth included,\n"
+        "; so a delayed leg comes back with its calibration intact); (3) skips\n"
+        "; the silent gap oldest-first and resumes at the FRESHEST capture with\n"
+        "; the original latency. One clean dropout you notice, instead of a\n"
+        "; buzz you cannot un-hear. A shallow miss (under half a switch) stays\n"
+        "; a sub-millisecond sliver with no restart. The restarts are logged\n"
+        "; ('drop corr') and counted in the devbuf line; a hold-off that lasts\n"
+        "; 3 s feeds the stall resync and reopens the leg, same as before.\n"
+        "; off = the legacy replay path, bit-for-bit.\n"
+        "drop_correct = on\n"
+        "\n"
         "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
-        "; thread starves (an interrupt storm, a 100%% CPU hog), the shortfall\n"
-        "; path masks it with the fragment-loop buzz and the leg falls behind.\n"
-        "; The health loop recovers both ways: stale backlog above the leg's\n"
-        "; anchor is discarded immediately (bit-exact skip, logged as 'stall\n"
-        "; resync'), and starvation lasting 3 consecutive seconds reopens the\n"
-        "; leg fresh -- which also resets whatever the device's own silicon\n"
-        "; accumulated during the storm.\n"
+        "; thread starves (an interrupt storm, a 100%% CPU hog) the leg falls\n"
+        "; behind while the pump kept feeding its ring (v7.8.3: a drop-correct\n"
+        "; hold-off counts as starvation evidence too). The health loop\n"
+        "; recovers both ways: stale backlog above the leg's anchor is\n"
+        "; discarded immediately (bit-exact skip, logged as 'stall resync'),\n"
+        "; and starvation lasting 3 consecutive seconds reopens the leg fresh\n"
+        "; -- which also resets whatever the device's own silicon accumulated\n"
+        "; during the storm.\n"
         "\n"
         "; KS LAPSE GUARD (v6.5.13, always on): if the KS pacing thread is\n"
         "; ever descheduled past one full WaveRT loop lap, the play\n"
@@ -4448,6 +4576,7 @@ static bool loadIni(const char* path) {
         else if (key == "drift_correct_ms") g_cfg.driftCorrectMs = (float)atof(val.c_str()); // v6.4
         else if (key == "drift_interval_ms") g_cfg.driftIntervalMs = (unsigned)atoi(val.c_str()); // v6.5.8
         else if (key == "deep_resync_min")   g_cfg.deepResyncMin   = (unsigned)atoi(val.c_str()); // v6.5.12
+        else if (key == "drop_correct")      g_cfg.dropCorrect     = !isOff(val);               // v7.8.3
         else if (key == "gui_theme") {
             g_themeSaved = atoi(val.c_str());      // v7.0.4: theme persistence
             if (g_themeSaved < 0 || g_themeSaved > 10) g_themeSaved = 0;   // v7.1.8: 11 themes
@@ -4914,6 +5043,7 @@ enum {
     // page: settings (v7.1.7: sync + startup + chime/keepalive, one page)
     IDC_TGL_STARTUP,            // v6.6.6: Run-key pill
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,
+    IDC_TGL_DROPCORR,           // v7.8.3: underrun = clean dropout + ring restart
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,
     IDC_CHIMGAIN,               // v7.1.7: IDC_KAHZ/IDC_KAGAIN retired (keepalive built in)
     // page: center eq
@@ -5820,6 +5950,7 @@ static std::string cfgValueText(const std::string& key) {
         else if (t == "_q")    { snprintf(b, 64, "%g", g_cfg.eqSlotQ[n]); return b; }
     }
     else if (key == "drift_correct_ms")  { snprintf(b, 64, "%g", g_cfg.driftCorrectMs); return b; }
+    else if (key == "drop_correct")       return boolText(g_cfg.dropCorrect);   // v7.8.3
     else if (key == "ks_period_frames")  { snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); return b; }
     else if (key == "ks_periods")        { snprintf(b, 64, "%u", g_cfg.ksPeriods); return b; }
     else if (key == "drift_interval_ms") { snprintf(b, 64, "%u", g_cfg.driftIntervalMs); return b; }
@@ -5860,6 +5991,7 @@ static const char* kIniKeys[] = {
     "backend1", "backend2", "ks_period_frames", "ks_periods",
     "drift_correct_ms", "drift_interval_ms",
     "deep_resync_min",
+    "drop_correct",             // v7.8.3: underrun = clean dropout + ring restart
     "gui_theme",                // v7.0.4: the GUI theme persists
     "startup_engine",           // v7.1.2: the startup launch auto-starts the engine
     "gui_window_x",             // v7.1.20: the panel's last position (-99999 = default)
@@ -5961,6 +6093,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.driftCorrectMs  = editFloat(w, IDC_DCORR, 5.0f);
     g_cfg.driftIntervalMs = (unsigned)editFloat(w, IDC_DINTERVAL, 5000);
     g_cfg.deepResyncMin   = (unsigned)editFloat(w, IDC_DEEPRESYNC, 0);
+    g_cfg.dropCorrect     = g_tog[IDC_TGL_DROPCORR];   // v7.8.3
     // v6.6.8: centerGate / centerUpmixGuard / background integrated.
     g_cfg.volumeFollow    = g_tog[IDC_TGL_VOLFOLLOW];
     g_cfg.chimes          = g_tog[IDC_TGL_CHIMES];
@@ -5996,6 +6129,7 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.driftCorrectMs);   SetDlgItemTextA(w, IDC_DCORR, b);
     snprintf(b, 64, "%u", g_cfg.driftIntervalMs);  SetDlgItemTextA(w, IDC_DINTERVAL, b);
     snprintf(b, 64, "%u", g_cfg.deepResyncMin);    SetDlgItemTextA(w, IDC_DEEPRESYNC, b);
+    g_tog[IDC_TGL_DROPCORR]   = g_cfg.dropCorrect;   // v7.8.3
     g_tog[IDC_TGL_VOLFOLLOW]  = g_cfg.volumeFollow;
     g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
     snprintf(b, 64, "%g", g_cfg.chimeGain);      SetDlgItemTextA(w, IDC_CHIMGAIN, b);
@@ -6249,11 +6383,13 @@ static void guiBuildPages(HWND w) {
     row(w, COLA_X, KROW0, "drift_correct_ms", IDC_DCORR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.driftCorrectMs); return std::string(b); }().c_str());
     row(w, COLA_X, 154, "drift_interval_ms", IDC_DINTERVAL, []{ char b[32]; snprintf(b,32,"%u",g_cfg.driftIntervalMs); return std::string(b); }().c_str());
     row(w, COLA_X, 188, "deep_resync_min", IDC_DEEPRESYNC, []{ char b[32]; snprintf(b,32,"%u",g_cfg.deepResyncMin); return std::string(b); }().c_str());
-    note(w, COLA_X, 230,
+    tglRow(w, COLA_X, 222, "drop_correct (ring restarts)", IDC_TGL_DROPCORR, g_cfg.dropCorrect);
+    note(w, COLA_X, 254,
          "drift_correct_ms: trigger distance from the calibrated baseline.\n"
-         "drift_interval_ms: minimum spacing between corrections (2000..60000).\n"
-         "deep_resync_min: scheduled center-leg reopen; 0 = off, else 5..1440.", 4);
-    tglRow(w, COLA_X, 316, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+         "drift_interval_ms: correction spacing (2000..60000). deep_resync_min:\n"
+         "scheduled center reopen (0 = off). drop_correct: a deep underrun now\n"
+         "restarts the ring -- one clean dropout instead of replay crackle.", 4);
+    tglRow(w, COLA_X, 324, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
     header(w, COLB_X, KHDR_Y, "CHIME/KEEPALIVE");
     tglRow(w, COLB_X, KROW0, "volume_follow", IDC_TGL_VOLFOLLOW, g_cfg.volumeFollow);
     row(w, COLB_X, 154, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
@@ -7601,7 +7737,7 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(852) + 1.0f,
                                         (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.8.0 |  %s",
+    snprintf(vbuf, sizeof(vbuf), "v7.8.3 |  %s",
              tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
@@ -7636,6 +7772,7 @@ static bool guiIsToggle(int id) {
         case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
         case IDC_TGL_STARTUP:   // v6.6.6: the startup pill
         case IDC_TGL_VOLFOLLOW: case IDC_TGL_CHIMES:
+        case IDC_TGL_DROPCORR:    // v7.8.3: the ring-restart pill
         case IDC_TGL_EQ:
             return true;
     }
@@ -9240,6 +9377,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.wardenDrops.store(0, std::memory_order_relaxed);
         L.wardenPads.store(0, std::memory_order_relaxed);
         L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
+        L.dropHold.store(false, std::memory_order_relaxed);    // v7.8.3 drop corr
+        L.dropRestarts.store(0, std::memory_order_relaxed);
+        L.dropEntryMs.store(0, std::memory_order_relaxed);
         L.lastCorrMs = 0;
     }
 
@@ -9999,7 +10139,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 const unsigned long long undPrev = (i == 0) ? u00 : u10;
                 const unsigned long long undNow =
                     SLeg.und.load(std::memory_order_relaxed);
-                const bool starved = undNow > undPrev;
+                // v7.8.3: a drop-correct hold-off IS starvation evidence too --
+                // while it runs the device pops nothing, so 'und' freezes and
+                // this meter alone would go blind. A hold-off lasting 3 s
+                // means the pump/capture never refilled the ring: reopen the
+                // leg exactly like the pre-drop-correct storm path did.
+                const bool starved = undNow > undPrev
+                                  || SLeg.dropHold.load(std::memory_order_relaxed);
                 stallSec[i] = starved ? stallSec[i] + 1 : 0;
                 if (!starved) continue;
                 // FAST PATH: immediate backlog resync (>= 1 ms of excess)
@@ -10180,6 +10326,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (laps0 || laps1)
                 tlog("                            KS lapse guard: %llu / %llu write-cursor re-pin(s) since boot\n",
                      laps0, laps1);
+            // v7.8.3: the drop-correction scorecard -- how often each ring
+            // restarted since boot (the crackle-suppression counter).
+            const unsigned long long dr0 = g_leg[0].dropRestarts.load(std::memory_order_relaxed);
+            const unsigned long long dr1 = g_leg[1].dropRestarts.load(std::memory_order_relaxed);
+            if (dr0 || dr1)
+                tlog("                            drop correct  : %llu / %llu ring restart(s) since boot\n"
+                     "                            (leg1 / leg2 -- each was a clean dropout, no replay crackle)\n",
+                     dr0, dr1);
         }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
         tlog(g_logToFile
