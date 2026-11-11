@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v7.9.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.0.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -26,6 +26,33 @@
 //    center_upmix_guard, background: always on.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.0.0 THE KERNEL LOOP + REALTIME. The v7.9.0 field log closed the
+//            case: with MMCSS "Pro Audio" on every thread, BOTH legs still
+//            served every other device switch ~2 ms late -- gap 4.15 ms on
+//            a 2 ms period, margin -0.15 ms, ~250 late switches/s per leg.
+//            That is a PHASE LOCK, not scheduler jitter: miniaudio's
+//            event-driven device thread misses one event, its service
+//            window eats the next boundary, and from then on it wakes at a
+//            2-period stride arriving just past the DAC's stale boundary
+//            every time. No priority can fix it -- MMCSS decides who wins
+//            the CPU once RUNNABLE; it cannot wake a thread before its
+//            event fires. So the scheduler is OUT of the render path:
+//            1) KS PACING BY DEFAULT: both legs open WDM-KS pins (the v6.3
+//               kernel-level loop, now the default transport) -- twinspeak's
+//               own thread writes each bite the instant the DAC's own
+//               position register says the lead was consumed. There is no
+//               deadline to miss, so scheduling lateness cannot reach the
+//               DAC. A refused pin falls back to wasapi automatically.
+//               One-time ini migration carries old templates over (their
+//               backendN = wasapi was boilerplate, not a choice).
+//            2) REALTIME PROCESS CLASS: the engine takes
+//               REALTIME_PRIORITY_CLASS (falls back to HIGH without the
+//               admin privilege, logged); the KS pacer registers MMCSS
+//               "Pro Audio" at AvrtPriorityCritical -- above both pumps.
+//            3) The pump spin-pacer's danger zone follows the transport
+//               (KS: one bite + burst; WASAPI: two periods + burst) -- the
+//               old 2-period zone sat above a KS ring floor and spun the
+//               pump against its 1.5 ms bound every tick, for nothing.
 //    v7.9.0 THE SPIN PACER. The v7.8.4 escalation cured the replay-tile
 //            static, but a ring can only clean up AFTER a late refill: the
 //            static that survives is the device buffer itself running dry
@@ -124,7 +151,8 @@
 //            quiet rule (default moved away AND foreignActiveSessions ==
 //            0), so no live stream is ever invalidated again, by boot or
 //            re-grab. A boot-yielded leg re-grabs on the WASAPI path (the
-//            generated ini's recommended backend anyway).
+//            quiet rule runs before any pin opens; the next restart takes
+//            the leg's configured backend -- KS by default since v8.0.0).
 //    v7.8.1 THE CAPTION PING. Field: "when I press the theme button, the
 //            window's dark mode property doesn't update visually until
 //            you change the window state." The attribute WAS landing (a
@@ -1629,7 +1657,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "7.9.0"
+#define TWS_VERSION "8.0.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -1845,12 +1873,14 @@ struct Config {
     // running. Default ON: the engine starts by itself, exactly as if START
     // was pressed. off = the old behavior (START is yours to press).
     bool        startupEngine  = true;
-    // v6.3 per-leg backend: "wasapi" = miniaudio exclusive WaveRT event
-    // mode; "ks" = direct kernel-streaming render pin + looped WaveRT buffer
+    // v6.3 per-leg backend; v8.0.0: "ks" IS the default -- the kernel-level
+    // loop. "ks" = direct kernel-streaming render pin + looped WaveRT buffer
     // paced against the mapped play-position register (below the audio
-    // engine, FlexASIO-grade). ks_period_frames = switch granularity.
-    std::string backend1       = "wasapi";
-    std::string backend2       = "wasapi";
+    // engine, FlexASIO-grade). "wasapi" = miniaudio exclusive WaveRT event
+    // mode -- the automatic fallback when a pin is refused, and the opt-out.
+    // ks_period_frames = switch granularity.
+    std::string backend1       = "ks";
+    std::string backend2       = "ks";
     unsigned    ksPeriodFrames = 256;    // KS buffer-switch size (frames)
     unsigned    ksPeriods      = 3;      // WaveRT looped buffer = ksPeriods * period
     // v6.4 drift warden: the frame-interval ledger is ALWAYS on (it only
@@ -3416,8 +3446,16 @@ static DWORD WINAPI pumpThread(LPVOID p) {
         // over. This is the "resort to busy-wait at 100% CPU" guarantee: a
         // late refill can no longer compound into a second late refill.
         {
-            const size_t dangerFr = (size_t)g_periodFrames[idx] * 2
-                                  + g_capBurstFrames + 16;
+            // v8.0.0: the danger zone follows the transport. A WASAPI
+            // exclusive leg pops its WHOLE buffer as two back-to-back
+            // callbacks -> two periods + burst of headroom. A KS leg pulls
+            // exactly ONE bite per switch (the pacer never asks for more)
+            // and its ring floor already sits at bite + burst + margin --
+            // the old 2-period zone sat ABOVE that floor and spun the pump
+            // against its 1.5 ms bound every tick, for nothing.
+            const size_t dangerFr = (L.backend == 1)
+                ? (size_t)g_cfg.ksPeriodFrames + g_capBurstFrames + 16
+                : (size_t)g_periodFrames[idx] * 2 + g_capBurstFrames + 16;
             if (L.out.count() < dangerFr) {
                 LARGE_INTEGER qpf, t0, t1;
                 QueryPerformanceFrequency(&qpf);
@@ -4079,7 +4117,11 @@ static DWORD WINAPI ksThread(LPVOID p) {
     const int idx = (int)(INT_PTR)p;
     Leg& L = g_leg[idx];
     KsOut& K = L.ks;
-    boostAudioThread();   // MMCSS "Pro Audio" + TIME_CRITICAL, same as the pumps
+    // v8.0.0: the pacer takes AvrtPriorityCritical INSIDE the "Pro Audio"
+    // task -- the thread whose deadline IS the DAC's register outranks both
+    // pumps (center pump ties it, mains pump loses). boostAudioThread()
+    // left it task-default: an equal inside MMCSS round-robin.
+    boostAudioThreadEx(2 /*AVRT_PRIORITY_CRITICAL*/);
 
     HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -4260,7 +4302,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v7.9.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.0.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY (every other channel muted), no resampler anywhere.\n"
         "\n"
         "; out1ms / out2ms set each leg's requested WASAPI device period. Keep them\n"
@@ -4434,19 +4476,25 @@ static void writeTemplate(const char* path) {
         "; (the log announces both directions -- 'legN YIELD').\n"
         "\n"
         "; WDM-KS OUTPUT BACKEND (v6.3) -- the FlexASIO path, inside twinspeak.\n"
-        "; v7.1.7: NO UI CONTROL -- both legs run wasapi exclusive unless these\n"
-        "; keys say ks. backend1 / backend2 route each leg through Kernel\n"
-        "; Streaming instead of wasapi exclusive: a direct render pin on the\n"
-        "; device's wave filter (KsCreatePin),\n"
+        "; v8.0.0: BOTH LEGS RUN KS BY DEFAULT -- the kernel-level loop. The\n"
+        "; v7.9.0 field log (the 'switch served' meter) closed the case: even\n"
+        "; with MMCSS on every thread, miniaudio's event-driven device thread\n"
+        "; phase-locks to a 2-period stride at 100%% CPU -- every service lands\n"
+        "; just past the DAC's stale boundary, and no priority can wake a\n"
+        "; thread before its event fires. KS pacing has no deadline to miss:\n"
+        "; the pacer writes the instant the DAC's own position register says\n"
+        "; the lead was consumed. v7.1.7: NO UI CONTROL -- backendN = wasapi\n"
+        "; opts a leg back into miniaudio exclusive event mode. A KS leg is a\n"
+        "; direct render pin on the device's wave filter (KsCreatePin),\n"
         "; the WaveRT looped buffer as the device's own DMA memory, and the\n"
         "; hardware play-position register mapped read-only -- twinspeak's own\n"
         "; TIME-CRITICAL thread paces the stream against the DAC itself, with no\n"
         "; events, no engine and no scheduler intermediaries in between. The\n"
         "; audio crossing the buffer switch is bit-identical (same rings, same\n"
         "; replay/drop rules, same gates); only the transport changes.\n"
-        ";   backendN = wasapi  wasapi exclusive -- the proven path (miniaudio,\n"
-        ";                      exclusive WaveRT event mode) -- the default\n"
-        ";   backendN = ks      WDM-KS, lowest latency, 256-sample switches\n"
+        ";   backendN = ks      WDM-KS -- the DEFAULT (the kernel-level loop)\n"
+        ";   backendN = wasapi  wasapi exclusive (miniaudio event mode) -- the\n"
+        ";                      automatic fallback and the opt-out\n"
         "; ks_period_frames = the buffer-switch size in SAMPLES (256 @ 48 kHz =\n"
         "; one bite every 5.33 ms; 96 = one bite every 2 ms -- smaller bites\n"
         "; shrink the KS ring floor too; v6.5.14 field note: 128 MINIMUM paces\n"
@@ -4470,8 +4518,8 @@ static void writeTemplate(const char* path) {
         ";   twinspeak --list-ks\n"
         "; to see every WDM-KS render filter with its pins and formats -- the\n"
         "; SAME name needles as below match the KS filters.\n"
-        "backend1 = wasapi\n"
-        "backend2 = wasapi\n"
+        "backend1 = ks\n"
+        "backend2 = ks\n"
         "ks_period_frames = 256\n"
         "ks_periods = 3\n"
         "\n"
@@ -6565,22 +6613,24 @@ static void guiBuildPages(HWND w) {
     // ============ page 2: TRANSPORT ============
     g_tab = 2;
     header(w, COLA_X, KHDR_Y, "OUTPUT TRANSPORT PER LEG");
-    // v7.1.7: the backend combos are GONE -- both legs run wasapi exclusive
-    // by default and KS is opted into with backend1/backend2 = ks in the ini
-    // (the user enforces exclusive anyway; the keys stay for power users).
+    // v8.0.0: the backend combos are still GONE (since v7.1.7) -- but both
+    // legs now run KS BY DEFAULT (the kernel-level loop); backendN = wasapi
+    // in the ini opts a leg back into miniaudio's event mode.
     row(w, COLA_X, KROW0, "period_frames", IDC_KSPF, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriodFrames); return std::string(b); }().c_str());
     row(w, COLA_X, 154, "periods", IDC_KSPD, []{ char b[32]; snprintf(b,32,"%u",g_cfg.ksPeriods); return std::string(b); }().c_str());
     note(w, COLB_X, 96,
-         "wasapi exclusive -- the proven path: miniaudio, exclusive WaveRT\n"
-         "event mode. This is what both legs run unless you say otherwise.\n\n"
-         "ks -- the FlexASIO-grade path: a direct kernel-streaming render pin,\n"
-         "the WaveRT looped buffer as the device's own DMA memory, paced\n"
-         "against the hardware play-position register. Below the Windows\n"
-         "engine: no events, no scheduler intermediaries.\n\n"
+         "ks -- the DEFAULT path (v8.0.0, the kernel-level loop): a direct\n"
+         "kernel-streaming render pin, the WaveRT looped buffer as the\n"
+         "device's own DMA memory, paced against the hardware play-position\n"
+         "register. Below the Windows engine: no events, no scheduler\n"
+         "intermediaries -- at 100% CPU the DAC never grazes its buffer.\n\n"
+         "wasapi exclusive -- miniaudio's exclusive WaveRT event mode; the\n"
+         "automatic fallback when a KS pin is refused (the log says so),\n"
+         "and the opt-out (backendN = wasapi in the ini).\n\n"
          "period_frames = the buffer-switch size in SAMPLES (128 @ 48 kHz\n"
          "= one bite every 2.67 ms; 128+ paces steadiest in the field).\n"
          "periods = the looped buffer around it (3 recommended, 2..8).\n\n"
-         "Route a leg through KS with backend1/backend2 = ks in the ini (no\n"
+         "Both legs run KS unless backend1/backend2 = wasapi in the ini (no\n"
          "UI control -- exclusive is enforced here). A driver refusal falls\n"
          "back to wasapi exclusive automatically and the log says so.", 13);
 
@@ -9262,6 +9312,51 @@ static bool wardenRepin(double err, double driftNow, double refMs, const char* t
     return did;
 }
 
+// ---------------------------------------------------------------- v8.0.0 ----
+// The kernel-loop default needs an ini-shaped on-ramp: every template before
+// v8.0.0 wrote "backend1/backend2 = wasapi" explicitly, so a default flip
+// alone never reaches an existing ini. One-time migration: a pre-8.0.0 ini
+// whose backendN still carries the old template value ("wasapi") is migrated
+// to ks, and the ini's version marker is bumped so the choice sticks. A user
+// who edits backendN = wasapi AFTER the bump opts that leg out for good.
+static int iniMarkerVersion(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    char head[1024] = {};
+    const size_t n = fread(head, 1, sizeof(head) - 1, f);
+    fclose(f);
+    head[n] = 0;
+    const char* p = strstr(head, "; twinspeak v");
+    if (!p) return 0;
+    int maj = 0, mnr = 0, pat = 0;
+    if (sscanf(p, "; twinspeak v%d.%d.%d", &maj, &mnr, &pat) != 3) return 0;
+    return maj * 10000 + mnr * 100 + pat;
+}
+static bool bumpIniMarker(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string txt;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) txt.append(buf, n);
+    fclose(f);
+    const size_t at = txt.find("; twinspeak v");
+    if (at == std::string::npos) return false;
+    const size_t eol = txt.find('\n', at);
+    if (eol == std::string::npos) return false;
+    const std::string line = txt.substr(at, eol - at);
+    const size_t cfgAt = line.find("config");
+    const std::string tail = (cfgAt == std::string::npos) ? "" : line.substr(cfgAt + 6);
+    char rep[160];
+    snprintf(rep, sizeof(rep), "; twinspeak v%s config", TWS_VERSION);
+    txt.replace(at, eol - at, std::string(rep) + tail);
+    f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = fwrite(txt.data(), 1, txt.size(), f) == txt.size();
+    fclose(f);
+    return ok;
+}
+
 static int engineMain(const std::string& iniPath, bool fgForce,
                       bool allowMulti, bool guiMode) {
     (void)allowMulti;   // the lock is the caller's business
@@ -9281,11 +9376,45 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v6.5.17: HIGH process priority class. MMCSS orders the RT threads
-    // WITHIN the process; the class is the scheduler's cross-process weight
-    // (at NORMAL a foreground boost can bury the helper threads). HIGH is
-    // the weight a DAW host takes; it does not starve other streams.
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    // v8.0.0 ONE-TIME BACKEND MIGRATION (see iniMarkerVersion above): an ini
+    // written by any pre-8.0.0 template carries backendN = wasapi as literal
+    // boilerplate -- the kernel-loop default would never reach it. Migrate
+    // the old template value to ks and bump the ini's version marker; from
+    // the next run on, an explicit wasapi in the ini is respected as a real
+    // opt-out. An ini with NO version marker (hand-written) is left alone.
+    {
+        const int marker = iniMarkerVersion(iniPath);
+        const bool legacy1 = (marker > 0 && marker < 80000 && g_cfg.backend1 == "wasapi");
+        const bool legacy2 = (marker > 0 && marker < 80000 && g_cfg.backend2 == "wasapi");
+        if (legacy1 || legacy2) {
+            if (legacy1) g_cfg.backend1 = "ks";
+            if (legacy2) g_cfg.backend2 = "ks";
+            bumpIniMarker(iniPath);
+            tlog("[twinspeak] v8.0.0       : one-time backend migration -- this ini predates the\n"
+                 "                            kernel-loop default and still carried the old template's\n"
+                 "                            backendN = wasapi; the leg(s) now open the direct WDM-KS pin\n"
+                 "                            paced against the DAC's own position register (the 100%%-CPU\n"
+                 "                            static fix). The ini's version marker is bumped, so an\n"
+                 "                            explicit backendN = wasapi from here on is a real opt-out.\n");
+        }
+    }
+
+    // v8.0.0: REALTIME process priority class -- the field directive, and
+    // the right weight for a kernel-level loop: at REALTIME the engine's
+    // TIME_CRITICAL threads sit at base 31, above every non-realtime thread
+    // the OS has. Without SeIncreaseBasePriorityPrivilege (a non-admin
+    // token) the call refuses -- fall back to HIGH and say so.
+    if (SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
+        tlog("[twinspeak] priority      : REALTIME process class -- the engine's threads sit at the\n"
+             "                            scheduler's top band; the KS pacer owns its core against\n"
+             "                            anything user-mode.\n");
+    } else {
+        const DWORD pclErr = GetLastError();
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        tlog("[twinspeak] priority      : REALTIME class refused (err %lu) -- HIGH engaged. Run once\n"
+             "                            as administrator for the full realtime band; MMCSS still\n"
+             "                            orders the audio threads inside it.\n", pclErr);
+    }
 
     timeBeginPeriod(1);
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
@@ -10024,7 +10153,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             tlog("[twinspeak] latency hint   : out periods are %u/%u ms (est path ~%.0f/~%.0f ms). v6.2 defaults are\n"
                    "            5/5 ms (est path ~34 ms): set out1ms = 5 and out2ms = 5 in the ini if the\n"
                    "            drivers accept it -- the banner prints the real negotiated periods.\n"
-                   "            (v6.3: a KS leg ignores outXms -- set backendN = ks + ks_period_frames.)\n",
+                   "            (a KS leg -- the v8.0.0 default -- ignores outXms; tune ks_period_frames.)\n",
                    (unsigned)periodMs1, (unsigned)periodMs2, legPathMs(0), legPathMs(1));
     }
     tlog("[twinspeak] threads        : 1 capture + 2 pumps (movers, one per leg) + device threads\n");

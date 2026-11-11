@@ -1,5 +1,13 @@
 // twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3..v7.7.9: version
 // bumps (the full per-version notes live in CHANGELOG.txt).
+// v8.0.0: THE KERNEL LOOP + REALTIME. Both legs open WDM-KS pins by default
+// (the kernel-level loop: twinspeak's own AvrtPriorityCritical thread writes
+// each bite the instant the DAC's position register says the lead was
+// consumed -- no events, no scheduler; wasapi exclusive is the automatic
+// fallback and the opt-out). One-time ini migration carries pre-8.0.0
+// templates over. The engine takes REALTIME_PRIORITY_CLASS (HIGH fallback,
+// logged). The pump spin-pacer's danger zone follows the transport. Version
+// steps to 8.0.0.
 // v7.8.1: THE CAPTION PING -- the theme click landed
 // DWMWA_USE_IMMERSIVE_DARK_MODE but Windows 10's DWM repaints its caption
 // only on a render-state CHANGE, so the titlebar stayed stale until
@@ -58,8 +66,8 @@
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     7,9,0,0
-PRODUCTVERSION  7,9,0,0
+FILEVERSION     8,0,0,0
+PRODUCTVERSION  8,0,0,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 FILESUBTYPE     0x0L
@@ -70,12 +78,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TidyVision"
             VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "7.9.0.0"
+            VALUE "FileVersion",      "8.0.0.0"
             VALUE "InternalName",     "twinspeak"
             VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
             VALUE "OriginalFilename", "twinspeak.exe"
             VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "7.9.0.0"
+            VALUE "ProductVersion",   "8.0.0.0"
         END
     END
     BLOCK "VarFileInfo"
