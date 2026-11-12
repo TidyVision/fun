@@ -56,6 +56,26 @@
 //            in out1's rear slots from the slave rings). The legacy mix
 //            loops stay byte-identical -- the merge mixes are their own
 //            functions, the merge pops their own helper.
+//    v8.6.0 THE SURROUND LEGS: leg5 (surr L) and leg6 (surr R) carry the
+//            cable's SIDE pair -- ch5 (SL) and ch6 (SR) -- the rear legs'
+//            pattern exactly: L = R = gain_sl/gain_sr * the one channel,
+//            EMPTY device = silent, KS-first, offset5_ms/offset6_ms their
+//            own delay knobs. Every leg walk is SIX legs now. The merge
+//            extends pairwise: legs 5+6 on one device = the SURROUND PAIR
+//            (one stereo stream, per-side offsets); on leg1's device too =
+//            the front stream widens to 8ch/7.1 and the sides ride the 7.1
+//            slots (slots 6/7; all six on one device = ONE stream). The
+//            GUI compacts: six device rows on page 0, a second gain quad
+//            (center/lfe/sl/sr), the timing quad grows offset5/offset6.
+//    v8.6.1 THE PER-RUN RESET (field-reported): a GUI STOP/START reruns the
+//            engine in-process, so static merge state survives the stop.
+//            g_outCh1 was only ever SET (8, under the all-on-one merge) --
+//            a later leg2-separate run inherited the stale 8: out1 opened
+//            as an 8ch stream while the legacy mix strides 6ch, and the
+//            mains came out scrambled ("pixelated" L/R/LFE). Every merge
+//            global and slave mark now resets at the top of the merge
+//            decision, every start; the leg5/leg6 banners also print their
+//            OWN device names now (the name chain was never extended).
 //    v8.4.2 THE STARTUP ROW, CORRECTED (field-directed): "bottom right"
 //            meant the ROW'S ORDER, not a new control style -- "launch at
 //            Windows startup" is a PLAIN tglRow again (label left, the
@@ -1768,7 +1788,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.0"
+#define TWS_VERSION "8.6.1"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -1891,7 +1911,7 @@ static unsigned           g_kaIdx  = 0;      // owned by leg2's device thread on
 // shortfall plays silence and is counted, capture excess evicts oldest at
 // the raw cap (ledger-true), nothing ever repeats or drops on a schedule.
 static size_t             g_capPeriodFrames   = 192;    // real negotiated capture period (informational)
-static size_t             g_periodFrames[4]   = {480, 480, 480, 480}; // real device period per leg (v8.4.0: four)
+static size_t             g_periodFrames[6]   = { 480, 480, 480, 480, 480, 480 }; // real device period per leg (v8.6.0: six)
 static constexpr unsigned kReplayMaxPeriods   = 4;      // lastBlock size (the KS lapse re-prime)
 // v8.2.0: the WASAPI device period is an ENGINE CONSTANT -- out1ms/out2ms
 // are read-and-ignored (like cap_ms). Both legs request 1 ms (the floor
@@ -1921,6 +1941,10 @@ struct Config {
     // is built, the needle never matches: empty in = empty out, the truth.
     std::string outputDevice3;
     std::string outputDevice4;
+    // v8.6.0 THE SURROUND LEGS: output_device5 = surr L, output_device6 =
+    // surr R -- the rear legs' exact pattern (EMPTY = that leg is silent).
+    std::string outputDevice5;
+    std::string outputDevice6;
     std::string volumeEndpoint;      // v3.9: needle for the cable's PLAYBACK endpoint
                                      //       (volume follow); empty = use input_device
     float       gainL          = 1.0f;
@@ -1931,6 +1955,10 @@ struct Config {
     // ch8, on both outputs of each 2ch device -- the leg2 pattern).
     float       gainRl         = 1.0f;
     float       gainRr         = 1.0f;
+    // v8.6.0: the side legs' gains (leg5 = gain_sl * ch5, leg6 = gain_sr *
+    // ch6, on both outputs of each 2ch device -- the rear legs' pattern).
+    float       gainSl         = 1.0f;
+    float       gainSr         = 1.0f;
     // v6.5.18 CENTER DIALOGUE EQ: RBJ peaking biquad on ch3, out2 mix only,
     // default OFF (off = bit-exact single multiply). KS pins bypass every
     // APO, so the dialogue boost must live in the engine.
@@ -1954,6 +1982,9 @@ struct Config {
     // prefill on leg3's / leg4's raw ring (the user's naming: offset3/4_ms).
     float       offset3Ms      = 0.0f;
     float       offset4Ms      = 0.0f;
+    // v8.6.0: the sides' own delay knobs (offset3/4's exact twins).
+    float       offset5Ms      = 0.0f;
+    float       offset6Ms      = 0.0f;
     bool        centerGate     = true;    // v6.1: ch3 digital-zero -> out2 keep-alive only
                                           //       v6.6.8: INTEGRATED -- always on
     bool        centerUpmixGuard = true;  // v6.1: ch3 == a*ch1+b*ch2 (Windows fills FC
@@ -2346,7 +2377,7 @@ struct Leg {
 // Legs 2/3 are OPTIONAL: an empty output_device3/4 marks them disabled.
 // v8.4.1: leg1 (center) is optional TOO -- an empty output_device2 marks it
 // disabled and turns on THE CENTER FOLD below.
-static Leg g_leg[4];
+static Leg g_leg[6];                              // v8.6.0: mains, center, rear L/R, surr L/R
 
 // v8.4.1 THE CENTER FOLD: an EMPTY output_device2 (no center device) means
 // leg2 never opens AND ch3 (center) folds onto leg1's FL/FR at gain_center
@@ -2383,6 +2414,14 @@ static bool g_centerFold = false;
 static bool g_frontMerge  = false;
 static bool g_rearPair    = false;
 static bool g_rearOnFront = false;
+static bool g_surrPair    = false;   // v8.6.0: legs 5+6 on one device -- ONE stereo side pair
+static bool g_surrOnFront = false;   // v8.6.0: ...and on leg1's device -- the sides ride out1's 7.1 slots
+// v8.6.0: the front stream's channel count -- 6 (Windows 5.1: FL FR FC LFE
+// + the rear slots) normally; 8 (7.1: + the side slots 6/7) when the sides
+// ride it (g_surrOnFront). Decided once per start in the merge block, before
+// the identity loop sizes anything. Every out1-specific site reads this
+// instead of kOutCh1; the KS path already opens 8ch pins with the 7.1 mask.
+static int g_outCh1 = kOutCh1;
 
 // v8.4.0: one place answers "which ini needle opens leg i" -- every open /
 // reopen / yield path asks here, so a rear leg can never fall back to a
@@ -2392,7 +2431,9 @@ static const char* legNeedle(int i) {
         case 0:  return g_cfg.outputDevice1.c_str();
         case 1:  return g_cfg.outputDevice2.c_str();
         case 2:  return g_cfg.outputDevice3.c_str();
-        default: return g_cfg.outputDevice4.c_str();
+        case 3:  return g_cfg.outputDevice4.c_str();
+        case 4:  return g_cfg.outputDevice5.c_str();   // v8.6.0: the sides
+        default: return g_cfg.outputDevice6.c_str();
     }
 }
 
@@ -2430,13 +2471,13 @@ struct OutPin {
     std::wstring          id;                       // endpoint id the pin came from
     IAudioEndpointVolume* vol = nullptr;
 };
-static OutPin g_pin[4];                               // v8.4.0: per-leg endpoint pins (watcher-owned)
+static OutPin g_pin[6];                               // v8.4.0/v8.6.0: per-leg endpoint pins (watcher-owned)
 
 // v3.8 watchdog heartbeats: each device callback refreshes its timestamp;
 // the health loop reopens any thread that goes silent >5 s.
 static std::atomic<unsigned long long> g_hbCap{0};
 // v8.4.0: one heartbeat slot per leg (was the two scalars g_hbOut0/g_hbOut1).
-static std::atomic<unsigned long long> g_hbOutTab[4];
+static std::atomic<unsigned long long> g_hbOutTab[6];   // v8.6.0: six legs
 // v6.5.8: set by every successful device reopen -- the health loop invalidates
 // and re-arms the warden's baseline, because a reopen can legitimately change
 // host-side latency and a boot-time baseline would then "correct" toward a
@@ -2703,7 +2744,7 @@ static void pinCheckTick() {
     // v3.9: this runs on the watcher thread and no longer touches Leg fields
     // -- tryRestartLeg (main thread) re-pins after a reopen, so the two
     // threads never race on the same Leg state.
-    for (int i = 0; i < 4; ++i) {   // v8.4.0: all four legs
+    for (int i = 0; i < 6; ++i) {   // v8.4.0: all four legs
         if (g_leg[i].disabled) continue;   // nothing held, nothing to pin
         // v6.5.15: a yielded leg's device IS the Windows default render
         // endpoint -- its volume slider belongs to the user, not to us.
@@ -2717,7 +2758,7 @@ static void pinCheckTick() {
             if (m != FALSE || s < 0.999f) {
                 v->SetMasterVolumeLevelScalar(1.0f, nullptr);
                 v->SetMute(FALSE, nullptr);
-                static unsigned long long lastPinLog[4] = { 0, 0, 0, 0 };
+                static unsigned long long lastPinLog[6] = { 0, 0, 0, 0, 0, 0 };   // v8.6.0: six legs
                 const unsigned long long now = GetTickCount64();
                 if (now - lastPinLog[i] >= 5000) {
                     tlog( "[twinspeak] out%d: endpoint volume drifted to %.0f%%%s -- re-pinned to 100%%/unmuted\n",
@@ -2802,7 +2843,7 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);   // v3.8 watchdog
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         // v8.4.0: a disabled rear leg owns no ring (pushOverwrite on an
         // uninit ring would be UB) -- empty device = nothing to feed.
         // v8.5.0: a MERGE SLAVE owns a ring its partner drains -- it feeds
@@ -2833,9 +2874,12 @@ static void centerEqFlushZ();                    // defined next to g_ceq
 static void centerGuard(Leg& L, float* sc, size_t n, int variant);
 static float* mergeSlavePop(int slaveIdx, size_t n);   // v8.5.0 THE MERGE: lockstep slave-ring pop
 static void mixFrontStage(const float* sc, const float* scRL, const float* scRR,
-                          float* chunk, size_t n);     // v8.5.0: leg1's front-stage mix
+                          const float* scSL, const float* scSS,
+                          float* chunk, size_t n);     // v8.5.0/v8.6.0: leg1's front-stage mix
 static void mixRearPair(const float* scL, const float* scR,
                         float* chunk, size_t n);       // v8.5.0: leg3's rear-pair mix
+static void mixSurrPair(const float* scL, const float* scR,
+                        float* chunk, size_t n);       // v8.6.0: leg5's surround-pair mix
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
 
@@ -2943,14 +2987,22 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // keeps its OWN delay prefill, so per-side alignment survives the
         // merge: the pair's R side reads ch8 at offset4; the front stream's
         // rear slots read ch7/ch8 at offset3/offset4.
-        float* scR  = nullptr;   // the pair's R source (leg4's ring)
+        float* scR  = nullptr;   // the pair's R source (leg4's ring, or leg6's for the sides)
         float* scRL = nullptr;   // rear-L source for out1's slots (leg3's ring)
         float* scRR = nullptr;   // rear-R source for out1's slots (leg4's ring)
+        float* scSL = nullptr;   // side-L source for out1's 7.1 slots (leg5's ring, v8.6.0)
+        float* scSS = nullptr;   // side-R source for out1's 7.1 slots (leg6's ring, v8.6.0)
         if (idx == 2 && g_rearPair) {
             scR = mergeSlavePop(3, n);
+        } else if (idx == 4 && g_surrPair) {          // v8.6.0: the sides' own pair
+            scR = mergeSlavePop(5, n);
         } else if (idx == 0 && g_rearOnFront) {
             scRL = mergeSlavePop(2, n);
             scRR = mergeSlavePop(3, n);
+            if (g_surrOnFront) {                      // v8.6.0: the 7.1 widening
+                scSL = mergeSlavePop(4, n);
+                scSS = mergeSlavePop(5, n);
+            }
         }
         if (idx == 1) centerGuard(L, sc, n, 0);   // v6.1: center presence gates
         // v8.4.1 THE CENTER FOLD: leg2 empty -> the SAME gates protect the
@@ -2972,13 +3024,16 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         float* dst = out + done * L.outCh;
         if (L.zeroFast && bitZero8(sc, n)
             && (!scR  || bitZero8(scR, n))
-            && ((!scRL && !scRR) || (bitZero8(scRL, n) && bitZero8(scRR, n)))) {
+            && ((!scRL && !scRR) || (bitZero8(scRL, n) && bitZero8(scRR, n)))
+            && ((!scSL && !scSS) || (bitZero8(scSL, n) && bitZero8(scSS, n)))) {
             if (idx == 1 || (idx == 0 && g_frontMerge)) centerEqFlushZ();
             // dst is already silence
         } else if (idx == 0 && g_frontMerge) {
-            mixFrontStage(sc, scRL, scRR, dst, n);   // v8.5.0: the front stage
+            mixFrontStage(sc, scRL, scRR, scSL, scSS, dst, n);   // v8.5.0/v8.6.0: the front stage
         } else if (idx == 2 && g_rearPair) {
             mixRearPair(sc, scR, dst, n);            // v8.5.0: the rear pair
+        } else if (idx == 4 && g_surrPair) {
+            mixSurrPair(sc, scR, dst, n);            // v8.6.0: the surround pair
         } else {
             mixBlock(idx, sc, dst, n);         // v6.5: the bulk mix, inline now
         }
@@ -3140,6 +3195,14 @@ static void playCallback3(ma_device*, void* pOutput, const void*, ma_uint32 fram
 static void playCallback4(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     playCore(3, (float*)pOutput, frameCount);
 }
+// v8.6.0: the surround legs -- the rears' pattern exactly (a side speaker
+// gets no keep-alive and no chime either).
+static void playCallback5(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(4, (float*)pOutput, frameCount);
+}
+static void playCallback6(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(5, (float*)pOutput, frameCount);
+}
 
 // ------------------------------------------- v6.5.18 center dialogue EQ ----
 // RBJ peaking biquad on the center channel, out2 only. One filter serves
@@ -3207,6 +3270,13 @@ static void centerEqInit() {
 // -- flip the two kRear*Ch indices below, nothing else.
 static const int kRearLCh = 6;    // 0-based: cable ch7 (RL)
 static const int kRearRCh = 7;    // 0-based: cable ch8 (RR)
+// v8.6.0: the SIDE pair -- cable ch5 (SL) and ch6 (SR), the VAC order's
+// L R C LFE SL SR RL RR. (If a movie's sides ever come out of the rears,
+// the cable is using the Windows mask order instead -- swap the device
+// rows leg3<->leg5 / leg4<->leg6, no source flip needed now that all four
+// single-channel legs exist.)
+static const int kSurrLCh = 4;    // 0-based: cable ch5 (SL)
+static const int kSurrRCh = 5;    // 0-based: cable ch6 (SR)
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // leg1 = NATIVE 5.1 stream. FC is DRIVEN SILENCE: the endpoint sees a
@@ -3300,10 +3370,15 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // no upmix fingerprint to guard and no sleep timer to feed). The
         // gain multiply is the ONLY op: g * 0 = 0, so a silent cable
         // channel stays bit-zero silence.
-        const int   srcCh = (idx == 2) ? kRearLCh : kRearRCh;
-        const float gRear = (idx == 2) ? g_cfg.gainRl : g_cfg.gainRr;
+        // v8.6.0: the FOUR single-channel legs -- RL (leg3), RR (leg4),
+        // SL (leg5), SR (leg6): L = R = gain * ONE cable channel ONLY,
+        // every other channel muted by never being touched.
+        const int   srcCh = (idx == 2) ? kRearLCh : (idx == 3) ? kRearRCh
+                       : (idx == 4) ? kSurrLCh : kSurrRCh;
+        const float gSolo = (idx == 2) ? g_cfg.gainRl : (idx == 3) ? g_cfg.gainRr
+                       : (idx == 4) ? g_cfg.gainSl : g_cfg.gainSr;
         for (size_t i = 0; i < n; ++i) {
-            const float s = gRear * sc[i * kInCh + srcCh];
+            const float s = gSolo * sc[i * kInCh + srcCh];
             chunk[i * 2 + 0] = s;
             chunk[i * 2 + 1] = s;
         }
@@ -3327,10 +3402,13 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 // carry the cable's rears from the slave rings (each side its own offset);
 // otherwise driven silence as ever.
 static void mixFrontStage(const float* sc, const float* scRL, const float* scRR,
+                          const float* scSL, const float* scSS,
                           float* chunk, size_t n) {
     const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
     const float gC = g_cfg.gainCenter;
     const float gRl = g_cfg.gainRl, gRr = g_cfg.gainRr;
+    const float gSl = g_cfg.gainSl, gSr = g_cfg.gainSr;   // v8.6.0: the sides
+    const int   oc  = g_outCh1;   // 6, or 8 when the sides ride this stream
     bool eq = g_ceq.on;
     if (eq) {   // leg2's contract: a bit-zero ch3 block RESETS the filter
         bool cz = true;
@@ -3340,7 +3418,6 @@ static void mixFrontStage(const float* sc, const float* scRL, const float* scRR,
     }
     for (size_t i = 0; i < n; ++i) {
         const float* f = sc + i * kInCh;
-        float* o = chunk + i * kOutCh1;
         const float lfe = gLfe * f[3];
         float c;
         if (eq) {
@@ -3354,12 +3431,17 @@ static void mixFrontStage(const float* sc, const float* scRL, const float* scRR,
         } else {
             c = gC * f[2];
         }
+        float* o = chunk + i * oc;
         o[0] = gL * f[0] + lfe;                     // FL -- the v6.5 ops, unchanged
         o[1] = gR * f[1] + lfe;                     // FR -- the v6.5 ops, unchanged
         o[2] = c;                                   // FC -- the center's own slot (the merge)
         o[3] = 0.0f;                                // LFE -- folded into the fronts
         o[4] = scRL ? gRl * scRL[i * kInCh + kRearLCh] : 0.0f;   // rear L (all-four merge)
         o[5] = scRR ? gRr * scRR[i * kInCh + kRearRCh] : 0.0f;   // rear R (all-four merge)
+        if (oc == 8) {                              // v8.6.0: the 7.1 widening
+            o[6] = scSL ? gSl * scSL[i * kInCh + kSurrLCh] : 0.0f;   // side L (all-six merge)
+            o[7] = scSS ? gSr * scSS[i * kInCh + kSurrRCh] : 0.0f;   // side R (all-six merge)
+        }
     }
 }
 
@@ -3373,6 +3455,18 @@ static void mixRearPair(const float* scL, const float* scR, float* chunk, size_t
     for (size_t i = 0; i < n; ++i) {
         chunk[i * 2 + 0] = gRl * scL[i * kInCh + kRearLCh];
         chunk[i * 2 + 1] = gRr * scR[i * kInCh + kRearRCh];
+    }
+}
+
+// mixSurrPair -- leg5's stream when leg6 shares its device (g_surrPair):
+// the SIDE pair, the rear pair's exact twin. L = gain_sl*ch5 from leg5's
+// ring (offset5), R = gain_sr*ch6 from leg6's ring (offset6) -- one stream,
+// one clock, each side its own source channel and delay (v8.6.0).
+static void mixSurrPair(const float* scL, const float* scR, float* chunk, size_t n) {
+    const float gSl = g_cfg.gainSl, gSr = g_cfg.gainSr;
+    for (size_t i = 0; i < n; ++i) {
+        chunk[i * 2 + 0] = gSl * scL[i * kInCh + kSurrLCh];
+        chunk[i * 2 + 1] = gSr * scR[i * kInCh + kSurrRCh];
     }
 }
 
@@ -3591,7 +3685,7 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
     const long long pos = (long long)seqBefore - t0;
     if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
     const size_t wn = g_tickWave.size();
-    const int    ch = (idx == 0) ? kOutCh1 : 2;
+    const int    ch = (idx == 0) ? g_outCh1 : 2;   // v8.6.0: the front stream may be 8ch
     for (size_t i = 0; i < n; ++i) {
         const long long t = pos + (long long)i;
         if (t >= (long long)(kTickCount * kTickPeriod)) break;
@@ -4458,7 +4552,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -4494,6 +4588,8 @@ static void writeTemplate(const char* path) {
         "delay2_ms = 0\n"
         "offset3_ms = 0\n"
         "offset4_ms = 0\n"
+        "offset5_ms = 0\n"
+        "offset6_ms = 0\n"
         "\n"
         "; v6.6.8: exclusive (WASAPI, both legs), capture_exclusive and\n"
         "; align_modes are part of the engine now -- ALWAYS ON, no ini key.\n"
@@ -4533,8 +4629,12 @@ static void writeTemplate(const char* path) {
         "; the center rides out1's FC slot (gain_center*ch3, the same gates\n"
         "; and the center EQ; delay2_ms is inert -- one stream, one clock).\n"
         "; All four on one device: ONE 5.1 stream carries everything (the\n"
-        "; rears in out1's rear slots, offset3/offset4 per side). The engine\n"
-        "; log names every merge at start.\n"
+        "; rears in out1's rear slots, offset3/offset4 per side). The sides\n"
+        "; (v8.6.0) merge the same way: legs 5+6 on one device = the SURROUND\n"
+        "; PAIR; on leg1's device too = the front stream widens to 7.1 and\n"
+        "; the sides ride the 7.1 slots (offset5/offset6 per side); all six\n"
+        "; on one device = ONE stream carries everything. The engine log\n"
+        "; names every merge at start.\n"
         "\n"
         "; v8.4.0 THE REAR LEGS: leg3 (rear L) and leg4 (rear R) carry the\n"
         "; cable's rear pair -- ch7 (RL) and ch8 (RR) -- on their OWN devices:\n"
@@ -4544,12 +4644,22 @@ static void writeTemplate(const char* path) {
         "; error, no output: empty in = empty out, the truth. out1's 5.1 rear\n"
         "; slots stay DRIVEN SILENCE either way. If a 5.1 movie ever leaves\n"
         "; the rears silent with the devices set, the cable's surround order\n"
-        "; is the Windows mask order (back = ch5/ch6): flip the two\n"
-        "; kRearLCh/kRearRCh indices in the source, nothing else.\n"
+        "; is the Windows mask order (back = ch5/ch6): SWAP the leg3<->leg5\n"
+        "; and leg4<->leg6 device rows (or their gains) -- no source flip\n"
+        "; needed now that all four single-channel legs exist.\n"
+        "\n"
+        "; v8.6.0 THE SURROUND LEGS: leg5 (surr L) and leg6 (surr R) carry\n"
+        "; the cable's SIDE pair -- ch5 (SL) and ch6 (SR) -- on their OWN\n"
+        "; devices: out5 = gain_sl * ch5 on both outputs, out6 = gain_sr *\n"
+        "; ch6 (the leg2/leg3 pattern), offset5_ms/offset6_ms their bit-exact\n"
+        "; delays. An EMPTY device (as shipped) keeps that leg SILENT -- no\n"
+        "; error, no output. out1's stream stays 5.1 (the sides ride ONLY\n"
+        "; their own legs, or the merge below).\n"
         "\n"
         "; Substring match against device names (see: twinspeak --list).\n"
         "; v8.4.0: the rear legs -- output_device3/4 EMPTY (as shipped) keeps\n"
         "; that rear leg silent; fill them when the rears get their own devices.\n"
+        "; v8.6.0: the side legs -- output_device5/6, exactly the same rule.\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
         "input_device   = Line 1\n"
@@ -4557,15 +4667,20 @@ static void writeTemplate(const char* path) {
         "output_device2 = Xtream\n"
         "output_device3 =\n"
         "output_device4 =\n"
+        "output_device5 =\n"
+        "output_device6 =\n"
         "\n"
         "; optional mixes (gain_lfe = the LFE fold gain onto FL/FR; 1.0 = a\n"
-        ";                    unity fold; gain_rl/gain_rr scale the rear legs;\n"
-        ";                    gain_center scales ch3 -- out2's mix, and the\n"
-        ";                    leg1 fold when output_device2 is EMPTY)\n"
+        ";                    unity fold; gain_rl/gain_rr scale the rear legs,\n"
+        ";                    gain_sl/gain_sr the side legs; gain_center scales\n"
+        ";                    ch3 -- out2's mix, and the leg1 fold when\n"
+        ";                    output_device2 is EMPTY)\n"
         "gain_l = 1.0\n"
         "gain_r = 1.0\n"
         "gain_rl = 1.0\n"
         "gain_rr = 1.0\n"
+        "gain_sl = 1.0\n"
+        "gain_sr = 1.0\n"
         "gain_lfe = 0.4\n"
         "gain_center = 1.0\n"
         "\n"
@@ -4916,6 +5031,11 @@ static void cfgSanitize() {
     if (g_cfg.offset3Ms > 1000.0f) g_cfg.offset3Ms = 1000.0f;
     if (g_cfg.offset4Ms < 0.0f)   g_cfg.offset4Ms = 0.0f;
     if (g_cfg.offset4Ms > 1000.0f) g_cfg.offset4Ms = 1000.0f;
+    // v8.6.0: the sides' offsets ride the same clamps.
+    if (g_cfg.offset5Ms < 0.0f)   g_cfg.offset5Ms = 0.0f;
+    if (g_cfg.offset5Ms > 1000.0f) g_cfg.offset5Ms = 1000.0f;
+    if (g_cfg.offset6Ms < 0.0f)   g_cfg.offset6Ms = 0.0f;
+    if (g_cfg.offset6Ms > 1000.0f) g_cfg.offset6Ms = 1000.0f;
     // v8.3.0: the drift trio's clamps are GONE with the keys -- hardcoded
     // constants (5 ms / 5000 ms / 30 min); nothing left to sanitize.
     // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
@@ -4999,12 +5119,16 @@ static bool loadIni(const char* path) {
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
         else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs
         else if (key == "output_device4") g_cfg.outputDevice4 = val;   // (empty = silent)
+        else if (key == "output_device5") g_cfg.outputDevice5 = val;   // v8.6.0: the sides
+        else if (key == "output_device6") g_cfg.outputDevice6 = val;   // (empty = silent)
         else if (key == "gain_l")         g_cfg.gainL = (float)atof(val.c_str());
         else if (key == "gain_r")         g_cfg.gainR = (float)atof(val.c_str());
         else if (key == "gain_lfe")       g_cfg.gainLfe = (float)atof(val.c_str());
         else if (key == "gain_center")    g_cfg.gainCenter = (float)atof(val.c_str());
         else if (key == "gain_rl")        g_cfg.gainRl     = (float)atof(val.c_str()); // v8.4.0
         else if (key == "gain_rr")        g_cfg.gainRr     = (float)atof(val.c_str()); // v8.4.0
+        else if (key == "gain_sl")        g_cfg.gainSl     = (float)atof(val.c_str()); // v8.6.0: the sides
+        else if (key == "gain_sr")        g_cfg.gainSr     = (float)atof(val.c_str()); // v8.6.0
         else if (key == "center_eq")      g_cfg.centerEq     = !isOff(val);          // v6.5.18
         else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
         else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
@@ -5023,6 +5147,8 @@ static bool loadIni(const char* path) {
         else if (key == "delay2_ms")      g_cfg.delay2Ms = (float)atof(val.c_str());
         else if (key == "offset3_ms")     g_cfg.offset3Ms = (float)atof(val.c_str()); // v8.4.0 rears
         else if (key == "offset4_ms")     g_cfg.offset4Ms = (float)atof(val.c_str()); // v8.4.0 rears
+        else if (key == "offset5_ms")     g_cfg.offset5Ms = (float)atof(val.c_str()); // v8.6.0: the sides
+        else if (key == "offset6_ms")     g_cfg.offset6Ms = (float)atof(val.c_str()); // v8.6.0
         else if (key == "out2_first")     g_cfg.out2First    = !isOff(val);
         else if (key == "volume_endpoint") g_cfg.volumeEndpoint = val;
         else if (key == "chimes")         g_cfg.chimes        = !isOff(val);   // v6.2
@@ -5204,10 +5330,11 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     pc.periods = 2;
     pc.playback.pDeviceID = id;
     pc.playback.format = ma_format_f32;
-    pc.playback.channels = (idx == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
+    pc.playback.channels = (idx == 0) ? g_outCh1 : kOutCh2;  // v8.6.0: out1 may widen to 8ch; legs 2..6 are all 2ch
     pc.playback.shareMode = wantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
     pc.dataCallback = (idx == 0) ? playCallback1 : (idx == 1) ? playCallback2
-                   : (idx == 2) ? playCallback3 : playCallback4;
+                   : (idx == 2) ? playCallback3 : (idx == 3) ? playCallback4
+                   : (idx == 4) ? playCallback5 : playCallback6;
     pc.wasapi.usage = ma_wasapi_usage_pro_audio;
     ma_result r = ma_device_init(ctx, &pc, &L.dev);
     if (r != MA_SUCCESS) {
@@ -5229,7 +5356,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
                           const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
     if (L.disabled) return false;   // v8.4.0: an empty rear leg never reopens
-    static unsigned long long lastLog[4] = { 0, 0, 0, 0 };
+    static unsigned long long lastLog[6] = { 0, 0, 0, 0, 0, 0 };   // v8.6.0: six legs
     const unsigned long long now = GetTickCount64();
     L.lastReopenMs = now;   // v6.4: the drift warden pauses while a leg settles
     if (now - lastLog[idx] >= 10000) {
@@ -5397,12 +5524,15 @@ static void printLegDevice(int idx) {
     // and discrete-LFE channels are DRIVEN DIGITAL SILENCE, so a stereo (or
     // any downmixed) endpoint has literally nothing to upmix -- the center
     // physically cannot appear on out1 no matter how the endpoint is set up.
-    if (idx == 0 && d->playback.internalChannels != kOutCh1)
-        tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 6ch -- fine with the strict split:\n"
-                        "            out1 drives FC/LFE AND the 5.1 rear slots as digital silence (the\n"
-                        "            rears live on leg3/leg4), so no layer (engine, miniaudio converter,\n"
-                        "            Speaker Fill) has anything to upmix into a fake center.\n",
-                (unsigned)d->playback.internalChannels);
+    // v8.6.0: the expected count is g_outCh1 (6, or 8 when the sides ride
+    // this stream) -- the merge decision has already run by banner time.
+    if (idx == 0 && d->playback.internalChannels != (ma_uint32)g_outCh1)
+        tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not %dch -- fine with the strict split:\n"
+                        "            out1 drives FC/LFE AND the 5.1/7.1 rear + side slots as digital\n"
+                        "            silence (the rears/sides live on their own legs), so no layer\n"
+                        "            (engine, miniaudio converter, Speaker Fill) has anything to\n"
+                        "            upmix into a fake center.\n",
+                (unsigned)d->playback.internalChannels, g_outCh1);
     // v6.0: a non-48k endpoint means miniaudio inserts a RESAMPLER on this
     // leg -- a pitch change, which twinspeak itself never does. Say it loud.
     if (sr != kSampleRate)
@@ -5521,6 +5651,9 @@ enum {
     // v8.4.0: the four-leg controls -- the rear device combos, the gain
     // quad's two new edits, the timing quad's two offset edits.
     IDC_OUT3, IDC_OUT4, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3, IDC_OFF4,
+    // v8.6.0: the surround legs -- the side device combos, the second gain
+    // quad's two side edits, the timing quad's two side offsets.
+    IDC_OUT5, IDC_OUT6, IDC_GAIN_SL, IDC_GAIN_SR, IDC_OFF5, IDC_OFF6,
 };
 
 // ---- gui state -------------------------------------------------------------
@@ -6378,12 +6511,12 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
 static void guiFillCombos(HWND w) {
     std::vector<std::string> pb, cp;
     guiEnumNames(pb, cp);
-    const int ids[5] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_OUT4, IDC_INDEV };  // 0..3 playback; 4 capture
-    for (int k = 0; k < 5; ++k) {
+    const int ids[7] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_OUT4, IDC_OUT5, IDC_OUT6, IDC_INDEV };  // 0..5 playback; 6 capture
+    for (int k = 0; k < 7; ++k) {
         HWND h = GetDlgItem(w, ids[k]);
         char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
         SendMessageA(h, CB_RESETCONTENT, 0, 0);
-        const std::vector<std::string>& v = (k < 4) ? pb : cp;   // v8.4.0: the rear combos fill too
+        const std::vector<std::string>& v = (k < 6) ? pb : cp;   // v8.4.0/v8.6.0: every leg combo fills
         for (size_t i = 0; i < v.size(); ++i)
             SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
         if (cur[0]) SetWindowTextA(h, cur);
@@ -6399,12 +6532,16 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "delay2_ms")         { snprintf(b, 64, "%g", g_cfg.delay2Ms); return b; }
     else if (key == "offset3_ms")        { snprintf(b, 64, "%g", g_cfg.offset3Ms); return b; }   // v8.4.0
     else if (key == "offset4_ms")        { snprintf(b, 64, "%g", g_cfg.offset4Ms); return b; }   // v8.4.0
+    else if (key == "offset5_ms")        { snprintf(b, 64, "%g", g_cfg.offset5Ms); return b; }   // v8.6.0
+    else if (key == "offset6_ms")        { snprintf(b, 64, "%g", g_cfg.offset6Ms); return b; }   // v8.6.0
     else if (key == "gain_l")            { snprintf(b, 64, "%g", g_cfg.gainL);     return b; }
     else if (key == "gain_r")            { snprintf(b, 64, "%g", g_cfg.gainR);     return b; }
     else if (key == "gain_lfe")          { snprintf(b, 64, "%g", g_cfg.gainLfe);   return b; }
     else if (key == "gain_center")       { snprintf(b, 64, "%g", g_cfg.gainCenter);return b; }
     else if (key == "gain_rl")           { snprintf(b, 64, "%g", g_cfg.gainRl);   return b; }   // v8.4.0
     else if (key == "gain_rr")           { snprintf(b, 64, "%g", g_cfg.gainRr);   return b; }   // v8.4.0
+    else if (key == "gain_sl")           { snprintf(b, 64, "%g", g_cfg.gainSl);   return b; }   // v8.6.0
+    else if (key == "gain_sr")           { snprintf(b, 64, "%g", g_cfg.gainSr);   return b; }   // v8.6.0
     else if (key == "chime_gain")        { snprintf(b, 64, "%g", g_cfg.chimeGain); return b; }
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
@@ -6429,6 +6566,8 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
     else if (key == "output_device4")    return g_cfg.outputDevice4;   // v8.4.0
+    else if (key == "output_device5")    return g_cfg.outputDevice5;   // v8.6.0
+    else if (key == "output_device6")    return g_cfg.outputDevice6;   // v8.6.0
     else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
     else if (key == "backend1")          return g_cfg.backend1;
     else if (key == "backend2")          return g_cfg.backend2;
@@ -6448,9 +6587,12 @@ static std::string cfgValueText(const std::string& key) {
 // lfe_fold is GONE too (the fold is built in, always on).
 static const char* kIniKeys[] = {
     "delay1_ms", "delay2_ms", "offset3_ms", "offset4_ms",      // v8.4.0 rears
+    "offset5_ms", "offset6_ms",                                // v8.6.0: the sides
     "input_device", "output_device1", "output_device2",
     "output_device3", "output_device4",                        // v8.4.0 rears
+    "output_device5", "output_device6",                        // v8.6.0: the sides
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_lfe", "gain_center",
+    "gain_sl", "gain_sr",                                      // v8.6.0: the sides
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
     "eq_slot2_on", "eq_slot2_freq", "eq_slot2_gain", "eq_slot2_q",
@@ -6539,11 +6681,15 @@ static void cfgFromControls(HWND w) {
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
     g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent
     g_cfg.outputDevice4  = editStr(w, IDC_OUT4);
+    g_cfg.outputDevice5  = editStr(w, IDC_OUT5);   // v8.6.0: the sides, same rule
+    g_cfg.outputDevice6  = editStr(w, IDC_OUT6);
     g_cfg.volumeEndpoint = editStr(w, IDC_VOLEP);
     g_cfg.gainL     = editFloat(w, IDC_GAIN_L,  1.0f);
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
     g_cfg.gainRl    = editFloat(w, IDC_GAIN_RL, 1.0f);   // v8.4.0 gain quad
     g_cfg.gainRr    = editFloat(w, IDC_GAIN_RR, 1.0f);
+    g_cfg.gainSl    = editFloat(w, IDC_GAIN_SL, 1.0f);   // v8.6.0: the second quad
+    g_cfg.gainSr    = editFloat(w, IDC_GAIN_SR, 1.0f);
     g_cfg.gainLfe   = editFloat(w, IDC_GAIN_LFE, 0.4f);
     g_cfg.gainCenter= editFloat(w, IDC_GAIN_CTR, 1.0f);
     // v8.4.0: lfeFold is INTEGRATED (always on) -- no control reads it.
@@ -6554,6 +6700,8 @@ static void cfgFromControls(HWND w) {
     g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
     g_cfg.offset3Ms = editFloat(w, IDC_OFF3, 0.0f);   // v8.4.0 timing quad
     g_cfg.offset4Ms = editFloat(w, IDC_OFF4, 0.0f);
+    g_cfg.offset5Ms = editFloat(w, IDC_OFF5, 0.0f);   // v8.6.0: the sides' quad
+    g_cfg.offset6Ms = editFloat(w, IDC_OFF6, 0.0f);
     g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
     // v7.0.0: pinOutputs is integrated -- always on; no control can change it.
     // v7.1.7: backend1/backend2 have NO control -- the ini keys stand as loaded.
@@ -6578,11 +6726,15 @@ static void controlsFromCfg(HWND w) {
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
     SetDlgItemTextA(w, IDC_OUT4,  g_cfg.outputDevice4.c_str());
+    SetDlgItemTextA(w, IDC_OUT5,  g_cfg.outputDevice5.c_str());   // v8.6.0
+    SetDlgItemTextA(w, IDC_OUT6,  g_cfg.outputDevice6.c_str());
     SetDlgItemTextA(w, IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
     snprintf(b, 64, "%g", g_cfg.gainL);      SetDlgItemTextA(w, IDC_GAIN_L, b);
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
     snprintf(b, 64, "%g", g_cfg.gainRl);     SetDlgItemTextA(w, IDC_GAIN_RL, b);
     snprintf(b, 64, "%g", g_cfg.gainRr);     SetDlgItemTextA(w, IDC_GAIN_RR, b);
+    snprintf(b, 64, "%g", g_cfg.gainSl);     SetDlgItemTextA(w, IDC_GAIN_SL, b);   // v8.6.0
+    snprintf(b, 64, "%g", g_cfg.gainSr);     SetDlgItemTextA(w, IDC_GAIN_SR, b);
     snprintf(b, 64, "%g", g_cfg.gainLfe);    SetDlgItemTextA(w, IDC_GAIN_LFE, b);
     snprintf(b, 64, "%g", g_cfg.gainCenter); SetDlgItemTextA(w, IDC_GAIN_CTR, b);
     // v8.4.0: no LFEFOLD pill to sync -- the fold is built in (always on).
@@ -6590,6 +6742,8 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     snprintf(b, 64, "%g", g_cfg.offset3Ms); SetDlgItemTextA(w, IDC_OFF3, b);   // v8.4.0
     snprintf(b, 64, "%g", g_cfg.offset4Ms); SetDlgItemTextA(w, IDC_OFF4, b);
+    snprintf(b, 64, "%g", g_cfg.offset5Ms); SetDlgItemTextA(w, IDC_OFF5, b);   // v8.6.0
+    snprintf(b, 64, "%g", g_cfg.offset6Ms); SetDlgItemTextA(w, IDC_OFF6, b);
     g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
     // v7.1.7: backend1/backend2 have no control -- loaded from the ini only
     snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); SetDlgItemTextA(w, IDC_KSPF, b);
@@ -6715,7 +6869,7 @@ static void guiStartEngine(HWND w) {
     // opens and the center folds onto leg1's FL/FR (g_centerFold); the
     // rear legs were already so. Only the capture and the mains are hard.
     if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty()) {
-        guiSetStatus(g_hwnd, "set input_device / output_device1 first (legs 2/3/4 may stay EMPTY)");
+        guiSetStatus(g_hwnd, "set input_device / output_device1 first (legs 2..6 may stay EMPTY)");
         // v7.2.12: tray-only start (no panel yet) has no status line -- the
         // refusal used to vanish into a hidden STATIC and "Start engine"
         // from the tray menu looked like a silent dead click. The balloon
@@ -6780,13 +6934,14 @@ static void comboRow(HWND w, int colX, int y, const char* label, int id,
 
 // v8.4.0 THE QUAD: a four-element compact group -- a short small-font label
 // OVER a narrow 92 px edit (100 px pitch, four across the column). The gain
-// quad (gain_l/gain_r/gain_rl/gain_rr) and the timing quad (delay1_ms/
-// delay2_ms/offset3_ms/offset4_ms) use it; the wide single-key rows keep
-// the classic label+edit layout (the field's ask: shorter-width values,
-// grouped).
+// quads (l/r/rl/rr, then center/lfe/sl/sr) and the timing quads (delay1/
+// delay2/offset3/offset4, then offset5/offset6) use it; the wide single-key
+// rows keep the classic label+edit layout (the field's ask: shorter-width
+// values, grouped). v8.6.0: the trailing n (default 4) lets a partial row
+// use just its first k slots -- the timing quad's side pair is a 2-row.
 static void quadRow(HWND w, int colX, int y, const char* const lbl[4],
-                    const int id[4], const char* const val[4]) {
-    for (int k = 0; k < 4; ++k) {
+                    const int id[4], const char* const val[4], int n = 4) {
+    for (int k = 0; k < n; ++k) {
         const int x = colX + k * 100;
         mkLabel(w, 0, x, y, 92, lbl[k], g_fSml, 14);
         mkEdit(w, id[k], x, y + 16, 92, 22, val[k]);
@@ -6798,22 +6953,29 @@ static void guiBuildPages(HWND w) {
     // chime rows from the late SETTINGS page live here too) ============
     g_tab = 0;
     header(w, COLA_X, KHDR_Y, "CONFIGURATION");
+    // v8.6.0: SIX device legs -- the column compacts to a 26 px pitch so
+    // capture + leg1..leg6 + volume_endpoint + REFRESH + the note all fit
+    // the 402 px panel (the note still ends at 401).
     comboRow(w, COLA_X, KROW0, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
-    comboRow(w, COLA_X, 154, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
-    comboRow(w, COLA_X, 188, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
-    comboRow(w, COLA_X, 222, "output leg3 (rear L)", IDC_OUT3, false, g_cfg.outputDevice3.c_str());
-    comboRow(w, COLA_X, 256, "output leg4 (rear R)", IDC_OUT4, false, g_cfg.outputDevice4.c_str());
-    row(w, COLA_X, 290, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 324, 150, 26, "REFRESH DEVICES");
+    comboRow(w, COLA_X, 146, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
+    comboRow(w, COLA_X, 172, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
+    comboRow(w, COLA_X, 198, "output leg3 (rear L)", IDC_OUT3, false, g_cfg.outputDevice3.c_str());
+    comboRow(w, COLA_X, 224, "output leg4 (rear R)", IDC_OUT4, false, g_cfg.outputDevice4.c_str());
+    comboRow(w, COLA_X, 250, "output leg5 (surr L)", IDC_OUT5, false, g_cfg.outputDevice5.c_str());
+    comboRow(w, COLA_X, 276, "output leg6 (surr R)", IDC_OUT6, false, g_cfg.outputDevice6.c_str());
+    row(w, COLA_X, 302, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 326, 150, 24, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
     note(w, COLA_X, 352,
          "leg1 = FL/FR + the LFE fold; an EMPTY leg2 folds the center onto\n"
          "FL/FR; a SAME-device leg2 puts it in out1's FC slot (v8.5.0 merge).\n"
-         "leg3/leg4 = the rears: EMPTY = silent, SAME device = one stereo pair.", 3);
+         "leg3-6 (rear/surr L/R): EMPTY = silent; a SAME pair device merges.", 3);
     header(w, COLB_X, KHDR_Y, "GAIN");
-    // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
-    // narrow edits in one group (the field's ask), gain_lfe just below,
-    // gain_center under it -- the wide rows that stay single-key.
+    // v8.4.0/v8.6.0 THE GAIN QUADS: two compact rows -- l/r/rl/rr (the
+    // mains + the rears), then center/lfe/sl/sr (the center, the LFE fold,
+    // the sides). The two wide rows (gain_lfe, gain_center) the quads
+    // absorbed are GONE; the chime rows and the startup row below keep
+    // their proven slots (240 / 274 / 308).
     {
         char bL[32], bR[32], bRL[32], bRR[32];
         snprintf(bL,  32, "%g", g_cfg.gainL);
@@ -6825,8 +6987,17 @@ static void guiBuildPages(HWND w) {
         const char* vals[4] = { bL, bR, bRL, bRR };
         quadRow(w, COLB_X, 118, lbl, ids, vals);
     }
-    row(w, COLB_X, 170, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
-    row(w, COLB_X, 204, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
+    {
+        char bC[32], bLF[32], bSL[32], bSR[32];
+        snprintf(bC,  32, "%g", g_cfg.gainCenter);
+        snprintf(bLF, 32, "%g", g_cfg.gainLfe);
+        snprintf(bSL, 32, "%g", g_cfg.gainSl);
+        snprintf(bSR, 32, "%g", g_cfg.gainSr);
+        const char* lbl[4]  = { "gain_center", "gain_lfe", "gain_sl", "gain_sr" };
+        const int   ids[4]  = { IDC_GAIN_CTR, IDC_GAIN_LFE, IDC_GAIN_SL, IDC_GAIN_SR };
+        const char* vals[4] = { bC, bLF, bSL, bSR };
+        quadRow(w, COLB_X, 162, lbl, ids, vals);   // v8.6.0: the second row
+    }
     // v6.6.8: capture_exclusive / exclusive / align_modes pills are gone --
     // the share-mode design is part of the engine now (always on).
     // v8.3.0: THE SETTINGS PAGE IS GONE -- its three survivors moved HERE.
@@ -6872,7 +7043,18 @@ static void guiBuildPages(HWND w) {
         const char* vals[4] = { b1, b2, b3, b4 };
         quadRow(w, COLB_X, 118, lbl, ids, vals);
     }
-    tglRow(w, COLB_X, 170, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
+    // v8.6.0: the sides' offsets -- a 2-slot quad row under the first (the
+    // same compact shape; n = 2 uses just the left pair of slots).
+    {
+        char b5[32], b6[32];
+        snprintf(b5, 32, "%g", g_cfg.offset5Ms);
+        snprintf(b6, 32, "%g", g_cfg.offset6Ms);
+        const char* lbl[4]  = { "offset5_ms", "offset6_ms", "", "" };
+        const int   ids[4]  = { IDC_OFF5, IDC_OFF6, 0, 0 };
+        const char* vals[4] = { b5, b6, "", "" };
+        quadRow(w, COLB_X, 160, lbl, ids, vals, 2);
+    }
+    tglRow(w, COLB_X, 202, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
     // v7.0.0: the pin_outputs pill is gone -- output pinning is part of the
     // engine now (always on): both endpoint volumes are pinned 100% / unmuted,
     // except a leg that IS the current default playback device (v7.6.3 --
@@ -6880,19 +7062,18 @@ static void guiBuildPages(HWND w) {
     // v8.2.0: the transport description (shortened) rides below the timing
     // one; v8.4.0: the quad pushed it down and the offsets joined the text
     // -- 12 declared lines for a 12-line text, nothing clipped.
-    note(w, COLB_X, 204,
+    note(w, COLB_X, 230,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
-         "EARLY leg. offset3_ms/offset4_ms are the same knob for the rear legs\n"
-         "(leg3/leg4 = rear L/R; an empty rear device = no rear output). The\n"
-         "banner prints every est path; 'drift' already includes your delay\n"
-         "(it IS the alignment, not a fault).\n"
+         "EARLY leg. offset3..offset6_ms are the same knob for the four single-\n"
+         "channel legs (leg3/4 = rear L/R, leg5/6 = side L/R; an empty device\n"
+         "row = that leg is silent). The banner prints every est path; 'drift'\n"
+         "already includes your delay (it IS the alignment, not a fault).\n"
          "\n"
          "period_frames = the buffer-switch bite in SAMPLES (128 @ 48 kHz =\n"
          "a bite every 2.67 ms; 128+ paces steadiest). periods = the looped\n"
          "buffer around it (3 recommended, 2..8). Every leg runs the KS kernel\n"
-         "loop by default -- a driver refusal falls back to wasapi exclusive\n"
-         "(backendN = wasapi opts legs 1/2 back in) and the log says so.\n"
-         "out1ms/out2ms are engine constants: 1 ms, hardcoded (a KS leg ignores).\n", 12);
+         "loop by default; a driver refusal falls back to wasapi exclusive and\n"
+         "the log says so. out1ms/out2ms are engine constants: 1 ms, hardcoded.\n", 11);
 
     // v8.3.0: THE SETTINGS PAGE IS GONE -- nothing on it survived as a
     // setting: the drift trio + volume_follow are hardcoded constants, and
@@ -9638,7 +9819,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
     // v8.5.0: the ids are value-init -- THE MERGE compares them pairwise
     // (the comparisons are short-circuit guarded; the init keeps it honest).
-    ma_device_id capId, id1, id2 = {}, id3 = {}, id4 = {}; std::string capName, n1, n2, n3, n4;
+    ma_device_id capId, id1, id2 = {}, id3 = {}, id4 = {}, id5 = {}, id6 = {};   // v8.6.0: the sides too
+    std::string capName, n1, n2, n3, n4, n5, n6;
     if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
         tlog( "[twinspeak] capture device matching \"%s\" not found (--list to see names)\n",
                 g_cfg.inputDevice.c_str());
@@ -9688,6 +9870,43 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] leg3 (rear L)   : output_device3 is EMPTY -- the leg stays SILENT (no device, no error)\n");
     if (g_leg[3].disabled)
         tlog("[twinspeak] leg4 (rear R)   : output_device4 is EMPTY -- the leg stays SILENT (no device, no error)\n");
+    // v8.6.0 THE SURROUND LEGS: the sides' own devices -- ch5 (SL) on leg5,
+    // ch6 (SR) on leg6, the rear legs' exact pattern. EMPTY = silent; a
+    // NON-empty needle that matches nothing is a hard error, like every leg.
+    g_leg[4].disabled = g_cfg.outputDevice5.empty();
+    g_leg[5].disabled = g_cfg.outputDevice6.empty();
+    if (!g_leg[4].disabled &&
+        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice5, &id5, &n5)) {
+        tlog( "[twinspeak] output_device5 matching \"%s\" not found (--list)\n",
+                g_cfg.outputDevice5.c_str());
+        return 1;
+    }
+    if (!g_leg[5].disabled &&
+        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice6, &id6, &n6)) {
+        tlog( "[twinspeak] output_device6 matching \"%s\" not found (--list)\n",
+                g_cfg.outputDevice6.c_str());
+        return 1;
+    }
+    if (g_leg[4].disabled)
+        tlog("[twinspeak] leg5 (surr L)   : output_device5 is EMPTY -- the leg stays SILENT (no device, no error)\n");
+    if (g_leg[5].disabled)
+        tlog("[twinspeak] leg6 (surr R)   : output_device6 is EMPTY -- the leg stays SILENT (no device, no error)\n");
+
+    // v8.6.1 THE PER-RUN RESET: a GUI STOP/START (or APPLY) reruns the
+    // engine in THIS process -- every static below survives the stop. The
+    // merge flags are reassigned unconditionally here anyway, but g_outCh1
+    // was only ever SET (8, under the all-on-one merge) and a mergedSlave
+    // was only ever MARKED: a stale 8 from a previous merged run opened
+    // out1 as an 8ch stream while the legacy mix strides 6ch -- the
+    // scrambled, "pixelated" mains; a stale slave mark built a ring no
+    // partner drains. Reset everything here, every start, no exceptions.
+    for (int i = 0; i < 6; ++i) g_leg[i].mergedSlave = false;
+    g_frontMerge  = false;
+    g_rearPair    = false;
+    g_rearOnFront = false;
+    g_surrPair    = false;
+    g_surrOnFront = false;
+    g_outCh1      = kOutCh1;
 
     // v8.5.0 THE MERGE -- two legs on ONE device become ONE stream: the
     // device opens ONCE (one clock, no second stream fighting for the
@@ -9720,7 +9939,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_leg[2].mergedSlave = true;
         g_leg[3].disabled = true;
         g_leg[3].mergedSlave = true;
-        tlog("[twinspeak] legs 3+4      : SHARE leg1's device too -- ALL FOUR MERGED: ONE 5.1 stream carries the\n"
+        tlog("[twinspeak] legs 3+4      : SHARE leg1's device too -- ALL FOUR MERGED: the front stream carries the\n"
              "                            show (FL/FR + the LFE fold + FC + the rears in out1's rear slots =\n"
              "                            %.2f*ch7 / %.2f*ch8, offset3_ms/offset4_ms PER SIDE from their own rings)\n",
              g_cfg.gainRl, g_cfg.gainRr);
@@ -9731,6 +9950,33 @@ static int engineMain(const std::string& iniPath, bool fgForce,
              "                            (L = %.2f*ch7 at offset3, R = %.2f*ch8 at offset4 -- each side its own\n"
              "                            ring and delay, one clock; no gates, no keep-alive)\n",
              g_cfg.gainRl, g_cfg.gainRr);
+    }
+    // v8.6.0: the sides' merge -- the rears' pattern, pairwise. On leg1's
+    // device the front stream WIDENS TO 7.1 (g_outCh1 = 8) and the sides
+    // ride the 7.1 slots (6/7), each from its own ring prefill; all six
+    // legs on one device = ONE stream carries the whole show.
+    const bool surrSame = !g_leg[4].disabled && !g_leg[5].disabled && sameDev(&id5, &id6);
+    g_surrOnFront = g_frontMerge && surrSame && sameDev(&id1, &id5);
+    g_surrPair    = surrSame && !g_surrOnFront;
+    if (g_surrOnFront) {
+        g_outCh1 = 8;   // the front stream widens: FL FR FC LFE RL RR SL SR
+        g_leg[4].disabled = true;   // side slaves WITH rings: out1's 7.1 slots read them
+        g_leg[4].mergedSlave = true;
+        g_leg[5].disabled = true;
+        g_leg[5].mergedSlave = true;
+        tlog("[twinspeak] legs 5+6      : SHARE leg1's device -- MERGED: out1's stream widens to 7.1 and the\n"
+             "                            sides ride the 7.1 slots (%.2f*ch5 / %.2f*ch6, offset5/offset6 PER SIDE\n"
+             "                            from their own rings)%s\n",
+             g_cfg.gainSl, g_cfg.gainSr,
+             g_rearOnFront ? " -- ALL SIX legs on ONE stream (the full show)"
+                           : " (the rears live on leg3/leg4 alone)");
+    } else if (g_surrPair) {
+        g_leg[5].disabled = true;   // side slave WITH ring: the pair's R side reads it
+        g_leg[5].mergedSlave = true;
+        tlog("[twinspeak] leg6 (surr R)  : SHARES leg5's device -- MERGED: ONE stereo pair stream on leg5\n"
+             "                            (L = %.2f*ch5 at offset5, R = %.2f*ch6 at offset6 -- each side its own\n"
+             "                            ring and delay, one clock; no gates, no keep-alive)\n",
+             g_cfg.gainSl, g_cfg.gainSr);
     }
 
     // per-leg periods -- one engine constant for both now. v8.1.0: the
@@ -9747,11 +9993,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
     // per-leg identity + work buffers (rings come later -- their size needs
     // the negotiated device period)
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         Leg& L = g_leg[i];
         L.index = i;
-        L.outCh = (i == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
-        L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3 : n4;
+        L.outCh = (i == 0) ? g_outCh1 : kOutCh2;  // v8.6.0: out1 may widen to 8ch; legs 2..6 are all 2ch
+        L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3
+               : (i == 3) ? n4 : (i == 4) ? n5 : n6;   // v8.6.1: the sides' own names
         // v8.5.0: a MERGE SLAVE owns a scratch -- the partner's callback
         // pops its ring into it (the slave's whole life is on the partner's
         // device thread). A front-merge slave owns neither.
@@ -9781,11 +10028,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // boots straight into the yielded state: the DAC is never touched at
     // boot, and the per-tick yield block re-grabs it under the v6.5.16
     // quiet rule (default moved away AND foreignActiveSessions == 0).
-    bool bootYield[4] = { false, false, false, false };
+    bool bootYield[6] = { false, false, false, false, false, false };
     {
         std::string defNm;
         const bool haveDef = defaultRenderName(&defNm);
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (g_leg[i].disabled) continue;      // v8.4.0: an empty rear leg holds nothing
             const char* yn = legNeedle(i);
             if (!yn[0]) continue;
@@ -9822,15 +10069,18 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // backend1/backend2; the rear legs are KS-first with no ini opt-out (a
     // driver refusal falls back to WASAPI exclusive, same as legs 1/2).
     // out2_first still orders the opens (center, mains, then the rears).
-    const bool wantKS[4] = { g_cfg.backend1 == "ks", g_cfg.backend2 == "ks", true, true };
-    int openOrder[4];
-    if (g_cfg.out2First) { openOrder[0] = 1; openOrder[1] = 0; openOrder[2] = 2; openOrder[3] = 3; }
-    else                 { openOrder[0] = 0; openOrder[1] = 1; openOrder[2] = 2; openOrder[3] = 3; }
+    // v8.6.0: the sides run the KS kernel loop first too (no backend key,
+    // exactly the rears).
+    const bool wantKS[6] = { g_cfg.backend1 == "ks", g_cfg.backend2 == "ks", true, true, true, true };
+    int openOrder[6];
+    if (g_cfg.out2First) { openOrder[0] = 1; openOrder[1] = 0; openOrder[2] = 2; openOrder[3] = 3; openOrder[4] = 4; openOrder[5] = 5; }
+    else                 { openOrder[0] = 0; openOrder[1] = 1; openOrder[2] = 2; openOrder[3] = 3; openOrder[4] = 4; openOrder[5] = 5; }
     auto legIdPtr = [&](int i) -> ma_device_id* {
-        return (i == 0) ? &id1 : (i == 1) ? &id2 : (i == 2) ? &id3 : &id4;
+        return (i == 0) ? &id1 : (i == 1) ? &id2 : (i == 2) ? &id3
+               : (i == 3) ? &id4 : (i == 4) ? &id5 : &id6;
     };
-    bool okLeg[4] = { false, false, false, false };
-    for (int oi = 0; oi < 4; ++oi) {
+    bool okLeg[6] = { false, false, false, false, false, false };
+    for (int oi = 0; oi < 6; ++oi) {
         const int i = openOrder[oi];
         if (g_leg[i].disabled) { okLeg[i] = true; continue; }   // empty rear: fine by design
         if (bootYield[i])      { okLeg[i] = true; continue; }   // released by choice, not broken
@@ -9841,7 +10091,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
         g_leg[i].backend = (okLeg[i] && wantKS[i]) ? 1 : 0;
     }
-    for (int oi = 0; oi < 4; ++oi) {
+    for (int oi = 0; oi < 6; ++oi) {
         const int i = openOrder[oi];
         if (g_leg[i].disabled || bootYield[i] || okLeg[i]) continue;
         okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodMs, g_cfg.exclusive);
@@ -9852,7 +10102,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // stays identical; KS legs are committed to their pin and stay as-is.
     {
         bool anyFail = false;
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 6; ++i)
             if (!okLeg[i] && !bootYield[i] && !g_leg[i].disabled) anyFail = true;
         if (anyFail && g_cfg.exclusive) {
             if (g_cfg.alignModes) {
@@ -9861,7 +10111,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 // leg holds no device at all -- the dance must never uninit or
                 // reopen it (ok stays true; it is released by choice).
                 tlog( "[twinspeak] align_modes: exclusive refused on a leg -- reopening the WASAPI legs shared so device buffering stays identical\n");
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 6; ++i) {
                     if (g_leg[i].disabled || bootYield[i] || g_leg[i].backend == 1) continue;
                     if (okLeg[i]) {
                         ma_device_uninit(&g_leg[i].dev);
@@ -9871,13 +10121,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     if (!okLeg[i]) okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodMs, false);
                 }
             } else {
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 6; ++i)
                     if (!okLeg[i] && !bootYield[i] && !g_leg[i].disabled && g_leg[i].backend == 0)
                         okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodMs, false);
             }
         }
     }
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         if (okLeg[i] || bootYield[i] || g_leg[i].disabled) continue;
         tlog( "[twinspeak] giving up -- a playback device could not be opened in any mode\n");
         return 1;
@@ -9918,7 +10168,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v4.0: the REAL negotiated device period per leg feeds the ring floor
     // and the gated-drop line. v6.3: a KS leg's bite is exactly
     // ks_period_frames (our pacing thread never asks for more).
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         if (g_leg[i].disabled) { g_periodFrames[i] = 0; continue; }   // v8.4.0: no device
         if (g_leg[i].backend == 1) {
             g_periodFrames[i] = (size_t)g_cfg.ksPeriodFrames;
@@ -9939,7 +10189,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // PREFILL (bit-exact, sequence-less). Capture excess evicts oldest at
     // the cap (counted in rawDrop, ledger-true); a device shortfall plays
     // silence (counted in und). Nothing manages depth.
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         Leg& L = g_leg[i];
         // v8.5.0: a MERGE SLAVE owns a ring too -- its own delay prefill
         // (offset3/offset4), fed by capCallback, drained by the partner's
@@ -9948,7 +10198,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const float delayMs = (i == 0) ? g_cfg.delay1Ms
                           : (i == 1) ? g_cfg.delay2Ms
                           : (i == 2) ? g_cfg.offset3Ms   // v8.4.0: the rears' own knob
-                                     : g_cfg.offset4Ms;
+                          : (i == 3) ? g_cfg.offset4Ms
+                          : (i == 4) ? g_cfg.offset5Ms   // v8.6.0: the sides' own knob
+                                     : g_cfg.offset6Ms;
         const size_t devPeriodFr  = (L.backend == 1)
                                   ? (size_t)g_cfg.ksPeriodFrames
                                   : (L.dev.playback.internalPeriodSizeInFrames
@@ -9979,11 +10231,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f
                && (!g_centerFold || g_cfg.gainCenter > 0.0f)         // v8.4.1: the fold term too
                && (!g_frontMerge || g_ceq.on || g_cfg.gainCenter > 0.0f)   // v8.5.0: the merged FC term (EQ on -> the flush path owns it)
-               && (!g_rearOnFront || (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f)))  // v8.5.0: the merged rear slots (g*0 == 0)
+               && (!g_rearOnFront || (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f))  // v8.5.0: the merged rear slots (g*0 == 0)
+               && (!g_surrOnFront || (g_cfg.gainSl >= 0.0f && g_cfg.gainSr >= 0.0f)))  // v8.6.0: the merged side slots
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (i == 2) ? (g_cfg.gainRl >= 0.0f && (!g_rearPair || g_cfg.gainRr >= 0.0f))  // v8.5.0: the pair's R side too
-                       : (g_cfg.gainRr >= 0.0f);         // (g * 0 == 0, always)
+            : (i == 3) ? (g_cfg.gainRr >= 0.0f)
+            : (i == 4) ? (g_cfg.gainSl >= 0.0f && (!g_surrPair || g_cfg.gainSr >= 0.0f))  // v8.6.0: the sides' pair
+                       : (g_cfg.gainSr >= 0.0f);         // (g * 0 == 0, always)
     }
 
     // ---------------- v3.8 COM volume layer (setup on the main thread) -----
@@ -10020,7 +10275,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
     }
     if (g_cfg.pinOutputs) {
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (g_leg[i].disabled) continue;   // v8.4.0: nothing to pin
             if (g_leg[i].backend == 1) {
                 // v6.3: a KS pin is a direct line to the DAC -- there is no
@@ -10107,7 +10362,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // nothing to start, success by design.
     {
         ma_result sAll = MA_SUCCESS;
-        for (int oi = 0; oi < 4; ++oi) {
+        for (int oi = 0; oi < 6; ++oi) {
             const int i = openOrder[oi];
             Leg& L = g_leg[i];
             if (L.disabled || L.yielded.load(std::memory_order_relaxed)) continue;
@@ -10149,7 +10404,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const unsigned long long alignT0 = GetTickCount64();
         for (;;) {
             bool all = true;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 if (g_leg[i].disabled) continue;
                 if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
                 if (g_leg[i].popped.load(std::memory_order_acquire) == 0) { all = false; break; }
@@ -10158,10 +10413,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
             Sleep(1);
         }
-        unsigned long long fs[4] = { 0, 0, 0, 0 };
+        unsigned long long fs[6] = { 0, 0, 0, 0, 0, 0 };   // v8.6.0: six legs
         int nPart = 0;
         bool missing = false;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (g_leg[i].disabled) continue;
             if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;   // released legs hand in nothing
             fs[i] = g_leg[i].firstSwitchUs.load(std::memory_order_acquire);
@@ -10173,9 +10428,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                  "                            aligns itself on its quiet reopen)\n");
         } else {
             int ref = -1;
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 6; ++i)
                 if (fs[i] && (ref < 0 || fs[i] < fs[ref])) ref = i;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 if (i == ref || !fs[i]) continue;
                 const long long gapUs = (long long)fs[i] - (long long)fs[ref];
                 if (gapUs <= 0) continue;               // within one frame of the reference
@@ -10286,10 +10541,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            g_leg[0].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs1);
     if (g_rearOnFront)
         tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE) | FC = %.2f*ch3\n"
-             "[twinspeak] route out1     : rear slots = %.2f*ch7 (cable RL) / %.2f*ch8 (cable RR) -- ALL FOUR legs ride\n"
-             "[twinspeak] route out1     : this ONE 5.1 stream (v8.5.0 THE MERGE); discrete LFE = the driven-silence fold\n",
+             "[twinspeak] route out1     : rear slots = %.2f*ch7 (cable RL) / %.2f*ch8 (cable RR) -- legs 1-4 ride this\n"
+             "[twinspeak] route out1     : ONE stream%s; discrete LFE = the driven-silence fold\n",
              g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe, g_cfg.gainCenter,
-             g_cfg.gainRl, g_cfg.gainRr);
+             g_cfg.gainRl, g_cfg.gainRr,
+             g_surrOnFront ? " widened to 7.1 (the sides ride slots 6/7 -- ALL SIX legs, v8.5.0/v8.6.0)"
+                           : " (v8.5.0 THE MERGE)");
+    else if (g_frontMerge && g_surrOnFront)
+        tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE) | FC = %.2f*ch3\n"
+             "[twinspeak] route out1     : side slots = %.2f*ch5 (cable SL) / %.2f*ch6 (cable SR) -- the stream widens to\n"
+             "[twinspeak] route out1     : 7.1 (leg5/leg6 share this device, v8.6.0 THE MERGE); discrete LFE + the 5.1 rear\n"
+             "[twinspeak] route out1     : slots = driven silence (the rears live on leg3/leg4 alone)\n",
+             g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe, g_cfg.gainCenter,
+             g_cfg.gainSl, g_cfg.gainSr);
     else if (g_frontMerge)
         tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE) | FC = %.2f*ch3\n"
              "[twinspeak] route out1     : (the center's own slot -- leg2 shares this device, v8.5.0 THE MERGE; FL/FR\n"
@@ -10309,11 +10573,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
                g_leg[1].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
                g_leg[1].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs2);
-    // v8.4.0: the rear legs' banner -- present only when a device is set.
-    for (int ri = 2; ri < 4; ++ri) {
+    // v8.4.0/v8.6.0: the four single-channel legs' banner -- rears (leg3/
+    // leg4) and sides (leg5/leg6), present only when a device is set.
+    for (int ri = 2; ri < 6; ++ri) {
         if (g_leg[ri].disabled) continue;
-        tlog("[twinspeak] leg%d (rear %c)  : \"%s\" | %s | %s\n",
-               ri + 1, ri == 2 ? 'L' : 'R', g_leg[ri].name.c_str(),
+        tlog("[twinspeak] leg%d (%s) : \"%s\" | %s | %s\n",
+               ri + 1, ri == 2 ? "rear L" : ri == 3 ? "rear R"
+                     : ri == 4 ? "surr L" : "surr R", g_leg[ri].name.c_str(),
                g_leg[ri].backend == 1 ? "WDM-KS (kernel streaming)" :
                g_leg[ri].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
                g_leg[ri].isExclusive ? "EXCLUSIVE" : "shared",
@@ -10334,6 +10600,22 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                    "[twinspeak] route out4     : L = R = %.2f*ch8 (cable RR) ONLY -- no gates, no keep-alive; an unconfigured\n"
                    "[twinspeak] route rears    : leg = silent by design (empty device = empty out; the cable's rears ride ONLY here)\n",
                    g_cfg.gainRl, g_cfg.gainRr);
+    // v8.6.0: the side legs' route banner -- the rears' pattern exactly.
+    if (g_surrOnFront)
+        tlog("[twinspeak] route surrs    : the sides ride OUT1's stream -- the 7.1 slots = %.2f*ch5 / %.2f*ch6 (offset5_ms /\n"
+             "                            offset6_ms PER SIDE, their own ring prefills); out5/out6 open no device (the merge;\n"
+             "                            out1's stream widens from 5.1 to 7.1 to carry them)\n",
+             g_cfg.gainSl, g_cfg.gainSr);
+    else if (g_surrPair)
+        tlog("[twinspeak] route out5     : THE SURROUND PAIR -- ONE stereo stream on the shared device: L = %.2f*ch5 (cable SL,\n"
+             "                            offset5), R = %.2f*ch6 (cable SR, offset6) -- each side its own channel, its own\n"
+             "                            delay, one clock; no gates, no keep-alive; out6 opens no device (v8.6.0)\n",
+             g_cfg.gainSl, g_cfg.gainSr);
+    else
+        tlog("[twinspeak] route out5     : L = R = %.2f*ch5 (cable SL) ONLY -- the sides' own legs (v8.6.0), the leg2 pattern;\n"
+                   "[twinspeak] route out6     : L = R = %.2f*ch6 (cable SR) ONLY -- no gates, no keep-alive; an unconfigured\n"
+                   "[twinspeak] route surrs    : leg = silent by design (empty device = empty out; the cable's sides ride ONLY here)\n",
+                   g_cfg.gainSl, g_cfg.gainSr);
     // v8.4.1: the route banner tells the truth for BOTH shapes -- a live
     // out2 (ch3 on its own device) and the fold (leg2 EMPTY, ch3 onto FL/FR).
     // v8.5.0: and the MERGE (leg2 on leg1's device, ch3 in out1's FC slot).
@@ -10454,6 +10736,29 @@ static int engineMain(const std::string& iniPath, bool fgForce,
              (int)(g_cfg.offset3Ms + 0.5f), (int)(g_cfg.offset4Ms + 0.5f),
              ep3 - ep1, ep4 - ep1);
     }
+    // v8.6.0: the sides' own align line -- the rears' pattern exactly.
+    if (g_surrOnFront) {
+        tlog("[twinspeak] align surrs   : offset5 +%d ms, offset6 +%d ms -- the sides ride OUT1's stream (one clock);\n"
+             "                            each side vs the fronts is pure prefill arithmetic: side L %+.1f ms, side R\n"
+             "                            %+.1f ms (trim the offset of a side that arrives EARLY vs the fronts)\n",
+             (int)(g_cfg.offset5Ms + 0.5f), (int)(g_cfg.offset6Ms + 0.5f),
+             (double)g_cfg.offset5Ms - (double)g_cfg.delay1Ms,
+             (double)g_cfg.offset6Ms - (double)g_cfg.delay1Ms);
+    } else if (g_surrPair) {
+        tlog("[twinspeak] align surrs   : offset5 +%d ms, offset6 +%d ms -- ONE pair stream, one clock: the sides'\n"
+             "                            relative alignment = offset6 - offset5 = %+.1f ms (pure prefill); the pair vs\n"
+             "                            leg1: %+.1f ms (trim BOTH offsets together to move the pair)\n",
+             (int)(g_cfg.offset5Ms + 0.5f), (int)(g_cfg.offset6Ms + 0.5f),
+             (double)g_cfg.offset6Ms - (double)g_cfg.offset5Ms, estPathOf(4) - ep1);
+    } else if (!g_leg[4].disabled || !g_leg[5].disabled) {
+        const double ep5 = g_leg[4].disabled ? 0.0 : estPathOf(4);
+        const double ep6 = g_leg[5].disabled ? 0.0 : estPathOf(5);
+        tlog("[twinspeak] align surrs   : offset5 +%d ms, offset6 +%d ms -- the side legs' bit-exact delays\n"
+             "                            est path vs leg1: leg5 %+.1f ms, leg6 %+.1f ms (positive = the side\n"
+             "                            arrives later; trim the offset of a side that arrives EARLY)\n",
+             (int)(g_cfg.offset5Ms + 0.5f), (int)(g_cfg.offset6Ms + 0.5f),
+             ep5 - ep1, ep6 - ep1);
+    }
     if (g_frontMerge)
         tlog("[twinspeak] route check    : out2 is MERGED -- center (ch3) rides out1's FC slot (gated, EQ-capable); out1\n"
              "                            plays ch1/ch2 + the LFE fold + the center; the rears (ch7/ch8) play %s\n",
@@ -10465,7 +10770,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
              "                            center fold; the rears (ch7/ch8) play ONLY on out3/out4, devices permitting\n");
     else
         tlog("[twinspeak] route check    : center (ch3) plays ONLY on out2; out1 plays ONLY ch1/ch2 + the LFE fold;\n"
-               "                            the rears (ch7/ch8) play ONLY on out3/out4, and ONLY when their devices are set\n");
+               "                            the rears (ch7/ch8) play ONLY on out3/out4 and the sides (ch5/ch6) ONLY on\n"
+               "                            out5/out6, and ONLY when their devices are set\n");
     if (g_cfg.volumeFollow) {
         if (g_srcVol)
             tlog("[twinspeak] volume        : following \"%ls\" (the cable's playback side) -- now %.0f%%%s -- drives every leg\n",
@@ -10483,11 +10789,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] output pins   : every WASAPI leg's endpoint forced 100%%/unmuted -- re-checked every 2 s\n");
     tlog("[twinspeak] start order   : %s\n",
            g_frontMerge
-               ? (g_rearOnFront ? "ONE stream -- all four legs merged onto leg1's device (v8.5.0)"
-                                : "out2 is MERGED into out1's stream -- leg1 opens, the rears follow (v8.5.0)")
-           : g_leg[1].disabled ? "out2 is EMPTY -- leg1 opens first, the rears follow; the center rides the FL/FR fold" :
-           g_cfg.out2First ? "out2 (center) FIRST -- its device opens first; out1 follows (v8.1.0: no pumps)"
-                           : "out1 first, then out2 (out2_first = off)");
+               ? (g_rearOnFront && g_surrOnFront ? "ONE stream -- ALL SIX legs merged onto leg1's device (v8.5.0/v8.6.0)"
+                              : g_rearOnFront ? "ONE stream -- legs 1-4 merged onto leg1's device; the sides follow (v8.5.0)"
+                                              : "out2 is MERGED into out1's stream -- leg1 opens, the rears/sides follow (v8.5.0)")
+           : g_leg[1].disabled ? "out2 is EMPTY -- leg1 opens first, the rears/sides follow; the center rides the FL/FR fold" :
+           g_cfg.out2First ? "out2 (center) FIRST -- its device opens first; out1 and the rears/sides follow (v8.1.0: no pumps)"
+                           : "out1 first, then out2, then the rears/sides (out2_first = off)");
     tlog("[twinspeak] dac yield     : %s -- the leg whose device IS the Windows default render endpoint\n"
            "                            is released the same second (KS pin closed / WASAPI device freed,\n"
            "                            pump parked) so the main device plays untouched; it reopens the\n"
@@ -10513,6 +10820,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     printLegDevice(1);
     printLegDevice(2);   // v8.4.0: the rear legs print only when configured
     printLegDevice(3);
+    printLegDevice(4);   // v8.6.0: the side legs, same rule
+    printLegDevice(5);
     // v8.2.0: the v6.0 latency hint is GONE -- it pointed at out1ms/out2ms,
     // and those are engine constants now (1 ms); its >=10 ms trigger cannot
     // fire. printLegDevice above prints each leg's real negotiated path.
@@ -10520,7 +10829,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            the pumps are gone)\n");
     {
         int ksLegs = 0, nLive = 0, firstWa = -1;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (g_leg[i].disabled) continue;
             ++nLive;
             if (g_leg[i].backend == 1) ++ksLegs;
@@ -10540,14 +10849,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
     // v8.4.0: per-leg state, four slots (a disabled rear's counters never
     // move and its streaks stay zero -- it can never fire anything).
-    unsigned long long uB[4] = { 0, 0, 0, 0 };           // prev-second 'short' per leg
-    unsigned long long dB[4] = { 0, 0, 0, 0 };           // prev-second 'evict' per leg
-    unsigned long long aB[4] = { 0, 0, 0, 0 };           // off-meter captured baselines
-    unsigned long long pB[4] = { 0, 0, 0, 0 };           // off-meter popped baselines
+    unsigned long long uB[6] = { 0, 0, 0, 0, 0, 0 };    // prev-second 'short' per leg (v8.6.0: six)
+    unsigned long long dB[6] = { 0, 0, 0, 0, 0, 0 };    // prev-second 'evict' per leg
+    unsigned long long aB[6] = { 0, 0, 0, 0, 0, 0 };    // off-meter captured baselines
+    unsigned long long pB[6] = { 0, 0, 0, 0, 0, 0 };    // off-meter popped baselines
     unsigned long long m00 = 0;                          // cumulative upmix-guard blocks
-    long offV[4] = { 0, 0, 0, 0 };                       // measured clock offset ppm per leg
-    int colStreak[4] = { 0, 0, 0, 0 };                   // v6.5.2 collapse sentinel
-    unsigned long long colLastMs[4] = { 0, 0, 0, 0 };    // per-leg reopen cooldown
+    long offV[6] = { 0, 0, 0, 0, 0, 0 };               // measured clock offset ppm per leg (v8.6.0: six)
+    int colStreak[6] = { 0, 0, 0, 0, 0, 0 };            // v6.5.2 collapse sentinel (v8.6.0: six legs)
+    unsigned long long colLastMs[6] = { 0, 0, 0, 0, 0, 0 };   // per-leg reopen cooldown (v8.6.0: six)
     bool ccHintDone = false;
     // v6.4 drift warden state (health-loop owned)
     double driftBase = 0.0;                              // calibrated inter-speaker offset
@@ -10565,7 +10874,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     unsigned sec = 0;
     int hintStreak = 0;
     long prevDom = 0;
-    unsigned stallSec[4] = { 0, 0, 0, 0 };   // v6.5.11: consecutive starved seconds per leg (v8.4.0: four)
+    unsigned stallSec[6] = { 0, 0, 0, 0, 0, 0 };   // v6.5.11: consecutive starved seconds per leg (v8.6.0: six)
     unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
     // v8.1.0: the first-second fast tier is GONE (it existed only to fire
     // the warden's re-pin early; the re-pin is gone with the ring system).
@@ -10575,7 +10884,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 over the
         // last second (both counters integrate the real clocks; bursts and
         // pop phase cancel in the deltas). Positive = cable runs fast.
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             const unsigned long long Ai = g_leg[i].captured.load(std::memory_order_relaxed);
             const unsigned long long Ci = g_leg[i].popped.load(std::memory_order_relaxed);
             if (pB[i] != 0 && Ci > pB[i] && Ai > aB[i])
@@ -10586,8 +10895,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // switches the raw ring could not fill; evict ('drop') = passive
         // oldest-evictions at the raw cap. Computed BEFORE the hint so it
         // can require a quiet window.
-        unsigned long long dropN[4], undN[4];
-        for (int i = 0; i < 4; ++i) {
+        unsigned long long dropN[6], undN[6];
+        for (int i = 0; i < 6; ++i) {
             dropN[i] = g_leg[i].rawDrop.load();
             undN[i]  = g_leg[i].und.load();
         }
@@ -10644,7 +10953,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // by definition -- do NOT storm reopen attempts at a device the OS
         // is putting to sleep; the resume path rebuilds everything.
         if (nowMs - g_bootMs > 3000 && !g_powerPark.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < 4; ++i) {   // v8.4.0: every live leg gets the 5 s check
+            for (int i = 0; i < 6; ++i) {   // v8.4.0: every live leg gets the 5 s check
                 if (g_leg[i].disabled) continue;
                 if (nowMs - hbOutGet(i) > 5000 && !g_leg[i].yielded.load(std::memory_order_relaxed))
                     tryRestartLeg(i, &ctx, kOutPeriodMs);
@@ -10665,7 +10974,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         if (g_cfg.yieldDefault && !g_powerPark.load(std::memory_order_relaxed)) {
             std::string defName;
             if (defaultRenderName(&defName)) {
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 6; ++i) {
                     if (g_leg[i].disabled) continue;   // v8.4.0: nothing held, nothing to yield
                     const char* yneedle = legNeedle(i);
                     if (!yneedle[0]) continue;
@@ -10700,7 +11009,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                         // a failed probe fails OPEN (logged).
                         const int busy = foreignActiveSessions(yneedle);
                         if (busy > 0) {
-                            static unsigned long long lastBusyLog[4] = { 0, 0, 0, 0 };
+                            static unsigned long long lastBusyLog[6] = { 0, 0, 0, 0, 0, 0 };   // v8.6.0
                             if (nowMs - lastBusyLog[i] >= 5000) {
                                 tlog("[twinspeak] leg%d YIELD     : the default moved away, but %d foreign audio\n"
                                      "                            session(s) are still ACTIVE on this device --\n"
@@ -10711,7 +11020,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                             }
                         } else {
                             if (busy < 0) {
-                                static unsigned long long lastProbeLog[4] = { 0, 0, 0, 0 };
+                                static unsigned long long lastProbeLog[6] = { 0, 0, 0, 0, 0, 0 };   // v8.6.0
                                 if (nowMs - lastProbeLog[i] >= 5000) {
                                     tlog("[twinspeak] leg%d YIELD     : session probe unavailable -- releasing fail-open\n", i + 1);
                                     lastProbeLog[i] = nowMs;
@@ -10741,14 +11050,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // choice, not broken); the yield check above re-evaluates the
             // default every tick and reopens it when the default moves.
             // v8.4.0: one pass over the legs, out2_first symmetry kept.
-            for (int oi = 0; oi < 4; ++oi) {
+            for (int oi = 0; oi < 6; ++oi) {
                 const int i = g_cfg.out2First ? (oi == 0 ? 1 : oi == 1 ? 0 : oi) : oi;
                 if (g_leg[i].disabled) continue;
                 if (!g_leg[i].yielded.load(std::memory_order_relaxed))
                     tryRestartLeg(i, &ctx, kOutPeriodMs);
             }
             wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
-            for (int k = 0; k < 4; ++k) colStreak[k] = 0;   // v8.4.0: all four legs
+            for (int k = 0; k < 6; ++k) colStreak[k] = 0;   // v8.4.0/v8.6.0: every leg
         }
         // CONSUMPTION-COLLAPSE SENTINEL: |off| beyond +-10% for 2 consecutive
         // seconds is impossible for a healthy 48 kHz link. A half-alive
@@ -10762,7 +11071,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // v8.4.0: a disabled leg's off reads a flat 0 (nothing moves)
             // -- it must not fire this either.
             int li = -1;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 const bool bad = !g_leg[i].disabled
                                  && !g_leg[i].yielded.load(std::memory_order_relaxed)
                                  && (offV[i] > kCollapsePpm || offV[i] < -kCollapsePpm);
@@ -10774,7 +11083,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 Leg& SL = g_leg[li];
                 if (nowMs - SL.lastReopenMs > 5000 && nowMs - colLastMs[li] >= 10000) {
                     colLastMs[li] = nowMs;
-                    for (int k = 0; k < 4; ++k) colStreak[k] = 0;
+                    for (int k = 0; k < 6; ++k) colStreak[k] = 0;
                     if (bad > 0) {
                         // positive = the DEVICE under-consumed (captured more
                         // than it popped) -- the field log's half-alive S5.
@@ -10803,7 +11112,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // the baseline + the suspend park; the reopen respects the 10 s
         // per-leg spacing.
         if (driftBaseOK && !g_powerPark.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 Leg& SLeg = g_leg[i];
                 if (SLeg.disabled) { stallSec[i] = 0; continue; }   // v8.4.0: no leg, no stall
                 if (SLeg.yielded.load(std::memory_order_relaxed)) {   // v6.5.14: released by choice
@@ -10944,9 +11253,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // the FULL buffer per event); WDM-KS = the pacer's write-minus-play
         // lead off the DAC position register. Telemetry only: a failed call
         // prints ----.
-        double      padMs[4]  = { 0.0, 0.0, 0.0, 0.0 };
-        const char* padHow[4] = { "----", "----", "----", "----" };
-        for (int i = 0; i < 4; ++i) {
+        double      padMs[6]  = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        const char* padHow[6] = { "----", "----", "----", "----", "----", "----" };
+        for (int i = 0; i < 6; ++i) {
             Leg& L = g_leg[i];
             if (L.disabled) continue;   // v8.4.0: no device, no pad
             if (L.backend == 1) {
@@ -10985,38 +11294,41 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                  padMs[1], padHow[1], g_leg[1].raw.count() * 1000.0 / kSampleRate, path2,
                  path1 - path2);
             // v8.4.0: the rear legs ride the same 10 s cadence, against leg1.
-            for (int i = 2; i < 4; ++i) {
+            for (int i = 2; i < 6; ++i) {   // v8.6.0: rears AND sides
                 if (g_leg[i].disabled) continue;
                 const double pathR = padMs[i] + (double)g_leg[i].raw.count() * 1000.0 / kSampleRate;
                 tlog("                            leg%d %5.1f ms (%s) + raw %5.1f = %5.1f ms (vs leg1: %+.1f ms)\n",
                      i + 1, padMs[i], padHow[i],
                      g_leg[i].raw.count() * 1000.0 / kSampleRate, pathR, pathR - path1);
             }
-            unsigned long long laps[4] = { 0, 0, 0, 0 };
+            unsigned long long laps[6] = { 0, 0, 0, 0, 0, 0 };
             bool anyLapse = false;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 laps[i] = g_leg[i].ks.lapses.load(std::memory_order_relaxed);
                 if (laps[i]) anyLapse = true;
             }
             if (anyLapse)
-                tlog("                            KS lapse guard: %llu / %llu / %llu / %llu write-cursor re-pin(s) since boot\n",
-                     laps[0], laps[1], laps[2], laps[3]);
+                tlog("                            KS lapse guard: %llu / %llu / %llu / %llu / %llu / %llu write-cursor re-pin(s)\n"
+                     "                            since boot\n",
+                     laps[0], laps[1], laps[2], laps[3], laps[4], laps[5]);
         }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
         tlog(g_logToFile
-             ? "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | cm +%llu | drift %s | err %s\n"
-             : "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | cm +%llu | drift %s | err %s   \r",
+             ? "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu/%llu/%llu | cm +%llu | drift %s | err %s\n"
+             : "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu/%llu/%llu | cm +%llu | drift %s | err %s   \r",
                g_leg[0].raw.count() * 1000.0f / kSampleRate,
                g_leg[1].raw.count() * 1000.0f / kSampleRate,
                volStr,   // v3.9 NOTE: this argument WAS missing in v3.8 (the crash);
                          // every conversion here is argument-checked since (v6.5.1 added err).
                offV[0], offV[1],   // v8.4.0: the rear legs' offsets live in the devbuf line
                undN[0] - uB[0], undN[1] - uB[1], undN[2] - uB[2], undN[3] - uB[3],
+               undN[4] - uB[4], undN[5] - uB[5],   // v8.6.0: the side legs
                dropN[0] - dB[0], dropN[1] - dB[1], dropN[2] - dB[2], dropN[3] - dB[3],
+               dropN[4] - dB[4], dropN[5] - dB[5],
                m1 - m00,
                driftStr, errStr);
         fflush(stdout);
-        for (int k = 0; k < 4; ++k) { uB[k] = undN[k]; dB[k] = dropN[k]; }
+        for (int k = 0; k < 6; ++k) { uB[k] = undN[k]; dB[k] = dropN[k]; }
         m00 = m1;
     }
 
@@ -11026,12 +11338,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     Sleep(150); // let the device threads drain their tails (v8.1.0: no pumps to join)
     if (hWatch) { WaitForSingleObject(hWatch, 2000); CloseHandle(hWatch); }
     if (g_capDev.pContext)     ma_device_uninit(&g_capDev);
-    for (int i = 0; i < 4; ++i) {   // v8.4.0: the rear legs close the same way
+    for (int i = 0; i < 6; ++i) {   // v8.4.0: the rear legs close the same way
         if (g_leg[i].backend == 1) ksCloseLeg(i);          // v6.3: stop thread + close pin
         if (g_leg[i].dev.pContext) ma_device_uninit(&g_leg[i].dev);
     }
     if (g_srcVol) { g_srcVol->Release(); g_srcVol = nullptr; }
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 6; ++i)
         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
     if (comOK) CoUninitialize();
     ma_context_uninit(&ctx);
