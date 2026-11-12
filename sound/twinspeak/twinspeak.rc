@@ -1,93 +1,34 @@
-// twinspeak.rc -- v6.6.4: app icon + version info. v7.5.3..v7.7.9: version
-// bumps (the full per-version notes live in CHANGELOG.txt).
-// v8.0.0: THE KERNEL LOOP + REALTIME. Both legs open WDM-KS pins by default
-// (the kernel-level loop: twinspeak's own AvrtPriorityCritical thread writes
-// each bite the instant the DAC's position register says the lead was
-// consumed -- no events, no scheduler; wasapi exclusive is the automatic
-// fallback and the opt-out). One-time ini migration carries pre-8.0.0
-// templates over. The engine takes REALTIME_PRIORITY_CLASS (HIGH fallback,
-// logged). The pump spin-pacer's danger zone follows the transport. Version
-// steps to 8.0.0.
-// v7.8.1: THE CAPTION PING -- the theme click landed
-// DWMWA_USE_IMMERSIVE_DARK_MODE but Windows 10's DWM repaints its caption
-// only on a render-state CHANGE, so the titlebar stayed stale until
-// minimize/restore; guiApplyDwmMode now pings WM_NCACTIVATE(FALSE)/
-// WM_NCACTIVATE(TRUE) after the attribute set and the flip lands in the
-// same click. (Details in twinspeak.cpp's changelog.) Version steps to
-// 7.8.1.
-// v7.8.3: DROP CORRECTION -- the ring restarts instead of crackling. A deep
-// underrun (>= half the buffer switch is hole) silence-fills, holds the leg
-// while the pump rebuilds the ring to its target anchor, then skips the
-// silent gap oldest-first and resumes at the freshest capture with the
-// original latency. New ini key drop_correct (default on; GUI pill on the
-// SETTINGS page), logged as 'drop corr', counted in the devbuf line.
-// Version steps to 7.8.3.
-// v7.9.0: THE SPIN PACER. The v6.1 line had demoted the MAINS pump from
-// TIME_CRITICAL (31) to HIGHEST (10) -- at 100% CPU the mains pump starved.
-// Both pumps stay time-critical now and rank INSIDE MMCSS (center =
-// AvrtPriorityCritical, mains = AvrtPriorityNormal). New pump spin pacer:
-// when an out ring falls under 2 device periods + 1 capture burst of
-// headroom the pump busy-waits with _mm_pause for a bounded 1.5 ms and
-// drains the instant capture lands. KS pacers spin through the last period
-// + 0.5 ms of slack against the DAC's position register. New device-switch
-// lateness meter logs "the DAC grazed the buffer edge" -- evidence for any
-// residual device-side static. The banner prints the real TWS_VERSION (the
-// old v7.1.19 literal is gone).
-// Version steps to 7.9.0.
-// v7.8.4: THE SHALLOW-STAIRCASE FIX + THE CENTER FADE. A SUSTAINED run of
-// shallow shortfalls (7 of the last 16 switches short -- the ring hovering
-// just above empty at 100% CPU) now escalates to the same clean restart a
-// deep shortfall gets; an isolated shallow miss still replays in place
-// (sample-continuous, inaudible). The center upmix guard engages after 2
-// consecutive fingerprint hits, releases after 8 consecutive misses, and
-// fades ch3 over 2.5 ms instead of hard-zeroing at a block boundary. The
-// drop_correct ini key and GUI pill are gone (integrated, always on).
-// Version steps to 7.8.4.
-// v7.8.0: THE ONE-FILE WINDOW HEADER RETIRES, WHOLE -- no include, no stub
-// file, no external chrome API. The window is the flat default Windows 10
-// frame (a stock WS_OVERLAPPEDWINDOW: native caption, icon, title, min/max/
-// close, sysmenu, resize, shadow), and every dark theme re-dials
-// DWMWA_USE_IMMERSIVE_DARK_MODE from the theme's background lightness so
-// the native titlebar follows the app's dark/light themes (attribute 20
-// with the 19 fallback, re-applied on every applyTheme and at creation).
-// The DPI child ledger lives in twinspeak.cpp now. Version steps to 7.8.0.
-// (the historical v7.5.x..v7.7.x window work -- the one-file window
-// header's arrival and every uDWM byte-chase it bought -- is retired with
-// it; the notes are preserved in CHANGELOG.txt)
-// No windows.h include needed -- the VERSIONINFO and
-// RT_MANIFEST forms used here are RC syntax, not C macros, so both windres
-// and zig rc accept this file as-is.
-// v7.1.20: `1 24` embeds twinspeak.manifest (RT_MANIFEST = 24, id 1) --
-// DPI awareness (the blur fix), comctl32 v6 (DarkMode_Explorer), asInvoker.
-// v7.1.21: the manifest's XML comments lost their "--" (illegal inside XML
-// comments -- the SxS loader refused the whole file and the exe would not
-// start: "side-by-side configuration is incorrect").
+// twinspeak.rc -- resources for the panel binary (v6.5.5 lineage).
+// No windows.h include: raw numeric constants only, so windres / zig rc both
+// compile it standalone. VERSIONINFO gives Task Manager its "TwinSpeak"
+// name; the icon is the tray/window icon; RT_MANIFEST (24) id 1 embeds
+// twinspeak.manifest (comctl32 v6 + PerMonitorV2 + asInvoker).
+
 1 ICON "twinspeak.ico"
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     8,0,0,0
-PRODUCTVERSION  8,0,0,0
-FILEOS          0x40004L
-FILETYPE        0x1L
+FILEVERSION     8,3,0,0
+PRODUCTVERSION  8,3,0,0
+FILEOS          0x00040004L          // VOS_NT_WINDOWS32
+FILETYPE        0x1L                 // VFT_APP
 FILESUBTYPE     0x0L
 BEGIN
-    BLOCK "StringFileInfo"
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"                 // US English, Unicode
     BEGIN
-        BLOCK "040904B0"
-        BEGIN
-            VALUE "CompanyName",      "TidyVision"
-            VALUE "FileDescription",  "TwinSpeak Control Panel"
-            VALUE "FileVersion",      "8.0.0.0"
-            VALUE "InternalName",     "twinspeak"
-            VALUE "LegalCopyright",   "Copyright 2026-beyond TidyVision -- MIT License"
-            VALUE "OriginalFilename", "twinspeak.exe"
-            VALUE "ProductName",      "TidyVision TwinSpeak"
-            VALUE "ProductVersion",   "8.0.0.0"
-        END
+      VALUE "FileDescription",   "TwinSpeak"
+      VALUE "ProductName",       "TwinSpeak"
+      VALUE "FileVersion",       "8.3.0.0"
+      VALUE "ProductVersion",    "8.3.0.0"
+      VALUE "OriginalFilename",  "twinspeak.exe"
+      VALUE "InternalName",      "twinspeak"
+      VALUE "Comments",          "TidyVision TwinSpeak -- bit-exact ASIO-strict engine"
     END
-    BLOCK "VarFileInfo"
-    BEGIN
-        VALUE "Translation", 0x409, 0x4B0
-    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
 END
