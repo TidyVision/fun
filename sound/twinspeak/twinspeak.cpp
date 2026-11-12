@@ -1,8 +1,9 @@
 // ============================================================================
-//  twinspeak v8.3.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
-//  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
+//  two independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold +
+//  the cable's rear pair (5.1),
 //  leg2 = Adesso Xtream S5 (center-only) -- WASAPI/WDM-KS exclusive, every
 //  sample bit-exact, no resampler or pitch path anywhere. delay1/2_ms are
 //  whole-ms prefills on the raw ring; drift is measured, never corrected
@@ -11,7 +12,8 @@
 //  ARCHITECTURE (v8.1.0 -- THE STRIPPED PATH):
 //    VAC cable (8ch shared capture, exclusive)
 //      +--> leg1.raw ring (the fan-out) --> the switch mixes INLINE --> Realtek
-//      |      mix: FL=L+gain_lfe*LFE, FR=R+gain_lfe*LFE, FC=driven, SL/SR=0
+//      |      mix: FL=L+gain_lfe*LFE, FR=R+gain_lfe*LFE, FC=driven,
+//      |      rear slots = ch7/ch8 (cable RL/RR), plain copy (v8.4.0)
 //      +--> leg2.raw ring (the fan-out) --> the switch mixes INLINE (out2 first)
 //             gates: ch3 zero -> nothing; ch3 == Windows stereo-upmix
 //             fingerprint -> muted; mix: both outs = ch3 only, rest muted
@@ -26,6 +28,15 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.0 REAR PASS-THROUGH + THE FOLD IS BUILT IN (field-directed):
+//            out1's 5.1 rear slots carry the cable's rear pair (ch7 RL /
+//            ch8 RR) BIT-EXACT -- no gate, no gain, no substitution: empty
+//            in = empty out (stereo content plays with silent rears; that
+//            is the truth, not a fault). FC and the discrete LFE slot stay
+//            driven silence. lfe_fold is RETIRED with its pill -- the fold
+//            is the confirmed routing, hardcoded on (gain_lfe still scales
+//            it); the key is read-and-ignored and the CONFIGURATION stack
+//            tightens to the uniform 34 px pitch.
 //    v8.3.0 THREE TABS (field-directed). The warden's last tunables and the
 //            volume path are RETIRED, hardcoded from the fielded ini:
 //            drift_correct_ms 5, drift_interval_ms 5000, deep_resync_min 30,
@@ -1719,7 +1730,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.3.0"
+#define TWS_VERSION "8.4.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -1863,7 +1874,7 @@ struct Config {
     bool        captureExclusive = true;  // v6.6.8: INTEGRATED -- always on
     bool        exclusive      = true;    // v6.6.8: INTEGRATED -- always on (v3 default was off)
     bool        alignModes     = true;    // v6.6.8: INTEGRATED -- always on
-    bool        lfeFold        = true;    // v3.1: user-confirmed routing (LFE onto FL/FR)
+    bool        lfeFold        = true;    // v3.1 routing; v8.4.0: INTEGRATED -- always on
     std::string inputDevice;
     std::string outputDevice1;
     std::string outputDevice2;
@@ -2970,37 +2981,35 @@ static void centerEqInit() {
 // ----------------------------------------------------------------- mixer ----
 // v6.5: whole-BLOCK mix with the ini gains hoisted into locals. Every
 // per-frame FP op is unchanged (multiply + add, never FMA -- -ffp-contract
-// off) so the mix is bit-identical to v6.4 (harness-proven, including the
-// IEEE -0 + +0 = +0 behavior of the discrete-LFE branch: the "+ 0.0f" stays).
+// off) so the mix is bit-identical to v6.4 (harness-proven). v8.4.0: the
+// discrete-LFE branch is RETIRED with the lfe_fold toggle -- the fold (the
+// confirmed routing) is the only path and its FP ops are untouched.
+// v8.4.0 REAR PASS-THROUGH: out1's 5.1 rear slots carry the cable's REAR
+// pair -- ch7 (RL) and ch8 (RR) of the VAC 8ch map (1L 2R 3C 4LFE 5SL 6SR
+// 7RL 8RR) -- as a PLAIN COPY: no gate, no gain, no substitution. Empty in
+// = empty out (stereo content plays with silent rears; that is the truth).
+// The sides (ch5/ch6) stay unused: the 5.1 layout has exactly one rear pair
+// and the rears take it. If a 5.1 movie ever leaves the rear jacks silent,
+// the cable's surround order is the Windows mask order (back = ch5/ch6) --
+// flip the two kRear*Ch indices below, nothing else.
+static const int kRearLCh = 6;    // 0-based: cable ch7 (RL)
+static const int kRearRCh = 7;    // 0-based: cable ch8 (RR)
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // leg1 = NATIVE 5.1 stream. FC is DRIVEN SILENCE: the endpoint sees a
         // full-layout 6ch stream, so neither miniaudio nor the Windows engine
         // may run a stereo->5.1 upmix -- the fake FC = 0.5L+0.5R smear is gone.
         const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
-        if (g_cfg.lfeFold) {
-            for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
-                float* o = chunk + i * kOutCh1;
-                const float lfe = gLfe * f[3];
-                o[0] = gL * f[0] + lfe;                     // FL
-                o[1] = gR * f[1] + lfe;                     // FR
-                o[2] = 0.0f;                                // FC -- silent on purpose (center lives on leg2)
-                o[3] = 0.0f;                                // LFE -- folded into the fronts
-                o[4] = 0.0f;                                // SL
-                o[5] = 0.0f;                                // SR
-            }
-        } else {
-            for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
-                float* o = chunk + i * kOutCh1;
-                o[0] = gL * f[0] + 0.0f;                    // FL (the +0.0f preserves v6.4's -0 -> +0)
-                o[1] = gR * f[1] + 0.0f;                    // FR
-                o[2] = 0.0f;                                // FC
-                o[3] = gLfe * f[3];                         // LFE -- discrete sub channel
-                o[4] = 0.0f;                                // SL
-                o[5] = 0.0f;                                // SR
-            }
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * kInCh;
+            float* o = chunk + i * kOutCh1;
+            const float lfe = gLfe * f[3];
+            o[0] = gL * f[0] + lfe;                     // FL
+            o[1] = gR * f[1] + lfe;                     // FR
+            o[2] = 0.0f;                                // FC -- silent on purpose (center lives on leg2)
+            o[3] = 0.0f;                                // LFE -- folded into the fronts
+            o[4] = f[kRearLCh];                         // rear L -- cable ch7 (RL), plain copy (v8.4.0)
+            o[5] = f[kRearRCh];                         // rear R -- cable ch8 (RR), plain copy (v8.4.0)
         }
     } else {
         // v6.0 EXPLICIT CENTER ISOLATION: the out2 copy of the block READS
@@ -4112,7 +4121,9 @@ static void writeTemplate(const char* path) {
         "; v8.3.0: volume_follow, drift_correct_ms, drift_interval_ms and\n"
         "; deep_resync_min joined them -- hardcoded from the fielded ini\n"
         "; (on / 5 / 5000 / 30). The knobs that are left: the delays below,\n"
-        "; the KS bite, the gains, the EQ and the chime.\n"
+        "; the KS bite, the gains, the EQ and the chime. v8.4.0: lfe_fold\n"
+        "; joined them too -- the fold is the confirmed routing, built in;\n"
+        "; gain_lfe below still scales it.\n"
         "\n"
         "; ALIGNMENT DELAY (v6.1): delay1_ms / delay2_ms push ONE leg's output\n"
         "; later by whole milliseconds -- a BIT-EXACT ring delay: the leg's ring\n"
@@ -4138,18 +4149,26 @@ static void writeTemplate(const char* path) {
         "\n"
         "; Fold the cable's LFE onto FL/FR at gain_lfe -- the CONFIRMED routing\n"
         "; (\"LFE is mixed fully into the left and right channels\"). The sub is\n"
-        "; not discrete; it lives inside the front channels. lfe_fold = off\n"
-        "; instead drives the DISCRETE 5.1 LFE channel (only for a real sub).\n"
-        "lfe_fold = on\n"
+        "; not discrete; it lives inside the front channels. v8.4.0: the fold\n"
+        "; is BUILT IN -- always on, no key (a stale lfe_fold line in an old\n"
+        "; ini loads clean and is ignored); gain_lfe below still scales it.\n"
+        "\n"
+        "; v8.4.0 REAR PASS-THROUGH: out1's 5.1 rear slots carry the cable's\n"
+        "; rear pair -- ch7 (RL) and ch8 (RR) -- BIT-EXACT. No gate, no gain,\n"
+        "; no substitution: empty in = empty out (a stereo game plays with\n"
+        "; silent rears; that is the truth, not a fault). The sides (ch5/ch6)\n"
+        "; stay unused -- the 5.1 layout has exactly one rear pair. If a 5.1\n"
+        "; movie ever leaves the rear jacks silent, the cable's surround\n"
+        "; order is the Windows mask order (back = ch5/ch6): flip the two\n"
+        "; kRearLCh/kRearRCh indices in the source, nothing else.\n"
         "\n"
         "; Substring match against device names (see: twinspeak --list)\n"
         "input_device   = Line 1\n"
         "output_device1 = Realtek\n"
         "output_device2 = Xtream\n"
         "\n"
-        "; optional mixes (gain_lfe = LFE fold gain onto FL/FR; set 1.0 for a\n"
-        ";                    unity fold. With lfe_fold = off it scales the\n"
-        ";                    discrete sub.)\n"
+        "; optional mixes (gain_lfe = the LFE fold gain onto FL/FR; 1.0 = a\n"
+        ";                    unity fold)\n"
         "gain_l = 1.0\n"
         "gain_r = 1.0\n"
         "gain_lfe = 0.4\n"
@@ -4434,13 +4453,17 @@ static void writeTemplate(const char* path) {
         ";     part of the engine now -- ALWAYS ON.\n"
         "\n"
         "; ROUTING GUARANTEE (zero duplication, by construction):\n"
-        ";   out1 gets ONLY ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE)\n"
-        ";   folded onto both. The 5.1 stream's center, discrete sub and\n"
-        ";   surround channels are DRIVEN DIGITAL SILENCE, so no layer (Windows\n"
-        ";   engine, miniaudio converter, Speaker Fill) has any signal to\n"
-        ";   upmix into a fake center. out2 gets ONLY ch3 (center): every other\n"
-        ";   input channel is EXPLICITLY MUTED in the out2 path -- out2 is not\n"
-        ";   a clone of the program audio. The startup banner prints the route\n"
+        ";   out1 gets ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE) folded\n"
+        ";   onto both, and the cable's REAR pair -- ch7 (RL) and ch8 (RR) --\n"
+        ";   passed through BIT-EXACT to the 5.1 layout's rear slots: no gate,\n"
+        ";   no gain, no substitution; empty in = empty out (v8.4.0 -- stereo\n"
+        ";   content plays with silent rears, and that is the truth, not a\n"
+        ";   fault). FC and the discrete LFE slot stay DRIVEN DIGITAL SILENCE,\n"
+        ";   so no layer (Windows engine, miniaudio converter, Speaker Fill)\n"
+        ";   has any signal to upmix into a fake center -- the center belongs\n"
+        ";   to out2 alone. out2 gets ONLY ch3 (center): every other input\n"
+        ";   channel is EXPLICITLY MUTED in the out2 path -- out2 is not a\n"
+        ";   clone of the program audio. The startup banner prints the route\n"
         ";   map on every launch.\n"
         ";\n"
         "; NOTE: output2 always sums the keep-alive sine (BUILT IN, v7.1.24:\n"
@@ -4562,8 +4585,8 @@ static bool loadIni(const char* path) {
                  key == "drift_correct_ms" ||    // v8.3.0: hardcoded 5
                  key == "drift_interval_ms"||    // v8.3.0: hardcoded 5000
                  key == "deep_resync_min"  ||    // v8.3.0: hardcoded 30
-                 key == "background"        || key == "pin_outputs") { }
-        else if (key == "lfe_fold")     { g_cfg.lfeFold = !isOff(val); }
+                 key == "background"        || key == "pin_outputs" ||
+                 key == "lfe_fold") { }         // v8.4.0: the fold is built in
         else if (key == "input_device")   g_cfg.inputDevice = val;
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
@@ -4960,8 +4983,9 @@ static void printLegDevice(int idx) {
     // physically cannot appear on out1 no matter how the endpoint is set up.
     if (idx == 0 && d->playback.internalChannels != kOutCh1)
         tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 6ch -- fine with the strict split:\n"
-                        "            out1 drives FC/LFE as digital silence, so no layer (engine,\n"
-                        "            miniaudio converter, Speaker Fill) has anything to upmix.\n",
+                        "            out1 drives FC/LFE as digital silence and the rear pair rides the\n"
+                        "            5.1 rear slots, so no layer (engine, miniaudio converter, Speaker\n"
+                        "            Fill) has anything to upmix into a fake center.\n",
                 (unsigned)d->playback.internalChannels);
     // v6.0: a non-48k endpoint means miniaudio inserts a RESAMPLER on this
     // leg -- a pitch change, which twinspeak itself never does. Say it loud.
@@ -5052,7 +5076,8 @@ enum {
     // from the late SETTINGS page live here too)
     IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
-    IDC_TGL_LFEFOLD,
+    IDC_TGL_LFEFOLD,            // v8.4.0: retired (the fold is built in) --
+                                 // id reserved, nothing creates it
     // page: timing (v8.2.0: unified -- the transport rows live here too;
     // IDC_OUT1MS/IDC_OUT2MS retired like IDC_CAPMS/RING1/RING2 before them)
     IDC_OUT1MS, IDC_OUT2MS, IDC_CAPMS, IDC_RING1, IDC_RING2,
@@ -5970,7 +5995,6 @@ static std::string cfgValueText(const std::string& key) {
     }
     else if (key == "ks_period_frames")  { snprintf(b, 64, "%u", g_cfg.ksPeriodFrames); return b; }
     else if (key == "ks_periods")        { snprintf(b, 64, "%u", g_cfg.ksPeriods); return b; }
-    else if (key == "lfe_fold")          return boolText(g_cfg.lfeFold);
     else if (key == "center_eq")         return boolText(g_cfg.centerEq);
     else if (key == "out2_first")        return boolText(g_cfg.out2First);
     else if (key == "chimes")            return boolText(g_cfg.chimes);
@@ -5992,9 +6016,10 @@ static std::string cfgValueText(const std::string& key) {
 // stale line in an old ini is copied verbatim by the save and ignored at
 // load, exactly like cap_ms / ring1_ms / ring2_ms before them.
 // v8.3.0: volume_follow + the drift trio are GONE with them (hardcoded
-// constants); a stale line rides the same verbatim-copy path.
+// constants); a stale line rides the same verbatim-copy path. v8.4.0:
+// lfe_fold is GONE too (the fold is built in, always on).
 static const char* kIniKeys[] = {
-    "delay1_ms", "delay2_ms", "lfe_fold",
+    "delay1_ms", "delay2_ms",
     "input_device", "output_device1", "output_device2",
     "gain_l", "gain_r", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
@@ -6088,7 +6113,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
     g_cfg.gainLfe   = editFloat(w, IDC_GAIN_LFE, 0.4f);
     g_cfg.gainCenter= editFloat(w, IDC_GAIN_CTR, 1.0f);
-    g_cfg.lfeFold          = g_tog[IDC_TGL_LFEFOLD];
+    // v8.4.0: lfeFold is INTEGRATED (always on) -- no control reads it.
     // v6.6.8: captureExclusive / exclusive / alignModes are integrated -- the
     // struct defaults (all on) are final; no control can change them.
     // v8.2.0: out1Ms/out2Ms have no controls -- kOutPeriodMs is the request.
@@ -6121,7 +6146,7 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
     snprintf(b, 64, "%g", g_cfg.gainLfe);    SetDlgItemTextA(w, IDC_GAIN_LFE, b);
     snprintf(b, 64, "%g", g_cfg.gainCenter); SetDlgItemTextA(w, IDC_GAIN_CTR, b);
-    g_tog[IDC_TGL_LFEFOLD]    = g_cfg.lfeFold;
+    // v8.4.0: no LFEFOLD pill to sync -- the fold is built in (always on).
     snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
@@ -6321,25 +6346,24 @@ static void guiBuildPages(HWND w) {
     HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 256, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
     note(w, COLA_X, 292,
-         "leg1 carries FL/FR (+ the LFE fold) -- the mains.\n"
-         "leg2 carries ONLY the center channel.\n"
+         "leg1 carries FL/FR + the LFE fold + the cable's rear pair (RL/RR) --\n"
+         "the mains and the rears. leg2 carries ONLY the center channel.\n"
          "volume_endpoint overrides which playback-side slider is the master volume.", 4);
     header(w, COLB_X, KHDR_Y, "GAIN");
     row(w, COLB_X, KROW0, "gain_l", IDC_GAIN_L, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainL); return std::string(b); }().c_str());
     row(w, COLB_X, 154, "gain_r", IDC_GAIN_R, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainR); return std::string(b); }().c_str());
     row(w, COLB_X, 188, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
     row(w, COLB_X, 222, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
-    tglRow(w, COLB_X, 260, "lfe_fold (LFE onto FL/FR)", IDC_TGL_LFEFOLD, g_cfg.lfeFold);
     // v6.6.8: capture_exclusive / exclusive / align_modes pills are gone --
     // the share-mode design is part of the engine now (always on).
-    // v8.3.0: THE SETTINGS PAGE IS GONE. Its three survivors moved HERE,
-    // under the gain stack (the stack ends at 382, inside the 402 px panel
-    // band); the drift trio + volume_follow went the other way -- RETIRED,
-    // hardcoded from the fielded ini (5 ms / 5000 ms / 30 min / on): no
-    // row, no pill, no splice key anywhere.
-    tglRow(w, COLB_X, 292, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
-    tglRow(w, COLB_X, 326, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
-    row(w, COLB_X, 360, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    // v8.3.0: THE SETTINGS PAGE IS GONE -- its three survivors moved HERE.
+    // v8.4.0: the lfe_fold pill joined the retired -- the fold is BUILT IN
+    // (always on; the gain_lfe row above still scales it) -- and the
+    // survivors tightened to the stack's uniform 34 px pitch: the column
+    // now ends at 350, inside the 402 px panel band.
+    tglRow(w, COLB_X, 256, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+    tglRow(w, COLB_X, 290, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
+    row(w, COLB_X, 324, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
 
     // ============ page 1: TIMING (v8.2.0: unified -- TRANSPORT lives here too) ==
     // v8.2.0 THE UNIFIED TIMING PAGE. The DEVICE PERIODS column is GONE --
@@ -7751,7 +7775,7 @@ static bool anySliderDragging() {
 }
 static bool guiIsToggle(int id) {
     switch (id) {
-        case IDC_TGL_LFEFOLD:
+        // v8.4.0: IDC_TGL_LFEFOLD retired (the fold is built in, always on)
         case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
         case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.3.0: on page 0)
         case IDC_TGL_CHIMES:    // v8.3.0: on page 0; IDC_TGL_VOLFOLLOW retired
@@ -9657,14 +9681,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            g_leg[0].backend == 1 ? "WDM-KS (kernel streaming)" :
            g_leg[0].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
            g_leg[0].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs1);
-    if (g_cfg.lfeFold)
-        tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
-               "[twinspeak] route out1     : FC + discrete LFE + SL + SR = digital silence (center never enters out1)\n",
+    tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
+               "[twinspeak] route out1     : rear L/R = ch7/ch8 (cable RL/RR) bit-exact; FC + discrete LFE = digital\n"
+               "[twinspeak] route out1     : silence (center never enters out1; empty rear in = empty rear out)\n",
                g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
-    else
-        tlog("[twinspeak] route out1     : FL = %.2f*ch1 | FR = %.2f*ch2 | discrete LFE = %.2f*ch4\n"
-               "[twinspeak] route out1     : FC + SL + SR = digital silence (center never enters out1)\n",
-               g_cfg.gainL, g_cfg.gainR, g_cfg.gainLfe);
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
            n2.c_str(),
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
