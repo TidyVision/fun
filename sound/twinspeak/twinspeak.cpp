@@ -43,6 +43,15 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.2 THE STARTUP ROW, CORRECTED (field-directed): "bottom right"
+//            meant the ROW'S ORDER, not a new control style -- "launch at
+//            Windows startup" is a PLAIN tglRow again (label left, the
+//            ON/OFF pill at the right, exactly every other row's shape),
+//            only REORDERED to be the LAST row of page 0's right column.
+//            v8.4.1's separately styled bottom-bar pill (its own "STARTUP
+//            ON/OFF" face, off the settings page) is GONE; the bar keeps
+//            its five controls and the row lives under the tabs with the
+//            rest. No engine change.
 //    v8.4.1 THE CENTER FOLD + THE STARTUP PILL'S NEW HOME (field-directed):
 //            an EMPTY output_device2 is legal -- leg2 never opens and ch3
 //            (center) folds onto leg1's FL/FR at gain_center, the LFE
@@ -1746,7 +1755,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.1"
+#define TWS_VERSION "8.4.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4241,7 +4250,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -5257,8 +5266,8 @@ enum {
     IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
     IDC_LOG = 204, IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
     // page: configuration (v8.3.0: was devices -- the chime pills from the
-    // late SETTINGS page live here; v8.4.1: the startup pill moved to the
-    // bottom bar)
+    // late SETTINGS page live here; v8.4.2: the startup row is this page's
+    // LAST row)
     IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
     IDC_TGL_LFEFOLD,            // v8.4.0: retired (the fold is built in) --
@@ -5272,10 +5281,10 @@ enum {
                                 // IDC_BE2 retired; the backend keys live in
                                 // the ini only)
     // v8.3.0: the SETTINGS page is GONE -- the chime pills live on page 0
-    // (v8.4.1: the startup pill lives on the bottom bar); the drift trio +
+    // (v8.4.2: the startup row is page 0's last row); the drift trio +
     // volume_follow ids are retired with their keys
     // (reserved here like IDC_OUT1MS before them, nothing creates them).
-    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (v8.4.1: the bottom bar, every page)
+    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (v8.4.2: the last row on page 0)
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,   // v8.3.0: retired (hardcoded)
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,          // v8.3.0: VOLFOLLOW retired; CHIMES on page 0
     IDC_CHIMGAIN,               // v8.3.0: lives on page 0 (v7.1.7: KAHZ/KAGAIN retired)
@@ -5403,7 +5412,7 @@ static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on de
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
 // v8.3.0: THREE tabs. The SETTINGS page is GONE -- its chime controls live
-// on page 0 (v8.4.1: the startup pill moved to the bottom bar's right end)
+// on page 0 (v8.4.2: the startup row is page 0's last row)
 // and the drift trio + volume_follow went with their keys (hardcoded from
 // the fielded ini: 5 / 5000 / 30 / on). With nothing left to configure
 // under the old label, page 0 says what it now is:
@@ -6600,13 +6609,14 @@ static void guiBuildPages(HWND w) {
     // v8.3.0: THE SETTINGS PAGE IS GONE -- its three survivors moved HERE.
     // v8.4.0: the lfe_fold pill joined the retired (the fold is BUILT IN,
     // always on; the gain_lfe row above still scales it); the gain quad
-    // took the top of the column. v8.4.1: the launch-at-startup pill moved
-    // ALL THE WAY DOWN to the bottom bar's right end (its own separate,
-    // always-visible control -- see guiBuildControls); the two chime rows
-    // ride the 34 px pitch below -- the column ends at 296, inside the
-    // 402 px panel band.
+    // took the top of the column. v8.4.2: "launch at Windows startup" is
+    // the column's LAST row -- a plain tglRow (label left, the ON/OFF pill
+    // at the right), exactly every other row's shape, only REORDERED to
+    // the bottom (v8.4.1's separately styled bottom-bar pill is gone).
+    // The column ends at 308, v8.4.0's proven last-slot geometry.
     tglRow(w, COLB_X, 240, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
     row(w, COLB_X, 274, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    tglRow(w, COLB_X, 308, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
 
     // ============ page 1: TIMING (v8.2.0: unified -- TRANSPORT lives here too) ==
     // v8.2.0 THE UNIFIED TIMING PAGE. The DEVICE PERIODS column is GONE --
@@ -7203,14 +7213,10 @@ static void guiBuildControls(HWND w) {
     // theme cycler (label = the ACTIVE theme, kThemes[g_theme].name).
     mkBtn(w, IDC_TICK, 448, 414, 150, 36, "120 BPM TICK TEST");
     mkBtn(w, IDC_THEME, 606, 414, 150, 36, kThemes[g_theme].name);
-    // v8.4.1: the startup pill lives HERE now -- ALL THE WAY DOWN at the
-    // bottom bar's right end, its own separate control (the field's ask:
-    // "all the way down to the bottom right, just so that it's separate"),
-    // visible on every page like the rest of the bar. It carries its own
-    // face text ("STARTUP ON"/"STARTUP OFF") -- no side label, and the
-    // 102 px width lands the right edge at 866, flush with the log pane.
-    mkBtn(w, IDC_TGL_STARTUP, 764, 414, 102, 36, "");
-    g_tog[IDC_TGL_STARTUP] = startupEnabled();   // the pill IS the Run key (v6.6.6)
+    // v8.4.2: the bottom-bar startup pill is GONE -- "launch at Windows
+    // startup" is a plain tglRow again, the LAST row of page 0's right
+    // column (same label + pill style as every other row; only its ORDER
+    // changed). The bar keeps its five controls; nothing else moved.
     // v7.1.5 FLICKER-FREE STATUS: the STATIC is HIDDEN -- it only stores the
     // string; guiPaintFrame draws the line inside the frame buffer (one blit,
     // no erase-then-draw flicker four times a second). Writers go through
@@ -8042,7 +8048,7 @@ static bool guiIsToggle(int id) {
     switch (id) {
         // v8.4.0: IDC_TGL_LFEFOLD retired (the fold is built in, always on)
         case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
-        case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.4.1: the bottom bar's right end, every page)
+        case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.4.2: the LAST row of page 0's right column)
         case IDC_TGL_CHIMES:    // v8.3.0: on page 0; IDC_TGL_VOLFOLLOW retired
         case IDC_TGL_EQ:
             return true;
@@ -8326,12 +8332,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             g.DrawPath(&pb, p);
             delete p;
-            // v8.4.1: the bottom-bar startup pill carries its own name on
-            // its face (no side label -- it sits alone at the bar's right end).
-            const char* kFace = (id == IDC_TGL_STARTUP)
-                              ? (on ? "STARTUP ON" : "STARTUP OFF")
-                              : (on ? "ON" : "OFF");
-            guiAAString(g, dc, rc, kFace, on ? guic::cOnText : guic::cText,
+            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cOnText : guic::cText,
                         g_fUIb, 0);
             if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
                 Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
