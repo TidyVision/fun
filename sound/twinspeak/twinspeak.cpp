@@ -43,6 +43,14 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.1 THE CENTER FOLD + THE STARTUP PILL'S NEW HOME (field-directed):
+//            an EMPTY output_device2 is legal -- leg2 never opens and ch3
+//            (center) folds onto leg1's FL/FR at gain_center, the LFE
+//            fold's pattern with the SAME upmix guard riding it (a stereo
+//            source's phantom FC fades out of the fronts; genuine 5.1
+//            center always plays; the center EQ stays out2-only). The
+//            launch-at-startup pill moved ALL THE WAY DOWN to the bottom
+//            bar's right end -- its own always-visible control, off page 0.
 //    v8.3.0 THREE TABS (field-directed). The warden's last tunables and the
 //            volume path are RETIRED, hardcoded from the fielded ini:
 //            drift_correct_ms 5, drift_interval_ms 5000, deep_resync_min 30,
@@ -1738,7 +1746,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.0"
+#define TWS_VERSION "8.4.1"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2307,7 +2315,20 @@ struct Leg {
 };
 // v8.4.0: FOUR legs -- 0 = mains (5.1), 1 = center, 2 = rear L, 3 = rear R.
 // Legs 2/3 are OPTIONAL: an empty output_device3/4 marks them disabled.
+// v8.4.1: leg1 (center) is optional TOO -- an empty output_device2 marks it
+// disabled and turns on THE CENTER FOLD below.
 static Leg g_leg[4];
+
+// v8.4.1 THE CENTER FOLD: an EMPTY output_device2 (no center device) means
+// leg2 never opens AND ch3 (center) folds onto leg1's FL/FR at gain_center
+// -- the LFE fold's pattern: FL = gain_l*L + gain_lfe*LFE + gain_center*C,
+// FR the mirror. The SAME center gates ride the fold (the upmix guard fades
+// a stereo source's phantom FC out of the fronts; genuine 5.1 center always
+// plays). Plain bool on the g_leg[].disabled discipline: written once per
+// engine start on the main thread before any device thread exists. With
+// output_device2 set, leg2 plays ch3 on its own device exactly as before
+// and the fold stays off.
+static bool g_centerFold = false;
 
 // v8.4.0: one place answers "which ini needle opens leg i" -- every open /
 // reopen / yield path asks here, so a rear leg can never fall back to a
@@ -2751,7 +2772,7 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n);
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore);
 static void centerEqFlushZ();                    // defined next to g_ceq
-static void centerGuard(Leg& L, float* sc, size_t n);   // v6.1 gates, defined below
+static void centerGuard(Leg& L, float* sc, size_t n, bool fold);   // v6.1 gates (v8.4.1: fold = the leg1 center-fold variant)
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
 
@@ -2814,7 +2835,13 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
             }
         }
-        if (idx == 1) centerGuard(L, sc, n);   // v6.1: center presence gates
+        if (idx == 1) centerGuard(L, sc, n, false);   // v6.1: center presence gates
+        // v8.4.1 THE CENTER FOLD: leg2 empty -> the SAME gates protect the
+        // fold. The guard fades sc's ch3 IN PLACE, so mixBlock's fold term
+        // reads the guarded value -- a stereo upmix's phantom FC (a*FL+b*FR)
+        // can never double onto the fronts. The state lives on g_leg[0],
+        // fully separate from a live leg2's.
+        else if (idx == 0 && g_centerFold) centerGuard(L, sc, n, true);
         // v6.6.9: silence compression -- a bit-zero block needs no mix
         // (see the start-frozen gate): same bytes out, none of the FP work.
         float* dst = out + done * L.outCh;
@@ -3054,17 +3081,44 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // leg1 = NATIVE 5.1 stream. FC is DRIVEN SILENCE: the endpoint sees a
         // full-layout 6ch stream, so neither miniaudio nor the Windows engine
         // may run a stereo->5.1 upmix -- the fake FC = 0.5L+0.5R smear is gone.
+        // v8.4.1 THE CENTER FOLD: when leg2 has NO device (output_device2
+        // EMPTY) the center must not vanish -- ch3 folds onto FL/FR at
+        // gain_center, the LFE fold's pattern. Two loops, not an in-loop
+        // branch: the no-fold loop is the v6.5 code VERBATIM (identical FP
+        // op sequence -- bit-identical output when the fold is off), and the
+        // fold loop only APPENDS the center term after the existing sums:
+        // ((gL*f[0]) + lfe) + cf -- the FL/FR ops themselves are unchanged.
+        // The FC slot stays driven silence even folded: the center CONTENT
+        // rides the fronts (the jack set is FL/FR + sub; a nonzero FC would
+        // feed a jack nothing is wired to), and the full 6ch layout keeps
+        // every upmixer out.
         const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
-        for (size_t i = 0; i < n; ++i) {
-            const float* f = sc + i * kInCh;
-            float* o = chunk + i * kOutCh1;
-            const float lfe = gLfe * f[3];
-            o[0] = gL * f[0] + lfe;                     // FL
-            o[1] = gR * f[1] + lfe;                     // FR
-            o[2] = 0.0f;                                // FC -- silent on purpose (center lives on leg2)
-            o[3] = 0.0f;                                // LFE -- folded into the fronts
-            o[4] = 0.0f;                                // rear L -- driven silence (the rears live on leg3/leg4, v8.4.0)
-            o[5] = 0.0f;                                // rear R -- driven silence (the rears live on leg3/leg4, v8.4.0)
+        if (g_centerFold) {
+            const float gC = g_cfg.gainCenter;
+            for (size_t i = 0; i < n; ++i) {
+                const float* f = sc + i * kInCh;
+                float* o = chunk + i * kOutCh1;
+                const float lfe = gLfe * f[3];
+                const float cf  = gC * f[2];            // the center fold (leg2 empty)
+                o[0] = gL * f[0] + lfe + cf;            // FL + the center fold
+                o[1] = gR * f[1] + lfe + cf;            // FR + the center fold
+                o[2] = 0.0f;                            // FC -- driven silence even folded (the content rides the fronts)
+                o[3] = 0.0f;                            // LFE -- folded into the fronts
+                o[4] = 0.0f;                            // rear L -- driven silence (the rears live on leg3/leg4, v8.4.0)
+                o[5] = 0.0f;                            // rear R -- driven silence (the rears live on leg3/leg4, v8.4.0)
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                const float* f = sc + i * kInCh;
+                float* o = chunk + i * kOutCh1;
+                const float lfe = gLfe * f[3];
+                o[0] = gL * f[0] + lfe;                     // FL
+                o[1] = gR * f[1] + lfe;                     // FR
+                o[2] = 0.0f;                                // FC -- silent on purpose (center lives on leg2)
+                o[3] = 0.0f;                                // LFE -- folded into the fronts
+                o[4] = 0.0f;                                // rear L -- driven silence (the rears live on leg3/leg4, v8.4.0)
+                o[5] = 0.0f;                                // rear R -- driven silence (the rears live on leg3/leg4, v8.4.0)
+            }
         }
     } else if (idx == 1) {
         // v6.0 EXPLICIT CENTER ISOLATION: the out2 copy of the block READS
@@ -3140,7 +3194,12 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 //      mute is a 2.5 ms fade, so a decision that flickers near the
 //      threshold can no longer chop the center into slices (that was the
 //      static-ey center gate crackle).
-static void centerGuard(Leg& L, float* sc, size_t n) {
+// v8.4.1: fold = THE CENTER FOLD variant -- the same two gates run on
+// LEG1's pump and guard the FL/FR fold instead of out2's mix. The state
+// (hysteresis, fade, counters) lives on the caller's Leg (g_leg[0]), fully
+// separate from a live leg2's, and the logs say 'out1 fold' so the two
+// paths never blur in the pane.
+static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
     // ---- gate 1: ch3 digital zero for the whole block ----------------------
     bool allZero = true;
     for (size_t i = 0; i < n; ++i) {
@@ -3153,7 +3212,8 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
                 const unsigned long long now = GetTickCount64();
                 if (now - L.lastGateLogMs >= 5000) {
                     L.lastGateLogMs = now;
-                    tlog("[twinspeak] out2 center gate : ch3 is digital zero -- out2 = keep-alive only\n");
+                    if (fold) tlog("[twinspeak] out1 fold gate  : ch3 is digital zero -- nothing to fold onto FL/FR\n");
+                    else      tlog("[twinspeak] out2 center gate : ch3 is digital zero -- out2 = keep-alive only\n");
                 }
             }
         }
@@ -3214,9 +3274,13 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
                         const unsigned long long now = GetTickCount64();
                         if (now - L.lastUpmixLogMs >= 5000) {
                             L.lastUpmixLogMs = now;
-                            tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
-                                 "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
-                                 a, b);
+                            if (fold) tlog("[twinspeak] out1 fold guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                           "                            (stereo source: the engine fills FC = a*FL + b*R; the phantom center\n"
+                                           "                            fades OUT of the FL/FR fold over 2.5 ms)\n",
+                                           a, b);
+                            else     tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                          "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
+                                          a, b);
                         }
                     }
                 } else {
@@ -3234,8 +3298,10 @@ static void centerGuard(Leg& L, float* sc, size_t n) {
                         const unsigned long long now = GetTickCount64();
                         if (now - L.lastUpmixLogMs >= 5000) {
                             L.lastUpmixLogMs = now;
-                            tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
-                                 "                            (ch3 fades back in over 2.5 ms)\n");
+                            if (fold) tlog("[twinspeak] out1 fold guard: independent center content -- guard released\n"
+                                           "                            (the real center fades back into the FL/FR fold over 2.5 ms)\n");
+                            else     tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
+                                          "                            (ch3 fades back in over 2.5 ms)\n");
                         }
                     }
                 }
@@ -4175,7 +4241,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -4226,6 +4292,18 @@ static void writeTemplate(const char* path) {
         "; is BUILT IN -- always on, no key (a stale lfe_fold line in an old\n"
         "; ini loads clean and is ignored); gain_lfe below still scales it.\n"
         "\n"
+        "; v8.4.1 THE CENTER FOLD: an EMPTY output_device2 (no center device)\n"
+        "; is LEGAL -- leg2 never opens, and the center channel (ch3) FOLDS\n"
+        "; onto leg1's FL/FR at gain_center, exactly the LFE fold's pattern:\n"
+        "; FL = gain_l*L + gain_lfe*LFE + gain_center*C, FR the mirror. The\n"
+        "; center upmix guard rides the fold too -- a stereo source's phantom\n"
+        "; FC (a*FL + b*FR, filled in by the Windows engine at the cable's\n"
+        "; playback side) fades out of the fronts over 2.5 ms, so it can\n"
+        "; never double onto FL/FR; genuine 5.1 center always plays. A\n"
+        "; NON-empty output_device2 that matches no device is still a hard\n"
+        "; error. The center EQ is out2-only: with the fold active it does\n"
+        "; not apply (the fold is a plain gain_center sum).\n"
+        "\n"
         "; v8.4.0 THE REAR LEGS: leg3 (rear L) and leg4 (rear R) carry the\n"
         "; cable's rear pair -- ch7 (RL) and ch8 (RR) -- on their OWN devices:\n"
         "; out3 = gain_rl * ch7 on both outputs, out4 = gain_rr * ch8 (the\n"
@@ -4240,6 +4318,8 @@ static void writeTemplate(const char* path) {
         "; Substring match against device names (see: twinspeak --list).\n"
         "; v8.4.0: the rear legs -- output_device3/4 EMPTY (as shipped) keeps\n"
         "; that rear leg silent; fill them when the rears get their own devices.\n"
+        "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
+        "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
         "input_device   = Line 1\n"
         "output_device1 = Realtek\n"
         "output_device2 = Xtream\n"
@@ -4247,7 +4327,9 @@ static void writeTemplate(const char* path) {
         "output_device4 =\n"
         "\n"
         "; optional mixes (gain_lfe = the LFE fold gain onto FL/FR; 1.0 = a\n"
-        ";                    unity fold; gain_rl/gain_rr scale the rear legs)\n"
+        ";                    unity fold; gain_rl/gain_rr scale the rear legs;\n"
+        ";                    gain_center scales ch3 -- out2's mix, and the\n"
+        ";                    leg1 fold when output_device2 is EMPTY)\n"
         "gain_l = 1.0\n"
         "gain_r = 1.0\n"
         "gain_rl = 1.0\n"
@@ -4532,14 +4614,20 @@ static void writeTemplate(const char* path) {
         ";     line counts guarded blocks ('cm') -- with real 5.1 content it\n"
         ";     must read 0. v6.6.8: center_gate and center_upmix_guard are\n"
         ";     part of the engine now -- ALWAYS ON.\n"
+        "; v8.4.1: the same two gates ride THE CENTER FOLD -- when\n"
+        ";     output_device2 is EMPTY and ch3 folds onto leg1's FL/FR, the\n"
+        ";     upmix fingerprint fades the phantom center out of the fronts;\n"
+        ";     'cm' then counts those guarded blocks on leg1.\n"
         "\n"
         "; ROUTING GUARANTEE (zero duplication, by construction):\n"
         ";   out1 gets ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE) folded\n"
         ";   onto both. FC, the discrete LFE slot AND the 5.1 rear slots stay\n"
         ";   DRIVEN DIGITAL SILENCE, so no layer (Windows engine, miniaudio\n"
         ";   converter, Speaker Fill) has any signal to upmix into a fake\n"
-        ";   center -- the center belongs to out2 alone, the rears to\n"
-        ";   out3/out4 alone. out2 gets ONLY ch3 (center): every other input\n"
+        ";   center -- the center belongs to out2 alone (v8.4.1: an EMPTY\n"
+        ";   output_device2 folds it onto out1's FL/FR at gain_center\n"
+        ";   instead), the rears to out3/out4 alone. out2 gets ONLY ch3\n"
+        ";   (center): every other input\n"
         ";   channel is EXPLICITLY MUTED in the out2 path -- out2 is not a\n"
         ";   clone of the program audio. out3 gets ONLY ch7 (rear L) and out4\n"
         ";   ONLY ch8 (rear R), each on both outputs at gain_rl/gain_rr\n"
@@ -4553,6 +4641,8 @@ static void writeTemplate(const char* path) {
         "; carries. The out2 pump also runs FIRST and at the higher priority\n"
         "; (out2_first): the center leg gets the freshest data and the most\n"
         "; scheduling attention; delay1_ms/delay2_ms then trim the alignment.\n"
+        "; v8.4.1: with out2 EMPTY there is no keep-alive and none is needed\n"
+        "; -- the center fold rides the always-driven mains.\n"
         "\n"
         "; v7.0.4: gui_theme = the control window's color theme (0..7), saved\n"
         "; automatically whenever the THEME button cycles it. 0 = DARK CYAN,\n"
@@ -5166,8 +5256,9 @@ enum {
                                 // the ids stay reserved; nothing creates them
     IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
     IDC_LOG = 204, IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
-    // page: configuration (v8.3.0: was devices -- the startup + chime pills
-    // from the late SETTINGS page live here too)
+    // page: configuration (v8.3.0: was devices -- the chime pills from the
+    // late SETTINGS page live here; v8.4.1: the startup pill moved to the
+    // bottom bar)
     IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
     IDC_TGL_LFEFOLD,            // v8.4.0: retired (the fold is built in) --
@@ -5180,10 +5271,11 @@ enum {
                                 // rows live on TIMING now (v7.1.7: IDC_BE1/
                                 // IDC_BE2 retired; the backend keys live in
                                 // the ini only)
-    // v8.3.0: the SETTINGS page is GONE -- the startup + chime pills live on
-    // page 0; the drift trio + volume_follow ids are retired with their keys
+    // v8.3.0: the SETTINGS page is GONE -- the chime pills live on page 0
+    // (v8.4.1: the startup pill lives on the bottom bar); the drift trio +
+    // volume_follow ids are retired with their keys
     // (reserved here like IDC_OUT1MS before them, nothing creates them).
-    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (v8.3.0: lives on page 0)
+    IDC_TGL_STARTUP,            // v6.6.6: Run-key pill (v8.4.1: the bottom bar, every page)
     IDC_DCORR, IDC_DINTERVAL, IDC_DEEPRESYNC,   // v8.3.0: retired (hardcoded)
     IDC_TGL_VOLFOLLOW, IDC_TGL_CHIMES,          // v8.3.0: VOLFOLLOW retired; CHIMES on page 0
     IDC_CHIMGAIN,               // v8.3.0: lives on page 0 (v7.1.7: KAHZ/KAGAIN retired)
@@ -5310,11 +5402,12 @@ static bool guiCreateRealWindow();   // v7.1.6 tray-first: deferred build, on de
 // v6.6.1 tray context-menu commands
 enum { IDM_TRAY_OPEN = 900, IDM_TRAY_START, IDM_TRAY_AUTORUN, IDM_TRAY_EXIT };
 
-// v8.3.0: THREE tabs. The SETTINGS page is GONE -- its startup + chime
-// controls live on page 0 and the drift trio + volume_follow went with
-// their keys (hardcoded from the fielded ini: 5 / 5000 / 30 / on). With
-// nothing left to configure under the old label, page 0 says what it now
-// is: CONFIGURATION | TIMING | CENTER EQ.
+// v8.3.0: THREE tabs. The SETTINGS page is GONE -- its chime controls live
+// on page 0 (v8.4.1: the startup pill moved to the bottom bar's right end)
+// and the drift trio + volume_follow went with their keys (hardcoded from
+// the fielded ini: 5 / 5000 / 30 / on). With nothing left to configure
+// under the old label, page 0 says what it now is:
+// CONFIGURATION | TIMING | CENTER EQ.
 static const char* kTabNames[3] = {
     "CONFIGURATION", "TIMING", "CENTER EQ"
 };
@@ -6386,15 +6479,18 @@ static void guiStartEngine(HWND w) {
     if (g_engState.load() != 0) return;
     cfgFromControls(w);
     cfgSanitize();
-    if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty() || g_cfg.outputDevice2.empty()) {
-        guiSetStatus(g_hwnd, "set input_device / output_device1 / output_device2 first");
+    // v8.4.1: output_device2 is OPTIONAL now -- an EMPTY center leg never
+    // opens and the center folds onto leg1's FL/FR (g_centerFold); the
+    // rear legs were already so. Only the capture and the mains are hard.
+    if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty()) {
+        guiSetStatus(g_hwnd, "set input_device / output_device1 first (legs 2/3/4 may stay EMPTY)");
         // v7.2.12: tray-only start (no panel yet) has no status line -- the
         // refusal used to vanish into a hidden STATIC and "Start engine"
         // from the tray menu looked like a silent dead click. The balloon
         // is the tray path's only voice.
         if (g_trayVisible && (!g_hwnd || g_hwnd == g_trayWnd))
-            trayBalloon("Cannot start: set input_device / output_device1 /\n"
-                        "output_device2 in twinspeak.ini first.");
+            trayBalloon("Cannot start: set input_device / output_device1 in\n"
+                        "twinspeak.ini first (output_device2/3/4 may stay EMPTY).");
         return;
     }
     if (!guiSaveIni())
@@ -6435,7 +6531,7 @@ static void guiStopEngineJoin() {
 }
 
 // ---- page building ----------------------------------------------------------
-static bool startupEnabled();   // v6.6.6: forward decl -- the GUARDS pill reads it at build time
+static bool startupEnabled();   // v6.6.6: forward decl -- the startup pill reads it at build time
 // v7.0.0: uniform tab width -- v7.1.7: five faces span the same strip
 // (5 x 160 px + 4 x 4 px gaps = 816 px, the 818 px layout's twin).
 // v7.1.8: the faces widened to 168; v7.1.9 trimmed to 164; v7.1.10 lands
@@ -6479,9 +6575,9 @@ static void guiBuildPages(HWND w) {
     HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 324, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
     note(w, COLA_X, 352,
-         "leg1 = FL/FR + the LFE fold. leg2 = center ONLY. leg3/leg4 = the\n"
-         "cable's rear pair (ch7/ch8); an EMPTY device row keeps that rear leg\n"
-         "silent -- no error, no output. volume_endpoint = the master slider.", 3);
+         "leg1 = FL/FR + the LFE fold; an EMPTY leg2 folds the center onto\n"
+         "FL/FR (gain_center). leg3/leg4 = the cable's rears (ch7/ch8); an\n"
+         "EMPTY device row = that leg stays silent. volume_endpoint = master.", 3);
     header(w, COLB_X, KHDR_Y, "GAIN");
     // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
     // narrow edits in one group (the field's ask), gain_lfe just below,
@@ -6504,11 +6600,13 @@ static void guiBuildPages(HWND w) {
     // v8.3.0: THE SETTINGS PAGE IS GONE -- its three survivors moved HERE.
     // v8.4.0: the lfe_fold pill joined the retired (the fold is BUILT IN,
     // always on; the gain_lfe row above still scales it); the gain quad
-    // took the top of the column and the survivors ride the 34 px pitch
-    // below -- the column ends at 330, inside the 402 px panel band.
-    tglRow(w, COLB_X, 240, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
-    tglRow(w, COLB_X, 274, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
-    row(w, COLB_X, 308, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
+    // took the top of the column. v8.4.1: the launch-at-startup pill moved
+    // ALL THE WAY DOWN to the bottom bar's right end (its own separate,
+    // always-visible control -- see guiBuildControls); the two chime rows
+    // ride the 34 px pitch below -- the column ends at 296, inside the
+    // 402 px panel band.
+    tglRow(w, COLB_X, 240, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
+    row(w, COLB_X, 274, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
 
     // ============ page 1: TIMING (v8.2.0: unified -- TRANSPORT lives here too) ==
     // v8.2.0 THE UNIFIED TIMING PAGE. The DEVICE PERIODS column is GONE --
@@ -7105,6 +7203,14 @@ static void guiBuildControls(HWND w) {
     // theme cycler (label = the ACTIVE theme, kThemes[g_theme].name).
     mkBtn(w, IDC_TICK, 448, 414, 150, 36, "120 BPM TICK TEST");
     mkBtn(w, IDC_THEME, 606, 414, 150, 36, kThemes[g_theme].name);
+    // v8.4.1: the startup pill lives HERE now -- ALL THE WAY DOWN at the
+    // bottom bar's right end, its own separate control (the field's ask:
+    // "all the way down to the bottom right, just so that it's separate"),
+    // visible on every page like the rest of the bar. It carries its own
+    // face text ("STARTUP ON"/"STARTUP OFF") -- no side label, and the
+    // 102 px width lands the right edge at 866, flush with the log pane.
+    mkBtn(w, IDC_TGL_STARTUP, 764, 414, 102, 36, "");
+    g_tog[IDC_TGL_STARTUP] = startupEnabled();   // the pill IS the Run key (v6.6.6)
     // v7.1.5 FLICKER-FREE STATUS: the STATIC is HIDDEN -- it only stores the
     // string; guiPaintFrame draws the line inside the frame buffer (one blit,
     // no erase-then-draw flicker four times a second). Writers go through
@@ -7936,7 +8042,7 @@ static bool guiIsToggle(int id) {
     switch (id) {
         // v8.4.0: IDC_TGL_LFEFOLD retired (the fold is built in, always on)
         case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
-        case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.3.0: on page 0)
+        case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.4.1: the bottom bar's right end, every page)
         case IDC_TGL_CHIMES:    // v8.3.0: on page 0; IDC_TGL_VOLFOLLOW retired
         case IDC_TGL_EQ:
             return true;
@@ -8220,7 +8326,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             g.DrawPath(&pb, p);
             delete p;
-            guiAAString(g, dc, rc, on ? "ON" : "OFF", on ? guic::cOnText : guic::cText,
+            // v8.4.1: the bottom-bar startup pill carries its own name on
+            // its face (no side label -- it sits alone at the bar's right end).
+            const char* kFace = (id == IDC_TGL_STARTUP)
+                              ? (on ? "STARTUP ON" : "STARTUP OFF")
+                              : (on ? "ON" : "OFF");
+            guiAAString(g, dc, rc, kFace, on ? guic::cOnText : guic::cText,
                         g_fUIb, 0);
             if (d->itemState & ODS_FOCUS) {   // v7.1.4: the keyboard focus cue
                 Gdiplus::Pen fp(GCol(guic::cAccent), 1.0f);
@@ -9212,8 +9323,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                         "            (tip: twinspeak --list shows every device name)\n", iniPath.c_str());
         return 1;
     }
-    if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty() || g_cfg.outputDevice2.empty()) {
-        tlog( "[twinspeak] config must set input_device, output_device1, output_device2\n");
+    // v8.4.1: output_device2 is OPTIONAL -- EMPTY = no center leg and the
+    // center folds onto leg1's FL/FR at gain_center (the rears were already so).
+    if (g_cfg.inputDevice.empty() || g_cfg.outputDevice1.empty()) {
+        tlog( "[twinspeak] config must set input_device and output_device1\n"
+              "            (output_device2/3/4 may stay EMPTY: an empty leg2 folds center onto FL/FR)\n");
         return 1;
     }
 
@@ -9309,11 +9423,23 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 g_cfg.outputDevice1.c_str());
         return 1;
     }
-    if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice2, &id2, &n2)) {
+    // v8.4.1: leg2 (center) joins the rears as OPTIONAL -- an EMPTY
+    // output_device2 marks the leg disabled and turns on THE CENTER FOLD
+    // (ch3 onto leg1's FL/FR at gain_center, the same upmix guard riding
+    // it). A NON-empty needle that matches nothing is still a hard error,
+    // exactly like leg1.
+    g_leg[1].disabled = g_cfg.outputDevice2.empty();
+    g_centerFold      = g_leg[1].disabled;
+    if (!g_leg[1].disabled &&
+        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice2, &id2, &n2)) {
         tlog( "[twinspeak] output_device2 matching \"%s\" not found (--list)\n",
                 g_cfg.outputDevice2.c_str());
         return 1;
     }
+    if (g_leg[1].disabled)
+        tlog("[twinspeak] leg2 (center)  : output_device2 is EMPTY -- no center device, no error;\n"
+             "                            the center FOLDS onto leg1's FL/FR at gain_center\n"
+             "                            (upmix-guarded: a stereo source's phantom FC fades out)\n");
     // v8.4.0 THE REAR LEGS: an EMPTY device string = the leg is DISABLED --
     // no device is picked, no ring is built, no thread starts: that rear
     // channel simply never plays (empty in = empty out). A NON-empty needle
@@ -9574,7 +9700,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
-            ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f)
+            ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f
+               && (!g_centerFold || g_cfg.gainCenter > 0.0f))   // v8.4.1: the fold term too
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (i == 2) ? (g_cfg.gainRl >= 0.0f)          // v8.4.0: the rear legs
@@ -9687,7 +9814,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
     }
 
-    armChime(true);   // v6.2: the first thing the center speaker plays is the signature
+    // v8.4.1: no center device = no chime (the signature rides out2 only);
+    // arming it with leg2 disabled would just never play.
+    if (!g_leg[1].disabled)
+        armChime(true);   // v6.2: the first thing the center speaker plays is the signature
 
     // v6.3: a KS leg "starts" by creating its pacing thread (the thread
     // flips the pin to RUN itself); ma_device_start applies to WASAPI legs.
@@ -9900,21 +10030,38 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                "[twinspeak] route out4     : L = R = %.2f*ch8 (cable RR) ONLY -- no gates, no keep-alive; an unconfigured\n"
                "[twinspeak] route rears    : leg = silent by design (empty device = empty out; the cable's rears ride ONLY here)\n",
                g_cfg.gainRl, g_cfg.gainRr);
-    tlog("[twinspeak] route out2     : L = R = %.2f*ch3(center) ONLY -- ch1/ch2/ch4..ch8 EXPLICITLY MUTED in the out2 path\n"
-           "[twinspeak] route out2     : (out2 is NOT a clone of the program audio) + %.0f Hz @ %.2f%% keep-alive\n",
-           g_cfg.gainCenter, g_kaHz, g_kaGain * 100.0f);
-    tlog("[twinspeak] route out2     : center gates %s -- ch3 digital-zero -> keep-alive only; ch3 == a*ch1+b*ch2\n"
-           "                            (the Windows stereo->8ch upmix fingerprint, residual < -30 dB) -> muted.\n"
-           "                            Genuine 5.1 center (an independent track) never matches and always plays.\n",
-           (g_cfg.centerGate && g_cfg.centerUpmixGuard) ? "BOTH ON" :
-           (g_cfg.centerUpmixGuard ? "upmix guard on, gate OFF" :
-           (g_cfg.centerGate ? "gate on, upmix guard OFF" : "OFF (center_gate = off)")));
-    if (g_ceq.on)
-        tlog("[twinspeak] route out2     : center EQ ON -- peaking %.0f Hz %+.1f dB Q %.2f on ch3 (dialogue boost;\n"
-               "                            a KS/WaveRT leg bypasses every system APO, so the boost lives here)\n",
-               g_ceq.f0, g_ceq.gainDb, g_ceq.q);
-    else
-        tlog("[twinspeak] route out2     : center EQ off -- out2 is bit-exact\n");
+    // v8.4.1: the route banner tells the truth for BOTH shapes -- a live
+    // out2 (ch3 on its own device) and the fold (leg2 EMPTY, ch3 onto FL/FR).
+    if (g_centerFold) {
+        tlog("[twinspeak] route out2     : EMPTY -- no center device; ch3 (center) FOLDS onto out1's FL/FR at\n"
+             "                            gain_center %.2f, the LFE fold's pattern (the FC slot stays driven silence).\n",
+             g_cfg.gainCenter);
+        tlog("[twinspeak] route out2     : center gates %s -- THE SAME gates ride the fold on leg1: digital-zero ch3\n"
+             "                            folds nothing; ch3 == a*ch1+b*ch2 (the Windows stereo->8ch upmix\n"
+             "                            fingerprint, residual < -30 dB) fades the phantom center out of the\n"
+             "                            fronts; genuine 5.1 center (an independent track) always plays.\n",
+             (g_cfg.centerGate && g_cfg.centerUpmixGuard) ? "BOTH ON" :
+             (g_cfg.centerUpmixGuard ? "upmix guard on, gate OFF" :
+             (g_cfg.centerGate ? "gate on, upmix guard OFF" : "OFF (center_gate = off)")));
+        tlog("[twinspeak] route out2     : center EQ idle -- it is out2-only and out2 is EMPTY; the fold is a plain\n"
+             "                            gain_center sum, no filter (a fold must never color the mains)\n");
+    } else {
+        tlog("[twinspeak] route out2     : L = R = %.2f*ch3(center) ONLY -- ch1/ch2/ch4..ch8 EXPLICITLY MUTED in the out2 path\n"
+               "[twinspeak] route out2     : (out2 is NOT a clone of the program audio) + %.0f Hz @ %.2f%% keep-alive\n",
+               g_cfg.gainCenter, g_kaHz, g_kaGain * 100.0f);
+        tlog("[twinspeak] route out2     : center gates %s -- ch3 digital-zero -> keep-alive only; ch3 == a*ch1+b*ch2\n"
+               "                            (the Windows stereo->8ch upmix fingerprint, residual < -30 dB) -> muted.\n"
+               "                            Genuine 5.1 center (an independent track) never matches and always plays.\n",
+               (g_cfg.centerGate && g_cfg.centerUpmixGuard) ? "BOTH ON" :
+               (g_cfg.centerUpmixGuard ? "upmix guard on, gate OFF" :
+               (g_cfg.centerGate ? "gate on, upmix guard OFF" : "OFF (center_gate = off)")));
+        if (g_ceq.on)
+            tlog("[twinspeak] route out2     : center EQ ON -- peaking %.0f Hz %+.1f dB Q %.2f on ch3 (dialogue boost;\n"
+                   "                            a KS/WaveRT leg bypasses every system APO, so the boost lives here)\n",
+                   g_ceq.f0, g_ceq.gainDb, g_ceq.q);
+        else
+            tlog("[twinspeak] route out2     : center EQ off -- out2 is bit-exact\n");
+    }
     // v6.3.1: the align line does the arithmetic -- both est paths and their
     // difference, with the trim direction spelled out. Same formula as
     // printLegDevice (ring + device lead + capture burst, delay included),
@@ -9931,18 +10078,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
               * 1000.0 / (double)d->playback.internalSampleRate : 0.0;
         return delayMsv + devMs;
     };
-    const double ep1 = estPathOf(0), ep2 = estPathOf(1);
-    tlog("[twinspeak] align          : delay1 +%d ms, delay2 +%d ms -- bit-exact prefill delay; put it on the EARLY leg\n"
-           "                            est path: leg1 ~%.1f ms vs leg2 ~%.1f ms (difference %+.1f ms with the\n"
-           "                            current delay included -> %s). The S5's own\n"
-           "                            amp latency is OUTSIDE the print -- the ear trims the last 1-2 ms.\n"
-           "                            v6.5.9: the health log's 'devbuf' line re-prints this from the LIVE\n"
-           "                            devices every 10 s (padding / exclusive buffer / KS lead + raw).\n",
-           (int)(g_cfg.delay1Ms + 0.5f), (int)(g_cfg.delay2Ms + 0.5f),
-           ep1, ep2, ep1 - ep2,
-           (ep1 - ep2) > 0.05 ? "leg1 arrives later -- raise delay2_ms" :
-           (ep1 - ep2) < -0.05 ? "leg2 (center) arrives later -- raise delay1_ms" :
-           "printed paths are EQUAL -- any offset left is device silicon");
+    const double ep1 = estPathOf(0), ep2 = g_centerFold ? 0.0 : estPathOf(1);   // v8.4.1: leg2 may be EMPTY
+    if (g_centerFold)
+        tlog("[twinspeak] align          : delay1 +%d ms -- out2 is EMPTY: no center leg to align (the center fold\n"
+             "                            rides leg1's own path, bit-exact; delay2_ms is inert until leg2 returns)\n",
+             (int)(g_cfg.delay1Ms + 0.5f));
+    else {
+        tlog("[twinspeak] align          : delay1 +%d ms, delay2 +%d ms -- bit-exact prefill delay; put it on the EARLY leg\n"
+               "                            est path: leg1 ~%.1f ms vs leg2 ~%.1f ms (difference %+.1f ms with the\n"
+               "                            current delay included -> %s). The S5's own\n"
+               "                            amp latency is OUTSIDE the print -- the ear trims the last 1-2 ms.\n"
+               "                            v6.5.9: the health log's 'devbuf' line re-prints this from the LIVE\n"
+               "                            devices every 10 s (padding / exclusive buffer / KS lead + raw).\n",
+               (int)(g_cfg.delay1Ms + 0.5f), (int)(g_cfg.delay2Ms + 0.5f),
+               ep1, ep2, ep1 - ep2,
+               (ep1 - ep2) > 0.05 ? "leg1 arrives later -- raise delay2_ms" :
+               (ep1 - ep2) < -0.05 ? "leg2 (center) arrives later -- raise delay1_ms" :
+               "printed paths are EQUAL -- any offset left is device silicon");
+    }
     // v8.4.0: the rear legs' est paths against the mains -- trim
     // offset3_ms/offset4_ms from this number (a rear that arrives EARLY
     // takes the offset).
@@ -9955,8 +10108,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
              (int)(g_cfg.offset3Ms + 0.5f), (int)(g_cfg.offset4Ms + 0.5f),
              ep3 - ep1, ep4 - ep1);
     }
-    tlog("[twinspeak] route check    : center (ch3) plays ONLY on out2; out1 plays ONLY ch1/ch2 + the LFE fold;\n"
-           "                            the rears (ch7/ch8) play ONLY on out3/out4, and ONLY when their devices are set\n");
+    if (g_centerFold)
+        tlog("[twinspeak] route check    : out2 is EMPTY -- center (ch3) FOLDS onto out1's FL/FR at gain_center, the\n"
+             "                            same upmix guard protecting it; out1 plays ch1/ch2 + the LFE fold + the\n"
+             "                            center fold; the rears (ch7/ch8) play ONLY on out3/out4, devices permitting\n");
+    else
+        tlog("[twinspeak] route check    : center (ch3) plays ONLY on out2; out1 plays ONLY ch1/ch2 + the LFE fold;\n"
+               "                            the rears (ch7/ch8) play ONLY on out3/out4, and ONLY when their devices are set\n");
     if (g_cfg.volumeFollow) {
         if (g_srcVol)
             tlog("[twinspeak] volume        : following \"%ls\" (the cable's playback side) -- now %.0f%%%s -- drives every leg\n",
@@ -9973,6 +10131,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_cfg.pinOutputs)
         tlog("[twinspeak] output pins   : every WASAPI leg's endpoint forced 100%%/unmuted -- re-checked every 2 s\n");
     tlog("[twinspeak] start order   : %s\n",
+           g_leg[1].disabled ? "out2 is EMPTY -- leg1 opens first, the rears follow; the center rides the FL/FR fold" :
            g_cfg.out2First ? "out2 (center) FIRST -- its device opens first; out1 follows (v8.1.0: no pumps)"
                            : "out1 first, then out2 (out2_first = off)");
     tlog("[twinspeak] dac yield     : %s -- the leg whose device IS the Windows default render endpoint\n"
@@ -9980,7 +10139,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            pump parked) so the main device plays untouched; it reopens the\n"
            "                            moment the default moves elsewhere (yield_default)\n",
            g_cfg.yieldDefault ? "ON" : "off");
-    if (g_cfg.chimes) {
+    if (g_leg[1].disabled)
+        tlog("[twinspeak] chimes        : %s -- but out2 is EMPTY (no center device): the signature rides the\n"
+             "                            center speaker only, so it stays silent this run\n",
+             g_cfg.chimes ? "on" : "off");
+    else if (g_cfg.chimes) {
         float cgp = g_cfg.chimeGain; if (cgp < 0.0f) cgp = 0.0f; if (cgp > 1.0f) cgp = 1.0f;
         tlog("[twinspeak] chimes        : ON -- CenterFold signature, modernized: low-treble TRIANGLE blips\n"
                "                            (rising C7->G7) on out2 at start + after a leg2 reopen | gain %.0f%%\n",
@@ -10070,7 +10233,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             dropN[i] = g_leg[i].rawDrop.load();
             undN[i]  = g_leg[i].und.load();
         }
-        const unsigned long long m1 = g_leg[1].cmUpmix.load();   // v6.1 upmix-guarded blocks
+        // v8.4.1: with the center fold active the guarded blocks count on
+        // LEG1 (the fold's guard state lives there) -- the 'cm' column stays
+        // the truth in both shapes.
+        const unsigned long long m1 = g_centerFold ? g_leg[0].cmUpmix.load()
+                                                   : g_leg[1].cmUpmix.load();   // v6.1 upmix-guarded blocks
         // v6.4 DRIFT LEDGER: the two legs' play boundaries in capture-sequence
         // space; their difference IS the inter-speaker offset (1 ms = 48 fr).
         // Silence prefills do NOT advance it; pops and evictions DO (v8.1.0:
