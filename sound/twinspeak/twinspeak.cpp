@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v8.4.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -43,6 +43,43 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.4 THE ABSOLUTE CENTER GATE + THE GUARD'S SMALL-BITE REPAIR
+//            (field-directed: "channel 3 is still mixing left and right
+//            even when there's zeroes in the whole buffer block of
+//            channel 3's input -- muting the center device whenever the
+//            capture input's channel 3 samples are detected to have all
+//            zeroes in the current buffer"). (1) THE ABSOLUTE CENTER GATE:
+//            an all-zero ch3 block now mutes the CENTER DEVICE itself, not
+//            just the channel. Every prior gate (v6.1's center_gate, the
+//            v7.8.4 guard) silenced the MIX -- but the device layer went
+//            on summing the 40 Hz keep-alive wobble through every one of
+//            them ("out2 = keep-alive only" was the honest log line): a
+//            zero-ch3 block still put a live signal on the center device,
+//            and anything downstream that keys on input activity (an amp
+//            DSP, an auto-on circuit) stayed engaged. The absolute gate is
+//            total and unconditional: a FULLY served block whose every
+//            ch3 sample is 0.0f (+0.0f and -0.0f both) skips the mix,
+//            resets the center EQ and kills the keep-alive wobble --
+//            literal digital silence out, no fade, no hysteresis, no ini
+//            switch. A starved block (a capture hole) keeps the wobble:
+//            gap-silence is the keep-alive's own job, not center content.
+//            An armed chime still plays (it is the user's own test, not
+//            ambient content). State changes are logged ("center gate:
+//            ... MUTED / live again") -- if the center speaker still mixes
+//            L/R while the log says MUTED, the leak is provably below the
+//            engine (driver DSP or hardware summing), and the log is the
+//            evidence. (2) THE GUARD'S SMALL-BITE REPAIR: the upmix
+//            fingerprint test required n >= 64 frames -- v8.4.3's 32-frame
+//            default bite silently DISABLED it (and a sub-64 WASAPI period
+//            had never run it either), so a stereo source's Windows upmix
+//            phantom (ch3 = a*ch1 + b*ch2) played through untouched: the
+//            literal "channel 3 mixing left and right". The fit now runs
+//            from 16 frames (the clamp floor) up; the 2-hit/8-miss
+//            hysteresis and the 2.5 ms fade absorb the noisier short-window
+//            fit. gate 1's old log/latch block is gone with its "out2 =
+//            keep-alive only" line -- the absolute gate owns zero blocks
+//            now, and centerGate/centerUpmixGuard stay hardcoded-on
+//            constants as they have been since v6.6.8.
 //    v8.4.3 THE SUB-MILLISECOND BITE + THE HONEST WATERMARK (field-
 //            directed: "roll back to v8.4.2 and start over from it; update
 //            the very old v7.8.4 visual text to the current version; the
@@ -1789,7 +1826,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.3"
+#define TWS_VERSION "8.4.4"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2316,7 +2353,12 @@ struct Leg {
     int                 cgMiss  = 0;             // consecutive full-test misses
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
-    bool                centerWasSilent = false; // for state-change logging
+    // v8.4.4 THE ABSOLUTE CENTER GATE: this block's verdict + the log
+    // latch. Written and read by leg2's device thread only (the switch
+    // sets it per block, sumLeg2Extras reads it right after on the same
+    // thread) -- single writer, no atomics, the cgGain pattern.
+    bool                centerDevMuted  = false; // this block's verdict: the keep-alive dies with it
+    bool                centerWasSilent = false; // previous block's verdict (state-change logging)
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -2859,6 +2901,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
     float* sc = L.scratch.data();
     size_t done = 0;
+    // v8.4.4 THE ABSOLUTE CENTER GATE: the whole-block ch3 verdict (idx==1
+    // only). Every popped chunk ANDs its own verdict in; a starved block
+    // (done < frameCount at the end) never reaches the mute -- the wobble
+    // through a capture gap is the keep-alive's own job, not center content.
+    bool ch3ZeroBlock = true;
     while (done < frameCount) {
         const size_t want = frameCount - done;
         const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
@@ -2878,7 +2925,17 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
             }
         }
-        if (idx == 1) centerGuard(L, sc, n, false);   // v6.1: center presence gates
+        // v8.4.4: the chunk's ch3 verdict feeds the absolute gate; the
+        // guard itself is unchanged below (it classifies NON-zero blocks
+        // -- a zero chunk has nothing to fingerprint).
+        bool z3 = false;
+        if (idx == 1) {
+            z3 = true;
+            for (size_t i = 0; i < n; ++i)
+                if (sc[i * kInCh + 2] != 0.0f) { z3 = false; break; }
+            ch3ZeroBlock = ch3ZeroBlock && z3;
+            centerGuard(L, sc, n, false);   // v6.1: center presence gates
+        }
         // v8.4.1 THE CENTER FOLD: leg2 empty -> the SAME gates protect the
         // fold. The guard fades sc's ch3 IN PLACE, so mixBlock's fold term
         // reads the guarded value -- a stereo upmix's phantom FC (a*FL+b*FR)
@@ -2888,7 +2945,10 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // v6.6.9: silence compression -- a bit-zero block needs no mix
         // (see the start-frozen gate): same bytes out, none of the FP work.
         float* dst = out + done * L.outCh;
-        if (L.zeroFast && bitZero8(sc, n)) {
+        // v8.4.4: an all-zero ch3 chunk skips the mix outright (bit-identical:
+        // out2 is gain_center * ch3 ONLY) and resets the EQ -- the gate's
+        // contract, in code.
+        if ((L.zeroFast && bitZero8(sc, n)) || (idx == 1 && z3)) {
             if (idx == 1) centerEqFlushZ();
             // dst is already silence
         } else {
@@ -2916,6 +2976,28 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // repeated frame, never a restart, never an escalation.
     if (done < frameCount)
         L.und.fetch_add(1);
+    // v8.4.4 THE ABSOLUTE CENTER GATE, the device-layer verdict: a FULLY
+    // served block whose every ch3 sample was digital zero MUTES THE CENTER
+    // DEVICE -- sumLeg2Extras reads the latch and kills the 40 Hz wobble,
+    // the one rider every previous gate let through. State changes are
+    // logged: if the speaker still mixes L/R while the log says MUTED, the
+    // leak is below the engine and this line is the evidence.
+    if (idx == 1) {
+        L.centerDevMuted = (done >= frameCount) && ch3ZeroBlock;
+        if (L.centerDevMuted != L.centerWasSilent) {
+            L.centerWasSilent = L.centerDevMuted;
+            const unsigned long long nowMs = GetTickCount64();
+            if (nowMs - L.lastGateLogMs >= 2000) {
+                L.lastGateLogMs = nowMs;
+                if (L.centerDevMuted)
+                    tlog("[twinspeak] center gate  : ch3 is digital zero -- THE CENTER DEVICE IS MUTED\n"
+                         "                            (v8.4.4 the absolute gate: mix skipped, EQ reset, keep-alive OFF --\n"
+                         "                            literal digital silence, no fade, no hysteresis, no ini switch)\n");
+                else
+                    tlog("[twinspeak] center gate  : ch3 carries samples again -- the center mix and keep-alive resume\n");
+            }
+        }
+    }
 
     // the last played frames -- the KS lapse guard's re-prime source (v8.1.0
     // note: the replay path itself is gone; this is the only consumer left).
@@ -2953,7 +3035,13 @@ static void sumLeg2Extras(float* out, ma_uint32 frameCount) {
     // wrap-free RUNS over the table -- same sample sequence and clamps,
     // bit-exact (harness-proven).
     int chSel = g_chimeSel.load(std::memory_order_acquire);
+    // v8.4.4 THE ABSOLUTE CENTER GATE, device layer: a block whose ch3 was
+    // all-zero kills the 40 Hz keep-alive wobble too -- the one rider every
+    // previous gate let through ("out2 = keep-alive only"). An armed chime
+    // still plays: it is the user's own test, not ambient content.
+    const bool kaGated = g_leg[1].centerDevMuted;
     if (chSel < 0) {
+        if (kaGated) return;                 // the wobble was the only rider: true silence
         const unsigned len = g_kaLen;
         unsigned idx = g_kaIdx;
         ma_uint32 done = 0;
@@ -2976,10 +3064,14 @@ static void sumLeg2Extras(float* out, ma_uint32 frameCount) {
         return;
     }
     for (ma_uint32 i = 0; i < frameCount; ++i) {
-        const float s = g_kaTable[g_kaIdx];
-        if (++g_kaIdx >= g_kaLen) g_kaIdx = 0;
-        float l = out[i * 2 + 0] + s;
-        float r = out[i * 2 + 1] + s;
+        float l = out[i * 2 + 0];
+        float r = out[i * 2 + 1];
+        if (!kaGated) {                      // v8.4.4: the wobble rides only a live center
+            const float s = g_kaTable[g_kaIdx];
+            if (++g_kaIdx >= g_kaLen) g_kaIdx = 0;
+            l += s;
+            r += s;
+        }
         if (chSel >= 0) {
             const unsigned ci = g_chimeIdx.fetch_add(1, std::memory_order_relaxed);
             if (ci < g_chimeBuf.size()) {
@@ -3223,9 +3315,10 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 }
 
 // ------------------------------------------------- v6.1 center gates -------
-// CENTER PRESENCE on out2 -- two gates in the leg2 pump, both default ON:
-//   1) center_gate: ch3 digital zero for the whole block -> out2's copy
-//      emits NOTHING (the keep-alive is summed later, at the device layer).
+// CENTER PRESENCE on out2 -- two gates, both default ON:
+//   1) v8.4.4 THE ABSOLUTE CENTER GATE (bufferSwitchFill): ch3 digital zero
+//      for the whole block -> THE DEVICE IS MUTED -- mix skipped, EQ reset,
+//      keep-alive wobble OFF (every prior gate let the wobble through).
 //   2) center_upmix_guard: a stereo app cannot write center to the 8ch
 //      cable -- the Windows engine UPmixES it first, FC = a*FL + b*R. The
 //      fingerprint is exact: per block, least-squares fit ch3 ~ a*ch1 +
@@ -3249,20 +3342,11 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
         if (sc[i * kInCh + 2] != 0.0f) { allZero = false; break; }
     }
     if (allZero) {
-        if (g_cfg.centerGate) {
-            if (!L.centerWasSilent) {
-                L.centerWasSilent = true;
-                const unsigned long long now = GetTickCount64();
-                if (now - L.lastGateLogMs >= 5000) {
-                    L.lastGateLogMs = now;
-                    if (fold) tlog("[twinspeak] out1 fold gate  : ch3 is digital zero -- nothing to fold onto FL/FR\n");
-                    else      tlog("[twinspeak] out2 center gate : ch3 is digital zero -- out2 = keep-alive only\n");
-                }
-            }
-        }
+        // v8.4.4: a zero block is THE ABSOLUTE CENTER GATE's territory now
+        // (bufferSwitchFill mutes the device, wobble included, and logs the
+        // state change itself) -- here there is nothing left to classify.
         return;                      // nothing left to classify on a silent block
     }
-    L.centerWasSilent = false;
 
     // ---- gate 2: engine upmix fingerprint (v7.8.4: hysteresis + fade) ------
     // The old guard hard-zeroed ch3 at a block boundary on every hit and
@@ -3276,7 +3360,13 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
     if (!g_cfg.centerUpmixGuard) return;
     constexpr float kCgFadeFr = 120.0f;             // 2.5 ms @ 48 kHz
     float target = L.cgMuted ? 0.0f : 1.0f;         // this block's fade goal
-    if (n >= 64) {
+    // v8.4.4: the fit runs at EVERY bite size. The old n >= 64 floor
+    // silently disabled the guard the day v8.4.3 made the default bite 32
+    // frames (and a sub-64 WASAPI period had never run it either) -- a
+    // stereo source's upmix phantom played through untouched. 16 = the
+    // clamp floor; the 2-hit/8-miss hysteresis and the 2.5 ms fade absorb
+    // the noisier short-window fit.
+    if (n >= 16) {
         // full test (the fit is verbatim v6.1)
         double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -4327,7 +4417,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -4687,9 +4777,12 @@ static void writeTemplate(const char* path) {
         "\n"
         "; CENTER PRESENCE (v6.1) -- out2 plays the center channel ONLY while it\n"
         "; is genuinely present. Two gates, both default ON:\n"
-        ";   center_gate -- a block whose ch3 is digital zero emits NOTHING but\n"
-        ";     the keep-alive tone: if the center channel is ever zero, every\n"
-        ";     channel of that sample stays zero. Never a substitute.\n"
+        ";   center_gate (v8.4.4: THE ABSOLUTE CENTER GATE) -- a block whose\n"
+        ";     ch3 is digital zero MUTES THE CENTER DEVICE ITSELF: mix skipped,\n"
+        ";     EQ reset, 40 Hz keep-alive OFF -- literal digital silence, no\n"
+        ";     fade, no hysteresis, no ini switch. A starved block keeps the\n"
+        ";     wobble (a capture gap is the keep-alive's own job); an armed\n"
+        ";     chime still plays. State changes log 'center gate'.\n"
         ";   center_upmix_guard -- when the SOURCE has no center of its own (a\n"
         ";     stereo app on the 8ch cable), the Windows engine fills FC with\n"
         ";     a*FL + b*R at the cable's playback side -- BEFORE twinspeak can\n"
@@ -4698,7 +4791,9 @@ static void writeTemplate(const char* path) {
         ";     issue). The guard recognizes that exact fingerprint per block\n"
         ";     (least-squares ch3 ~ a*ch1 + b*ch2, residual < -30 dB, gains in\n"
         ";     the upmix band, fronts active) and mutes those blocks too -- the\n"
-        ";     center speaker stays on keep-alive only. Genuine 5.1 center is an\n"
+        ";     center speaker stays on keep-alive only. v8.4.4: the fit runs\n"
+        ";     from 16 frames up (the old 64-frame floor silently skipped it on\n"
+        ";     the 32-frame default bite). Genuine 5.1 center is an\n"
         ";     INDEPENDENT track and never matches; it always passes. The health\n"
         ";     line counts guarded blocks ('cm') -- with real 5.1 content it\n"
         ";     must read 0. v6.6.8: center_gate and center_upmix_guard are\n"
@@ -10138,9 +10233,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] route out2     : L = R = %.2f*ch3(center) ONLY -- ch1/ch2/ch4..ch8 EXPLICITLY MUTED in the out2 path\n"
                "[twinspeak] route out2     : (out2 is NOT a clone of the program audio) + %.0f Hz @ %.2f%% keep-alive\n",
                g_cfg.gainCenter, g_kaHz, g_kaGain * 100.0f);
-        tlog("[twinspeak] route out2     : center gates %s -- ch3 digital-zero -> keep-alive only; ch3 == a*ch1+b*ch2\n"
-               "                            (the Windows stereo->8ch upmix fingerprint, residual < -30 dB) -> muted.\n"
-               "                            Genuine 5.1 center (an independent track) never matches and always plays.\n",
+        tlog("[twinspeak] route out2     : center gates %s -- ch3 digital-zero -> THE DEVICE IS MUTED (v8.4.4: mix, EQ\n"
+               "                            and keep-alive all OFF -- literal silence); ch3 == a*ch1+b*ch2 (the Windows\n"
+               "                            stereo->8ch upmix fingerprint, residual < -30 dB) -> muted. Genuine 5.1\n"
+               "                            center (an independent track) never matches and always plays.\n",
                (g_cfg.centerGate && g_cfg.centerUpmixGuard) ? "BOTH ON" :
                (g_cfg.centerUpmixGuard ? "upmix guard on, gate OFF" :
                (g_cfg.centerGate ? "gate on, upmix guard OFF" : "OFF (center_gate = off)")));
