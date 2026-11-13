@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v8.4.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -43,6 +43,40 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.3 THE SUB-MILLISECOND BITE + THE HONEST WATERMARK (field-
+//            directed: "roll back to v8.4.2 and start over from it; update
+//            the very old v7.8.4 visual text to the current version; the
+//            one optimization I want is a polling rate faster than 1 ms --
+//            polish it like an iron fist and keep it as a center channel
+//            router"). The v8.5-v8.8 line (the merges, the surround legs,
+//            the zero watches) is RETIRED whole -- the baseline is the
+//            v8.4.2 tree verbatim, and the app stays what the field
+//            validated: out1 = L/R + LFE fold, out2 = center, optional
+//            rears. (1) THE HONEST WATERMARK: the top-right corner still
+//            read "v7.8.4 | <ini path>" -- a hard literal the v7.9.0
+//            banner fix missed; it prints the real TWS_VERSION now, so it
+//            can never go stale again. (2) THE SUB-MILLISECOND BITE: the
+//            KS service cadence (the buffer-switch bite) goes under 1 ms
+//            and STAYS steady. ks_period_frames defaults to 32 now (0.67
+//            ms of service per bite at 48 kHz) and the clamp floor drops
+//            32 -> 16 (0.33 ms); the deadline-zone poll was already the
+//            finest expressible wait (one-shot 100 ns high-resolution
+//            timer). What buzzed in the v6.5.14 field at sub-128 bites
+//            was never the cadence -- it was the WaveRT LOOP shrinking
+//            with the bite (bite x ks_periods): the lap window and the
+//            write lead collapsed to a couple of ms and every ordinary
+//            deschedule lapped the DAC into stale audio plus a re-pin
+//            seam. A sub-128 bite now FLOORS the loop at the shipped
+//            default's own numbers -- 768 frames (16 ms lap window) and a
+//            512-frame (~10.7 ms) write lead, the cushion the field
+//            proved steady -- while the bite writes as fine as 333 us.
+//            The lapse guard's disagreement tolerance scales with the
+//            loop (the fixed 2*bite+96 was degenerate at both ends: 96
+//            alone exceeded the whole loop at a 32-frame bite, and 8288
+//            exceeded the 8192-frame loop at bite 4096 x 2 periods).
+//            Bites of 128+ are byte-identical to v8.4.2 (request, lead,
+//            pacing, tolerance); the WASAPI fallback keeps its 1 ms period
+//            request (a fallback's job is to open, not to race).
 //    v8.4.2 THE STARTUP ROW, CORRECTED (field-directed): "bottom right"
 //            meant the ROW'S ORDER, not a new control style -- "launch at
 //            Windows startup" is a PLAIN tglRow again (label left, the
@@ -1755,7 +1789,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.2"
+#define TWS_VERSION "8.4.3"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -1973,7 +2007,7 @@ struct Config {
     // ks_period_frames = switch granularity.
     std::string backend1       = "ks";
     std::string backend2       = "ks";
-    unsigned    ksPeriodFrames = 256;    // KS buffer-switch size (frames)
+    unsigned    ksPeriodFrames = 32;     // v8.4.3: the sub-ms bite -- 0.67 ms of service @ 48 kHz
     unsigned    ksPeriods      = 3;      // WaveRT looped buffer = ksPeriods * period
     // v6.4 drift warden: the frame-interval ledger is ALWAYS on (it only
     // observes); drift_guard switches the automatic re-pin on top of it.
@@ -2212,7 +2246,7 @@ struct KsOut {
     std::string   filterName;
     std::string   fmtName;
     // pacing state (ksThread-private once running)
-    unsigned      periodFrames = 256; // write granularity == ks_period_frames
+    unsigned      periodFrames = 32;  // write granularity == ks_period_frames (v8.4.3: sub-ms default)
     unsigned      leadFrames   = 512; // keep the write cursor this far ahead
     unsigned long long playFrames = 0;   // monotonic frames consumed by the DAC
     unsigned long long writeFrames = 0;  // monotonic frames written
@@ -3417,6 +3451,20 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 static constexpr long long kTick500us = -5000;   // 0.5 ms, negative = relative (100-ns units)
 static constexpr long long kTick100ns = -1;      // one 100-ns tick -- the poll-only wait
 
+// v8.4.3 THE SUB-MILLISECOND BITE -- the loop floor. A bite under 128
+// frames used to shrink the WaveRT loop with it (bite x ks_periods), and
+// sub-128 loops buzzed in the field (v6.5.14): the lap window AND the
+// write lead collapsed to a couple of ms, and every ordinary deschedule
+// past them lapped the DAC into stale audio plus a re-pin seam. The
+// floor pins the loop at the shipped default's own numbers for any
+// sub-128 bite -- 768 frames of ring (16 ms lap window) and a 512-frame
+// (~10.7 ms) write lead, the cushion the field proved steady -- while
+// the BITE (the service cadence the pacer writes) goes as fine as 16
+// frames (333 us). Bites of 128+ are untouched: request, lead and
+// pacing byte-identical to v8.4.2.
+static constexpr unsigned kKsLoopFloorFrames   = 768;  // 16 ms @ 48 kHz -- the default's own lap window
+static constexpr unsigned kKsFlooredLeadFrames = 512;  // ~10.7 ms @ 48 kHz -- the default's own write lead
+
 // ============================================================ v6.3 WDM-KS ===
 // A direct kernel-streaming output path -- the FlexASIO protocol, embedded
 // and paced harder: filter = KSCATEGORY_RENDER wave filter opened as a file;
@@ -3781,6 +3829,15 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     const int outCh = L.outCh;
     const unsigned periodFrames = g_cfg.ksPeriodFrames;
     const unsigned loopPeriods  = g_cfg.ksPeriods;
+    // v8.4.3: the loop request for a sub-128 bite is the FLOOR (768 fr),
+    // not bite x ks_periods -- the lap window and the write cushion must
+    // not shrink with the service cadence. ks_periods stays the knob for
+    // bites of 128+ (and for sub-128 bites that already exceed the floor).
+    const bool biteFloored = (periodFrames < 128)
+        && ((unsigned long long)loopPeriods * periodFrames
+            < (unsigned long long)kKsLoopFloorFrames);
+    const unsigned loopReqFrames = biteFloored ? kKsLoopFloorFrames
+                                               : loopPeriods * periodFrames;
 
     if (!ksCreatePinFn()) {
         tlog("[twinspeak] leg%d KS        : ksuser.dll unavailable -- WDM-KS not usable on this install\n",
@@ -3851,7 +3908,7 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
                 if (!hp) continue;
                 unsigned char* buf = nullptr; size_t got = 0; BOOL barrier = FALSE;
                 const size_t wantBytes = (size_t)outCh * (size_t)f.container *
-                                         (size_t)periodFrames * (size_t)loopPeriods;
+                                         (size_t)loopReqFrames;
                 if (!ksAllocRtBuffer(hp, (ULONG)(outCh * f.container), wantBytes,
                                      &buf, &got, &barrier)) {
                     tlog("[twinspeak] leg%d KS        : pin %lu accepted %s but has no WaveRT looped buffer\n",
@@ -3925,8 +3982,22 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     const size_t posFrames = (size_t)(posBytes % (ULONG)K.loopBytes) / K.frameBytes;
 
     K.leadFrames  = (loopPeriods - 1) * periodFrames;
-    if (K.leadFrames + periodFrames > (unsigned)K.loopFrames)
+    if (biteFloored)
+        // v8.4.3: a floored loop rides the default's own write lead
+        // (512 fr, ~10.7 ms), clamped to what the driver actually gave.
+        K.leadFrames = (unsigned)std::min< size_t >(kKsFlooredLeadFrames,
+                                                    K.loopFrames - periodFrames);
+    else if (K.leadFrames + periodFrames > (unsigned)K.loopFrames)
         K.leadFrames = (unsigned)(K.loopFrames - periodFrames);   // driver gave us more room than asked
+    if (biteFloored)
+        tlog("[twinspeak] leg%d KS        : sub-ms bite %u fr (~%.2f ms of service @ %u Hz) -- the WaveRT loop\n"
+             "                            is floored at %u fr (%.1f ms lap window; ks_periods is inert below\n"
+             "                            the floor) and the write lead rides %u fr (~%.1f ms): the deschedule\n"
+             "                            cushion never shrinks with the bite\n",
+             idx + 1, periodFrames,
+             (double)periodFrames * 1000.0 / (double)kSampleRate, (unsigned)kSampleRate,
+             (unsigned)K.loopFrames, (double)K.loopFrames * 1000.0 / (double)kSampleRate,
+             K.leadFrames, (double)K.leadFrames * 1000.0 / (double)kSampleRate);
     K.playFrames  = posFrames;
     K.writeFrames = posFrames + K.leadFrames;   // prefill silence sits [pos, pos+lead)
     K.lastPosBytes = posFrames * K.frameBytes;
@@ -4111,7 +4182,13 @@ static DWORD WINAPI ksThread(LPVOID p) {
                 long long obsFr = ((long long)pbGuard - (long long)K.lastPosBytes)
                                 / (long long)K.frameBytes;
                 if (obsFr < 0) obsFr += (long long)K.loopFrames;   // residue wrap
-                const long long tolFr = (long long)2 * periodFr + 96;
+                // v8.4.3: the tolerance scales with the loop -- the fixed
+                // 2*bite+96 was degenerate at both ends (96 alone exceeded
+                // the whole loop at a 32-frame bite; 8288 exceeded the
+                // 8192-frame loop at bite 4096 x 2 periods). The default
+                // config keeps its exact v8.4.2 value (608 > 768/4).
+                const long long tolFr = std::max< long long >(
+                    (long long)2 * periodFr + 96, (long long)K.loopFrames / 4);
                 const bool lapLoss    = expectedFr >= (long long)K.loopFrames;
                 const bool residueOdd = obsFr > expectedFr + tolFr
                                      || obsFr + tolFr < expectedFr;
@@ -4250,7 +4327,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -4466,12 +4543,15 @@ static void writeTemplate(const char* path) {
         ";   backendN = ks      WDM-KS -- the DEFAULT (the kernel-level loop)\n"
         ";   backendN = wasapi  wasapi exclusive (miniaudio event mode) -- the\n"
         ";                      automatic fallback and the opt-out\n"
-        "; ks_period_frames = the buffer-switch size in SAMPLES (256 @ 48 kHz =\n"
-        "; one bite every 5.33 ms; 96 = one bite every 2 ms -- smaller bites\n"
-        "; shrink the pacer's loop window too; v6.5.14 field note: 128 MINIMUM\n"
-        "; paces much steadier -- the lapse guard's lap window shrinks with the\n"
-        "; loop and sub-128 loops buzzed in the field). ks_periods = the looped\n"
-        "; buffer size around it: 2 = the write lead is one period (lowest\n"
+        "; ks_period_frames = the buffer-switch bite in SAMPLES -- the service\n"
+        "; cadence. v8.4.3 THE SUB-MILLISECOND BITE: 32 @ 48 kHz = one bite\n"
+        "; every 0.67 ms (the default), 16 = 0.33 ms (the floor), 256 = the\n"
+        "; old 5.33 ms cadence. A bite under 128 frames FLOORS the WaveRT loop\n"
+        "; at 768 fr (16 ms, the shipped default's own lap window) and rides a\n"
+        "; 512-fr (~10.7 ms) write lead, so the deschedule cushion never\n"
+        "; shrinks with the bite (v6.5.14's sub-128 buzz was the loop shrinking\n"
+        "; with it); bites of 128+ are byte-identical to v8.4.2. ks_periods =\n"
+        "; the looped buffer size around it (inert below the floor): 2 = the\n"
         "; latency, the pacer must never miss a deadline), 3 = one extra period\n"
         "; of grace (recommended), up to 8 -- a 1 in the ini clamps to 2 with a log line\n"
         "; (a 1-period loop has no write lead at all). The DAC adds its hardware\n"
@@ -4491,7 +4571,7 @@ static void writeTemplate(const char* path) {
         "; SAME name needles as below match the KS filters.\n"
         "backend1 = ks\n"
         "backend2 = ks\n"
-        "ks_period_frames = 256\n"
+        "ks_period_frames = 32\n"
         "ks_periods = 3\n"
         "\n"
         "; CLOCK SYNC (v6.0, ASIO-strict): the audio path is BIT-EXACT -- there\n"
@@ -4705,10 +4785,11 @@ static void cfgSanitize() {
     }
     // v6.3.1: the clamps are now LOGGED -- a silently-ignored ini value looks
     // exactly like a broken feature from the driver's seat.
-    if (g_cfg.ksPeriodFrames < 32 || g_cfg.ksPeriodFrames > 4096) {
-        tlog("[twinspeak] config        : ks_period_frames %u -> %u (usable bite range is 32..4096)\n",
-             g_cfg.ksPeriodFrames, g_cfg.ksPeriodFrames < 32 ? 32u : 4096u);
-        g_cfg.ksPeriodFrames = g_cfg.ksPeriodFrames < 32 ? 32 : 4096;
+    if (g_cfg.ksPeriodFrames < 16 || g_cfg.ksPeriodFrames > 4096) {
+        tlog("[twinspeak] config        : ks_period_frames %u -> %u (usable bite range is 16..4096; 16 @ 48 kHz\n"
+             "                            = 333 us of service per bite)\n",
+             g_cfg.ksPeriodFrames, g_cfg.ksPeriodFrames < 16 ? 16u : 4096u);
+        g_cfg.ksPeriodFrames = g_cfg.ksPeriodFrames < 16 ? 16 : 4096;
     }
     if (g_cfg.ksPeriods < 2 || g_cfg.ksPeriods > 8) {
         tlog("[twinspeak] config        : ks_periods %u -> %u -- the WaveRT loop needs 2..8 periods; a\n"
@@ -4717,11 +4798,14 @@ static void cfgSanitize() {
              g_cfg.ksPeriods, g_cfg.ksPeriods < 2 ? 2u : 8u);
         g_cfg.ksPeriods = g_cfg.ksPeriods < 2 ? 2 : 8;
     }
-    if (g_cfg.ksPeriodFrames < 128) {   // v6.5.14: field note, NOT a clamp
-        tlog("[twinspeak] config        : ks_period_frames %u -- field note: bites under 128 frames pace on\n"
-             "                            the edge (the lapse-guard lap window shrinks with the loop and\n"
-             "                            64-frame loops buzzed in the field); 128+ is the steady zone\n",
-             g_cfg.ksPeriodFrames);
+    if (g_cfg.ksPeriodFrames < 128) {   // v8.4.3: the loop floor carries the cushion now
+        tlog("[twinspeak] config        : ks_period_frames %u -- sub-millisecond bite (~%.2f ms of service\n"
+             "                            @ 48 kHz); the WaveRT loop is floored at %u fr (16 ms) with a\n"
+             "                            512-fr (~10.7 ms) write lead, so the deschedule cushion never\n"
+             "                            shrinks with the bite (v6.5.14's sub-128 buzz was the loop\n"
+             "                            shrinking with it)\n",
+             g_cfg.ksPeriodFrames, (double)g_cfg.ksPeriodFrames * 1000.0 / (double)kSampleRate,
+             kKsLoopFloorFrames);
     }
 }
 
@@ -6334,7 +6418,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
     // v7.0.0: pinOutputs is integrated -- always on; no control can change it.
     // v7.1.7: backend1/backend2 have NO control -- the ini keys stand as loaded.
-    g_cfg.ksPeriodFrames = (unsigned)editFloat(w, IDC_KSPF, 256);
+    g_cfg.ksPeriodFrames = (unsigned)editFloat(w, IDC_KSPF, 32);
     g_cfg.ksPeriods      = (unsigned)editFloat(w, IDC_KSPD, 3);
     // v6.6.8: clockSync / driftGuard / powerGuard / yieldDefault integrated.
     // v8.3.0: the drift trio + volume_follow are hardcoded constants now
@@ -6664,12 +6748,12 @@ static void guiBuildPages(HWND w) {
          "banner prints every est path; 'drift' already includes your delay\n"
          "(it IS the alignment, not a fault).\n"
          "\n"
-         "period_frames = the buffer-switch bite in SAMPLES (128 @ 48 kHz =\n"
-         "a bite every 2.67 ms; 128+ paces steadiest). periods = the looped\n"
-         "buffer around it (3 recommended, 2..8). Every leg runs the KS kernel\n"
-         "loop by default -- a driver refusal falls back to wasapi exclusive\n"
-         "(backendN = wasapi opts legs 1/2 back in) and the log says so.\n"
-         "out1ms/out2ms are engine constants: 1 ms, hardcoded (a KS leg ignores).\n", 12);
+         "period_frames = the buffer-switch bite in SAMPLES (32 @ 48 kHz = a\n"
+         "bite every 0.67 ms; 16..4096; a sub-128 bite floors the loop at\n"
+         "16 ms). periods = the looped buffer around it (3 recommended,\n"
+         "2..8). Every leg runs the KS kernel loop by default -- a driver\n"
+         "refusal falls back to wasapi exclusive (backendN = wasapi opts\n"
+         "legs 1/2 back in); out1ms/out2ms are constants: 1 ms (a KS ignores).\n", 12);
 
     // v8.3.0: THE SETTINGS PAGE IS GONE -- nothing on it survived as a
     // setting: the drift trio + volume_follow are hardcoded constants, and
@@ -8015,8 +8099,12 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
                                         (Gdiplus::REAL)S(852) + 1.0f,
                                         (Gdiplus::REAL)S(114) + 1.0f));
     char vbuf[640];
-    snprintf(vbuf, sizeof(vbuf), "v7.8.4 |  %s",
-             tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
+    // v8.4.3 THE HONEST WATERMARK: this corner still read "v7.8.4 | <ini>"
+    // -- a hard literal the v7.9.0 banner fix missed. It prints the real
+    // TWS_VERSION now, exactly like the banner and the ini header: it can
+    // never go stale again.
+    snprintf(vbuf, sizeof(vbuf), "v%s |  %s",
+             TWS_VERSION, tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
