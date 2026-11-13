@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v8.4.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -7,7 +7,10 @@
 //  (optional: an EMPTY rear device keeps that leg silent) -- WASAPI/WDM-KS
 //  exclusive, every sample bit-exact, no resampler or pitch path anywhere.
 //  delay1/2_ms + offset3/4_ms are whole-ms prefills on the raw ring; drift
-//  is measured, never corrected (v8.1.0).
+//  is measured, never resampled (v8.1.0) -- v8.4.7 SLOW SYNC: every leg
+//  EXCEPT the first holds its settled offset to leg1's play boundary (a
+//  1-frame drop/pad at most every 200 ms; no key, no UI); the cable clock
+//  itself stays measure-only.
 //
 //  ARCHITECTURE (v8.1.0 -- THE STRIPPED PATH):
 //    VAC cable (8ch shared capture, exclusive)
@@ -52,6 +55,36 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.7 SLOW SYNC TO THE FIRST DEVICE + THE TIMING PAGE MOVES LEFT
+//            (field-directed: "each audio device delays eachother over
+//            time and I want you to just fix that ... I want a slow drift
+//            between each audio device and the others which should all
+//            sync together to exactly that first audio device ... just
+//            minimally implemented and that's it. And no adding new ini
+//            keys nor have them on the user interface either way").
+//            Every crystal walks its own ppm, so over an hour the legs'
+//            relative offset creeps by tens of ms until the raw cap evicts
+//            or the stream starves and the offset JUMPS -- that is the
+//            "delays eachother over time". THE FIX: out2/out3/out4 servo
+//            to OUT1's play boundary (seqTail -- pure frame arithmetic, no
+//            clock, no resampler, nothing bends pitch): each leg latches
+//            its SETTLED offset to leg1 two seconds after its last
+//            (re)open, then holds it -- a 1-frame nudge at most every
+//            200 ms, only past a 12-frame (250 us) dead-band. A LATE leg
+//            (its crystal runs slow, the ring grows) DROPS one oldest
+//            frame; an EARLY leg PADs one frame (the switch pops one frame
+//            less and REPEATS its last mixed frame -- a held sample: the
+//            DAC always receives its full frameCount, the wobble rides
+//            the repeat like any frame). A leg that jumps past 2000 fr (an
+//            eviction batch, a stall, a reopen) RE-LATCHES its baseline
+//            instead of grinding the distance back. Leg1 itself is NEVER
+//            touched (the master); a yielded or heart-silent leg1 freezes
+//            the sync whole (a parked leg's ring still evicts, and eviction
+//            jitter is not a clock to follow). MINIMAL BY DECREE: no ini
+//            key, no UI row, constants in the config block, nudges logged
+//            rate-limited. THE TIMING PAGE: its rows move from the right
+//            column to the LEFT (COLA_X), field-directed, unchanged
+//            otherwise; the note gains the sync story.
 //    v8.4.6 THE SIDE FOLD + EVERY LANE GATED BY ITSELF (field-directed:
 //            "the rear channels get the gate alone. I would not do ch8
 //            -> ch4. Just have ch7 and ch8 make the output ch7 and ch8
@@ -1909,7 +1942,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.6"
+#define TWS_VERSION "8.4.7"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2010,6 +2043,23 @@ static constexpr int      kSideLCh       = 4;      // 0-based: cable ch5 (SL) --
 static constexpr int      kSideRCh       = 5;      // 0-based: cable ch6 (SR) -- out4's side-fold source (v8.4.6)
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
+
+// v8.4.7 SLOW SYNC TO THE FIRST DEVICE (field-directed: "each audio
+// device delays eachother over time ... all sync together to exactly that
+// first audio device ... minimally ... no new ini keys nor ... the user
+// interface"). Every output leg EXCEPT leg1 servos its play boundary to
+// LEG1's (the first device is the master, never adjusted): each leg
+// latches its settled offset once, then holds it with one-frame nudges,
+// rate-limited -- a drop (discardOldest(1)) when it runs late, a pad (the
+// switch's last frame repeats the one before it) when it runs early. The
+// DAC always receives its full frameCount; nothing resamples, nothing
+// bends pitch, no key, no UI row.
+static constexpr int      kSyncDeadBandFr = 12;     // 250 us at 48 kHz -- the ear places ~1 ms between speakers
+static constexpr unsigned kSyncNudgeMs    = 200;    // one frame per window: 5 fr/s capacity (~100 ppm)
+static constexpr unsigned kSyncSettleMs   = 2000;   // past the last (re)open before the baseline latches
+static constexpr int      kSyncRelatchFr  = 2000;   // ~40 ms: a jump re-latches the baseline, never grinds
+static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
+static constexpr long long kSyncUnlatched = -0x7fffffffffffffffLL;  // the baseline sentinel
 
 // v8.4.5 THE UNIVERSAL KEEP-ALIVE tone: 20 Hz at 0.1% gain (0.001,
 // ~-60 dBFS -- 14 dB under v7.1.24's 40 Hz @ 0.5%) summed onto EVERY
@@ -2475,6 +2525,18 @@ struct Leg {
     bool                gateMuted2   = false;    // v8.4.6: the side lane's own verdict (rear legs only)
     bool                gateWasMuted2 = false;   // v8.4.6: its state-change latch ('side L/R gate')
     unsigned long long  lastSideLogMs = 0;       // v8.4.6: the side gate's own rate limit
+    // ---- v8.4.7 SLOW SYNC TO LEG1: the drift servo state (no key, no UI).
+    // syncBase holds the SETTLED offset to leg1's play boundary this leg
+    // must hold (frames; + = this leg is the delayed one). Written by this
+    // leg's device thread ONLY (the syncToFirst call inside its buffer
+    // switch); kSyncUnlatched = arming. lastSyncMs rate-limits the servo
+    // look; syncDrops/syncPads count the nudges (logged rate-limited,
+    // per-run like the ledger clocks).
+    std::atomic<long long> syncBase{kSyncUnlatched};
+    unsigned long long     lastSyncMs    = 0;
+    unsigned long long     syncDrops     = 0;
+    unsigned long long     syncPads      = 0;
+    unsigned long long     lastSyncLogMs = 0;
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -2500,7 +2562,10 @@ struct Leg {
     // sequence of its play boundary). Pops and passive evictions advance it;
     // silence prefills do not. The two legs' difference = the measured
     // inter-speaker offset. The buffer switch owns the boundary, the health
-    // loop owns the baseline -- corrections are GONE (v8.1.0).
+    // loop owns the baseline -- corrections are GONE (v8.1.0). v8.4.7: the
+    // INTER-LEG sync returns as a slow servo on this same boundary (see
+    // syncToFirst -- out2/3/4 hold their settled offset to leg1, one frame
+    // at a time, no key, no UI); the cable clock itself stays measure-only.
     size_t              prefillRemaining = 0;        // delay prefill: carries no sequence
     std::atomic<double> lagMs{0.0};                  // age of the newest played frame (ms)
     // v7.1.5 START ALIGN: the QPC microsecond stamp of this leg's FIRST buffer
@@ -2966,6 +3031,92 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     }
 }
 
+// ------------------------------------------------- v8.4.7 slow sync --------
+// THE PROBLEM (field-directed): every output device carries its own
+// crystal, and the crystals disagree by a few ppm -- over an hour the
+// legs' relative offset walks by tens of milliseconds (one device slowly
+// delays the others) until the raw cap evicts or the stream starves and
+// the offset jumps. THE FIX: every leg EXCEPT the first servos to LEG1's
+// play boundary -- the FIRST device is the master, never adjusted, and
+// all the others sync together to exactly it. The metric is the two
+// seqTails' difference (pure frame arithmetic, no clock, no resampler):
+// each leg latches its SETTLED offset kSyncSettleMs after its last
+// (re)open, then holds it with one-frame nudges, at most one per
+// kSyncNudgeMs and only past kSyncDeadBandFr. LATE (its crystal runs
+// slow, its ring grows): discardOldest(1) -- the boundary advances one
+// frame, 20.8 us earlier. EARLY (crystal fast, ring shallow): the switch
+// pops one frame less and repeats its last mixed frame -- the DAC always
+// receives its full frameCount, and the pad is a held sample, not a hole.
+// A leg that jumps past kSyncRelatchFr (an eviction batch, a stall, a
+// reopen) re-latches its baseline instead of grinding the distance back
+// -- the reference itself moved. A yielded or heart-silent leg1 freezes
+// the sync whole (a parked leg's ring still evicts, and eviction jitter
+// is not a clock to follow). Returns the number of pad frames the switch
+// must synthesize (0 or 1). No ini key, no UI row: the constants are the
+// engine's truth.
+static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
+{
+    const unsigned long long nowMs = GetTickCount64();
+    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
+    L.lastSyncMs = nowMs;
+    // leg1 must be ALIVE as a reference: not yielded, its device callback
+    // heartbeating. Otherwise freeze (keep the baseline, nudge nothing).
+    if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
+    if (nowMs - hbOutGet(0) > kSyncRefDeadMs) return 0;
+    const long long off =
+        (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed) -
+                    L.raw.seqTail.load(std::memory_order_relaxed));
+    // settle: kSyncSettleMs past the last (re)open AND kSyncSettleMs of
+    // this leg's own switches -- the prefills and the start-align pads are
+    // through, and the offset the user configured is what sits in the ring.
+    const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
+    if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) {
+        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // (re)arm
+        return 0;
+    }
+    LARGE_INTEGER fsw;
+    QueryPerformanceCounter(&fsw);
+    const unsigned long long nowUs =
+        (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
+    if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) {
+        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);
+        return 0;
+    }
+    const long long base = L.syncBase.load(std::memory_order_relaxed);
+    if (base == kSyncUnlatched) {
+        L.syncBase.store(off, std::memory_order_relaxed);   // latch the settled offset
+        return 0;
+    }
+    const long long err = off - base;   // + = this leg drifted LATE vs leg1
+    if (err > kSyncRelatchFr || err < -kSyncRelatchFr) {
+        // a jump, not a drift: the reference (or this leg) moved whole --
+        // re-latch, never grind tens of ms back one frame at a time.
+        L.syncBase.store(off, std::memory_order_relaxed);
+        if (nowMs - L.lastSyncLogMs >= 10000) {
+            L.lastSyncLogMs = nowMs;
+            tlog("[twinspeak] sync out%d     : offset jumped to %lld fr vs out1 (a reopen-class event) -- baseline\n"
+                 "                            re-latched, not ground back (slow sync: 1 fr / %u ms, %d fr dead-band)\n",
+                 idx + 1, off, kSyncNudgeMs, kSyncDeadBandFr);
+        }
+        return 0;
+    }
+    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop one oldest frame
+        if (L.raw.discardOldest(1)) {
+            L.syncDrops++;
+            if (nowMs - L.lastSyncLogMs >= 10000) {
+                L.lastSyncLogMs = nowMs;
+                tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- dropped 1 frame (%llu total; slow sync,\n"
+                     "                            1 fr / %u ms max, the 20 Hz @ 0.1%% keep-alive rides on)\n",
+                     idx + 1, err, L.syncDrops, kSyncNudgeMs);
+            }
+        }
+        return 0;
+    }
+    if (err <= -(long long)kSyncDeadBandFr)           // EARLY: pad one frame
+        return (frameCount >= 2) ? 1 : 0;
+    return 0;                                         // inside the dead-band: hold
+}
+
 // v8.1.0 forward declarations: the stripped switch sits at the TOP of the
 // playback section, above the mixer / tick / EQ definitions it calls (the
 // pumps that used to separate them are gone). Definitions stay where they
@@ -3017,6 +3168,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
     float* sc = L.scratch.data();
     size_t done = 0;
+    // v8.4.7 SLOW SYNC: out2/3/4 servo to leg1's play boundary. A drop
+    // happened inside syncToFirst (the oldest frame is gone); a PAD is
+    // applied below -- this switch deliberately pops one frame less and
+    // repeats its last mixed frame. Leg1 (the master) is never touched.
+    const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
     // per leg -- the center reads ch3 (idx==1), the rears read ch7/ch8
     // (idx==2/3, v8.4.5); the mains (idx==0) carry no gate. Every popped
@@ -3030,8 +3186,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     const int gateLane2 = (idx == 2) ? kSideLCh : (idx == 3) ? kSideRCh : -1;   // v8.4.6: the side fold's lane (rears only)
     bool laneZeroBlock  = true;    // the leg's own lane verdict (ch3/ch7/ch8)
     bool lane2ZeroBlock = true;    // v8.4.6: the side lane's own verdict (ch5/ch6)
-    while (done < frameCount) {
-        const size_t want = frameCount - done;
+    while (done + padFr < frameCount) {
+        const size_t want = frameCount - padFr - done;
         const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
         const size_t avail = L.raw.count();
         const size_t n = (avail < take) ? avail : take;
@@ -3109,9 +3265,28 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         }
         done += n;
     }
+    // v8.4.7 THE SYNC PAD: this switch deliberately popped padFr frames
+    // less -- the LAST output frame repeats the one before it (a held
+    // sample: the DAC receives its full frameCount, the boundary stalls by
+    // one frame, the wobble rides the repeat like any frame). A starved
+    // switch abandons its pad (the shortfall already stalled the boundary).
+    const size_t padApplied = (padFr && done + padFr >= frameCount) ? padFr : 0;
+    if (padApplied) {
+        memcpy(out + (frameCount - 1) * L.outCh, out + (frameCount - 2) * L.outCh,
+               L.outCh * sizeof(float));
+        L.syncPads++;
+        const unsigned long long nowMs = GetTickCount64();
+        if (nowMs - L.lastSyncLogMs >= 10000) {
+            L.lastSyncLogMs = nowMs;
+            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded 1 frame (%llu total; slow sync,\n"
+                 "                            1 fr / %u ms max, a held sample, never a hole)\n",
+                 idx + 1, L.syncPads, kSyncNudgeMs);
+        }
+    }
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
-    // repeated frame, never a restart, never an escalation.
-    if (done < frameCount)
+    // restart, never an escalation. (v8.4.7: the sync pad's frame is not a
+    // hole -- it repeated, above; only real holes count.)
+    if (done + padApplied < frameCount)
         L.und.fetch_add(1);
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE, the device-layer verdict: a
     // FULLY served block whose every lane sample was digital zero MUTES
@@ -3125,7 +3300,9 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // their own 'side L gate' / 'side R gate' lines on their own latch
     // and their own rate limit.
     if (gateLane >= 0) {
-        const bool full = (done >= frameCount);
+        // v8.4.7: a padded switch is fully served too -- every output frame
+        // carries gated content (the pad repeats an already-gated frame).
+        const bool full = (done + padApplied >= frameCount);
         L.gateMuted = full && laneZeroBlock;
         if (L.gateMuted != L.gateWasMuted) {
             L.gateWasMuted = L.gateMuted;
@@ -4587,7 +4764,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair + the v8.4.6 side folds\n"
         "; (ch5 onto out3, ch6 onto out4; optional; an EMPTY device keeps that\n"
         "; rear leg silent), no resampler anywhere.\n"
@@ -4899,12 +5076,20 @@ static void writeTemplate(const char* path) {
         "; invalidates the drift baseline and re-arms it once the path settles\n"
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
+        "; v8.4.7 SLOW SYNC: the INTER-LEG drift is synced away -- out2/3/4\n"
+        "; hold their settled offset to OUT1, the first device (the master,\n"
+        "; never adjusted): a 1-frame drop/pad at most every 200 ms, only\n"
+        "; past a 250 us dead-band, the baseline latching 2 s after each\n"
+        "; (re)open; a jump past ~40 ms re-latches instead of grinding. No\n"
+        "; key, no UI row. The cable clock itself stays observe-only.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
         "; and counts it in the health line's 'short' column -- never a\n"
-        "; repeated frame, never a replay tile, never a restart: seams are\n"
-        "; gone by construction, and what remains is the honest hole. 3 s of\n"
+        "; repeated frame, never a replay tile, never a restart (v8.4.7: the\n"
+        "; slow sync's one-frame pad is not a hole-filler -- it is a held\n"
+        "; sample, rate-limited, holding the leg to out1): seams are gone by\n"
+        "; construction, and what remains is the honest hole. 3 s of\n"
         "; sustained starvation (short switches every second) reopens the\n"
         "; leg fresh -- which also resets the device's own silicon. Capture\n"
         "; excess beyond the raw cap evicts the OLDEST frames (counted in\n"
@@ -6971,7 +7156,9 @@ static void guiBuildPages(HWND w) {
     // page's rows into this page's left column; v8.4.5 retires them
     // whole, the out1ms/out2ms pattern.)
     g_tab = 1;
-    header(w, COLB_X, KHDR_Y, "TIMING");
+    // v8.4.7: the page moved from the right column to the LEFT
+    // (field-directed) -- the rows themselves are unchanged.
+    header(w, COLA_X, KHDR_Y, "TIMING");
     // v8.4.0 THE TIMING QUAD: delay1_ms/delay2_ms/offset3_ms/offset4_ms as
     // four short narrow edits in one group (the gain quad's twin) -- every
     // per-leg delay knob in one row.
@@ -6984,9 +7171,9 @@ static void guiBuildPages(HWND w) {
         const char* lbl[4]  = { "delay1_ms", "delay2_ms", "offset3_ms", "offset4_ms" };
         const int   ids[4]  = { IDC_DELAY1, IDC_DELAY2, IDC_OFF3, IDC_OFF4 };
         const char* vals[4] = { b1, b2, b3, b4 };
-        quadRow(w, COLB_X, 118, lbl, ids, vals);
+        quadRow(w, COLA_X, 118, lbl, ids, vals);
     }
-    tglRow(w, COLB_X, 170, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
+    tglRow(w, COLA_X, 170, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
     // v7.0.0: the pin_outputs pill is gone -- output pinning is part of the
     // engine now (always on): both endpoint volumes are pinned 100% / unmuted,
     // except a leg that IS the current default playback device (v7.6.3 --
@@ -6994,7 +7181,7 @@ static void guiBuildPages(HWND w) {
     // v8.2.0: the transport description (shortened) rides below the timing
     // one; v8.4.0: the quad pushed it down and the offsets joined the text
     // -- 12 declared lines for a 12-line text, nothing clipped.
-    note(w, COLB_X, 204,
+    note(w, COLA_X, 204,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
          "EARLY leg. offset3_ms/offset4_ms are the same knob for the rear legs\n"
          "(leg3/leg4 = rear L/R; an empty rear device = no rear output). The\n"
@@ -7005,7 +7192,11 @@ static void guiBuildPages(HWND w) {
          "service, a 12 ms loop, no knob. Every leg runs the KS kernel loop\n"
          "by default -- a driver refusal falls back to wasapi exclusive\n"
          "(backendN = wasapi opts legs 1/2 back in); out1ms/out2ms are\n"
-         "constants: 1 ms (a KS ignores).\n", 12);
+         "constants: 1 ms (a KS ignores).\n"
+         "\n"
+         "v8.4.7 SLOW SYNC: out2/3/4 hold their settled offset to out1, the\n"
+         "first device (a 1-frame nudge at most every 200 ms, past a 250 us\n"
+         "dead-band) -- the devices no longer drift apart over time.\n", 16);
 
     // v8.3.0: THE SETTINGS PAGE IS GONE -- nothing on it survived as a
     // setting: the drift trio + volume_follow are hardcoded constants, and
@@ -10039,6 +10230,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.und.store(0, std::memory_order_relaxed);
         L.cmUpmix.store(0, std::memory_order_relaxed);
         L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
+        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // v8.4.7: the sync baseline
+        L.syncDrops = 0;                                               // (per run, like the clocks)
+        L.syncPads  = 0;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -10326,8 +10520,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                         "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
-           "                            'evict'). Nothing replays, nothing drops on a schedule, no rate\n"
-           "                            state: nothing can bend pitch. The DAC's register paces it all.\n");
+           "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
+           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/3/4 hold\n"
+           "                            their settled offset to OUT1 (the first device, never adjusted) -- a\n"
+           "                            1-frame drop/pad at most every 200 ms past a 250 us dead-band.\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
@@ -10336,7 +10532,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            alignment, not a fault). The baseline (your delay calibration included) is\n"
            "                            averaged ~5-9 s after boot and re-arms after any reopen. v8.1.0: MEASUREMENT\n"
            "                            ONLY -- no skip, no pad, no correction; it LOGS when the drift leaves the\n"
-           "                            %+.0f ms band for 3 s and the ears decide.\n",
+           "                            %+.0f ms band for 3 s and the ears decide. v8.4.7: the INTER-LEG drift is\n"
+           "                            now slowly synced away (out2/3/4 hold their offset to out1 -- see clock\n"
+           "                            sync above); the cable clock itself stays measurement-only.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
     tlog("[twinspeak] power guard   : %s -- suspend parks the legs, resume rebuilds capture + both\n"
            "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
