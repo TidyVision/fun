@@ -62,6 +62,38 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.12 THE DEPTH GUARD + THE DELAY-CORRECTED LANDING + NO RE-LATCH
+//            (field-directed, one hour of field data: "I left it sitting
+//            there for an hour ... I still get raw2 drift. Somehow, I got
+//            it to get to 62ms ... Maybe delay1_ms is being added to the
+//            drift corrector (which it shouldn't have)? ... whenever I
+//            open e.g. obs that raw2 jumps to 162ms"). THREE mechanisms,
+//            all confirmed in code: (1) THE DELAY LEAK -- the user's
+//            hypothesis, CONFIRMED, but in the REOPEN path, not the
+//            servo: dropReopenBacklog landed a reopened slave at leg1's
+//            FULL ring depth + held -- and leg1's depth includes the
+//            delay1_ms prefill -- so with delay1 = 68 every reopen put
+//            ~68 ms of phantom backlog on raw2 (the "62 ms"), which the
+//            servo then spent ~11 s grinding back off; the landing is
+//            now delay-corrected (leg1's REAL backlog + held + the
+//            slave's own prefill). (2) THE DEPTH GUARD -- the servo's
+//            off = r2 - r1 is the REAL-backlog DIFFERENCE, blind to
+//            COMMON-MODE ring growth: a shared-mode capture burst
+//            (audiodg starved under load -- exactly an OBS open)
+//            permanently added its size to EVERY ring, ratchet by
+//            ratchet, and a big spike pinned them at the power-of-two
+//            caps (8192 fr = 170.7 ms at delay 0 -- the "162 ms").
+//            NOTHING drained depth back down; now the master's real
+//            backlog is pinned to a 10 ms anchor past a 5 ms dead-band,
+//            dropping the oldest frames at the warden's exact pacing
+//            (16 fr / 100 ms, 240 fr / 2 s), and the slaves drain with
+//            it through the err loop -- the legs drain TOGETHER, the
+//            calibration intact, logged as 'depth out1'. (3) NO
+//            RE-LATCH -- the v8.4.11 step test retired: both it and the
+//            old |err| test silently ACCEPTED bloat as a new baseline;
+//            a jump is now ground back like any other error, and only a
+//            reopen re-arms the baseline (the settle gate). NO new ini
+//            key, NO UI row.
 //    v8.4.11 THE INSTANT ZERO, THE WARDEN BITE, THE ONE REAR LEG + THE
 //            384x3 BITE (field-directed: "I still hear this center channel
 //            upmix ... I think the audio device drifting is from the fact
@@ -2095,7 +2127,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.11"
+#define TWS_VERSION "8.4.12"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2222,14 +2254,20 @@ static constexpr unsigned kSyncSettleMs   = 2000;   // past the last (re)open be
 // creep is CORRECTED, never accepted.
 static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms)
 static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
-// v8.4.11 THE RE-LATCH, FIXED: the v8.4.7 re-latch could not tell slow
-// creep from a reopen-class jump -- every ~40 ms of accumulated drift was
-// silently accepted as the new baseline (the field's "raw2 increasing in
-// offset over time ... up to like 36 ms"). A jump is now a STEP test: the
-// offset moving more than 20 ms inside ONE 100 ms servo window (an eviction
-// batch, a stall, a reopen) re-latches; creep of any size is ground back
-// with the nudge + the bite. CREEP IS NEVER ACCEPTED AGAIN.
-static constexpr int      kSyncJumpFr     = 960;    // ~20 ms in one 100 ms window = a jump, not creep
+// v8.4.12 THE DEPTH GUARD: the servo holds the SLAVES to the master's play
+// boundary, but off = r2 - r1 (the REAL-backlog difference, prefill
+// excluded) is blind to COMMON-MODE ring growth -- a shared-mode capture
+// burst (audiodg under load: OBS, a game) permanently added its size to
+// EVERY ring, ratchet by ratchet (the field's raw creep to 62 ms over an
+// hour, and the jump to the ring's power-of-two cap -- 8192 fr = 170.7 ms
+// at delay 0 -- when OBS opens). Nothing ever drained depth back down.
+// The master's real backlog is now PINNED to its anchor: past the
+// dead-band the oldest frames are dropped, at the warden's pacing, and
+// the err loop drags every slave to the same anchor. Re-latches are GONE
+// (v8.4.12): a jump is ground back like any other error -- only a reopen
+// re-arms the baseline (the settle gate).
+static constexpr unsigned kDepthAnchorFr   = 480;  // 10 ms: capture delivery + device buffer + slack
+static constexpr int      kDepthDeadbandFr = 240;  // 5 ms: healthy jitter is never touched
 static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
 static constexpr long long kSyncUnlatched = -0x7fffffffffffffffLL;  // the baseline sentinel
 
@@ -2719,17 +2757,15 @@ struct Leg {
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
     unsigned long long     lastSyncLogMs = 0;
-    // v8.4.11: the warden bite + the step-jump tracker (this leg's device
-    // thread only, the same single-writer discipline). lastSyncOff/
-    // syncOffValid hold the previous look's offset so a ~20 ms move inside
-    // one 100 ms window is provably a jump, not creep; lastBiteMs
-    // rate-limits the 240-frame warden bite to one per 2 s;
-    // wardenDrops/wardenPads count the bites.
-    long long              lastSyncOff   = 0;
-    bool                   syncOffValid  = false;
+    // v8.4.11/8.4.12: the warden bite state (this leg's device thread only,
+    // the same single-writer discipline). lastBiteMs rate-limits the
+    // 240-frame bite to one per 2 s (the slave's err bites AND the master's
+    // depth-guard bites -- a leg never runs both); wardenDrops/wardenPads
+    // count the bites, depthDrops counts the v8.4.12 depth-guard drops.
     unsigned long long     lastBiteMs    = 0;
     unsigned long long     wardenDrops   = 0;
     unsigned long long     wardenPads    = 0;
+    unsigned long long     depthDrops    = 0;
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -3249,11 +3285,12 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000) rides the
 // same servo -- past 5 ms of accumulated drift a leg takes up to a
 // 240-frame drop or held-sample pad, at most once per 2 s, on top of the
-// wide nudge; slow creep is CORRECTED, never accepted. THE RE-LATCH IS A
-// STEP TEST now: only the offset moving ~20 ms inside ONE servo window
-// (an eviction batch, a stall, a reopen) re-latches the baseline -- the
-// old |err| test silently accepted every ~40 ms of creep (the field's
-// "raw2 increasing ... up to like 36 ms").
+// wide nudge; slow creep is CORRECTED, never accepted. v8.4.12: NO
+// RE-LATCH of any kind -- a jump is ground back like any other error
+// (the old |err| test AND the v8.4.11 step test both silently ACCEPTED
+// bloat as a new baseline; only a reopen re-arms, through the settle
+// gate), and the master's DEPTH GUARD (masterDepthGuard, below) owns
+// common-mode ring growth, which this difference metric cannot see.
 // A yielded or heart-silent leg1 freezes
 // the sync whole (a parked leg's ring still evicts, and eviction jitter
 // is not a clock to follow). Returns the number of pad frames the switch
@@ -3277,7 +3314,6 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
     if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) {
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // (re)arm
-        L.syncOffValid = false;
         return 0;
     }
     LARGE_INTEGER fsw;
@@ -3286,39 +3322,21 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
         (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
     if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) {
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);
-        L.syncOffValid = false;
         return 0;
     }
     const long long base = L.syncBase.load(std::memory_order_relaxed);
     if (base == kSyncUnlatched) {
         L.syncBase.store(off, std::memory_order_relaxed);   // latch the settled offset
-        L.lastSyncOff  = off;
-        L.syncOffValid = true;
         return 0;
     }
     const long long err = off - base;   // + = this leg drifted LATE vs leg1
-    // v8.4.11 THE STEP-JUMP TEST: the offset moving ~20 ms INSIDE one 100 ms
-    // window is a reopen-class event (an eviction batch, a stall, a reopen)
-    // -- re-latch, never grind. SLOW CREEP of any size is NOT a jump: it is
-    // corrected below, never accepted (the old |err| re-latch silently
-    // blessed every ~40 ms of accumulated drift -- the field's "raw2
-    // increasing in offset over time ... up to like 36 ms").
-    const bool hadOff    = L.syncOffValid;
-    const long long step = hadOff ? (off - L.lastSyncOff) : 0;
-    L.lastSyncOff  = off;
-    L.syncOffValid = true;
-    if (hadOff && (step > kSyncJumpFr || step < -kSyncJumpFr)) {
-        L.syncBase.store(off, std::memory_order_relaxed);
-        if (nowMs - L.lastSyncLogMs >= 10000) {
-            L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : offset jumped %+lld fr inside one window vs out1 (a reopen-class\n"
-                 "                            event) -- baseline re-latched, not ground back (the warden bite\n"
-                 "                            %d fr / %u ms, the %d fr / %u ms nudge, %d fr dead-band)\n",
-                 idx + 1, step, kDriftCorrectFr, kDriftIntervalMs,
-                 kSyncNudgeFr, kSyncNudgeMs, kSyncDeadBandFr);
-        }
-        return 0;
-    }
+    // v8.4.12: NO RE-LATCH anywhere below. A jump (a stall, an eviction
+    // batch, a hiccup) is GROUND BACK like any other error -- accepting it
+    // was the ratchet that parked raw2 at 36, then 62, then the ring cap.
+    // Only a REOPEN re-arms the baseline, and it does so through the settle
+    // gate above (lastReopenMs -> unlatch -> re-latch 2 s later). The
+    // master's depth guard owns common-mode ring growth; this loop owns
+    // the difference; nothing is ever blessed.
     if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop (nudge v8.4.9, warden bite v8.4.11)
         // THE WARDEN BITE: past 5 ms of drift, take a 240-frame bite in one
         // discard -- at most once per 2 s (the old version's drift
@@ -3382,6 +3400,66 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     return 0;                                         // inside the dead-band: hold
 }
 
+// v8.4.12 THE DEPTH GUARD -- the master's own drift correction (no key, no
+// UI row). The servo measures off = r2 - r1, the REAL-backlog difference
+// (r = ring depth minus the leg's delay prefill): it holds every slave to
+// the master's boundary but is BY CONSTRUCTION blind to common-mode ring
+// growth -- both seqTails move together, off does not move, and a
+// shared-mode capture burst (audiodg starved under load: OBS, a game, a
+// browser) permanently added its size to EVERY ring. Nothing in the
+// stripped path ever drained depth: small bursts ratcheted the latency up
+// burst by burst (the field's "raw2 increasing over time ... to 62 ms"),
+// and a load spike big enough pinned the rings at their power-of-two caps
+// (8192 fr = 170.7 ms at delay 0 -- the field's "jumps to 162 when I open
+// OBS") and kept them there. THE FIX: the master's real backlog is pinned
+// to its anchor -- kDepthAnchorFr (10 ms: the capture delivery plus the
+// device buffer plus slack) -- past a kDepthDeadbandFr (5 ms) dead-band,
+// dropping the OLDEST frames at the warden's exact pacing (the 16 fr /
+// 100 ms wide nudge, the 240 fr / 2 s bite, the shipped ini's drift
+// correction). The skip is the correction: the leg catches up to the
+// freshest capture, the latency returns to the anchor, nothing is
+// accepted. The SLAVES ride it for free through the servo: draining the
+// master's r1 raises off, the err loop drops each slave by the same
+// amount, and off itself never moves -- the legs drain TOGETHER, the
+// user's calibration intact. A healthy ring (jitter inside the dead-band)
+// is never touched. Master-only by design: the err loop already owns each
+// slave's depth relative to the master, and one owner per quantity keeps
+// the two corrections from fighting.
+static void masterDepthGuard(Leg& L) {
+    const unsigned long long nowMs = GetTickCount64();
+    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return;   // slow: one look per window (the servo's clock)
+    L.lastSyncMs = nowMs;
+    const long long over = (long long)L.raw.count()
+                         - (long long)L.delayFrames   // real backlog, prefill excluded
+                         - (long long)kDepthAnchorFr;
+    if (over < (long long)kDepthDeadbandFr) return;    // healthy jitter: hold
+    if (over >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+        if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
+            L.depthDrops += kDriftCorrectFr;
+            L.lastBiteMs = nowMs;
+            if (nowMs - L.lastSyncLogMs >= 10000) {
+                L.lastSyncLogMs = nowMs;
+                tlog("[twinspeak] depth out1    : ring %lld fr over its anchor -- the guard bit %d frames\n"
+                     "                            (%llu total; a capture burst's bloat is drained, never kept;\n"
+                     "                            the %d fr / %u ms warden pacing, the slaves follow through the\n"
+                     "                            sync loop)\n",
+                     over, kDriftCorrectFr, (unsigned long long)L.depthDrops,
+                     kDriftCorrectFr, kDriftIntervalMs);
+            }
+        }
+        return;
+    }
+    if (L.raw.discardOldest((size_t)kSyncNudgeFr)) {
+        L.depthDrops += kSyncNudgeFr;
+        if (nowMs - L.lastSyncLogMs >= 10000) {
+            L.lastSyncLogMs = nowMs;
+            tlog("[twinspeak] depth out1    : ring %lld fr over its anchor -- dropped %d frames (%llu total;\n"
+                 "                            the 16 fr / %u ms wide nudge, the skip is the correction)\n",
+                 over, kSyncNudgeFr, (unsigned long long)L.depthDrops, kSyncNudgeMs);
+        }
+    }
+}
+
 // v8.1.0 forward declarations: the stripped switch sits at the TOP of the
 // playback section, above the mixer / tick / EQ definitions it calls (the
 // pumps that used to separate them are gone). Definitions stay where they
@@ -3433,11 +3511,15 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
     float* sc = L.scratch.data();
     size_t done = 0;
-    // v8.4.7 SLOW SYNC: out2/3/4 servo to leg1's play boundary. A drop
-    // happened inside syncToFirst (the oldest frames are gone); a PAD is
-    // applied below -- this switch deliberately pops padFr frames less
-    // and holds its last mixed frame across the pad region (v8.4.9: up
-    // to kSyncNudgeFr frames). Leg1 (the master) is never touched.
+    // v8.4.12 THE DEPTH GUARD: the master's real backlog is pinned to its
+    // anchor (the slaves follow through the servo's err loop -- off IS the
+    // real-backlog difference). Then v8.4.7 SLOW SYNC: out2/out3 servo to
+    // leg1's play boundary. A drop happened inside one of the two guards
+    // (the oldest frames are gone); a PAD is applied below -- this switch
+    // deliberately pops padFr frames less and holds its last mixed frame
+    // across the pad region (v8.4.9: up to kSyncNudgeFr frames). Leg1 is
+    // never SERVOED (it is the master) but its DEPTH is guarded.
+    if (idx == 0) masterDepthGuard(L);
     const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
     // per leg -- the center reads ch3 (idx==1); v8.4.11: the ONE rear leg
@@ -5114,7 +5196,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.12 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5428,15 +5510,17 @@ static void writeTemplate(const char* path) {
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
         "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE; v8.4.11 THE WARDEN\n"
-        "; BITE): the INTER-LEG drift is synced away -- out2/out3 hold their\n"
-        "; settled offset to OUT1, the first device (the master, never\n"
-        "; adjusted): a 16-frame drop/pad at most every 100 ms, only past a\n"
-        "; 250 us dead-band, the baseline latching 2 s after each (re)open.\n"
-        "; v8.4.11: past 5 ms of accumulated drift the old warden bite takes\n"
-        "; over (up to 240 frames per 2 s), a jump is a STEP test (~20 ms\n"
-        "; inside one 100 ms window -- reopen-class events only), and slow\n"
-        "; creep is CORRECTED, never accepted. No key, no UI row. The cable\n"
-        "; clock itself stays observe-only.\n"
+        "; BITE; v8.4.12 THE DEPTH GUARD): the INTER-LEG drift is synced\n"
+        "; away -- out2/out3 hold their settled offset to OUT1, the first\n"
+        "; device (the master, never servoed): a 16-frame drop/pad at most\n"
+        "; every 100 ms, only past a 250 us dead-band, the baseline latching\n"
+        "; 2 s after each (re)open; past 5 ms of accumulated drift the old\n"
+        "; warden bite takes over (up to 240 frames per 2 s); creep is\n"
+        "; CORRECTED, never accepted, and no re-latch exists. v8.4.12: the\n"
+        "; MASTER's ring depth is guarded too (a capture burst's bloat is\n"
+        "; drained to a 10 ms anchor, the slaves follow through the sync\n"
+        "; loop), and reopens land delay-corrected. No key, no UI row. The\n"
+        "; cable clock itself stays observe-only.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
@@ -5917,8 +6001,10 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 // ON THE OFFSET THE SERVO WAS HOLDING: syncBase is the settled inter-leg
 // offset this leg held before the reopen (the user's calibration, written
 // by this leg's now-joined device thread -- a relaxed read here is sound),
-// so the target level is leg1's current level + held and the offset the
-// servo re-latches 2 s after the reopen is the offset it held before: the
+// so the target level is leg1's REAL BACKLOG (its depth minus its delay
+// prefill -- v8.4.12: the old full-depth target leaked delay1_ms into the
+// landing) + held + this leg's own prefill, and the offset the servo
+// latches 2 s after the reopen is the offset it held before: the
 // calibration survives. The fallback (no baseline yet, or the master leg
 // -- never servoed) keeps the delay prefill + one WaveRT loop of live
 // margin; a margin floor keeps the restart's first fill from starving.
@@ -5928,7 +6014,17 @@ static void dropReopenBacklog(int idx) {
     const long long held = L.syncBase.load(std::memory_order_relaxed);
     long long want;
     if (idx != 0 && held != kSyncUnlatched)
-        want = (long long)g_leg[0].raw.count() + held;   // land on the held offset
+        // v8.4.12 THE DELAY-CORRECTED LANDING (the field's "maybe delay1_ms
+        // is being added to the drift corrector" -- CONFIRMED, here): the
+        // held offset lives in REAL-backlog space (r = depth - delay
+        // prefill; the servo's off = r_slave - r_master), so the landing
+        // target is leg1's REAL backlog + held + THIS leg's own prefill.
+        // The old leg1.count() + held used leg1's FULL depth, delay
+        // prefill included -- with delay1_ms = 68 every reopen put ~68 ms
+        // of phantom backlog on the slave (the field's "raw2 sits at 62"),
+        // and the servo then spent the next ~11 s grinding it back off.
+        want = ((long long)g_leg[0].raw.count() - (long long)g_leg[0].delayFrames)
+             + held + (long long)L.delayFrames;
     else
         want = (long long)(L.delayFrames + (size_t)kKsPeriods * kKsPeriodFrames);
     const long long margin = (long long)kKsPeriods * (long long)kKsPeriodFrames;
@@ -10623,11 +10719,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // v8.4.7: the sync baseline
         L.syncDrops = 0;                                               // (per run, like the clocks)
         L.syncPads  = 0;
-        L.syncOffValid = false;                                        // v8.4.11: the step-jump tracker + the warden bite
-        L.lastSyncOff  = 0;
-        L.lastBiteMs   = 0;
+        L.lastBiteMs   = 0;                                            // v8.4.11/8.4.12: the bite + depth-guard clocks
         L.wardenDrops  = 0;
         L.wardenPads   = 0;
+        L.depthDrops   = 0;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -10920,8 +11015,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            16-frame drop/pad at most every 100 ms past a 250 us dead-band (v8.4.9).\n"
            "                            v8.4.11 THE WARDEN BITE: the old drift correction (5 ms per 2 s) rides\n"
            "                            the same servo -- past 5 ms of accumulated drift a leg drops/pads up to\n"
-           "                            240 frames in one bite, and slow creep is corrected, NEVER accepted\n"
-           "                            (the old re-latch silently blessed it -- the raw2 climb to ~36 ms).\n");
+           "                            240 frames in one bite, and slow creep is corrected, NEVER accepted.\n"
+           "                            v8.4.12 THE DEPTH GUARD: the master's ring depth is pinned to a 10 ms\n"
+           "                            anchor (past a 5 ms dead-band, the same warden pacing) -- a capture\n"
+           "                            burst's bloat is DRAINED, never kept, and the slaves follow through\n"
+           "                            the sync loop; reopens land delay-corrected; no re-latch anywhere.\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
