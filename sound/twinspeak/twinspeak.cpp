@@ -67,6 +67,60 @@
 //            slots (slots 6/7; all six on one device = ONE stream). The
 //            GUI compacts: six device rows on page 0, a second gain quad
 //            (center/lfe/sl/sr), the timing quad grows offset5/offset6.
+//    v8.8.0 THE DAC ZERO WATCH + THE UPIMX GUARD, EVERYWHERE (field-
+//            directed: "the center channel, and possibly the rear and
+//            surround channels, are still being upmixed by windows itself
+//            when the samples are just zeroes -- instantly detect zero
+//            samples of every single channel other than the left and right
+//            channels the moment it is read from the DAC, rears and
+//            surround included"). (1) THE DAC ZERO WATCH: the buffer
+//            switch IS the DAC-read moment (WASAPI: the callback the DAC's
+//            clock pulls; KS: the period write paced by the DAC's own
+//            position register) -- it now walks every span it peeks PER
+//            SAMPLE over all six non-L/R channels (ch3 center, ch4 LFE,
+//            ch5/ch6 surr, ch7/ch8 rear): each zero sample is detected
+//            (== 0.0f catches +0.0f AND -0.0f) and normalized to the
+//            literal +0.0f bit pattern (no sign-bit residue ever reaches a
+//            mix: g * -0.0f == -0.0f until now), each channel's whole-span
+//            verdict feeds its gate, and the LFE gets its own latch and
+//            log. The v8.7.1 zero gate is verdict-driven now. (2) THE
+//            UPIMX GUARD, EVERYWHERE: Windows' stereo->8ch upmix fills the
+//            cable's extra channels from FL/FR -- the phantom center
+//            (guarded since v6.1) AND the rears/sides (never guarded).
+//            The center guard's verbatim fingerprint math (least-squares
+//            chK ~ a*ch1 + b*ch2, residual < -30 dB, gains in the upmix
+//            band, 2-hit/8-miss hysteresis, 2.5 ms fade, in place on the
+//            ring) now runs per side on ch5-ch8; genuine multichannel
+//            content is independent and always passes. The ini carries the
+//            one honest limit: a shared-mode ENDPOINT set to more channels
+//            than its stream carries is filled by the Windows engine above
+//            twinspeak -- match the endpoint's speaker configuration to
+//            the stream, or run the KS backends (no engine above a pin).
+//    v8.7.1 THE FRESH-STATE RESET + THE ZERO GATE, EVERYWHERE (field-
+//            directed, two asks, one root cause). (1) A RESTART IS A
+//            FRESH ENGINE: the in-process APPLY+RESTART re-ran engineMain
+//            over statics the v8.6.1 per-run reset barely touched -- a run
+//            that stopped with the center upmix guard ENGAGED restarted
+//            with ch3 still faded toward zero (the "center zero-gate is
+//            gone" report), a released leg stayed dead through the
+//            restart, the lateness meter logged the first switch against
+//            the previous run's last one, and every counter, the keep-
+//            alive phase and the no-longer-running legs' rings survived
+//            too. freshAudioState() now clears every gate verdict, fade,
+//            silence latch, meter, counter, heartbeat, yield mark and
+//            stale ring BEFORE any device opens and before the boot-yield
+//            walk re-marks what this run wants -- and the pane certifies
+//            it with one line at every start. (2) THE ZERO GATE,
+//            EVERYWHERE: the center_gate discipline (a source channel
+//            that is digital zero for the whole block emits NOTHING)
+//            covers the rears/sides now -- legs 3-6 test their OWN cable
+//            channel per block, each side of a merged pair independently
+//            (the slave's latch on its own Leg, cleared by the fresh
+//            reset with everyone else's). No filter state lives on these
+//            legs, so the audio is the same g*0 zeros the mix always
+//            wrote -- what is new is the GUARANTEE made explicit, the
+//            per-silence-period log line in the center gate's own format,
+//            and the route banner that says so at every start.
 //    v8.7.0 THE START GATE + ZERO-COPY + THE ONTO-FRONT RETIREMENT
 //            (field-directed, three asks). (1) MINIMAL LATENCY, ALL LEGS
 //            AT ONCE: the playback devices still start in sequence, but a
@@ -1813,7 +1867,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.7.0"
+#define TWS_VERSION "8.8.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2163,6 +2217,18 @@ struct Ring {
         // bpm tick's flam differently on every APPLY + RESTART.
         seqTail.store(0, std::memory_order_release);
     }
+    // v8.7.1: the fresh-state reset's drop -- the atomics make Ring
+    // non-assignable, so a leg whose ring is not rebuilt this run clears
+    // through here instead: no capacity, no storage, no counters (the
+    // ring walk re-inits the legs that run, right after).
+    void reset() {
+        buf.clear();
+        buf.shrink_to_fit();
+        cap = mask = stride = 0;
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+        seqTail.store(0, std::memory_order_release);
+    }
     size_t count() const {
         return (size_t)(head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire));
     }
@@ -2363,6 +2429,8 @@ struct Leg {
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
     bool                centerWasSilent = false; // for state-change logging
+    bool                soloWasSilent   = false; // v8.7.1: legs 3-6's zero-gate latch (state-change logging)
+    bool                lfeWasSilent    = false; // v8.8.0: the DAC zero watch's LFE latch (leg1's switch owns it)
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -2904,6 +2972,10 @@ static void centerEqFlushZ();                    // defined next to g_ceq
 // v8.5.0: variant 0 = out2's gates, 1 = the leg1 center-fold variant,
 // 2 = the leg1 front-merge variant (the FC slot).
 static void centerGuard(Leg& L, float* sc, size_t n, int variant);
+static int  soloChOf(int idx);   // v8.8.0: a solo leg's own cable channel (leg3 ch7, leg4 ch8, leg5 ch5, leg6 ch6)
+static void dacZeroWatch(float* sc, size_t n, bool* zv);   // v8.8.0: per-sample zero detect+normalize, every non-L/R channel
+static void soloZeroGate(Leg& L, int idx, const char* who, bool zw);   // v8.7.1 (v8.8.0: verdict-driven -- the watch owns the test)
+static void soloUpmixGuard(Leg& L, float* sc, size_t n, int srcCh, int idx, const char* who, bool zw);   // v8.8.0: the rears/sides
 static void mixFrontStage(const float* sc, float* chunk, size_t n, float vg);   // v8.5.0: leg1's front-stage mix (v8.7.0: always 5.1, zero-copy, vg folded)
 static void mixRearPair(const float* scL, const float* scR,
                         float* chunk, size_t n, float vg);       // v8.5.0: leg3's rear-pair mix (v8.7.0: scR may be null = a dry slave reads zeros)
@@ -3035,6 +3107,21 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             }
         }
         if (!n) break;   // defensive: every peeked run has length >= 1 here
+        // v8.8.0 THE DAC ZERO WATCH -- "instantly detect zero samples of
+        // every single channel other than the left and right channels the
+        // moment it is read from the DAC": THIS is that moment. The switch
+        // is what the DAC's clock pulls (WASAPI: the device callback; KS:
+        // the pacing thread's period write, paced by the DAC's own
+        // position register), and the watch walks this span per SAMPLE,
+        // on all six non-L/R channels (ch3 center, ch4 LFE, ch5/ch6 surr,
+        // ch7/ch8 rear): every zero sample is normalized to the LITERAL
+        // +0.0f bit pattern (-0.0f and its sign bit never reach a mix:
+        // g * -0.0f == -0.0f until now), and the per-channel whole-span
+        // verdicts feed every gate below. The rewrite rides the ring's
+        // storage in place -- the guard-fade's own discipline (this
+        // switch is the ring's only reader).
+        bool zvM[6];
+        dacZeroWatch(m1, n, zvM);
         if (idx == 1) centerGuard(L, m1, n, 0);   // v6.1: center presence gates
         // v8.4.1 THE CENTER FOLD: leg2 empty -> the SAME gates protect the
         // fold. The guard fades ch3 IN PLACE on the ring's storage (this
@@ -3047,6 +3134,44 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // the FC SLOT (variant 2); mixFrontStage reads the faded ch3.
         else if (idx == 0 && g_centerFold)  centerGuard(L, m1, n, 1);
         else if (idx == 0 && g_frontMerge)  centerGuard(L, m1, n, 2);
+        // v8.8.0: the LFE's own latch -- ch4 folds onto THIS stream's
+        // FL/FR; a digital-zero LFE adds exactly nothing, and the pane
+        // says so (one line per silence period, the gates' format).
+        if (idx == 0) {
+            if (zvM[1]) {
+                if (!L.lfeWasSilent) {
+                    L.lfeWasSilent = true;
+                    const unsigned long long now = GetTickCount64();
+                    if (now - L.lastGateLogMs >= 5000) {
+                        L.lastGateLogMs = now;
+                        tlog("[twinspeak] lfe zero      : ch4 is digital zero -- the LFE fold adds exactly nothing\n");
+                    }
+                }
+            } else {
+                L.lfeWasSilent = false;
+            }
+        }
+        // v8.7.1 THE ZERO GATE, EVERYWHERE (v8.8.0: verdict-driven -- the
+        // watch owns the test) + v8.8.0 THE UPIMX GUARD, EVERYWHERE: the
+        // rears/sides run the center_gate AND center_upmix_guard
+        // disciplines on their OWN channels -- each side of a merged pair
+        // independently (the slave's state on the slave's Leg; a dry
+        // slave has no span to test, its zeros are already the mixer's
+        // own).
+        if (idx >= 2) {
+            const int   mCh  = soloChOf(idx);
+            const char* mWho = ((idx == 2 && g_rearPair) || (idx == 4 && g_surrPair))
+                                   ? "the L side" : "the leg";
+            soloZeroGate(L, idx, mWho, zvM[mCh - 2]);
+            soloUpmixGuard(L, m1, n, mCh, idx, mWho, zvM[mCh - 2]);
+            if (SL && scR) {
+                bool zvS[6];
+                dacZeroWatch(scR, n, zvS);   // the slave's span, its own read moment
+                const int sCh = soloChOf(idx + 1);
+                soloZeroGate(*SL, idx + 1, "the R side", zvS[sCh - 2]);
+                soloUpmixGuard(*SL, scR, n, sCh, idx + 1, "the R side", zvS[sCh - 2]);
+            }
+        }
         // v6.6.9: silence compression -- a bit-zero block needs no mix
         // (see the start-frozen gate): same bytes out, none of the FP work.
         // v8.7.0: the spans are tested RAW -- the old pre-pass zeroed the
@@ -3302,6 +3427,93 @@ static void centerEqInit() {
     g_ceq.b2 = (float)(b2 / a0); g_ceq.a1 = (float)(a1 / a0);
     g_ceq.a2 = (float)(a2 / a0);
     g_ceq.z1 = g_ceq.z2 = 0.0f;
+}
+
+// ------------------------------------- v8.7.1 THE FRESH-STATE RESET ---------
+// "a restart does not guarantee that the audio state will be any fresh" --
+// now it does. A GUI STOP/START or APPLY+RESTART re-runs engineMain in
+// THIS process, and every static the engine owns survives the stop. The
+// v8.6.1 per-run reset cleared the merge flags and nothing else, so a
+// restart inherited, among others:
+//   * the center gate/upmix-guard STATE MACHINES (cgMuted/cgGain) -- a run
+//     that stopped with the guard engaged restarted with ch3 still faded
+//     toward zero: the center audibly gone at the new run's start until 8
+//     misses released it, and the gate's own log silent (centerWasSilent
+//     never re-armed) -- that is what "the center zero-gate is gone" was;
+//   * yielded -- a leg released by the previous run's boot yield or the
+//     quiet rule stayed dead through a restart (nothing started it, the
+//     start gate waited for a switch that never came);
+//   * the lateness meter (haveSwQpc/lastSwQpc) -- the new run's FIRST
+//     switch was measured against the previous run's LAST one: a false
+//     "served N seconds late" log on every restart;
+//   * every per-leg counter, the keep-alive tone phase, stale rings on
+//     legs that no longer run, and the KS lapse/lead meters.
+// The reset runs on the main thread BEFORE any device opens, before the
+// boot-yield walk re-marks what THIS run actually wants released, and
+// before the ring walk builds this run's rings -- so everything audio is
+// genuinely fresh: no stale fade, no stale verdict, no stale silence
+// state, no dead legs. The device silicon itself is already fresh (a KS
+// pin open zeroes the WaveRT loop; a WASAPI device opens a new buffer).
+static void freshAudioState() {
+    for (int i = 0; i < 6; ++i) {
+        Leg& L = g_leg[i];
+        // the gates' state machines -- the center presence gates (ch3) and
+        // the solo zero gate (legs 3-6): every verdict, fade and silence
+        // latch is this run's own
+        L.cgMuted = false;
+        L.cgGain  = 1.0f;
+        L.cgHits  = 0;
+        L.cgMiss  = 0;
+        L.centerWasSilent = false;
+        L.soloWasSilent   = false;
+        L.lfeWasSilent    = false;   // v8.8.0: the zero watch's LFE latch
+        L.lastGateLogMs  = 0;
+        L.lastUpmixLogMs = 0;
+        // yield/release -- this run's boot-yield walk re-marks what should
+        // stay released; a stale mark must never keep a live leg dead
+        L.yielded.store(false, std::memory_order_relaxed);
+        // meters and counters -- per-run clocks, per-run truth (the ring
+        // walk re-zeroes the ring legs too; this covers the rest)
+        L.captured.store(0, std::memory_order_relaxed);
+        L.popped.store(0, std::memory_order_relaxed);
+        L.rawDrop.store(0, std::memory_order_relaxed);
+        L.und.store(0, std::memory_order_relaxed);
+        L.cmUpmix.store(0, std::memory_order_relaxed);
+        L.firstSwitchUs.store(0, std::memory_order_relaxed);
+        L.lateSwitches.store(0, std::memory_order_relaxed);
+        L.lagMs.store(0.0, std::memory_order_relaxed);
+        L.haveSwQpc = false;
+        L.lastSwQpc = {};
+        L.lastLateLogMs = 0;
+        L.lastReopenMs = 0;
+        L.ks.lapses.store(0, std::memory_order_relaxed);
+        L.ks.aheadFr.store(0, std::memory_order_relaxed);
+        // the lapse guard's re-prime source: no last block until this run
+        // plays one (the ring walk re-seats lastCap for the legs that run)
+        L.lastN = 0;
+        L.haveLast = false;
+        L.prefillRemaining = 0;
+        // a ring this run does not build must not keep the previous run's
+        // frames -- the ring walk re-inits the legs that run, everything
+        // else drops to an empty ring
+        L.raw.reset();
+    }
+    // the device-layer extras: the keep-alive tone starts at phase zero and
+    // the chime's flap guard forgets the previous run's arm
+    g_kaIdx = 0;
+    g_chimeLastArmMs = 0;
+    // the center EQ's filter state (the coefficients are re-derived by
+    // centerEqInit just above; the state must not ring the previous run
+    // into this one -- "a gated block emits NOTHING", restart included)
+    g_ceq.z1 = g_ceq.z2 = 0.0f;
+    // the master volume re-seeds from the endpoint when volume follow
+    // resolves; until then unity, never the previous run's last knob
+    g_vol.store(1.0f, std::memory_order_relaxed);
+    g_volMuted.store(false, std::memory_order_relaxed);
+    // the watchdog's heartbeat stamps and the drift baseline re-arm: a new
+    // run must calibrate its own baseline, not inherit a stale one
+    for (int i = 0; i < 6; ++i) g_hbOutTab[i].store(0, std::memory_order_relaxed);
+    g_driftRecalReq.store(true, std::memory_order_relaxed);
 }
 
 // ----------------------------------------------------------------- mixer ----
@@ -3674,6 +3886,187 @@ static void centerGuard(Leg& L, float* sc, size_t n, int variant) {
             L.cgGain = g;
             if (g > 0.0f) sc[i * kInCh + 2] *= g;
             else          sc[i * kInCh + 2]  = 0.0f;
+        }
+    }
+}
+
+// --------------------------------- v8.8.0 THE DAC ZERO WATCH + THE GUARDS ---
+// v8.7.1 THE ZERO GATE, EVERYWHERE brought the center_gate discipline (a
+// source channel that is DIGITAL ZERO for the whole block emits NOTHING)
+// to the rears/sides, each side of a merged pair independently. v8.8.0
+// splits the duty in two, per the field ask:
+//   * THE DAC ZERO WATCH owns the TEST -- per sample, every non-L/R
+//     channel, the moment the DAC reads the span (below);
+//   * THE ZERO GATE owns the latch and the log, verdict-driven;
+//   * THE UPIMX GUARD, EVERYWHERE owns the Windows upmix fill.
+
+// the solo legs' own cable channel: leg3 ch7 (RL), leg4 ch8 (RR), leg5 ch5
+// (SL), leg6 ch6 (SR) -- the mixBlock chain's constant twin.
+static int soloChOf(int idx) {
+    return (idx == 2) ? kRearLCh : (idx == 3) ? kRearRCh
+         : (idx == 4) ? kSurrLCh : kSurrRCh;
+}
+
+// v8.8.0 THE DAC ZERO WATCH -- "instantly detect zero samples of every
+// single channel other than the left and right channels the moment it is
+// read from the DAC". The buffer switch IS that moment: it is what the
+// DAC's clock pulls (WASAPI: the device callback; KS: the pacing thread's
+// period write, paced by the DAC's own position register). One walk of
+// the span, per SAMPLE, over all six non-L/R channels (k = 0..5 =
+// ch3..ch8):
+//   * DETECT: s == 0.0f catches BOTH zeros (+0.0f and -0.0f -- a value
+//     compare, unlike bitZero8 which demands the literal +0.0f bits);
+//   * NORMALIZE: a detected zero is rewritten as the LITERAL +0.0f bit
+//     pattern -- -0.0f, and the sign bit a gain multiply would carry
+//     through it (g * -0.0f == -0.0f), is gone from the wire; the mixes
+//     then emit bit-exact digital silence for every zero sample, and a
+//     span that was all -0.0f becomes truly BIT-zero (it takes the
+//     v6.6.9 fast path now too);
+//   * VERDICT: zv[k] = the channel (ch3+k) was digital zero for the WHOLE
+//     span -- the gates' input (the zero gate's latch, the upmix guard's
+//     nothing-to-classify, the LFE fold's own latch).
+// The rewrite rides the ring's storage in place -- the guard-fade's own
+// discipline (this switch is the ring's only reader).
+static void dacZeroWatch(float* sc, size_t n, bool* zv) {
+    bool allz[6] = { true, true, true, true, true, true };
+    for (size_t i = 0; i < n; ++i) {
+        float* f = sc + i * kInCh;
+        for (int k = 0; k < 6; ++k) {
+            const float s = f[2 + k];
+            if (s == 0.0f) f[2 + k] = 0.0f;   // detect + normalize (-0.0f -> +0.0f)
+            else           allz[k] = false;
+        }
+    }
+    for (int k = 0; k < 6; ++k) zv[k] = allz[k];
+}
+
+// the zero gate, v8.8.0 edition: verdict-driven (the watch owns the
+// test), the latch and the LOG in the center gate's own format, one line
+// per silence period. The latch lives on the Leg and the fresh-state
+// reset clears it every start -- a restart never inherits the previous
+// run's silence.
+static void soloZeroGate(Leg& L, int idx, const char* who, bool zw) {
+    const int srcCh = soloChOf(idx);
+    if (zw) {
+        if (!L.soloWasSilent) {
+            L.soloWasSilent = true;
+            const unsigned long long now = GetTickCount64();
+            if (now - L.lastGateLogMs >= 5000) {
+                L.lastGateLogMs = now;
+                tlog("[twinspeak] leg%d zero gate : ch%d is digital zero -- %s emits nothing\n",
+                     idx + 1, srcCh + 1, who);
+            }
+        }
+    } else {
+        L.soloWasSilent = false;
+    }
+}
+
+// v8.8.0 THE UPIMX GUARD, EVERYWHERE -- the center's engine-upmix
+// fingerprint, extended to the rears and sides. A stereo app cannot write
+// the cable's extra channels either: the Windows engine fills them from
+// FL/FR before twinspeak can capture it (the same 'if the center channel
+// is absent it mixes left and right instead' issue, ch7/ch8/ch5/ch6
+// edition). The test is the center guard's verbatim v6.1/v7.8.4 math with
+// the channel index freed: per span, least-squares fit chK ~ a*ch1 +
+// b*ch2; residual < -30 dB with the gains inside the upmix band and the
+// fronts active -> the span is engine fill, not content -> the SAME
+// hysteresis state machine (engage after 2 consecutive hits, release
+// after 8 misses, a definitive independent verdict counts 4) and the SAME
+// 2.5 ms fade, applied IN PLACE on the ring's storage. Genuine
+// multichannel rears/sides are INDEPENDENT tracks and always pass. The
+// state rides the leg's own cg* fields (unused on legs 3-6 until now) --
+// which the fresh-state reset already clears every start. A span the
+// watch marked fully zero returns immediately: nothing to classify, the
+// hysteresis keeps (exactly the center's gate-1 return).
+static void soloUpmixGuard(Leg& L, float* sc, size_t n, int srcCh, int idx,
+                           const char* who, bool zw) {
+    if (zw) return;                      // nothing to classify on a silent span
+    if (!g_cfg.centerUpmixGuard) return; // rides the center's key -- ALWAYS ON (v6.6.8)
+    constexpr float kCgFadeFr = 120.0f;             // 2.5 ms @ 48 kHz
+    float target = L.cgMuted ? 0.0f : 1.0f;         // this span's fade goal
+    if (n >= 64) {
+        // full test (the fit is the center guard's verbatim v6.1 math)
+        double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * kInCh;
+            const double x = f[0], y = f[1], z = f[srcCh];
+            S11 += x * x; S22 += y * y; S12 += x * y;
+            S31 += z * x; S32 += z * y; S33 += z * z;
+        }
+        const double nD = (double)n;
+        const double ms1 = S11 / nD, ms2 = S22 / nD, ms3 = S33 / nD;
+        if (ms3 >= 1e-8 && 0.5 * (ms1 + ms2) >= 4e-8) {
+            double a = 0.0, b = 0.0, res2 = 0.0;
+            bool outside = false;                    // definitive independent content
+            const double det = S11 * S22 - S12 * S12;
+            if (det > 1e-6 * (S11 * S22 + 1e-30)) {
+                a = (S31 * S22 - S32 * S12) / det;
+                b = (S32 * S11 - S31 * S12) / det;
+                res2 = S33 - a * S31 - b * S32;
+                if (a < 0.05 || a > 2.0 || b < 0.05 || b > 2.0) outside = true;
+            } else {
+                // collinear fronts (mono content): 1-D fit on the dominant front
+                const bool useCh1 = (S11 >= S22);
+                const double Suu = useCh1 ? S11 : S22;
+                const double S3u = useCh1 ? S31 : S32;
+                if (Suu > 0.0) {
+                    a = S3u / Suu;
+                    res2 = S33 - a * S3u;
+                    if (a < 0.05 || a > 2.0) outside = true;
+                } else outside = true;
+            }
+            if (res2 < 0.0) res2 = 0.0;  // float noise below the fit
+            if (!outside && res2 / S33 < 1e-3) {         // HIT: exact upmix fingerprint
+                if (!L.cgMuted) {
+                    if (++L.cgHits >= 2) {               // engage: 2 consecutive hits
+                        L.cgMuted = true;
+                        L.cgMiss = 0;
+                        L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                        const unsigned long long now = GetTickCount64();
+                        if (now - L.lastUpmixLogMs >= 5000) {
+                            L.lastUpmixLogMs = now;
+                            tlog("[twinspeak] leg%d upmix guard: ch%d matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                 "                            (a stereo source has no channel of its own there: the engine fills\n"
+                                 "                            it from FL/FR, and %s fades out over 2.5 ms -- the phantom center's\n"
+                                 "                            exact discipline)\n",
+                                 idx + 1, srcCh + 1, a, b, who);
+                        }
+                    }
+                } else {
+                    L.cgMiss = 0;                        // stays engaged
+                    L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                }
+                target = 0.0f;
+            } else {                                     // miss or definitive independent content
+                L.cgHits = 0;
+                if (L.cgMuted) {
+                    L.cgMiss += outside ? 4 : 1;         // independent content releases 4x faster
+                    if (L.cgMiss >= 8) {
+                        L.cgMuted = false;               // release: the channel fades back in
+                        L.cgMiss = 0;
+                        const unsigned long long now = GetTickCount64();
+                        if (now - L.lastUpmixLogMs >= 5000) {
+                            L.lastUpmixLogMs = now;
+                            tlog("[twinspeak] leg%d upmix guard: ch%d is independent of ch1/ch2 -- guard released\n"
+                                 "                            (the real content fades back in over 2.5 ms)\n",
+                                 idx + 1, srcCh + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // apply the fade to the span (any size -- the ramp never stalls)
+    if (target < 1.0f || L.cgGain < 1.0f) {
+        const float step = 1.0f / kCgFadeFr;
+        for (size_t i = 0; i < n; ++i) {
+            float g = L.cgGain;
+            if (g < target) { g += step; if (g > target) g = target; }
+            else if (g > target) { g -= step; if (g < target) g = target; }
+            L.cgGain = g;
+            if (g > 0.0f) sc[i * kInCh + srcCh] *= g;
+            else          sc[i * kInCh + srcCh]  = 0.0f;
         }
     }
 }
@@ -4597,7 +4990,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.7.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.8.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair (optional; an EMPTY\n"
         "; device keeps that rear leg silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
@@ -5010,6 +5403,22 @@ static void writeTemplate(const char* path) {
         ";     output_device2 is EMPTY and ch3 folds onto leg1's FL/FR, the\n"
         ";     upmix fingerprint fades the phantom center out of the fronts;\n"
         ";     'cm' then counts those guarded blocks on leg1.\n"
+        "; v8.7.1 THE ZERO GATE, EVERYWHERE: the rears/sides run the same\n"
+        ";     digital-zero discipline on their OWN channels (leg3 ch7, leg4\n"
+        ";     ch8, leg5 ch5, leg6 ch6, each side of a merged pair\n"
+        ";     independently) -- always on, no key: a silent source channel can\n"
+        ";     never become output noise, and the pane logs each silence period.\n"
+        "; v8.8.0 THE DAC ZERO WATCH: the test is PER SAMPLE, on EVERY non-L/R\n"
+        ";     channel (ch3 center, ch4 LFE, ch5/ch6 surr, ch7/ch8 rear), the\n"
+        ";     moment the DAC reads the block -- a zero sample is emitted as\n"
+        ";     literal +0.0f (never -0.0f or sign residue; no engine layer\n"
+        ";     ever sees content on a silent channel), and a fully-zero channel\n"
+        ";     is latched and logged (the LFE fold of a silent ch4 adds exactly\n"
+        ";     nothing). v8.8.0 THE UPIMX GUARD, EVERYWHERE: the center's\n"
+        ";     engine-upmix fingerprint (ch == a*ch1 + b*ch2, residual < -30\n"
+        ";     dB, gains in the upmix band) now guards the rears/sides too, per\n"
+        ";     side -- Windows' stereo->8ch fill fades out of them over 2.5 ms\n"
+        ";     exactly as the phantom center always has.\n"
         "\n"
         "; ROUTING GUARANTEE (zero duplication, by construction):\n"
         ";   out1 gets ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE) folded\n"
@@ -9944,6 +10353,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // partner drains (the v8.6.1 field report also caught a stale front
     // stream width -- the variable itself is retired in v8.7.0, so the
     // hazard is gone with it). Reset everything here, every start.
+    // v8.7.1: and now it MEANS it -- THE FRESH-STATE RESET (see its block
+    // by the start gate) clears every surviving gate verdict, fade,
+    // silence latch, meter, counter, heartbeat and stale ring BEFORE the
+    // boot-yield walk re-marks what this run wants released, so a restart
+    // is a genuinely fresh engine: no stale center fade, no dead legs, no
+    // inherited silence state (the devices' own silicon was already fresh
+    // -- a KS pin open zeroes the WaveRT loop, a WASAPI open builds a new
+    // buffer -- the hole was everything ABOVE them).
+    freshAudioState();
     for (int i = 0; i < 6; ++i) g_leg[i].mergedSlave = false;
     g_frontMerge  = false;
     g_rearPair    = false;
@@ -10478,6 +10896,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             tlog("[twinspeak] start gate   : released (one live leg -- nothing to synchronize against)\n");
         }
     }
+    // v8.7.1: the fresh-state certificate -- one line, every start, so the
+    // pane says what the reset guaranteed (a restart is a fresh engine).
+    tlog("[twinspeak] fresh state  : every gate verdict, fade, silence latch, meter and ring cleared before the\n"
+         "                            devices opened -- a restart is a fresh engine (no stale center fade, no\n"
+         "                            dead legs, no inherited silence)\n");
     // v8.4.1: no center device = no chime (the signature rides out2 only);
     // arming it with leg2 disabled would just never play. v8.7.0: armed
     // AFTER the gate release -- the signature is the first thing the center
@@ -10667,6 +11090,17 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         else
             tlog("[twinspeak] route out2     : center EQ off -- out2 is bit-exact\n");
     }
+    // v8.8.0 THE DAC ZERO WATCH + THE UPIMX GUARD, EVERYWHERE -- told at
+    // start so the route map carries both (structural: no ini key, always
+    // on -- a silent source channel can never become output, and an
+    // engine upmix fill can never pose as content).
+    tlog("[twinspeak] zero watch   : ch3-ch8 tested PER SAMPLE the moment the DAC reads the block -- every\n"
+         "                            channel but L/R (center, LFE fold, rears, surrounds): a zero sample is\n"
+         "                            emitted as literal +0.0f (never -0.0f residue), a fully-zero channel is\n"
+         "                            latched and logged\n");
+    tlog("[twinspeak] upmix guard  : the center's engine-upmix fingerprint guards the REARS/SIDES too -- ch5-ch8\n"
+         "                            matching a*ch1 + b*ch2 (residual < -30 dB, gains in band) fades out per\n"
+         "                            side over 2.5 ms, the phantom center's exact discipline\n");
     // v6.3.1: the align line does the arithmetic -- both est paths and their
     // difference, with the trim direction spelled out. Same formula as
     // printLegDevice (ring + device lead + capture burst, delay included),
