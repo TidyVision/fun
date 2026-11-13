@@ -62,6 +62,24 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.13 NO BASELINE (field-directed, eight idle minutes + one glance:
+//            "I do see a slow creep in delay on both raw1 and raw2 ... raw1
+//            is at 8 and raw2 is at 12-16 ... I just saw raw2 jump to like
+//            70 after raw1 went to 11 and then 7. This is suspicious."). raw2
+//            PARKED at raw1 + ~60 ms while the servo sat silent was the
+//            settle latch -- the LAST acceptance path v8.4.12 missed: two
+//            seconds after any reopen it captured whatever off happened to
+//            be, and if a burst (or the tail of a grind -- 60 ms takes ~10 s
+//            at the warden's 5.7 ms/s) was still in the rings, the bloat
+//            became the servo's TRUTH: it then defended raw2 = raw1 + bloat
+//            with pads and drops like any other calibration. The baseline
+//            also random-walked up a few ms per event -- the raw2-4-8-ms-
+//            over-raw1 creep. THE FIX: syncBase/kSyncUnlatched are RETIRED
+//            whole -- the servo's error IS the measured offset now (err =
+//            off); the settle gate is a pure startup hush; the reopen
+//            landing is r2 = r1 exactly. A nonzero settled offset was
+//            startup skew, and startup skew is drift to be corrected, not
+//            held. NO new ini key, NO UI row.
 //    v8.4.12 THE DEPTH GUARD + THE DELAY-CORRECTED LANDING + NO RE-LATCH
 //            (field-directed, one hour of field data: "I left it sitting
 //            there for an hour ... I still get raw2 drift. Somehow, I got
@@ -2127,7 +2145,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.12"
+#define TWS_VERSION "8.4.13"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2246,7 +2264,7 @@ static constexpr unsigned kSampleRate    = 48000;
 static constexpr int      kSyncDeadBandFr = 12;     // 250 us at 48 kHz -- the ear places ~1 ms between speakers
 static constexpr int      kSyncNudgeFr    = 16;     // v8.4.9: the nudge step -- 16 fr (333 us) drop or held-sample pad
 static constexpr unsigned kSyncNudgeMs    = 100;    // v8.4.9: 16 fr per window: 160 fr/s capacity (~3333 ppm)
-static constexpr unsigned kSyncSettleMs   = 2000;   // past the last (re)open before the baseline latches
+static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.13: a pure startup hush past the last (re)open (no baseline)
 // v8.4.11 THE WARDEN BITE (the old version's drift correction, from the
 // shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000): past 5 ms
 // of accumulated drift a leg takes up to a 240-frame bite (drop or
@@ -2269,7 +2287,15 @@ static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_i
 static constexpr unsigned kDepthAnchorFr   = 480;  // 10 ms: capture delivery + device buffer + slack
 static constexpr int      kDepthDeadbandFr = 240;  // 5 ms: healthy jitter is never touched
 static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
-static constexpr long long kSyncUnlatched = -0x7fffffffffffffffLL;  // the baseline sentinel
+// v8.4.13 NO BASELINE: the settled-offset latch (syncBase) is RETIRED -- it
+// was the last acceptance path. Two seconds after any reopen it captured
+// whatever off happened to be, and a burst still in the rings became the
+// servo's truth FOREVER (the field's "raw2 jumped to like 70 after raw1
+// went to 11 and then 7" -- the servo defending raw1 + bloat), and the
+// baseline random-walked up a few ms per event (raw2 creeping 4-8 ms over
+// raw1 in eight idle minutes). The user's calibration lives in the delay
+// prefills, which off never sees; a nonzero settled offset is startup
+// skew, and startup skew is drift to be corrected, not held. err = off.
 
 // v8.4.5 THE UNIVERSAL KEEP-ALIVE tone: 20 Hz at 0.1% gain (0.001,
 // ~-60 dBFS -- 14 dB under v7.1.24's 40 Hz @ 0.5%) summed onto EVERY
@@ -2746,13 +2772,16 @@ struct Leg {
     unsigned long long  lastSide2LogMs = 0;      // v8.4.11: rear R gate's own rate limit
     unsigned long long  lastSide3LogMs = 0;      // v8.4.11: side R gate's own rate limit
     // ---- v8.4.7 SLOW SYNC TO LEG1: the drift servo state (no key, no UI).
-    // syncBase holds the SETTLED offset to leg1's play boundary this leg
-    // must hold (frames; + = this leg is the delayed one). Written by this
-    // leg's device thread ONLY (the syncToFirst call inside its buffer
-    // switch); kSyncUnlatched = arming. lastSyncMs rate-limits the servo
-    // look; syncDrops/syncPads count the nudges (logged rate-limited,
-    // per-run like the ledger clocks).
-    std::atomic<long long> syncBase{kSyncUnlatched};
+    // v8.4.13: NO BASELINE -- the servo's error IS the measured offset
+    // (the settled-baseline latch was the last acceptance path: 2 s after
+    // any reopen it captured whatever off happened to be, and a burst
+    // still in the rings became the servo's truth forever -- raw2 parked
+    // at raw1 + bloat, and the baseline random-walked up a few ms per
+    // event). The settle gate in syncToFirst is a pure startup hush now.
+    // Written by this leg's device thread ONLY (the syncToFirst call
+    // inside its buffer switch); lastSyncMs rate-limits the servo look;
+    // syncDrops/syncPads count the nudges (logged rate-limited, per-run
+    // like the ledger clocks).
     unsigned long long     lastSyncMs    = 0;
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
@@ -3272,8 +3301,9 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // play boundary -- the FIRST device is the master, never adjusted, and
 // all the others sync together to exactly it. The metric is the two
 // seqTails' difference (pure frame arithmetic, no clock, no resampler):
-// each leg latches its SETTLED offset kSyncSettleMs after its last
-// (re)open, then holds it with kSyncNudgeFr-frame nudges, at most one
+// v8.4.13: the servo's ERROR IS that difference -- no settled baseline
+// (the latch was an acceptance path; see the constants block) -- corrected
+// with kSyncNudgeFr-frame nudges, at most one
 // per kSyncNudgeMs and only past kSyncDeadBandFr (v8.4.9: 16 fr /
 // 100 ms). LATE (its crystal runs slow, its ring grows):
 // discardOldest(kSyncNudgeFr) -- the boundary advances 16 frames, 333 us
@@ -3310,33 +3340,26 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
                     L.raw.seqTail.load(std::memory_order_relaxed));
     // settle: kSyncSettleMs past the last (re)open AND kSyncSettleMs of
     // this leg's own switches -- the prefills and the start-align pads are
-    // through, and the offset the user configured is what sits in the ring.
+    // through. v8.4.13: a pure STARTUP HUSH -- no baseline to arm or latch
+    // (the settled latch captured mid-grind bloat as the servo's truth; see
+    // the constants block).
     const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
-    if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) {
-        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // (re)arm
-        return 0;
-    }
+    if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) return 0;
     LARGE_INTEGER fsw;
     QueryPerformanceCounter(&fsw);
     const unsigned long long nowUs =
         (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
-    if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) {
-        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);
-        return 0;
-    }
-    const long long base = L.syncBase.load(std::memory_order_relaxed);
-    if (base == kSyncUnlatched) {
-        L.syncBase.store(off, std::memory_order_relaxed);   // latch the settled offset
-        return 0;
-    }
-    const long long err = off - base;   // + = this leg drifted LATE vs leg1
-    // v8.4.12: NO RE-LATCH anywhere below. A jump (a stall, an eviction
-    // batch, a hiccup) is GROUND BACK like any other error -- accepting it
-    // was the ratchet that parked raw2 at 36, then 62, then the ring cap.
-    // Only a REOPEN re-arms the baseline, and it does so through the settle
-    // gate above (lastReopenMs -> unlatch -> re-latch 2 s later). The
-    // master's depth guard owns common-mode ring growth; this loop owns
-    // the difference; nothing is ever blessed.
+    if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) return 0;
+    // v8.4.13: NO BASELINE -- the error IS the offset. A nonzero settled
+    // offset was startup skew, and startup skew is drift to be corrected,
+    // not held.
+    const long long err = off;   // + = this leg is LATE vs leg1
+    // NO RE-LATCH anywhere below (v8.4.12/8.4.13). A jump (a stall, an
+    // eviction batch, a hiccup) is GROUND BACK like any other error --
+    // accepting it was the ratchet that parked raw2 at 36, then 62, then
+    // the ring cap, then parked it at raw1 + bloat via the settle latch.
+    // The master's depth guard owns common-mode ring growth; this loop
+    // owns the difference; nothing is ever blessed.
     if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop (nudge v8.4.9, warden bite v8.4.11)
         // THE WARDEN BITE: past 5 ms of drift, take a 240-frame bite in one
         // discard -- at most once per 2 s (the old version's drift
@@ -5196,7 +5219,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.12 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.13 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5510,17 +5533,19 @@ static void writeTemplate(const char* path) {
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
         "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE; v8.4.11 THE WARDEN\n"
-        "; BITE; v8.4.12 THE DEPTH GUARD): the INTER-LEG drift is synced\n"
-        "; away -- out2/out3 hold their settled offset to OUT1, the first\n"
-        "; device (the master, never servoed): a 16-frame drop/pad at most\n"
-        "; every 100 ms, only past a 250 us dead-band, the baseline latching\n"
-        "; 2 s after each (re)open; past 5 ms of accumulated drift the old\n"
-        "; warden bite takes over (up to 240 frames per 2 s); creep is\n"
-        "; CORRECTED, never accepted, and no re-latch exists. v8.4.12: the\n"
-        "; MASTER's ring depth is guarded too (a capture burst's bloat is\n"
-        "; drained to a 10 ms anchor, the slaves follow through the sync\n"
-        "; loop), and reopens land delay-corrected. No key, no UI row. The\n"
-        "; cable clock itself stays observe-only.\n"
+        "; BITE; v8.4.12 THE DEPTH GUARD; v8.4.13 NO BASELINE): the\n"
+        "; INTER-LEG drift is synced away -- out2/out3 sync their boundary\n"
+        "; to OUT1, the first device (the master, never servoed): a\n"
+        "; 16-frame drop/pad at most every 100 ms, only past a 250 us\n"
+        "; dead-band, NO baseline at all (the servo's error is the measured\n"
+        "; offset -- the settled latch was an acceptance path and is\n"
+        "; retired); past 5 ms of accumulated drift the old warden bite\n"
+        "; takes over (up to 240 frames per 2 s); creep is CORRECTED, never\n"
+        "; accepted, and no re-latch exists. v8.4.12: the MASTER's ring\n"
+        "; depth is guarded too (a capture burst's bloat is drained to a\n"
+        "; 10 ms anchor, the slaves follow through the sync loop), and\n"
+        "; reopens land delay-corrected. No key, no UI row. The cable\n"
+        "; clock itself stays observe-only.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
@@ -5998,33 +6023,32 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 // dead-consumer window (the old device thread is joined; tail advances
 // are monotonic CAS, a discipline the producer's evictions already
 // share). The leg resumes at the FRESHEST capture, and the discard LANDS
-// ON THE OFFSET THE SERVO WAS HOLDING: syncBase is the settled inter-leg
-// offset this leg held before the reopen (the user's calibration, written
-// by this leg's now-joined device thread -- a relaxed read here is sound),
-// so the target level is leg1's REAL BACKLOG (its depth minus its delay
-// prefill -- v8.4.12: the old full-depth target leaked delay1_ms into the
-// landing) + held + this leg's own prefill, and the offset the servo
-// latches 2 s after the reopen is the offset it held before: the
-// calibration survives. The fallback (no baseline yet, or the master leg
-// -- never servoed) keeps the delay prefill + one WaveRT loop of live
-// margin; a margin floor keeps the restart's first fill from starving.
+// ON THE SERVO'S TARGET: the servo's error is the raw offset (v8.4.13: no
+// baseline), so the clean landing is r2 = r1 -- leg1's REAL BACKLOG (its
+// depth minus its delay prefill -- v8.4.12: the original full-depth target
+// leaked delay1_ms into the landing, the field's "raw2 sits at 62") plus
+// this leg's own prefill. The user's calibration lives in the delay
+// prefills and needs no baseline to survive a reopen. The fallback (the
+// master leg -- never servoed) keeps the delay prefill + one WaveRT loop
+// of live margin; a margin floor keeps the restart's first fill from
+// starving.
 static void dropReopenBacklog(int idx) {
     Leg& L = g_leg[idx];
     const size_t have = L.raw.count();
-    const long long held = L.syncBase.load(std::memory_order_relaxed);
     long long want;
-    if (idx != 0 && held != kSyncUnlatched)
+    if (idx != 0)
         // v8.4.12 THE DELAY-CORRECTED LANDING (the field's "maybe delay1_ms
         // is being added to the drift corrector" -- CONFIRMED, here): the
-        // held offset lives in REAL-backlog space (r = depth - delay
-        // prefill; the servo's off = r_slave - r_master), so the landing
-        // target is leg1's REAL backlog + held + THIS leg's own prefill.
-        // The old leg1.count() + held used leg1's FULL depth, delay
-        // prefill included -- with delay1_ms = 68 every reopen put ~68 ms
-        // of phantom backlog on the slave (the field's "raw2 sits at 62"),
-        // and the servo then spent the next ~11 s grinding it back off.
+        // landing target is leg1's REAL backlog (its depth minus its delay
+        // prefill) + THIS leg's own prefill. The original leg1.count() +
+        // held used leg1's FULL depth, delay prefill included -- with
+        // delay1_ms = 68 every reopen put ~68 ms of phantom backlog on the
+        // slave (the field's "raw2 sits at 62"), and the servo then spent
+        // the next ~11 s grinding it back off. v8.4.13: no baseline to add
+        // -- the servo's error is the raw offset, so the clean landing is
+        // r2 = r1 exactly.
         want = ((long long)g_leg[0].raw.count() - (long long)g_leg[0].delayFrames)
-             + held + (long long)L.delayFrames;
+             + (long long)L.delayFrames;
     else
         want = (long long)(L.delayFrames + (size_t)kKsPeriods * kKsPeriodFrames);
     const long long margin = (long long)kKsPeriods * (long long)kKsPeriodFrames;
@@ -10716,7 +10740,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.und.store(0, std::memory_order_relaxed);
         L.cmUpmix.store(0, std::memory_order_relaxed);
         L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
-        L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // v8.4.7: the sync baseline
         L.syncDrops = 0;                                               // (per run, like the clocks)
         L.syncPads  = 0;
         L.lastBiteMs   = 0;                                            // v8.4.11/8.4.12: the bite + depth-guard clocks
@@ -11019,7 +11042,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            v8.4.12 THE DEPTH GUARD: the master's ring depth is pinned to a 10 ms\n"
            "                            anchor (past a 5 ms dead-band, the same warden pacing) -- a capture\n"
            "                            burst's bloat is DRAINED, never kept, and the slaves follow through\n"
-           "                            the sync loop; reopens land delay-corrected; no re-latch anywhere.\n");
+           "                            the sync loop; reopens land delay-corrected; no re-latch anywhere.\n"
+           "                            v8.4.13 NO BASELINE: the servo's error IS the measured offset -- the\n"
+           "                            settled latch (an acceptance path) is retired; the settle gate is a\n"
+           "                            startup hush only; nothing is ever blessed as the new truth.\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
