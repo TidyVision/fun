@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v8.4.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -9,8 +9,8 @@
 //  delay1/2_ms + offset3/4_ms are whole-ms prefills on the raw ring; drift
 //  is measured, never resampled (v8.1.0) -- v8.4.7 SLOW SYNC: every leg
 //  EXCEPT the first holds its settled offset to leg1's play boundary (a
-//  1-frame drop/pad at most every 200 ms; no key, no UI); the cable clock
-//  itself stays measure-only.
+//  16-frame drop/pad at most every 100 ms, v8.4.9; no key, no UI); the
+//  cable clock itself stays measure-only.
 //
 //  ARCHITECTURE (v8.1.0 -- THE STRIPPED PATH):
 //    VAC cable (8ch shared capture, exclusive)
@@ -55,6 +55,48 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.9 THE WIDE NUDGE + THE POWER BITE (field-directed: "I would
+//            also do a slow sample-level nudge every 100ms and have the
+//            buffer be 288 samples and 2 buffers (since it's slower but
+//            more power saving that way). Also, I still get L/R
+//            stuttering, which means the 1-frame nudge is clearly causing
+//            decoherence in the sample level stuff, and that's why I want
+//            a 16 sample nudge for every 100ms"). THE WIDE NUDGE: the
+//            servo's step is 16 frames every 100 ms (was 1 fr / 200 ms)
+//            -- the drop discards 16 oldest frames at once, the pad holds
+//            the last mixed frame across 16 switch frames (the DAC still
+//            gets its full frameCount; a held sample, never a hole),
+//            capacity 160 fr/s ~ 3333 ppm; the 12-fr / 250 us dead-band,
+//            the 2 s settle and the 2000-fr re-latch unchanged; the
+//            clamp keeps the pad under the block so it always repeats a
+//            REAL mixed frame. THE POWER BITE: 288 frames x 2 periods --
+//            6.0 ms of service, ~167 writes/s, a 576-fr / 12.0 ms loop
+//            and a 288-fr / 6.0 ms lead: fewer, larger writes than
+//            v8.4.8's 256 x 4 (power saving, field-directed); the double
+//            cushion RETIRES with the field's own diagnosis -- the L/R
+//            stutter rode the 1-frame nudge's decoherence, not the lead.
+//            NO new ini key, NO UI row; the est-path banner prints the
+//            shallower lead live.
+//    v8.4.8 THE DOUBLE CUSHION + THE TIMING NOTE TRIMMED (field-directed:
+//            "I want to have a 256 sample buffer and 4 samples instead,
+//            and also prevent the left and right from stuttering. And that
+//            should be it. Also, remove the two whole paragraphs after the
+//            first one from the timing tab, because it's overflowing").
+//            THE BITE: 256 frames x 4 periods (was 192 x 3) -- 5.33 ms of
+//            service per write, ~188 writes/s, a 1024-fr / 21.3 ms WaveRT
+//            loop and a 768-fr / 16.0 ms write lead. THE L/R STUTTER: the
+//            mains' left/right stuttered when a loaded video decoder
+//            descheduled the pacer straight through v8.4.5's 8.0 ms lead
+//            into a starved DAC -- the DOUBLED lead keeps the DAC fed
+//            through the same spike (same kernel loop, same register
+//            pacing, no resampler anywhere; leadFrames is still
+//            (periods-1)*period and the est-path banner prints the deeper
+//            lead live). NO new ini key, NO UI row: the two constants
+//            carry it all, stale ks_period_frames / ks_periods lines stay
+//            read-and-ignored. THE TIMING NOTE: only its FIRST paragraph
+//            remains (the KS-bite and slow-sync paragraphs are gone from
+//            the tab, which overflowed) -- both stories stay told by the
+//            boot banner and the ini.
 //    v8.4.7 SLOW SYNC TO THE FIRST DEVICE + THE TIMING PAGE MOVES LEFT
 //            (field-directed: "each audio device delays eachother over
 //            time and I want you to just fix that ... I want a slow drift
@@ -1942,7 +1984,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.7"
+#define TWS_VERSION "8.4.9"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2049,13 +2091,18 @@ static constexpr unsigned kSampleRate    = 48000;
 // first audio device ... minimally ... no new ini keys nor ... the user
 // interface"). Every output leg EXCEPT leg1 servos its play boundary to
 // LEG1's (the first device is the master, never adjusted): each leg
-// latches its settled offset once, then holds it with one-frame nudges,
-// rate-limited -- a drop (discardOldest(1)) when it runs late, a pad (the
-// switch's last frame repeats the one before it) when it runs early. The
-// DAC always receives its full frameCount; nothing resamples, nothing
-// bends pitch, no key, no UI row.
+// latches its settled offset once, then holds it with kSyncNudgeFr-frame
+// nudges, rate-limited -- a drop (discardOldest(kSyncNudgeFr)) when it
+// runs late, a pad (the switch's last kSyncNudgeFr frames hold the last
+// mixed one) when it runs early. The DAC always receives its full
+// frameCount; nothing resamples, nothing bends pitch, no key, no UI row.
+// v8.4.9 THE WIDE NUDGE (field-directed: "the 1-frame nudge is clearly
+// causing decoherence in the sample level stuff ... I want a 16 sample
+// nudge for every 100ms"): the step is 16 frames and the window 100 ms
+// -- fewer, wider, cleaner corrections instead of per-frame chatter.
 static constexpr int      kSyncDeadBandFr = 12;     // 250 us at 48 kHz -- the ear places ~1 ms between speakers
-static constexpr unsigned kSyncNudgeMs    = 200;    // one frame per window: 5 fr/s capacity (~100 ppm)
+static constexpr int      kSyncNudgeFr    = 16;     // v8.4.9: the nudge step -- 16 fr (333 us) drop or held-sample pad
+static constexpr unsigned kSyncNudgeMs    = 100;    // v8.4.9: 16 fr per window: 160 fr/s capacity (~3333 ppm)
 static constexpr unsigned kSyncSettleMs   = 2000;   // past the last (re)open before the baseline latches
 static constexpr int      kSyncRelatchFr  = 2000;   // ~40 ms: a jump re-latches the baseline, never grinds
 static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
@@ -2100,19 +2147,20 @@ static constexpr unsigned kReplayMaxPeriods   = 4;      // lastBlock size (the K
 // default -- ignores the request whole. Equal by construction.
 static constexpr unsigned kOutPeriodMs       = 1;      // WASAPI leg request (v8.2.0)
 
-// v8.4.5 THE CALM BITE (field-directed: "vlc ... crackles errily"):
-// v8.4.3's sub-millisecond bite -- 32 fr of service, a 0.67 ms cadence,
-// ~1500 wakes/s -- crackled erratically under a video decoder's load; the
-// missed services lapped the DAC into stale audio. The bite is BUILT IN
-// now: 192 frames (4.0 ms of service, 250 wakes/s -- six times the
-// deschedule cushion) x 3 periods (a 576-fr / 12.0 ms WaveRT loop, an
-// 8.0 ms write lead -- SMALLER than the v8.4.3 floor's 10.7 ms, so the
-// transport latency drops). No ini key, no GUI row, no clamp; stale
-// ks_period_frames / ks_periods lines load clean and are ignored. The
-// v8.4.3 sub-128 loop floor (768 fr / 512-fr lead) is retired with the
-// sub-ms bites it protected.
-static constexpr unsigned kKsPeriodFrames    = 192;  // the bite: 4.0 ms of service @ 48 kHz (v8.4.5)
-static constexpr unsigned kKsPeriods         = 3;    // the WaveRT loop: 576 fr (12.0 ms), lead 384 fr (8.0 ms)
+// v8.4.9 THE POWER BITE (field-directed: "have the buffer be 288 samples
+// and 2 buffers (since it's slower but more power saving that way)"):
+// the bite is 288 frames x 2 periods -- 6.0 ms of service per write,
+// ~167 writes/s (fewer, larger writes than v8.4.8's 256 x 4), a 576-fr
+// / 12.0 ms WaveRT loop and a 288-fr / 6.0 ms write lead. The v8.4.8
+// double cushion RETIRES with it: the field still heard the L/R stutter
+// at the 16 ms lead, so the cushion was not the cause -- the diagnosis
+// moved to the sync servo's 1-frame nudge (see kSyncNudgeFr below).
+// Same kernel loop, same register pacing, no resampler anywhere; the
+// est-path banner prints the shallower lead live. No ini key, no GUI
+// row, no clamp; stale ks_period_frames / ks_periods lines load clean
+// and are ignored.
+static constexpr unsigned kKsPeriodFrames    = 288;  // the bite: 6.0 ms of service @ 48 kHz (v8.4.9)
+static constexpr unsigned kKsPeriods         = 2;    // the WaveRT loop: 576 fr (12.0 ms), lead 288 fr (6.0 ms)
 
 // v6.4 drift warden pacing: the observe log never fires more than once per
 // drift_interval_ms (v6.5.8; was the hardcoded 30 s), only after the drift
@@ -2199,8 +2247,8 @@ struct Config {
     // paced against the mapped play-position register (below the audio
     // engine, FlexASIO-grade). "wasapi" = miniaudio exclusive WaveRT event
     // mode -- the automatic fallback when a pin is refused, and the opt-out.
-    // v8.4.5 THE CALM BITE: ks_period_frames / ks_periods are BUILT IN
-    // (kKsPeriodFrames 192 / kKsPeriods 3) -- no struct fields, no ini
+    // v8.4.5-v8.4.9 THE CALM BITE: ks_period_frames / ks_periods are BUILT
+    // IN (kKsPeriodFrames 288 / kKsPeriods 2) -- no struct fields, no ini
     // keys, no GUI rows; stale lines load clean and are ignored.
     std::string backend1       = "ks";
     std::string backend2       = "ks";
@@ -2564,8 +2612,9 @@ struct Leg {
     // inter-speaker offset. The buffer switch owns the boundary, the health
     // loop owns the baseline -- corrections are GONE (v8.1.0). v8.4.7: the
     // INTER-LEG sync returns as a slow servo on this same boundary (see
-    // syncToFirst -- out2/3/4 hold their settled offset to leg1, one frame
-    // at a time, no key, no UI); the cable clock itself stays measure-only.
+    // syncToFirst -- out2/3/4 hold their settled offset to leg1, 16 frames
+    // at a time (v8.4.9), no key, no UI); the cable clock itself stays
+    // measure-only.
     size_t              prefillRemaining = 0;        // delay prefill: carries no sequence
     std::atomic<double> lagMs{0.0};                  // age of the newest played frame (ms)
     // v7.1.5 START ALIGN: the QPC microsecond stamp of this leg's FIRST buffer
@@ -3041,19 +3090,21 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // all the others sync together to exactly it. The metric is the two
 // seqTails' difference (pure frame arithmetic, no clock, no resampler):
 // each leg latches its SETTLED offset kSyncSettleMs after its last
-// (re)open, then holds it with one-frame nudges, at most one per
-// kSyncNudgeMs and only past kSyncDeadBandFr. LATE (its crystal runs
-// slow, its ring grows): discardOldest(1) -- the boundary advances one
-// frame, 20.8 us earlier. EARLY (crystal fast, ring shallow): the switch
-// pops one frame less and repeats its last mixed frame -- the DAC always
-// receives its full frameCount, and the pad is a held sample, not a hole.
+// (re)open, then holds it with kSyncNudgeFr-frame nudges, at most one
+// per kSyncNudgeMs and only past kSyncDeadBandFr (v8.4.9: 16 fr /
+// 100 ms). LATE (its crystal runs slow, its ring grows):
+// discardOldest(kSyncNudgeFr) -- the boundary advances 16 frames, 333 us
+// earlier. EARLY (crystal fast, ring shallow): the switch pops
+// kSyncNudgeFr frames less and holds its last mixed frame across them --
+// the DAC always receives its full frameCount, and the pad is a held
+// sample, not a hole.
 // A leg that jumps past kSyncRelatchFr (an eviction batch, a stall, a
 // reopen) re-latches its baseline instead of grinding the distance back
 // -- the reference itself moved. A yielded or heart-silent leg1 freezes
 // the sync whole (a parked leg's ring still evicts, and eviction jitter
 // is not a clock to follow). Returns the number of pad frames the switch
-// must synthesize (0 or 1). No ini key, no UI row: the constants are the
-// engine's truth.
+// must synthesize (0 or kSyncNudgeFr, clamped under the block). No ini
+// key, no UI row: the constants are the engine's truth.
 static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
@@ -3095,25 +3146,29 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
             tlog("[twinspeak] sync out%d     : offset jumped to %lld fr vs out1 (a reopen-class event) -- baseline\n"
-                 "                            re-latched, not ground back (slow sync: 1 fr / %u ms, %d fr dead-band)\n",
-                 idx + 1, off, kSyncNudgeMs, kSyncDeadBandFr);
+                 "                            re-latched, not ground back (slow sync: %d fr / %u ms, %d fr dead-band)\n",
+                 idx + 1, off, kSyncNudgeFr, kSyncNudgeMs, kSyncDeadBandFr);
         }
         return 0;
     }
-    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop one oldest frame
-        if (L.raw.discardOldest(1)) {
+    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop kSyncNudgeFr oldest frames (v8.4.9)
+        if (L.raw.discardOldest((size_t)kSyncNudgeFr)) {
             L.syncDrops++;
             if (nowMs - L.lastSyncLogMs >= 10000) {
                 L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- dropped 1 frame (%llu total; slow sync,\n"
-                     "                            1 fr / %u ms max, the 20 Hz @ 0.1%% keep-alive rides on)\n",
-                     idx + 1, err, L.syncDrops, kSyncNudgeMs);
+                tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- dropped %d frames (%llu total; slow sync,\n"
+                     "                            %d fr / %u ms max, the 20 Hz @ 0.1%% keep-alive rides on)\n",
+                     idx + 1, err, kSyncNudgeFr, L.syncDrops, kSyncNudgeFr, kSyncNudgeMs);
             }
         }
         return 0;
     }
-    if (err <= -(long long)kSyncDeadBandFr)           // EARLY: pad one frame
-        return (frameCount >= 2) ? 1 : 0;
+    if (err <= -(long long)kSyncDeadBandFr) {         // EARLY: pad kSyncNudgeFr frames (v8.4.9)
+        // clamp under the block: the pad region must repeat a REAL mixed
+        // frame (holdSrc = the last popped frame), never read past it.
+        if (frameCount > (size_t)kSyncNudgeFr) return (size_t)kSyncNudgeFr;
+        return (frameCount >= 2) ? frameCount - 1 : 0;
+    }
     return 0;                                         // inside the dead-band: hold
 }
 
@@ -3169,9 +3224,10 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     float* sc = L.scratch.data();
     size_t done = 0;
     // v8.4.7 SLOW SYNC: out2/3/4 servo to leg1's play boundary. A drop
-    // happened inside syncToFirst (the oldest frame is gone); a PAD is
-    // applied below -- this switch deliberately pops one frame less and
-    // repeats its last mixed frame. Leg1 (the master) is never touched.
+    // happened inside syncToFirst (the oldest frames are gone); a PAD is
+    // applied below -- this switch deliberately pops padFr frames less
+    // and holds its last mixed frame across the pad region (v8.4.9: up
+    // to kSyncNudgeFr frames). Leg1 (the master) is never touched.
     const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
     // per leg -- the center reads ch3 (idx==1), the rears read ch7/ch8
@@ -3265,22 +3321,26 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         }
         done += n;
     }
-    // v8.4.7 THE SYNC PAD: this switch deliberately popped padFr frames
-    // less -- the LAST output frame repeats the one before it (a held
-    // sample: the DAC receives its full frameCount, the boundary stalls by
-    // one frame, the wobble rides the repeat like any frame). A starved
-    // switch abandons its pad (the shortfall already stalled the boundary).
+    // v8.4.7 THE SYNC PAD, v8.4.9 THE WIDE NUDGE: this switch deliberately
+    // popped padApplied frames less -- the pad region HOLDS the last mixed
+    // frame (a held sample: the DAC receives its full frameCount, the
+    // boundary stalls by padApplied frames, the wobble rides the hold like
+    // any frame; at padApplied = 1 this is byte-for-byte the v8.4.7 pad).
+    // A starved switch abandons its pad (the shortfall already stalled
+    // the boundary).
     const size_t padApplied = (padFr && done + padFr >= frameCount) ? padFr : 0;
     if (padApplied) {
-        memcpy(out + (frameCount - 1) * L.outCh, out + (frameCount - 2) * L.outCh,
-               L.outCh * sizeof(float));
+        const float* holdSrc = out + (frameCount - padApplied - 1) * L.outCh;
+        for (size_t i = 0; i < padApplied; ++i)
+            memcpy(out + (frameCount - padApplied + i) * L.outCh, holdSrc,
+                   L.outCh * sizeof(float));
         L.syncPads++;
         const unsigned long long nowMs = GetTickCount64();
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded 1 frame (%llu total; slow sync,\n"
-                 "                            1 fr / %u ms max, a held sample, never a hole)\n",
-                 idx + 1, L.syncPads, kSyncNudgeMs);
+            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; slow sync,\n"
+                 "                            %d fr / %u ms max, a held sample, never a hole)\n",
+                 idx + 1, kSyncNudgeFr, L.syncPads, kSyncNudgeFr, kSyncNudgeMs);
         }
     }
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
@@ -3928,7 +3988,7 @@ static constexpr long long kTick100ns = -1;      // one 100-ns tick -- the poll-
 // buffer = the WaveRT looped buffer (driver DMA memory, mapped here); clock
 // = the mapped HW play-position register or KSPROPERTY_AUDIO_POSITION;
 // pacing = our own TIME-CRITICAL MMCSS thread writing exactly the
-// built-in 192-fr bite (v8.4.5) when the write cursor nears the lead. No events, no
+// built-in 288-fr bite (v8.4.9) when the write cursor nears the lead. No events, no
 // engine, no scheduler. The audio crossing bufferSwitchFill() is
 // bit-identical to WASAPI; only who paces the DMA changes. NOTE: a KS pin
 // is a direct line to the DAC -- Windows endpoint volume/muting do not
@@ -4283,9 +4343,10 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     Leg& L = g_leg[idx];
     KsOut& K = L.ks;
     const int outCh = L.outCh;
-    // v8.4.5 THE CALM BITE: 192 fr x 3, BUILT IN -- the loop request is
-    // simply bite x periods (the v8.4.3 sub-128 floor is retired with the
-    // sub-ms bites it protected).
+    // v8.4.9 THE POWER BITE: 288 fr x 2, BUILT IN -- the loop request is
+    // simply bite x periods (fewer, larger writes than v8.4.8's 256 x 4:
+    // ~167 writes/s; the double cushion retired with the field's own
+    // diagnosis -- the L/R stutter was the servo's 1-fr nudge, not the lead).
     const unsigned periodFrames  = kKsPeriodFrames;
     const unsigned loopPeriods   = kKsPeriods;
     const unsigned loopReqFrames = kKsPeriods * kKsPeriodFrames;
@@ -4764,7 +4825,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair + the v8.4.6 side folds\n"
         "; (ch5 onto out3, ch6 onto out4; optional; an EMPTY device keeps that\n"
         "; rear leg silent), no resampler anywhere.\n"
@@ -4993,16 +5054,17 @@ static void writeTemplate(const char* path) {
         ";   backendN = ks      WDM-KS -- the DEFAULT (the kernel-level loop)\n"
         ";   backendN = wasapi  wasapi exclusive (miniaudio event mode) -- the\n"
         ";                      automatic fallback and the opt-out\n"
-        "; v8.4.5 THE CALM BITE (field-directed: \"vlc ... crackles errily\"):\n"
-        "; ks_period_frames / ks_periods are BUILT IN -- 192 frames (4.0 ms of\n"
-        "; service, 250 wakes/s) x 3 periods (a 576-fr / 12.0 ms WaveRT loop,\n"
-        "; an 8.0 ms write lead). v8.4.3's sub-ms bite (a 0.67 ms cadence,\n"
-        "; ~1500 wakes/s) crackled erratically under a video decoder's load\n"
-        "; (VLC): the missed services lapped the DAC into stale audio. 192 fr\n"
-        "; buys six times the deschedule cushion and a SMALLER lead than the\n"
-        "; v8.4.3 floor rode (8 vs 10.7 ms) -- calmer and lower-latency at\n"
-        "; once. No keys, no rows; stale ks_period_frames / ks_periods lines\n"
-        "; load clean and are ignored. The DAC adds its hardware FIFO on top\n"
+        "; v8.4.9 THE POWER BITE (field-directed: \"have the buffer be 288\n"
+        "; samples and 2 buffers (since it's slower but more power saving\n"
+        "; that way)\"): ks_period_frames / ks_periods are BUILT IN -- 288\n"
+        "; frames (6.0 ms of service, ~167 writes/s) x 2 periods (a 576-fr\n"
+        "; / 12.0 ms WaveRT loop, a 6.0 ms write lead). Fewer, larger\n"
+        "; writes than v8.4.8's 256 x 4 -- power saving; the double cushion\n"
+        "; retired with the field's own diagnosis (the L/R stutter was the\n"
+        "; servo's 1-frame nudge decohering the sample stream, not the\n"
+        "; lead -- see the wide nudge above). No keys, no rows; stale\n"
+        "; ks_period_frames / ks_periods lines load clean and are ignored.\n"
+        "; The DAC adds its hardware FIFO on top\n"
         "; (~1-2 ms, printed). v6.3.1: with both legs on ks the\n"
         "; banner's align line prints the est-path DIFFERENCE and which delay\n"
         "; knob to move -- the delay trim starts from that number. v6.5.9: the\n"
@@ -5076,12 +5138,13 @@ static void writeTemplate(const char* path) {
         "; invalidates the drift baseline and re-arms it once the path settles\n"
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
-        "; v8.4.7 SLOW SYNC: the INTER-LEG drift is synced away -- out2/3/4\n"
-        "; hold their settled offset to OUT1, the first device (the master,\n"
-        "; never adjusted): a 1-frame drop/pad at most every 200 ms, only\n"
-        "; past a 250 us dead-band, the baseline latching 2 s after each\n"
-        "; (re)open; a jump past ~40 ms re-latches instead of grinding. No\n"
-        "; key, no UI row. The cable clock itself stays observe-only.\n"
+        "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE): the INTER-LEG drift is\n"
+        "; synced away -- out2/3/4 hold their settled offset to OUT1, the\n"
+        "; first device (the master, never adjusted): a 16-frame drop/pad\n"
+        "; at most every 100 ms, only past a 250 us dead-band, the baseline\n"
+        "; latching 2 s after each (re)open; a jump past ~40 ms re-latches\n"
+        "; instead of grinding. No key, no UI row. The cable clock itself\n"
+        "; stays observe-only.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
@@ -7179,24 +7242,17 @@ static void guiBuildPages(HWND w) {
     // except a leg that IS the current default playback device (v7.6.3 --
     // its slider stays the user's; yield_default releases the DAC anyway).
     // v8.2.0: the transport description (shortened) rides below the timing
-    // one; v8.4.0: the quad pushed it down and the offsets joined the text
-    // -- 12 declared lines for a 12-line text, nothing clipped.
+    // one; v8.4.0: the quad pushed it down and the offsets joined the text.
+    // v8.4.8: the two paragraphs after the first are GONE (field-directed:
+    // "remove the two whole paragraphs after the first one from the timing
+    // tab, because it's overflowing") -- the KS-bite and slow-sync stories
+    // stay told by the boot banner and the ini.
     note(w, COLA_X, 204,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
          "EARLY leg. offset3_ms/offset4_ms are the same knob for the rear legs\n"
          "(leg3/leg4 = rear L/R; an empty rear device = no rear output). The\n"
          "banner prints every est path; 'drift' already includes your delay\n"
-         "(it IS the alignment, not a fault).\n"
-         "\n"
-         "The KS bite is BUILT IN (v8.4.5): 192 frames x 3 periods -- 4 ms of\n"
-         "service, a 12 ms loop, no knob. Every leg runs the KS kernel loop\n"
-         "by default -- a driver refusal falls back to wasapi exclusive\n"
-         "(backendN = wasapi opts legs 1/2 back in); out1ms/out2ms are\n"
-         "constants: 1 ms (a KS ignores).\n"
-         "\n"
-         "v8.4.7 SLOW SYNC: out2/3/4 hold their settled offset to out1, the\n"
-         "first device (a 1-frame nudge at most every 200 ms, past a 250 us\n"
-         "dead-band) -- the devices no longer drift apart over time.\n", 16);
+         "(it IS the alignment, not a fault).\n", 5);
 
     // v8.3.0: THE SETTINGS PAGE IS GONE -- nothing on it survived as a
     // setting: the drift trio + volume_follow are hardcoded constants, and
@@ -10177,7 +10233,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
     // v4.0: the REAL negotiated device period per leg feeds the ring floor
     // and the gated-drop line. v6.3: a KS leg's bite is exactly the
-    // built-in 192-fr bite (v8.4.5; our pacing thread never asks for more).
+    // built-in 288-fr bite (v8.4.9; our pacing thread never asks for more).
     for (int i = 0; i < 4; ++i) {
         if (g_leg[i].disabled) { g_periodFrames[i] = 0; continue; }   // v8.4.0: no device
         if (g_leg[i].backend == 1) {
@@ -10523,7 +10579,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
            "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/3/4 hold\n"
            "                            their settled offset to OUT1 (the first device, never adjusted) -- a\n"
-           "                            1-frame drop/pad at most every 200 ms past a 250 us dead-band.\n");
+           "                            16-frame drop/pad at most every 100 ms past a 250 us dead-band (v8.4.9).\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
