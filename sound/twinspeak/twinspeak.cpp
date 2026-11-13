@@ -1,16 +1,35 @@
+// v8.4.11: the Windows link set, carried by the source so a bare cl.exe line
+// needs no .vcxproj (field-directed compile command):
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "propsys.lib")
+
 // ============================================================================
-//  twinspeak v8.4.10 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
-//  leg2 = Adesso Xtream S5 (center-only), leg3 = rear L, leg4 = rear R
-//  (optional: an EMPTY rear device keeps that leg silent) -- WASAPI/WDM-KS
-//  exclusive, every sample bit-exact, no resampler or pitch path anywhere.
-//  delay1/2_ms + offset3/4_ms are whole-ms prefills on the raw ring; drift
-//  is measured, never resampled (v8.1.0) -- v8.4.7 SLOW SYNC: every leg
-//  EXCEPT the first holds its settled offset to leg1's play boundary (a
-//  16-frame drop/pad at most every 100 ms, v8.4.9; no key, no UI); the
-//  cable clock itself stays measure-only.
+//  leg2 = Adesso Xtream S5 (center-only), leg3 = THE REARS ON ONE DEVICE
+//  (stereo: L = ch7+ch5 at gain_rl, R = ch8+ch6 at gain_rr; optional: an
+//  EMPTY device keeps the rears silent) -- WASAPI/WDM-KS exclusive, every
+//  sample bit-exact, no resampler or pitch path anywhere. delay1/2_ms +
+//  offset3_ms are whole-ms prefills on the raw ring; drift is measured,
+//  never resampled (v8.1.0) -- v8.4.7 SLOW SYNC: every leg EXCEPT the first
+//  holds its settled offset to leg1's play boundary (a 16-frame drop/pad at
+//  most every 100 ms, v8.4.9; no key, no UI), and v8.4.11 adds the old
+//  warden's 5 ms / 2 s BITE on top so slow creep is corrected, never
+//  accepted; the cable clock itself stays measure-only.
 //
 //  ARCHITECTURE (v8.1.0 -- THE STRIPPED PATH):
 //    VAC cable (8ch shared capture, exclusive)
@@ -21,14 +40,14 @@
 //      +--> leg2.raw ring (the fan-out) --> the switch mixes INLINE (out2 first)
 //      |      gates: ch3 zero -> mix muted; ch3 == Windows stereo-upmix
 //      |      fingerprint -> muted; mix: both outs = ch3 only, rest muted
-//      +--> leg3.raw / leg4.raw (v8.4.0: the rear legs, OPTIONAL)
-//             mix: both outs = gain_rl*(ch7+ch5) / gain_rr*(ch8+ch6) --
+//      +--> leg3.raw (v8.4.11: THE REARS ON ONE DEVICE, OPTIONAL)
+//             mix: out L = gain_rl*(ch7+ch5), out R = gain_rr*(ch8+ch6) --
 //             the rear pair at plain gain + THE v8.4.6 SIDE FOLD (the
-//             sides ch5/ch6 ride their same-side rear leg at the LEG's
+//             sides ch5/ch6 ride their same-side rear OUTPUT at their
 //             gain; out1's side slots stay ZERO so the sides never play
 //             anywhere but here), each lane gated BY ITSELF (ch7/ch8/
 //             ch5/ch6 zero -> that lane's term muted; the mix skips only
-//             when BOTH lanes are zero); EMPTY device = leg silent
+//             when ALL FOUR lanes are zero); EMPTY device = leg silent
 //      v8.4.5: EVERY leg sums the universal keep-alive at the device layer
 //      -- 20 Hz @ 0.1% on the driven slots (leg1: FL/FR only), through
 //      every gate and every gap: a gated leg is PROGRAM-silent, never
@@ -43,6 +62,49 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.11 THE INSTANT ZERO, THE WARDEN BITE, THE ONE REAR LEG + THE
+//            384x3 BITE (field-directed: "I still hear this center channel
+//            upmix ... I think the audio device drifting is from the fact
+//            the sample size is still a tad too small ... I want it so
+//            it's 384 samples with 3 buffers instead ... raw2 is increasing
+//            in offset over time without me knowing it ... something
+//            happens and raw2 increases up to like 36ms ... Apply the same
+//            thing to rear L and rear R, but combine both to just be one
+//            leg3 so you only have to handle one device of the rear at
+//            once"). (1) THE INSTANT ZERO: the upmix guard's 2.5 ms fade
+//            is RETIRED -- a fingerprint HIT zeroes the chunk that
+//            produced it on the spot (the fade was the leak: every engage
+//            let ~120 frames of a*FL+b*FR through at ramping gain, the
+//            field audibly; deepseek's diagnosis, confirmed in code); a
+//            MISS plays it on the spot. No fade, no ramp, no anti-click
+//            compromise -- the v8.4.10 "play the moment the input frame is
+//            detected" contract, byte for byte. (2) THE WARDEN BITE: the
+//            old version's drift correction (the shipped ini:
+//            drift_correct_ms = 5, drift_interval_ms = 2000) returns
+//            INSIDE the sync servo -- past 5 ms of accumulated drift a leg
+//            drops (or held-sample pads) up to 240 frames in one bite, at
+//            most once per 2 s, on top of the 16 fr / 100 ms wide nudge.
+//            THE 36 MS ABNORMALITY IS THE OLD RE-LATCH: kSyncRelatchFr
+//            could not tell slow creep from a reopen-class jump, so every
+//            ~40 ms of accumulated drift got silently accepted as the new
+//            baseline ("increasing over time without me knowing it") -- a
+//            jump now re-latches only when the offset moves ~20 ms inside
+//            ONE servo window (an eviction batch, a stall, a reopen);
+//            CREEP is corrected, never accepted, and the bites log.
+//            (3) THE ONE REAR LEG: leg3 + leg4 merge -- ONE rear device,
+//            out L = gain_rl*(ch7 + ch5), out R = gain_rr*(ch8 + ch6),
+//            all four lanes gated BY THEMSELVES ('rear L / side L / rear R
+//            / side R gate'), the mix skipping only when ALL FOUR are
+//            zero; output_device4 and offset4_ms are read-and-ignored
+//            (stale inis load clean), the gain quad and the delay quad's
+//            first three knobs keep their keys, and the servo + bite ride
+//            leg3 like every non-master leg. (4) THE 384x3 BITE: 384
+//            frames x 3 periods -- 8.0 ms of service, ~125 writes/s, a
+//            1152-fr / 24.0 ms WaveRT loop and a 768-fr / 16.0 ms write
+//            lead (deeper than every prior default; the field's own
+//            diagnosis for the drift stress). NO new ini key, NO UI row
+//            beyond the retired leg4 controls; the est-path banner prints
+//            the deeper lead live.
 //    v8.4.0 FOUR LEGS + THE FOLD IS BUILT IN (field-directed):
 //            leg3 (rear L) and leg4 (rear R) carry the cable's rear pair
 //            (ch7 RL / ch8 RR) on their OWN devices: out3 = gain_rl * ch7
@@ -1964,8 +2026,10 @@
 //                               ; leg takes the delay; see the template)
 //      lfe_fold = on            ; (retired -- the fold is built in, ignored)
 //      input_device / output_device1 / output_device2
-//      output_device3 / output_device4 ; v8.4.0 rear legs -- EMPTY = silent
-//      offset3_ms / offset4_ms  ; v8.4.0: the rear legs' delay twins
+//      output_device3          ; v8.4.0 rear legs -- EMPTY = silent (v8.4.11:
+//                               ; ONE device carries both rears;
+//                               ; output_device4/offset4_ms retired, ignored)
+//      offset3_ms              ; v8.4.0: the rear leg's delay twin
 //      optional: gain_l, gain_r, gain_rl, gain_rr, gain_lfe, gain_center,
 //                out2_first, volume_endpoint, chimes, chime_gain,
 //                pin_outputs (retired key, ignored)
@@ -2031,7 +2095,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.10"
+#define TWS_VERSION "8.4.11"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2126,10 +2190,10 @@ typedef DWORD (WINAPI *TS_KsCreatePinFn)(HANDLE, PKSPIN_CONNECT, ACCESS_MASK, PH
 static constexpr int      kInCh          = 8;      // VAC order: L R C LFE SL SR RL RR
 static constexpr int      kOutCh1        = 6;      // leg1: Windows 5.1 FL FR FC LFE XL XR
 static constexpr int      kOutCh2        = 2;      // leg2: stereo center speaker
-static constexpr int      kRearLCh       = 6;      // 0-based: cable ch7 (RL) -- out3's source (v8.4.5: hoisted for the lane gates)
-static constexpr int      kRearRCh       = 7;      // 0-based: cable ch8 (RR) -- out4's source
-static constexpr int      kSideLCh       = 4;      // 0-based: cable ch5 (SL) -- out3's side-fold source (v8.4.6)
-static constexpr int      kSideRCh       = 5;      // 0-based: cable ch6 (SR) -- out4's side-fold source (v8.4.6)
+static constexpr int      kRearLCh       = 6;      // 0-based: cable ch7 (RL) -- out3's LEFT source (v8.4.5: hoisted for the lane gates)
+static constexpr int      kRearRCh       = 7;      // 0-based: cable ch8 (RR) -- out3's RIGHT source (v8.4.11: one device)
+static constexpr int      kSideLCh       = 4;      // 0-based: cable ch5 (SL) -- out3's left side-fold source (v8.4.6)
+static constexpr int      kSideRCh       = 5;      // 0-based: cable ch6 (SR) -- out3's right side-fold source (v8.4.6/8.4.11)
 static constexpr int      kScratchFrames = 8192;
 static constexpr unsigned kSampleRate    = 48000;
 
@@ -2151,7 +2215,21 @@ static constexpr int      kSyncDeadBandFr = 12;     // 250 us at 48 kHz -- the e
 static constexpr int      kSyncNudgeFr    = 16;     // v8.4.9: the nudge step -- 16 fr (333 us) drop or held-sample pad
 static constexpr unsigned kSyncNudgeMs    = 100;    // v8.4.9: 16 fr per window: 160 fr/s capacity (~3333 ppm)
 static constexpr unsigned kSyncSettleMs   = 2000;   // past the last (re)open before the baseline latches
-static constexpr int      kSyncRelatchFr  = 2000;   // ~40 ms: a jump re-latches the baseline, never grinds
+// v8.4.11 THE WARDEN BITE (the old version's drift correction, from the
+// shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000): past 5 ms
+// of accumulated drift a leg takes up to a 240-frame bite (drop or
+// held-sample pad) at most once per 2 s, on top of the wide nudge -- slow
+// creep is CORRECTED, never accepted.
+static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms)
+static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
+// v8.4.11 THE RE-LATCH, FIXED: the v8.4.7 re-latch could not tell slow
+// creep from a reopen-class jump -- every ~40 ms of accumulated drift was
+// silently accepted as the new baseline (the field's "raw2 increasing in
+// offset over time ... up to like 36 ms"). A jump is now a STEP test: the
+// offset moving more than 20 ms inside ONE 100 ms servo window (an eviction
+// batch, a stall, a reopen) re-latches; creep of any size is ground back
+// with the nudge + the bite. CREEP IS NEVER ACCEPTED AGAIN.
+static constexpr int      kSyncJumpFr     = 960;    // ~20 ms in one 100 ms window = a jump, not creep
 static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
 static constexpr long long kSyncUnlatched = -0x7fffffffffffffffLL;  // the baseline sentinel
 
@@ -2194,20 +2272,19 @@ static constexpr unsigned kReplayMaxPeriods   = 4;      // lastBlock size (the K
 // default -- ignores the request whole. Equal by construction.
 static constexpr unsigned kOutPeriodMs       = 1;      // WASAPI leg request (v8.2.0)
 
-// v8.4.9 THE POWER BITE (field-directed: "have the buffer be 288 samples
-// and 2 buffers (since it's slower but more power saving that way)"):
-// the bite is 288 frames x 2 periods -- 6.0 ms of service per write,
-// ~167 writes/s (fewer, larger writes than v8.4.8's 256 x 4), a 576-fr
-// / 12.0 ms WaveRT loop and a 288-fr / 6.0 ms write lead. The v8.4.8
-// double cushion RETIRES with it: the field still heard the L/R stutter
-// at the 16 ms lead, so the cushion was not the cause -- the diagnosis
-// moved to the sync servo's 1-frame nudge (see kSyncNudgeFr below).
-// Same kernel loop, same register pacing, no resampler anywhere; the
-// est-path banner prints the shallower lead live. No ini key, no GUI
-// row, no clamp; stale ks_period_frames / ks_periods lines load clean
-// and are ignored.
-static constexpr unsigned kKsPeriodFrames    = 288;  // the bite: 6.0 ms of service @ 48 kHz (v8.4.9)
-static constexpr unsigned kKsPeriods         = 2;    // the WaveRT loop: 576 fr (12.0 ms), lead 288 fr (6.0 ms)
+// v8.4.11 THE 384x3 BITE (field-directed: "I think the audio device drifting
+// is from the fact the sample size is still a tad too small ... I want it so
+// it's 384 samples with 3 buffers instead. At this point that's just enough
+// for me"): the bite is 384 frames x 3 periods -- 8.0 ms of service per
+// write, ~125 writes/s, a 1152-fr / 24.0 ms WaveRT loop and a 768-fr /
+// 16.0 ms write lead (the deepest shipped lead yet: a late service has
+// twice the v8.4.9 margin before the DAC grazes the buffer edge -- the
+// field's own diagnosis for the drift stress). Same kernel loop, same
+// register pacing, no resampler anywhere; the est-path banner prints the
+// lead live. No ini key, no GUI row, no clamp; stale ks_period_frames /
+// ks_periods lines load clean and are ignored.
+static constexpr unsigned kKsPeriodFrames    = 384;  // the bite: 8.0 ms of service @ 48 kHz (v8.4.11)
+static constexpr unsigned kKsPeriods         = 3;    // the WaveRT loop: 1152 fr (24.0 ms), lead 768 fr (16.0 ms)
 
 // v6.4 drift warden pacing: the observe log never fires more than once per
 // drift_interval_ms (v6.5.8; was the hardcoded 30 s), only after the drift
@@ -2226,19 +2303,21 @@ struct Config {
     std::string inputDevice;
     std::string outputDevice1;
     std::string outputDevice2;
-    // v8.4.0 THE REAR LEGS: output_device3 = rear L, output_device4 = rear R.
-    // An EMPTY string keeps that leg SILENT -- no device is opened, no ring
-    // is built, the needle never matches: empty in = empty out, the truth.
+    // v8.4.0 THE REAR LEGS; v8.4.11 THE ONE REAR LEG: output_device3 opens
+    // ONE stereo device carrying BOTH rears (out L = ch7+ch5, out R =
+    // ch8+ch6). output_device4 is RETIRED -- read-and-ignored (stale ini
+    // lines load clean). An EMPTY output_device3 keeps the rears SILENT --
+    // no device is opened, no ring is built, the needle never matches:
+    // empty in = empty out, the truth.
     std::string outputDevice3;
-    std::string outputDevice4;
     std::string volumeEndpoint;      // v3.9: needle for the cable's PLAYBACK endpoint
                                      //       (volume follow); empty = use input_device
     float       gainL          = 1.0f;
     float       gainR          = 1.0f;
     float       gainLfe        = 0.4f;
     float       gainCenter     = 1.0f;
-    // v8.4.0: the rear legs' gains (leg3 = gain_rl * ch7, leg4 = gain_rr *
-    // ch8, on both outputs of each 2ch device -- the leg2 pattern).
+    // v8.4.0: the rear gains; v8.4.11: leg3's ONE stereo device --
+    // out L = gain_rl * (ch7 + ch5), out R = gain_rr * (ch8 + ch6).
     float       gainRl         = 1.0f;
     float       gainRr         = 1.0f;
     // v6.5.18 CENTER DIALOGUE EQ: RBJ peaking biquad on ch3, out2 mix only,
@@ -2260,10 +2339,10 @@ struct Config {
                                           // v6.6.8: INTEGRATED -- always on
     float       delay1Ms       = 0.0f;    // v6.1: bit-exact ring delay per leg
     float       delay2Ms       = 0.0f;    //       (the EARLY leg takes the delay)
-    // v8.4.0: delay1/2's exact twins for the rear legs -- a whole-ms silence
-    // prefill on leg3's / leg4's raw ring (the user's naming: offset3/4_ms).
+    // v8.4.0: delay1/2's exact twin for the rear leg -- a whole-ms silence
+    // prefill on leg3's raw ring (the user's naming: offset3_ms;
+    // offset4_ms retired with the one-rear-leg merge, read-and-ignored).
     float       offset3Ms      = 0.0f;
-    float       offset4Ms      = 0.0f;
     bool        centerGate     = true;    // v6.1: ch3 digital-zero -> the out2 mix mutes (v8.4.5: the universal wobble rides on)
                                           //       v6.6.8: INTEGRATED -- always on
     bool        centerUpmixGuard = true;  // v6.1: ch3 == a*ch1+b*ch2 (Windows fills FC
@@ -2593,16 +2672,16 @@ struct Leg {
     size_t              delayFrames = 0;         // extra ring depth = delay_ms * 48
     float               delayMs     = 0.0f;      // as configured (banner)
     std::atomic<unsigned long long> cmUpmix{0}; // blocks muted by the upmix guard
-    // v8.4.10: the upmix guard is INSTANT -- each chunk's verdict is that
-    // chunk's own fingerprint evidence, applied to that chunk BEFORE it is
-    // mixed (the v7.8.4 2-hit/8-miss hysteresis retired with the field's
-    // diagnosis: it left the gate whole buffers behind the evidence, and
-    // the late verdict chopped the center at every content transition --
-    // the chattering). The ch3 mute stays a 2.5 ms per-frame FADE (the
-    // anti-click at a flip, not a delay). Leg2's device thread owns the
-    // state (single writer, no atomics needed).
-    bool                cgMuted = false;         // guard engaged: ch3 fades toward 0
-    float               cgGain  = 1.0f;          // current ch3 fade gain (1 = pass)
+    // v8.4.10/8.4.11: the upmix guard is INSTANT and the zero is INSTANT --
+    // each chunk's verdict is that chunk's own fingerprint evidence,
+    // applied to that chunk BEFORE it is mixed (the v7.8.4 2-hit/8-miss
+    // hysteresis retired: it left the gate whole buffers behind the
+    // evidence; the v7.8.4 2.5 ms fade retired v8.4.11: it WAS the leak --
+    // every engage let ~120 frames of a*FL+b*FR through at ramping gain).
+    // Leg2's device thread owns the state (single writer, no atomics
+    // needed).
+    bool                cgMuted = false;         // guard engaged: ch3 ZEROED on the spot
+    float               cgGain  = 1.0f;          // verdict mirror for the pane (1 = pass, 0 = zeroed)
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: this block's verdict + the log
@@ -2619,6 +2698,15 @@ struct Leg {
     bool                gateMuted2   = false;    // v8.4.6: the side lane's own verdict (rear legs only)
     bool                gateWasMuted2 = false;   // v8.4.6: its state-change latch ('side L/R gate')
     unsigned long long  lastSideLogMs = 0;       // v8.4.6: the side gate's own rate limit
+    // v8.4.11: the merged rear's RIGHT lanes, each on its own latch and its
+    // own rate limit (rear R ch8 / side R ch6) -- the v8.4.6 contract
+    // verbatim, one device carrying both rears.
+    bool                gateMuted3   = false;    // v8.4.11: rear R's own verdict ('rear R gate')
+    bool                gateWasMuted3 = false;
+    bool                gateMuted4   = false;    // v8.4.11: side R's own verdict ('side R gate')
+    bool                gateWasMuted4 = false;
+    unsigned long long  lastSide2LogMs = 0;      // v8.4.11: rear R gate's own rate limit
+    unsigned long long  lastSide3LogMs = 0;      // v8.4.11: side R gate's own rate limit
     // ---- v8.4.7 SLOW SYNC TO LEG1: the drift servo state (no key, no UI).
     // syncBase holds the SETTLED offset to leg1's play boundary this leg
     // must hold (frames; + = this leg is the delayed one). Written by this
@@ -2631,6 +2719,17 @@ struct Leg {
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
     unsigned long long     lastSyncLogMs = 0;
+    // v8.4.11: the warden bite + the step-jump tracker (this leg's device
+    // thread only, the same single-writer discipline). lastSyncOff/
+    // syncOffValid hold the previous look's offset so a ~20 ms move inside
+    // one 100 ms window is provably a jump, not creep; lastBiteMs
+    // rate-limits the 240-frame warden bite to one per 2 s;
+    // wardenDrops/wardenPads count the bites.
+    long long              lastSyncOff   = 0;
+    bool                   syncOffValid  = false;
+    unsigned long long     lastBiteMs    = 0;
+    unsigned long long     wardenDrops   = 0;
+    unsigned long long     wardenPads    = 0;
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -2674,8 +2773,10 @@ struct Leg {
     // plays silence and counts into 'und' -- nothing escalates, nothing
     // restarts, nothing repeats a frame.
 };
-// v8.4.0: FOUR legs -- 0 = mains (5.1), 1 = center, 2 = rear L, 3 = rear R.
-// Legs 2/3 are OPTIONAL: an empty output_device3/4 marks them disabled.
+// v8.4.0: FOUR slots -- 0 = mains (5.1), 1 = center, 2 = the rears (ONE
+// stereo device, v8.4.11), 3 = RETIRED (force-disabled; the old leg4's
+// slot). The rear leg is OPTIONAL: an empty output_device3 marks it
+// disabled.
 // v8.4.1: leg1 (center) is optional TOO -- an empty output_device2 marks it
 // disabled and turns on THE CENTER FOLD below.
 static Leg g_leg[4];
@@ -2699,7 +2800,7 @@ static const char* legNeedle(int i) {
         case 0:  return g_cfg.outputDevice1.c_str();
         case 1:  return g_cfg.outputDevice2.c_str();
         case 2:  return g_cfg.outputDevice3.c_str();
-        default: return g_cfg.outputDevice4.c_str();
+        default: return "";            // v8.4.11: leg4 is retired -- never opens, never yields
     }
 }
 
@@ -3144,13 +3245,20 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // kSyncNudgeFr frames less and holds its last mixed frame across them --
 // the DAC always receives its full frameCount, and the pad is a held
 // sample, not a hole.
-// A leg that jumps past kSyncRelatchFr (an eviction batch, a stall, a
-// reopen) re-latches its baseline instead of grinding the distance back
-// -- the reference itself moved. A yielded or heart-silent leg1 freezes
+// v8.4.11 THE WARDEN BITE: the old version's drift correction (the
+// shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000) rides the
+// same servo -- past 5 ms of accumulated drift a leg takes up to a
+// 240-frame drop or held-sample pad, at most once per 2 s, on top of the
+// wide nudge; slow creep is CORRECTED, never accepted. THE RE-LATCH IS A
+// STEP TEST now: only the offset moving ~20 ms inside ONE servo window
+// (an eviction batch, a stall, a reopen) re-latches the baseline -- the
+// old |err| test silently accepted every ~40 ms of creep (the field's
+// "raw2 increasing ... up to like 36 ms").
+// A yielded or heart-silent leg1 freezes
 // the sync whole (a parked leg's ring still evicts, and eviction jitter
 // is not a clock to follow). Returns the number of pad frames the switch
-// must synthesize (0 or kSyncNudgeFr, clamped under the block). No ini
-// key, no UI row: the constants are the engine's truth.
+// must synthesize (0, or up to kDriftCorrectFr, clamped under the block).
+// No ini key, no UI row: the constants are the engine's truth.
 static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
@@ -3169,6 +3277,7 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
     if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) {
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // (re)arm
+        L.syncOffValid = false;
         return 0;
     }
     LARGE_INTEGER fsw;
@@ -3177,41 +3286,96 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
         (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
     if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) {
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);
+        L.syncOffValid = false;
         return 0;
     }
     const long long base = L.syncBase.load(std::memory_order_relaxed);
     if (base == kSyncUnlatched) {
         L.syncBase.store(off, std::memory_order_relaxed);   // latch the settled offset
+        L.lastSyncOff  = off;
+        L.syncOffValid = true;
         return 0;
     }
     const long long err = off - base;   // + = this leg drifted LATE vs leg1
-    if (err > kSyncRelatchFr || err < -kSyncRelatchFr) {
-        // a jump, not a drift: the reference (or this leg) moved whole --
-        // re-latch, never grind tens of ms back one frame at a time.
+    // v8.4.11 THE STEP-JUMP TEST: the offset moving ~20 ms INSIDE one 100 ms
+    // window is a reopen-class event (an eviction batch, a stall, a reopen)
+    // -- re-latch, never grind. SLOW CREEP of any size is NOT a jump: it is
+    // corrected below, never accepted (the old |err| re-latch silently
+    // blessed every ~40 ms of accumulated drift -- the field's "raw2
+    // increasing in offset over time ... up to like 36 ms").
+    const bool hadOff    = L.syncOffValid;
+    const long long step = hadOff ? (off - L.lastSyncOff) : 0;
+    L.lastSyncOff  = off;
+    L.syncOffValid = true;
+    if (hadOff && (step > kSyncJumpFr || step < -kSyncJumpFr)) {
         L.syncBase.store(off, std::memory_order_relaxed);
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : offset jumped to %lld fr vs out1 (a reopen-class event) -- baseline\n"
-                 "                            re-latched, not ground back (slow sync: %d fr / %u ms, %d fr dead-band)\n",
-                 idx + 1, off, kSyncNudgeFr, kSyncNudgeMs, kSyncDeadBandFr);
+            tlog("[twinspeak] sync out%d     : offset jumped %+lld fr inside one window vs out1 (a reopen-class\n"
+                 "                            event) -- baseline re-latched, not ground back (the warden bite\n"
+                 "                            %d fr / %u ms, the %d fr / %u ms nudge, %d fr dead-band)\n",
+                 idx + 1, step, kDriftCorrectFr, kDriftIntervalMs,
+                 kSyncNudgeFr, kSyncNudgeMs, kSyncDeadBandFr);
         }
         return 0;
     }
-    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop kSyncNudgeFr oldest frames (v8.4.9)
+    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop (nudge v8.4.9, warden bite v8.4.11)
+        // THE WARDEN BITE: past 5 ms of drift, take a 240-frame bite in one
+        // discard -- at most once per 2 s (the old version's drift
+        // correction, from the shipped ini: drift_correct_ms = 5,
+        // drift_interval_ms = 2000). The wide nudge keeps ticking between
+        // bites, so the total capacity is ~272 fr/s and a 36 ms creep is
+        // gone in seconds -- visibly, in the log.
+        if (err >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
+                L.syncDrops++;
+                L.wardenDrops++;
+                L.lastBiteMs = nowMs;
+                if (nowMs - L.lastSyncLogMs >= 10000) {
+                    L.lastSyncLogMs = nowMs;
+                    tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- the warden bit %d frames\n"
+                         "                            (%llu bite(s), %llu total dropped; the old drift correction:\n"
+                         "                            %d fr / %u ms, creep corrected, never accepted)\n",
+                         idx + 1, err, kDriftCorrectFr,
+                         (unsigned long long)L.wardenDrops, (unsigned long long)L.syncDrops,
+                         kDriftCorrectFr, kDriftIntervalMs);
+                }
+            }
+            return 0;
+        }
         if (L.raw.discardOldest((size_t)kSyncNudgeFr)) {
             L.syncDrops++;
             if (nowMs - L.lastSyncLogMs >= 10000) {
                 L.lastSyncLogMs = nowMs;
                 tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- dropped %d frames (%llu total; slow sync,\n"
                      "                            %d fr / %u ms max, the 20 Hz @ 0.1%% keep-alive rides on)\n",
-                     idx + 1, err, kSyncNudgeFr, L.syncDrops, kSyncNudgeFr, kSyncNudgeMs);
+                     idx + 1, err, kSyncNudgeFr, (unsigned long long)L.syncDrops, kSyncNudgeFr, kSyncNudgeMs);
             }
         }
         return 0;
     }
-    if (err <= -(long long)kSyncDeadBandFr) {         // EARLY: pad kSyncNudgeFr frames (v8.4.9)
+    if (err <= -(long long)kSyncDeadBandFr) {         // EARLY: pad (nudge v8.4.9, warden bite v8.4.11)
         // clamp under the block: the pad region must repeat a REAL mixed
         // frame (holdSrc = the last popped frame), never read past it.
+        const long long need = -err;
+        if (need >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            const size_t pad = (frameCount > (size_t)kDriftCorrectFr)
+                             ? (size_t)kDriftCorrectFr
+                             : (frameCount >= 2) ? frameCount - 1 : 0;
+            if (pad) {
+                L.syncPads++;
+                L.wardenPads++;
+                L.lastBiteMs = nowMs;
+                if (nowMs - L.lastSyncLogMs >= 10000) {
+                    L.lastSyncLogMs = nowMs;
+                    tlog("[twinspeak] sync out%d     : %lld fr early vs out1 -- the warden padded %d frames\n"
+                         "                            (%llu bite(s), %llu total padded; a held sample, never a hole)\n",
+                         idx + 1, err, kDriftCorrectFr,
+                         (unsigned long long)L.wardenPads, (unsigned long long)L.syncPads);
+                }
+            }
+            return pad;
+        }
         if (frameCount > (size_t)kSyncNudgeFr) return (size_t)kSyncNudgeFr;
         return (frameCount >= 2) ? frameCount - 1 : 0;
     }
@@ -3276,18 +3440,22 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // to kSyncNudgeFr frames). Leg1 (the master) is never touched.
     const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
-    // per leg -- the center reads ch3 (idx==1), the rears read ch7/ch8
-    // (idx==2/3, v8.4.5); the mains (idx==0) carry no gate. Every popped
-    // chunk ANDs its own verdict in; a starved block (done < frameCount at
-    // the end) never reaches the mute -- the wobble through a capture gap
-    // is the keep-alive's own job, not lane content. v8.4.6: a rear leg
-    // gates TWO lanes, each BY ITSELF -- its rear channel (gateLane) and
-    // its side fold (gateLane2: ch5 onto out3, ch6 onto out4); the center
-    // keeps its single ch3 lane untouched.
-    const int gateLane  = (idx == 1) ? 2 : (idx == 2) ? kRearLCh : (idx == 3) ? kRearRCh : -1;
-    const int gateLane2 = (idx == 2) ? kSideLCh : (idx == 3) ? kSideRCh : -1;   // v8.4.6: the side fold's lane (rears only)
-    bool laneZeroBlock  = true;    // the leg's own lane verdict (ch3/ch7/ch8)
-    bool lane2ZeroBlock = true;    // v8.4.6: the side lane's own verdict (ch5/ch6)
+    // per leg -- the center reads ch3 (idx==1); v8.4.11: the ONE rear leg
+    // (idx==2) reads FOUR lanes, each BY ITSELF -- rear L ch7 and side L
+    // ch5 gate the LEFT output, rear R ch8 and side R ch6 gate the RIGHT
+    // output; the mains (idx==0) carry no gate. Every popped chunk ANDs
+    // its own verdicts in; a starved block (done < frameCount at the end)
+    // never reaches the mute -- the wobble through a capture gap is the
+    // keep-alive's own job, not lane content. (The old leg4's lanes
+    // retired with the merge: one device carries both rears.)
+    const int gateLane  = (idx == 1) ? 2 : (idx == 2) ? kRearLCh : -1;
+    const int gateLane2 = (idx == 2) ? kSideLCh : -1;   // v8.4.6: the side fold's lane (left output)
+    const int gateLane3 = (idx == 2) ? kRearRCh : -1;   // v8.4.11: rear R's own lane (right output)
+    const int gateLane4 = (idx == 2) ? kSideRCh : -1;   // v8.4.11: the side fold's lane (right output)
+    bool laneZeroBlock  = true;    // the leg's own lane verdict (ch3 / rear L ch7)
+    bool lane2ZeroBlock = true;    // the side fold's lane verdict (side L ch5)
+    bool lane3ZeroBlock = true;    // v8.4.11: rear R's own verdict (ch8)
+    bool lane4ZeroBlock = true;    // v8.4.11: side R's own verdict (ch6)
     while (done + padFr < frameCount) {
         const size_t want = frameCount - padFr - done;
         const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
@@ -3312,7 +3480,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // blocks -- a zero chunk has nothing to fingerprint). v8.4.6: the
         // side lane carries its OWN verdict -- one lane going zero never
         // touches the other's evidence.
-        bool zLane = false, zLane2 = false;
+        bool zLane = false, zLane2 = false, zLane3 = false, zLane4 = false;
         if (gateLane >= 0) {
             zLane = true;
             for (size_t i = 0; i < n; ++i)
@@ -3323,6 +3491,18 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 for (size_t i = 0; i < n; ++i)
                     if (sc[i * kInCh + gateLane2] != 0.0f) { zLane2 = false; break; }
                 lane2ZeroBlock = lane2ZeroBlock && zLane2;
+            }
+            if (gateLane3 >= 0) {
+                zLane3 = true;
+                for (size_t i = 0; i < n; ++i)
+                    if (sc[i * kInCh + gateLane3] != 0.0f) { zLane3 = false; break; }
+                lane3ZeroBlock = lane3ZeroBlock && zLane3;
+            }
+            if (gateLane4 >= 0) {
+                zLane4 = true;
+                for (size_t i = 0; i < n; ++i)
+                    if (sc[i * kInCh + gateLane4] != 0.0f) { zLane4 = false; break; }
+                lane4ZeroBlock = lane4ZeroBlock && zLane4;
             }
         }
         if (idx == 1)
@@ -3339,11 +3519,13 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // v8.4.4/v8.4.5: an all-zero lane chunk skips the mix outright
         // (bit-identical: the center mix is gain_center * ch3 ONLY) and the
         // center resets its EQ -- the gate's contract, in code. v8.4.6: a
-        // rear chunk skips only when BOTH its lanes are all-zero (a live
-        // side plays through a silent rear, a live rear through a silent
-        // side); a lone zero lane's term is a bit-exact no-op in the sum.
+        // lone zero lane's term is a bit-exact no-op in the sum. v8.4.11:
+        // the merged rear chunk skips only when ALL FOUR of its lanes are
+        // all-zero (a live side plays through a silent rear on the same
+        // output; a live right plays through a silent left).
         if ((L.zeroFast && bitZero8(sc, n)) ||
-            (gateLane >= 0 && zLane && (gateLane2 < 0 || zLane2))) {
+            (gateLane >= 0 && zLane && (gateLane2 < 0 || zLane2) &&
+             (gateLane3 < 0 || zLane3) && (gateLane4 < 0 || zLane4))) {
             if (idx == 1) centerEqFlushZ();
             // dst is already silence
         } else {
@@ -3425,23 +3607,26 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                              "                            the amp stays fed; no fade, no hysteresis, no ini switch)\n",
                              kGateName[idx], kGateLane[idx], kGateEq[idx]);
                     else
-                        tlog("[twinspeak] %s : %s is digital zero -- its term is muted on out%d (the v8.4.6 side fold\n"
-                             "                            still plays if the side lane is live; the mix skips only when BOTH\n"
-                             "                            lanes are zero; the 20 Hz @ 0.1%% keep-alive rides on -- program silence)\n",
+                        tlog("[twinspeak] %s : %s is digital zero -- its term is muted on out%d's LEFT output (the\n"
+                             "                            other lanes still play if they are live; the mix skips only when ALL\n"
+                             "                            FOUR lanes are zero; the 20 Hz @ 0.1%% keep-alive rides on -- program\n"
+                             "                            silence, v8.4.11: one rear device carries both rears)\n",
                              kGateName[idx], kGateLane[idx], idx + 1);
                 } else {
                     if (idx == 1)
                         tlog("[twinspeak] %s : %s carries samples again -- the mix resumes (the wobble never left)\n",
                              kGateName[idx], kGateLane[idx]);
                     else
-                        tlog("[twinspeak] %s : %s carries samples again -- its term resumes on out%d (the wobble never left)\n",
+                        tlog("[twinspeak] %s : %s carries samples again -- its term resumes on out%d's LEFT output (the wobble never left)\n",
                              kGateName[idx], kGateLane[idx], idx + 1);
                 }
             }
         }
         // v8.4.6 THE SIDE GATE: the fold's lane, on its own latch and its
         // own rate limit -- one lane's state change never swallows the
-        // other lane's evidence.
+        // other lane's evidence. v8.4.11: the merged rear carries the same
+        // four-lane contract on ONE device -- rear L / side L latch above
+        // and here, rear R / side R below.
         if (gateLane2 >= 0) {
             L.gateMuted2 = full && lane2ZeroBlock;
             if (L.gateMuted2 != L.gateWasMuted2) {
@@ -3449,16 +3634,58 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 const unsigned long long nowMs = GetTickCount64();
                 if (nowMs - L.lastSideLogMs >= 2000) {
                     L.lastSideLogMs = nowMs;
-                    static const char* kSideName[4] = { "", "", "side L gate", "side R gate" };
-                    static const char* kSideLane[4] = { "", "", "ch5", "ch6" };
+                    static const char* kSideName[4] = { "", "", "side L gate", "" };
+                    static const char* kSideLane[4] = { "", "", "ch5", "" };
                     if (L.gateMuted2)
-                        tlog("[twinspeak] %s : %s is digital zero -- the side fold's term is muted on out%d (the rear\n"
-                             "                            lane still plays if it is live; the mix skips only when BOTH lanes\n"
-                             "                            are zero; the 20 Hz @ 0.1%% keep-alive rides on -- program silence)\n",
+                        tlog("[twinspeak] %s : %s is digital zero -- the side fold's term is muted on out%d's LEFT\n"
+                             "                            output (the rear lane still plays if it is live; the mix skips only\n"
+                             "                            when ALL FOUR lanes are zero; the 20 Hz @ 0.1%% keep-alive rides on\n"
+                             "                            -- program silence)\n",
                              kSideName[idx], kSideLane[idx], idx + 1);
                     else
-                        tlog("[twinspeak] %s : %s carries samples again -- the side fold resumes on out%d (the wobble never left)\n",
+                        tlog("[twinspeak] %s : %s carries samples again -- the side fold resumes on out%d's LEFT output (the wobble never left)\n",
                              kSideName[idx], kSideLane[idx], idx + 1);
+                }
+            }
+        }
+        // v8.4.11 THE RIGHT LANES of the merged rear: rear R (ch8) and its
+        // side fold (ch6), each on its own latch and its own rate limit --
+        // the v8.4.6 contract, verbatim, for the right output.
+        if (gateLane3 >= 0) {
+            L.gateMuted3 = full && lane3ZeroBlock;
+            if (L.gateMuted3 != L.gateWasMuted3) {
+                L.gateWasMuted3 = L.gateMuted3;
+                const unsigned long long nowMs = GetTickCount64();
+                if (nowMs - L.lastSide2LogMs >= 2000) {
+                    L.lastSide2LogMs = nowMs;
+                    if (L.gateMuted3)
+                        tlog("[twinspeak] rear R gate : ch8 is digital zero -- its term is muted on out%d's RIGHT output (the\n"
+                             "                            other lanes still play if they are live; the mix skips only when ALL\n"
+                             "                            FOUR lanes are zero; the 20 Hz @ 0.1%% keep-alive rides on -- program\n"
+                             "                            silence)\n",
+                             idx + 1);
+                    else
+                        tlog("[twinspeak] rear R gate : ch8 carries samples again -- its term resumes on out%d's RIGHT output (the wobble never left)\n",
+                             idx + 1);
+                }
+            }
+        }
+        if (gateLane4 >= 0) {
+            L.gateMuted4 = full && lane4ZeroBlock;
+            if (L.gateMuted4 != L.gateWasMuted4) {
+                L.gateWasMuted4 = L.gateMuted4;
+                const unsigned long long nowMs = GetTickCount64();
+                if (nowMs - L.lastSide3LogMs >= 2000) {
+                    L.lastSide3LogMs = nowMs;
+                    if (L.gateMuted4)
+                        tlog("[twinspeak] side R gate : ch6 is digital zero -- the side fold's term is muted on out%d's RIGHT\n"
+                             "                            output (the rear lane still plays if it is live; the mix skips only\n"
+                             "                            when ALL FOUR lanes are zero; the 20 Hz @ 0.1%% keep-alive rides on\n"
+                             "                            -- program silence)\n",
+                             idx + 1);
+                    else
+                        tlog("[twinspeak] side R gate : ch6 carries samples again -- the side fold resumes on out%d's RIGHT output (the wobble never left)\n",
+                             idx + 1);
                 }
             }
         }
@@ -3668,19 +3895,19 @@ static void centerEqInit() {
 // off) so the mix is bit-identical to v6.4 (harness-proven). v8.4.0: the
 // discrete-LFE branch is RETIRED with the lfe_fold toggle -- the fold (the
 // confirmed routing) is the only path and its FP ops are untouched.
-// v8.4.0 THE REAR LEGS + v8.4.6 THE SIDE FOLD: out1's 5.1 side slots are
-// DRIVEN SILENCE -- the cable's rear pair (ch7 RL / ch8 RR of the VAC 8ch
-// map: 1L 2R 3C 4LFE 5SL 6SR 7RL 8RR) plays on its OWN legs: leg3 =
-// gain_rl * ch7 on both outputs, leg4 = gain_rr * ch8, the leg2 pattern
-// (one channel, both outputs). v8.4.6: the SIDES (ch5 SL / ch6 SR -- the
-// slots a 5.1 movie's surround lands on) FOLD onto their same-side rear
-// leg at the LEG's gain: out3 = gain_rl*(ch7 + ch5), out4 = gain_rr*(ch8 +
-// ch6); out1's side slots stay hard 0.0f so the sides never play anywhere
-// but the rears. A rear leg with an EMPTY device never runs -- empty in =
-// empty out (stereo content plays with silent rears; that is the truth),
-// and an empty leg3/leg4 takes its side fold down with it. A 5.1 movie
-// (surround on ch5/ch6) plays its surround on the rear speakers natively
-// now -- the v8.4.0 "flip the kRear*Ch constants" advice retires.
+// v8.4.0 THE REAR LEGS + v8.4.6 THE SIDE FOLD; v8.4.11 THE ONE REAR LEG:
+// out1's 5.1 side slots are DRIVEN SILENCE -- the cable's rear pair (ch7 RL
+// / ch8 RR of the VAC 8ch map: 1L 2R 3C 4LFE 5SL 6SR 7RL 8RR) plays on ONE
+// stereo leg: leg3's LEFT output = gain_rl * ch7, its RIGHT output =
+// gain_rr * ch8, the leg2 pattern (one source per output). v8.4.6: the
+// SIDES (ch5 SL / ch6 SR -- the slots a 5.1 movie's surround lands on)
+// FOLD onto their same-side rear OUTPUT at that side's gain: out L =
+// gain_rl*(ch7 + ch5), out R = gain_rr*(ch8 + ch6); out1's side slots stay
+// hard 0.0f so the sides never play anywhere but the rears. A rear leg
+// with an EMPTY device never runs -- empty in = empty out (stereo content
+// plays with silent rears; that is the truth), and an empty leg3 takes its
+// side fold down with it. A 5.1 movie (surround on ch5/ch6) plays its
+// surround on the rear speakers natively now.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // leg1 = NATIVE 5.1 stream. FC is DRIVEN SILENCE: the endpoint sees a
@@ -3769,25 +3996,25 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             }
         }
     } else {
-        // v8.4.0 THE REAR LEGS: one cable channel, both outputs -- the
-        // leg2 pattern minus the fingerprint guard and the chime (a rear
-        // has no upmix fingerprint to guard; v8.4.5: the lane gate and the
-        // universal keep-alive ride it from the switch/device layers). The
-        // gain multiply is the ONLY op: g * 0 = 0, so a silent cable
-        // channel stays bit-zero silence. v8.4.6 THE SIDE FOLD: the leg's
-        // SAME-SIDE side channel appends AFTER the rear term, riding the
-        // LEG's gain (one calibrated knob per speaker): gRear*ch7 +
-        // gRear*ch5. gRear * 0 = 0 and x + 0 = x, so a silent side lane
-        // leaves the v8.4.5 bytes bit-identical; the switch layer skips
-        // the whole mix only when BOTH lanes are all-zero (each lane's
-        // gate is its own, above).
-        const int   srcRear = (idx == 2) ? kRearLCh : kRearRCh;
-        const int   srcSide = (idx == 2) ? kSideLCh : kSideRCh;   // v8.4.6: ch5 onto out3, ch6 onto out4
-        const float gRear   = (idx == 2) ? g_cfg.gainRl : g_cfg.gainRr;
+        // v8.4.0 THE REAR LEGS; v8.4.11 THE ONE REAR LEG: ONE stereo device
+        // carries both rears -- the leg2 pattern minus the fingerprint
+        // guard and the chime (a rear has no upmix fingerprint to guard;
+        // v8.4.5: the lane gates and the universal keep-alive ride it from
+        // the switch/device layers). The gain multiplies are the ONLY ops:
+        // g * 0 = 0, so a silent cable channel stays bit-zero silence, and
+        // a gated lane contributes exactly zero to the sum. v8.4.6 THE
+        // SIDE FOLD: each output's SAME-SIDE side channel appends AFTER
+        // the rear term, riding that side's gain (one calibrated knob per
+        // speaker): out L = gain_rl*ch7 + gain_rl*ch5, out R = gain_rr*ch8
+        // + gain_rr*ch6. g*0 = 0 and x + 0 = x, so a silent side lane
+        // leaves the bytes bit-identical; the switch layer skips the whole
+        // mix only when ALL FOUR lanes are all-zero (each lane's gate is
+        // its own, above).
+        const float gRL = g_cfg.gainRl, gRR = g_cfg.gainRr;
         for (size_t i = 0; i < n; ++i) {
-            const float s = gRear * sc[i * kInCh + srcRear] + gRear * sc[i * kInCh + srcSide];
-            chunk[i * 2 + 0] = s;
-            chunk[i * 2 + 1] = s;
+            const float* f = sc + i * kInCh;
+            chunk[i * 2 + 0] = gRL * f[kRearLCh] + gRL * f[kSideLCh];   // rear L ch7 + side L ch5
+            chunk[i * 2 + 1] = gRR * f[kRearRCh] + gRR * f[kSideRCh];   // rear R ch8 + side R ch6
         }
     }
 }
@@ -3815,8 +4042,13 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 //      center, released on the spot. The v7.8.4 2-hit/8-miss hysteresis
 //      retired with the field's diagnosis: it left the gate whole buffers
 //      behind the evidence and the late verdict chopped the center at
-//      every content transition (the chattering). The 2.5 ms fade stays
-//      as the anti-click at a flip.
+//      every content transition (the chattering). v8.4.11: the 2.5 ms
+//      fade is RETIRED TOO (field-directed, deepseek-confirmed: "the
+//      center upmix is still leaking because it has a 2.5ms fade whenever
+//      it should've just rendered the zeroing out immediately") -- the
+//      fade WAS the leak: every engage let ~120 frames of a*FL+b*FR
+//      through at ramping gain. A HIT's chunk is ZEROED immediately, a
+//      MISS's chunk plays immediately; no ramp, no anti-click compromise.
 // v8.4.1: fold = THE CENTER FOLD variant -- the same two gates run on
 // LEG1's pump and guard the FL/FR fold instead of out2's mix. The state
 // (hysteresis, fade, counters) lives on the caller's Leg (g_leg[0]), fully
@@ -3835,25 +4067,24 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
         return;                      // nothing left to classify on a silent block
     }
 
-    // ---- gate 2: engine upmix fingerprint (v8.4.10: INSTANT) ---------------
-    // The verdict is the CHUNK's OWN evidence, applied to that chunk before
+    // ---- gate 2: engine upmix fingerprint (v8.4.10 INSTANT, v8.4.11 ZEROED
+    // ON THE SPOT) ----------------------------------------------------------
+    // The verdict is the CHUNK's own evidence, applied to that chunk before
     // it is mixed (centerGuard runs ahead of mixBlock in the switch): a HIT
     // mutes this chunk, a MISS plays it. The v7.8.4 2-hit/8-miss hysteresis
     // retired with the field's diagnosis ("the absolute center gate is
     // being delayed by exactly one buffer frame") -- it left the verdict
     // whole buffers behind the evidence and the late gate chopped the
-    // center at every content transition. The 2.5 ms per-frame fade stays:
-    // it is the anti-click at a verdict flip, not a delay -- the ramp
-    // starts inside the same chunk that produced the evidence.
+    // center at every content transition. v8.4.11 retires the 2.5 ms fade
+    // with them: the mute is a hard zero of this chunk, the pass is a hard
+    // pass -- the ramp WAS the leak.
     if (!g_cfg.centerUpmixGuard) return;
-    constexpr float kCgFadeFr = 120.0f;             // 2.5 ms @ 48 kHz
-    float target = L.cgMuted ? 0.0f : 1.0f;         // the held verdict (this chunk may flip it)
     // v8.4.4: the fit runs at EVERY bite size. The old n >= 64 floor
     // silently disabled the guard the day v8.4.3 made the default bite 32
     // frames (and a sub-64 WASAPI period had never run it either) -- a
     // stereo source's upmix phantom played through untouched. 16 = the
-    // clamp floor; the 2.5 ms fade absorbs the noisier short-window fit
-    // (v8.4.10: the hysteresis is gone).
+    // clamp floor (v8.4.11: the fade that "absorbed" the noisier
+    // short-window fit is gone with it).
     if (n >= 16) {
         // full test (the fit is verbatim v6.1)
         double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
@@ -3888,36 +4119,35 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
             if (res2 < 0.0) res2 = 0.0;  // float noise below the fit
             if (!outside && res2 / S33 < 1e-3) {         // HIT: exact upmix fingerprint
                 if (!L.cgMuted) {
-                    L.cgMuted = true;                    // v8.4.10: engage THIS chunk
+                    L.cgMuted = true;                    // v8.4.10: engage THIS chunk (v8.4.11: zeroed on the spot)
                     L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
                     const unsigned long long now = GetTickCount64();
                     if (now - L.lastUpmixLogMs >= 5000) {
                         L.lastUpmixLogMs = now;
                         if (fold) tlog("[twinspeak] out1 fold guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
                                        "                            (stereo source: the engine fills FC = a*FL + b*R; the phantom center\n"
-                                       "                            fades OUT of the FL/FR fold over 2.5 ms)\n",
+                                       "                            is ZEROED immediately -- no fade, no leak)\n",
                                        a, b);
                         else     tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
-                                      "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
+                                      "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 is ZEROED\n"
+                                      "                            immediately -- no fade, no leak)\n",
                                       a, b);
                     }
                 } else {
                     L.cmUpmix.fetch_add(1, std::memory_order_relaxed);   // stays engaged
                 }
-                target = 0.0f;
             } else {                                     // miss or definitive real center
                 if (L.cgMuted) {
-                    L.cgMuted = false;                   // v8.4.10: release THIS chunk
+                    L.cgMuted = false;                   // v8.4.10: release THIS chunk (v8.4.11: plays on the spot)
                     const unsigned long long now = GetTickCount64();
                     if (now - L.lastUpmixLogMs >= 5000) {
                         L.lastUpmixLogMs = now;
                         if (fold) tlog("[twinspeak] out1 fold guard: independent center content -- guard released\n"
-                                       "                            (the real center fades back into the FL/FR fold over 2.5 ms)\n");
+                                       "                            (the real center folds back into the FL/FR immediately)\n");
                         else     tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
-                                      "                            (ch3 fades back in over 2.5 ms)\n");
+                                      "                            (ch3 plays immediately -- the miss carries its own chunk)\n");
                     }
-                }
-                target = 1.0f;                           // v8.4.10: the miss plays THIS chunk
+                }                                        // v8.4.10: the miss plays THIS chunk
             }
         } else if (ms3 >= 1e-8) {
             // v8.4.10: ch3 ALIVE against fronts too quiet to fit -- a*0 +
@@ -3934,20 +4164,19 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
                     else     tlog("[twinspeak] out2 upmix guard: ch3 alive over silent fronts -- released\n");
                 }
             }
-            target = 1.0f;
         }
     }
-    // apply the fade to the block (any size -- the ramp never stalls)
-    if (target < 1.0f || L.cgGain < 1.0f) {
-        const float step = 1.0f / kCgFadeFr;
-        for (size_t i = 0; i < n; ++i) {
-            float g = L.cgGain;
-            if (g < target) { g += step; if (g > target) g = target; }
-            else if (g > target) { g -= step; if (g < target) g = target; }
-            L.cgGain = g;
-            if (g > 0.0f) sc[i * kInCh + 2] *= g;
-            else          sc[i * kInCh + 2]  = 0.0f;
-        }
+    // v8.4.11: apply the verdict to the chunk IMMEDIATELY -- a muted chunk's
+    // ch3 is ZEROED on the spot (every sample, bit-exact zero), a passing
+    // chunk is left untouched (no multiply, the bytes pass verbatim). No
+    // fade, no ramp: the zeroing is rendered the moment the fingerprint
+    // evidence exists, inside the very chunk that produced it.
+    if (L.cgMuted) {
+        for (size_t i = 0; i < n; ++i)
+            sc[i * kInCh + 2] = 0.0f;
+        L.cgGain = 0.0f;
+    } else {
+        L.cgGain = 1.0f;
     }
 }
 
@@ -4885,10 +5114,10 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.10 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
-        "; out2 = center ONLY, out3/out4 = the rear pair + the v8.4.6 side folds\n"
-        "; (ch5 onto out3, ch6 onto out4; optional; an EMPTY device keeps that\n"
-        "; rear leg silent), no resampler anywhere.\n"
+        "; twinspeak v8.4.11 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
+        "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
+        "; device keeps the rears silent), no resampler anywhere.\n"
         "; v8.1.0 THE STRIPPED PATH: no out rings, no pumps, no capture-burst\n"
         "; accounting -- the buffer switch pops the capture fan-out ring\n"
         "; directly and mixes inline; the DAC's own position register paces\n"
@@ -4904,8 +5133,10 @@ static void writeTemplate(const char* path) {
         "; rear offsets below, the KS bite, the gains, the EQ and the chime.\n"
         "; v8.4.0: lfe_fold joined them too -- the fold is the confirmed\n"
         "; routing, built in; gain_lfe below still scales it. v8.4.0 also\n"
-        "; adds THE REAR LEGS: output_device3/4, offset3_ms/offset4_ms and\n"
-        "; gain_rl/gain_rr (an EMPTY rear device keeps that leg silent).\n"
+        "; adds THE REAR LEGS: output_device3, offset3_ms and gain_rl/gain_rr\n"
+        "; (an EMPTY rear device keeps the rears silent). v8.4.11: ONE rear\n"
+        "; device carries BOTH rears (the old output_device4/offset4_ms are\n"
+        "; read-and-ignored -- stale lines load clean).\n"
         "\n"
         "; ALIGNMENT DELAY (v6.1): delay1_ms / delay2_ms push ONE leg's output\n"
         "; later by whole milliseconds -- a BIT-EXACT ring delay: the leg's ring\n"
@@ -4921,7 +5152,6 @@ static void writeTemplate(const char* path) {
         "delay1_ms = 0\n"
         "delay2_ms = 0\n"
         "offset3_ms = 0\n"
-        "offset4_ms = 0\n"
         "\n"
         "; v6.6.8: exclusive (WASAPI, both legs), capture_exclusive and\n"
         "; align_modes are part of the engine now -- ALWAYS ON, no ini key.\n"
@@ -4943,39 +5173,40 @@ static void writeTemplate(const char* path) {
         "; FL = gain_l*L + gain_lfe*LFE + gain_center*C, FR the mirror. The\n"
         "; center upmix guard rides the fold too -- a stereo source's phantom\n"
         "; FC (a*FL + b*FR, filled in by the Windows engine at the cable's\n"
-        "; playback side) fades out of the fronts over 2.5 ms, so it can\n"
-        "; never double onto FL/FR; genuine 5.1 center always plays. A\n"
+        "; playback side) is ZEROED out of the fronts immediately (v8.4.11:\n"
+        "; no fade -- the zeroing renders the moment the fingerprint is\n"
+        "; measured), so it can never double onto FL/FR; genuine 5.1 center\n"
+        "; always plays. A\n"
         "; NON-empty output_device2 that matches no device is still a hard\n"
         "; error. The center EQ is out2-only: with the fold active it does\n"
         "; not apply (the fold is a plain gain_center sum).\n"
         "\n"
-        "; v8.4.0 THE REAR LEGS + v8.4.6 THE SIDE FOLD: leg3 (rear L) and\n"
-        "; leg4 (rear R) carry the cable's rear pair -- ch7 (RL) and ch8\n"
-        "; (RR) -- on their OWN devices, and the SIDES fold onto them:\n"
-        "; out3 = gain_rl * (ch7 + ch5) on both outputs, out4 = gain_rr *\n"
-        "; (ch8 + ch6) -- the side (ch5 SL / ch6 SR, the slots a 5.1 movie's\n"
-        "; surround lands on) rides its same-side rear leg at the LEG's\n"
-        "; gain, each lane gated BY ITSELF (see CENTER PRESENCE below); a\n"
-        "; 7.1 movie sums sides and backs on each rear leg.\n"
-        "; offset3_ms/offset4_ms stay the per-leg bit-exact delays. An EMPTY\n"
-        "; device (as shipped below) keeps that leg SILENT -- no error, no\n"
-        "; output: empty in = empty out, the truth, and an empty leg3/leg4\n"
-        "; takes its side fold down with it. out1's 5.1 side slots stay\n"
-        "; DRIVEN SILENCE, hardcoded -- the sides never play out1, they ride\n"
-        "; the rears ONLY. A 5.1 movie's surround now plays the rear\n"
-        "; speakers natively; the v8.4.0 flip-the-kRear*Ch-constants advice\n"
-        "; retires.\n"
+        "; v8.4.0 THE REAR LEGS + v8.4.6 THE SIDE FOLD; v8.4.11 THE ONE REAR\n"
+        "; LEG: ONE stereo device carries the cable's rear pair -- ch7 (RL)\n"
+        "; and ch8 (RR) -- with the SIDES folded onto their same-side output:\n"
+        "; out L = gain_rl * (ch7 + ch5), out R = gain_rr * (ch8 + ch6) --\n"
+        "; the side (ch5 SL / ch6 SR, the slots a 5.1 movie's surround lands\n"
+        "; on) rides its same-side rear output at that side's gain, each\n"
+        "; lane gated BY ITSELF (see CENTER PRESENCE below); a 7.1 movie\n"
+        "; sums sides and backs on each rear output.\n"
+        "; offset3_ms stays the leg's bit-exact delay (offset4_ms is retired\n"
+        "; with the merge, read-and-ignored). An EMPTY device (as shipped\n"
+        "; below) keeps the rears SILENT -- no error, no output: empty in =\n"
+        "; empty out, the truth, and an empty leg3 takes its side fold down\n"
+        "; with it. out1's 5.1 side slots stay DRIVEN SILENCE, hardcoded --\n"
+        "; the sides never play out1, they ride the rears ONLY. A 5.1\n"
+        "; movie's surround now plays the rear speakers natively.\n"
         "\n"
         "; Substring match against device names (see: twinspeak --list).\n"
-        "; v8.4.0: the rear legs -- output_device3/4 EMPTY (as shipped) keeps\n"
-        "; that rear leg silent; fill them when the rears get their own devices.\n"
+        "; v8.4.0: the rear leg -- output_device3 EMPTY (as shipped) keeps the\n"
+        "; rears silent; fill it when the rears get their own device (ONE\n"
+        "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
         "input_device   = Line 1\n"
         "output_device1 = Realtek\n"
         "output_device2 = Xtream\n"
         "output_device3 =\n"
-        "output_device4 =\n"
         "\n"
         "; optional mixes (gain_lfe = the LFE fold gain onto FL/FR; 1.0 = a\n"
         ";                    unity fold; gain_rl/gain_rr scale the rear legs\n"
@@ -5114,15 +5345,13 @@ static void writeTemplate(const char* path) {
         ";   backendN = ks      WDM-KS -- the DEFAULT (the kernel-level loop)\n"
         ";   backendN = wasapi  wasapi exclusive (miniaudio event mode) -- the\n"
         ";                      automatic fallback and the opt-out\n"
-        "; v8.4.9 THE POWER BITE (field-directed: \"have the buffer be 288\n"
-        "; samples and 2 buffers (since it's slower but more power saving\n"
-        "; that way)\"): ks_period_frames / ks_periods are BUILT IN -- 288\n"
-        "; frames (6.0 ms of service, ~167 writes/s) x 2 periods (a 576-fr\n"
-        "; / 12.0 ms WaveRT loop, a 6.0 ms write lead). Fewer, larger\n"
-        "; writes than v8.4.8's 256 x 4 -- power saving; the double cushion\n"
-        "; retired with the field's own diagnosis (the L/R stutter was the\n"
-        "; servo's 1-frame nudge decohering the sample stream, not the\n"
-        "; lead -- see the wide nudge above). No keys, no rows; stale\n"
+        "; v8.4.11 THE 384x3 BITE (field-directed: \"I want it so it's 384\n"
+        "; samples with 3 buffers instead\"): ks_period_frames / ks_periods\n"
+        "; are BUILT IN -- 384 frames (8.0 ms of service, ~125 writes/s) x\n"
+        "; 3 periods (a 1152-fr / 24.0 ms WaveRT loop, a 16.0 ms write\n"
+        "; lead -- the deepest shipped lead yet). Fewer, larger writes\n"
+        "; than v8.4.9's 288 x 2, and a late service has twice the margin\n"
+        "; before the DAC grazes the buffer edge. No keys, no rows; stale\n"
         "; ks_period_frames / ks_periods lines load clean and are ignored.\n"
         "; The DAC adds its hardware FIFO on top\n"
         "; (~1-2 ms, printed). v6.3.1: with both legs on ks the\n"
@@ -5198,13 +5427,16 @@ static void writeTemplate(const char* path) {
         "; invalidates the drift baseline and re-arms it once the path settles\n"
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
-        "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE): the INTER-LEG drift is\n"
-        "; synced away -- out2/3/4 hold their settled offset to OUT1, the\n"
-        "; first device (the master, never adjusted): a 16-frame drop/pad\n"
-        "; at most every 100 ms, only past a 250 us dead-band, the baseline\n"
-        "; latching 2 s after each (re)open; a jump past ~40 ms re-latches\n"
-        "; instead of grinding. No key, no UI row. The cable clock itself\n"
-        "; stays observe-only.\n"
+        "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE; v8.4.11 THE WARDEN\n"
+        "; BITE): the INTER-LEG drift is synced away -- out2/out3 hold their\n"
+        "; settled offset to OUT1, the first device (the master, never\n"
+        "; adjusted): a 16-frame drop/pad at most every 100 ms, only past a\n"
+        "; 250 us dead-band, the baseline latching 2 s after each (re)open.\n"
+        "; v8.4.11: past 5 ms of accumulated drift the old warden bite takes\n"
+        "; over (up to 240 frames per 2 s), a jump is a STEP test (~20 ms\n"
+        "; inside one 100 ms window -- reopen-class events only), and slow\n"
+        "; creep is CORRECTED, never accepted. No key, no UI row. The cable\n"
+        "; clock itself stays observe-only.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
@@ -5276,10 +5508,11 @@ static void writeTemplate(const char* path) {
         ";     device-silent -- that is what keeps the amp fed. A starved\n"
         ";     block keeps it too; an armed chime still plays. v8.4.5: the\n"
         ";     SAME gate rides the rears; v8.4.6 every lane is gated BY\n"
-        ";     ITSELF -- ch7 all-zero mutes ch7's term on out3, ch8 all-zero\n"
-        ";     mutes ch8's term on out4, and the side folds gate the same\n"
-        ";     way (ch5/ch6 all-zero mutes the fold's term on out3/out4); a\n"
-        ";     rear mix skips only when BOTH its lanes are zero. State\n"
+        ";     ITSELF -- ch7 all-zero mutes ch7's term on out3's left\n"
+        ";     output, ch8 all-zero mutes ch8's term on out3's right\n"
+        ";     output, and the side folds gate the same way (ch5/ch6\n"
+        ";     all-zero mutes the fold's term on that output); v8.4.11: the\n"
+        ";     rear mix skips only when ALL FOUR its lanes are zero. State\n"
         ";     changes log 'center gate' / 'rear L gate' / 'rear R gate' /\n"
         ";     'side L gate' / 'side R gate'.\n"
         ";   center_upmix_guard -- when the SOURCE has no center of its own (a\n"
@@ -5302,7 +5535,10 @@ static void writeTemplate(const char* path) {
         ";     verdict chopped the center at every content transition -- the\n"
         ";     chattering); a hit mutes the chunk it was measured on, a\n"
         ";     miss plays it, and ch3 alive over silent fronts is released\n"
-        ";     on the spot. The 2.5 ms fade stays as the anti-click.\n"
+        ";     on the spot. v8.4.11: the 2.5 ms fade is retired too -- a hit's\n"
+        ";     chunk is ZEROED immediately (the fade was the leak: every\n"
+        ";     engage let ~120 frames of the upmix through at ramping gain),\n"
+        ";     a miss's chunk plays immediately.\n"
         "; v8.4.1: the same two gates ride THE CENTER FOLD -- when\n"
         ";     output_device2 is EMPTY and ch3 folds onto leg1's FL/FR, the\n"
         ";     upmix fingerprint fades the phantom center out of the fronts;\n"
@@ -5316,15 +5552,15 @@ static void writeTemplate(const char* path) {
         ";   converter, Speaker Fill) has any signal to upmix into a fake\n"
         ";   center -- the center belongs to out2 alone (v8.4.1: an EMPTY\n"
         ";   output_device2 folds it onto out1's FL/FR at gain_center\n"
-        ";   instead), the rears AND the sides to out3/out4 alone. out2 gets\n"
+        ";   instead), the rears AND the sides to out3 alone. out2 gets\n"
         ";   ONLY ch3 (center): every other input\n"
         ";   channel is EXPLICITLY MUTED in the out2 path -- out2 is not a\n"
-        ";   clone of the program audio. out3 gets ch7 (rear L) + ch5 (side\n"
-        ";   L, the v8.4.6 fold) and out4 gets ch8 (rear R) + ch6 (side R),\n"
-        ";   each on both outputs at gain_rl/gain_rr, every lane gated BY\n"
-        ";   ITSELF (an all-zero lane mutes its own term; the mix skips only\n"
-        ";   when both of the leg's lanes are zero); an unconfigured rear\n"
-        ";   leg is silent, never an error. The startup banner prints the route map on every launch.\n"
+        ";   clone of the program audio. out3's LEFT output gets ch7 (rear\n"
+        ";   L) + ch5 (side L, the v8.4.6 fold) and its RIGHT output gets\n"
+        ";   ch8 (rear R) + ch6 (side R), at gain_rl/gain_rr, every lane\n"
+        ";   gated BY ITSELF (an all-zero lane mutes its own term; the mix\n"
+        ";   skips only when all four of the leg's lanes are zero); an\n"
+        ";   unconfigured rear leg is silent, never an error. The startup banner prints the route map on every launch.\n"
         ";\n"
         "; NOTE: EVERY output sums the keep-alive sine (BUILT IN, v8.4.5:\n"
         "; 20 Hz @ 0.1%%) on its driven slots, every frame, so no device EVER\n"
@@ -5374,8 +5610,6 @@ static void cfgSanitize() {
     // v8.4.0: the rear offsets ride the same clamps as the delays.
     if (g_cfg.offset3Ms < 0.0f)   g_cfg.offset3Ms = 0.0f;
     if (g_cfg.offset3Ms > 1000.0f) g_cfg.offset3Ms = 1000.0f;
-    if (g_cfg.offset4Ms < 0.0f)   g_cfg.offset4Ms = 0.0f;
-    if (g_cfg.offset4Ms > 1000.0f) g_cfg.offset4Ms = 1000.0f;
     // v8.3.0: the drift trio's clamps are GONE with the keys -- hardcoded
     // constants (5 ms / 5000 ms / 30 min); nothing left to sanitize.
     // v6.3 backend normalization: "ks" (aliases: wdm-ks / wdmks) selects the
@@ -5442,8 +5676,9 @@ static bool loadIni(const char* path) {
         else if (key == "input_device")   g_cfg.inputDevice = val;
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
-        else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs
-        else if (key == "output_device4") g_cfg.outputDevice4 = val;   // (empty = silent)
+        else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs (v8.4.11: ONE device, both rears)
+        // v8.4.11: output_device4 is RETIRED -- the key is read-and-ignored
+        // (an unknown key falls through the loader untouched).
         else if (key == "gain_l")         g_cfg.gainL = (float)atof(val.c_str());
         else if (key == "gain_r")         g_cfg.gainR = (float)atof(val.c_str());
         else if (key == "gain_lfe")       g_cfg.gainLfe = (float)atof(val.c_str());
@@ -5466,8 +5701,8 @@ static bool loadIni(const char* path) {
         }
         else if (key == "delay1_ms")      g_cfg.delay1Ms = (float)atof(val.c_str());
         else if (key == "delay2_ms")      g_cfg.delay2Ms = (float)atof(val.c_str());
-        else if (key == "offset3_ms")     g_cfg.offset3Ms = (float)atof(val.c_str()); // v8.4.0 rears
-        else if (key == "offset4_ms")     g_cfg.offset4Ms = (float)atof(val.c_str()); // v8.4.0 rears
+        else if (key == "offset3_ms")     g_cfg.offset3Ms = (float)atof(val.c_str()); // v8.4.0 rears (v8.4.11: the one rear leg)
+        // v8.4.11: offset4_ms is RETIRED -- read-and-ignored, like out1ms.
         else if (key == "out2_first")     g_cfg.out2First    = !isOff(val);
         else if (key == "volume_endpoint") g_cfg.volumeEndpoint = val;
         else if (key == "chimes")         g_cfg.chimes        = !isOff(val);   // v6.2
@@ -5885,7 +6120,7 @@ static void printLegDevice(int idx) {
     if (idx == 0 && d->playback.internalChannels != kOutCh1)
         tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 6ch -- fine with the strict split:\n"
                         "            out1 drives FC/LFE AND the 5.1 rear slots as digital silence (the\n"
-                        "            rears live on leg3/leg4), so no layer (engine, miniaudio converter,\n"
+                        "            rears live on leg3), so no layer (engine, miniaudio converter,\n"
                         "            Speaker Fill) has anything to upmix into a fake center.\n",
                 (unsigned)d->playback.internalChannels);
     // v6.0: a non-48k endpoint means miniaudio inserts a RESAMPLER on this
@@ -6006,7 +6241,7 @@ enum {
     IDC_LBL_FREQ, IDC_LBL_GAIN, IDC_LBL_Q,
     // v8.4.0: the four-leg controls -- the rear device combos, the gain
     // quad's two new edits, the timing quad's two offset edits.
-    IDC_OUT3, IDC_OUT4, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3, IDC_OFF4,
+    IDC_OUT3, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3,   // v8.4.11: IDC_OUT4/IDC_OFF4 retired with leg4
 };
 
 // ---- gui state -------------------------------------------------------------
@@ -6864,12 +7099,12 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
 static void guiFillCombos(HWND w) {
     std::vector<std::string> pb, cp;
     guiEnumNames(pb, cp);
-    const int ids[5] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_OUT4, IDC_INDEV };  // 0..3 playback; 4 capture
-    for (int k = 0; k < 5; ++k) {
+    const int ids[4] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_INDEV };  // 0..2 playback (v8.4.11: ONE rear combo); 3 capture
+    for (int k = 0; k < 4; ++k) {
         HWND h = GetDlgItem(w, ids[k]);
         char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
         SendMessageA(h, CB_RESETCONTENT, 0, 0);
-        const std::vector<std::string>& v = (k < 4) ? pb : cp;   // v8.4.0: the rear combos fill too
+        const std::vector<std::string>& v = (k < 3) ? pb : cp;   // v8.4.11: three playback combos
         for (size_t i = 0; i < v.size(); ++i)
             SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
         if (cur[0]) SetWindowTextA(h, cur);
@@ -6884,7 +7119,6 @@ static std::string cfgValueText(const std::string& key) {
     if      (key == "delay1_ms")         { snprintf(b, 64, "%g", g_cfg.delay1Ms); return b; }
     else if (key == "delay2_ms")         { snprintf(b, 64, "%g", g_cfg.delay2Ms); return b; }
     else if (key == "offset3_ms")        { snprintf(b, 64, "%g", g_cfg.offset3Ms); return b; }   // v8.4.0
-    else if (key == "offset4_ms")        { snprintf(b, 64, "%g", g_cfg.offset4Ms); return b; }   // v8.4.0
     else if (key == "gain_l")            { snprintf(b, 64, "%g", g_cfg.gainL);     return b; }
     else if (key == "gain_r")            { snprintf(b, 64, "%g", g_cfg.gainR);     return b; }
     else if (key == "gain_lfe")          { snprintf(b, 64, "%g", g_cfg.gainLfe);   return b; }
@@ -6912,7 +7146,6 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
-    else if (key == "output_device4")    return g_cfg.outputDevice4;   // v8.4.0
     else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
     else if (key == "backend1")          return g_cfg.backend1;
     else if (key == "backend2")          return g_cfg.backend2;
@@ -6932,9 +7165,9 @@ static std::string cfgValueText(const std::string& key) {
 // lfe_fold is GONE too (the fold is built in, always on). v8.4.5:
 // ks_period_frames / ks_periods join them -- THE CALM BITE is built in.
 static const char* kIniKeys[] = {
-    "delay1_ms", "delay2_ms", "offset3_ms", "offset4_ms",      // v8.4.0 rears
+    "delay1_ms", "delay2_ms", "offset3_ms",                    // v8.4.0 rears (v8.4.11: offset4_ms retired)
     "input_device", "output_device1", "output_device2",
-    "output_device3", "output_device4",                        // v8.4.0 rears
+    "output_device3",                                          // v8.4.0 rears (v8.4.11: output_device4 retired)
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
@@ -7022,8 +7255,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.inputDevice    = editStr(w, IDC_INDEV);
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
-    g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent
-    g_cfg.outputDevice4  = editStr(w, IDC_OUT4);
+    g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent (v8.4.11: ONE rear device)
     g_cfg.volumeEndpoint = editStr(w, IDC_VOLEP);
     g_cfg.gainL     = editFloat(w, IDC_GAIN_L,  1.0f);
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
@@ -7037,8 +7269,7 @@ static void cfgFromControls(HWND w) {
     // v8.2.0: out1Ms/out2Ms have no controls -- kOutPeriodMs is the request.
     g_cfg.delay1Ms = editFloat(w, IDC_DELAY1, 0.0f);
     g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
-    g_cfg.offset3Ms = editFloat(w, IDC_OFF3, 0.0f);   // v8.4.0 timing quad
-    g_cfg.offset4Ms = editFloat(w, IDC_OFF4, 0.0f);
+    g_cfg.offset3Ms = editFloat(w, IDC_OFF3, 0.0f);   // v8.4.0 timing quad (v8.4.11: the one rear leg)
     g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
     // v7.0.0: pinOutputs is integrated -- always on; no control can change it.
     // v7.1.7: backend1/backend2 have NO control -- the ini keys stand as loaded.
@@ -7060,7 +7291,6 @@ static void controlsFromCfg(HWND w) {
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
-    SetDlgItemTextA(w, IDC_OUT4,  g_cfg.outputDevice4.c_str());
     SetDlgItemTextA(w, IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
     snprintf(b, 64, "%g", g_cfg.gainL);      SetDlgItemTextA(w, IDC_GAIN_L, b);
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
@@ -7072,7 +7302,6 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     snprintf(b, 64, "%g", g_cfg.offset3Ms); SetDlgItemTextA(w, IDC_OFF3, b);   // v8.4.0
-    snprintf(b, 64, "%g", g_cfg.offset4Ms); SetDlgItemTextA(w, IDC_OFF4, b);
     g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
     // v7.1.7: backend1/backend2 have no control -- loaded from the ini only
     // v8.3.0: the drift trio + volume_follow have no controls to sync.
@@ -7259,15 +7488,15 @@ static void comboRow(HWND w, int colX, int y, const char* label, int id,
     if (cur && cur[0]) SetWindowTextA(h, cur);
 }
 
-// v8.4.0 THE QUAD: a four-element compact group -- a short small-font label
-// OVER a narrow 92 px edit (100 px pitch, four across the column). The gain
-// quad (gain_l/gain_r/gain_rl/gain_rr) and the timing quad (delay1_ms/
-// delay2_ms/offset3_ms/offset4_ms) use it; the wide single-key rows keep
-// the classic label+edit layout (the field's ask: shorter-width values,
-// grouped).
-static void quadRow(HWND w, int colX, int y, const char* const lbl[4],
-                    const int id[4], const char* const val[4]) {
-    for (int k = 0; k < 4; ++k) {
+// v8.4.0 THE QUAD: a compact group -- a short small-font label OVER a
+// narrow 92 px edit (100 px pitch, across the column). The gain quad
+// (gain_l/gain_r/gain_rl/gain_rr) and the timing row (delay1_ms/delay2_ms/
+// offset3_ms -- v8.4.11: offset4_ms retired with leg4) use it; the wide
+// single-key rows keep the classic label+edit layout (the field's ask:
+// shorter-width values, grouped).
+static void quadRow(HWND w, int colX, int y, int cnt, const char* const lbl[],
+                    const int id[], const char* const val[]) {
+    for (int k = 0; k < cnt; ++k) {
         const int x = colX + k * 100;
         mkLabel(w, 0, x, y, 92, lbl[k], g_fSml, 14);
         mkEdit(w, id[k], x, y + 16, 92, 22, val[k]);
@@ -7282,16 +7511,15 @@ static void guiBuildPages(HWND w) {
     comboRow(w, COLA_X, KROW0, "capture input", IDC_INDEV, false, g_cfg.inputDevice.c_str());
     comboRow(w, COLA_X, 154, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
     comboRow(w, COLA_X, 188, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
-    comboRow(w, COLA_X, 222, "output leg3 (rear L)", IDC_OUT3, false, g_cfg.outputDevice3.c_str());
-    comboRow(w, COLA_X, 256, "output leg4 (rear R)", IDC_OUT4, false, g_cfg.outputDevice4.c_str());
-    row(w, COLA_X, 290, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 324, 150, 26, "REFRESH DEVICES");
+    comboRow(w, COLA_X, 222, "output leg3 (rears)", IDC_OUT3, false, g_cfg.outputDevice3.c_str());
+    row(w, COLA_X, 256, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 290, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
-    note(w, COLA_X, 352,
+    note(w, COLA_X, 318,
          "leg1 = FL/FR + the LFE fold; an EMPTY leg2 folds the center onto\n"
-         "FL/FR (gain_center). leg3/leg4 = the cable's rears + the side folds\n"
-         "(ch7+ch5 / ch8+ch6, v8.4.6); an EMPTY device row = that leg stays\n"
-         "silent. volume_endpoint = master.", 4);
+         "FL/FR (gain_center). leg3 = the cable's rears on ONE stereo device\n"
+         "(out L = ch7+ch5 at gain_rl, out R = ch8+ch6 at gain_rr, v8.4.11);\n"
+         "an EMPTY device row = the rears stay silent. volume_endpoint = master.", 4);
     header(w, COLB_X, KHDR_Y, "GAIN");
     // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
     // narrow edits in one group (the field's ask), gain_lfe just below,
@@ -7305,7 +7533,7 @@ static void guiBuildPages(HWND w) {
         const char* lbl[4]  = { "gain_l", "gain_r", "gain_rl", "gain_rr" };
         const int   ids[4]  = { IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_RL, IDC_GAIN_RR };
         const char* vals[4] = { bL, bR, bRL, bRR };
-        quadRow(w, COLB_X, 118, lbl, ids, vals);
+        quadRow(w, COLB_X, 118, 4, lbl, ids, vals);
     }
     row(w, COLB_X, 170, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
     row(w, COLB_X, 204, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
@@ -7334,19 +7562,19 @@ static void guiBuildPages(HWND w) {
     // v8.4.7: the page moved from the right column to the LEFT
     // (field-directed) -- the rows themselves are unchanged.
     header(w, COLA_X, KHDR_Y, "TIMING");
-    // v8.4.0 THE TIMING QUAD: delay1_ms/delay2_ms/offset3_ms/offset4_ms as
-    // four short narrow edits in one group (the gain quad's twin) -- every
-    // per-leg delay knob in one row.
+    // v8.4.0 THE TIMING QUAD; v8.4.11 THE TRIPLE: delay1_ms/delay2_ms/
+    // offset3_ms as short narrow edits in one group (the gain quad's twin)
+    // -- every per-leg delay knob in one row (offset4_ms retired with the
+    // one-rear-leg merge).
     {
-        char b1[32], b2[32], b3[32], b4[32];
+        char b1[32], b2[32], b3[32];
         snprintf(b1, 32, "%g", g_cfg.delay1Ms);
         snprintf(b2, 32, "%g", g_cfg.delay2Ms);
         snprintf(b3, 32, "%g", g_cfg.offset3Ms);
-        snprintf(b4, 32, "%g", g_cfg.offset4Ms);
-        const char* lbl[4]  = { "delay1_ms", "delay2_ms", "offset3_ms", "offset4_ms" };
-        const int   ids[4]  = { IDC_DELAY1, IDC_DELAY2, IDC_OFF3, IDC_OFF4 };
-        const char* vals[4] = { b1, b2, b3, b4 };
-        quadRow(w, COLA_X, 118, lbl, ids, vals);
+        const char* lbl[3]  = { "delay1_ms", "delay2_ms", "offset3_ms" };
+        const int   ids[3]  = { IDC_DELAY1, IDC_DELAY2, IDC_OFF3 };
+        const char* vals[3] = { b1, b2, b3 };
+        quadRow(w, COLA_X, 118, 3, lbl, ids, vals);
     }
     tglRow(w, COLA_X, 170, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
     // v7.0.0: the pin_outputs pill is gone -- output pinning is part of the
@@ -7361,8 +7589,8 @@ static void guiBuildPages(HWND w) {
     // stay told by the boot banner and the ini.
     note(w, COLA_X, 204,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
-         "EARLY leg. offset3_ms/offset4_ms are the same knob for the rear legs\n"
-         "(leg3/leg4 = rear L/R; an empty rear device = no rear output). The\n"
+         "EARLY leg. offset3_ms is the same knob for the rear leg (leg3 = the\n"
+         "rears on ONE device; an empty rear device = no rear output). The\n"
          "banner prints every est path; 'drift' already includes your delay\n"
          "(it IS the alignment, not a fault).\n", 5);
 
@@ -10113,7 +10341,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    ma_device_id capId, id1, id2, id3, id4; std::string capName, n1, n2, n3, n4;
+    ma_device_id capId, id1, id2, id3; std::string capName, n1, n2, n3;   // v8.4.11: id4/n4 retired with leg4
     if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
         tlog( "[twinspeak] capture device matching \"%s\" not found (--list to see names)\n",
                 g_cfg.inputDevice.c_str());
@@ -10140,29 +10368,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_leg[1].disabled)
         tlog("[twinspeak] leg2 (center)  : output_device2 is EMPTY -- no center device, no error;\n"
              "                            the center FOLDS onto leg1's FL/FR at gain_center\n"
-             "                            (upmix-guarded: a stereo source's phantom FC fades out)\n");
-    // v8.4.0 THE REAR LEGS: an EMPTY device string = the leg is DISABLED --
-    // no device is picked, no ring is built, no thread starts: that rear
-    // channel simply never plays (empty in = empty out). A NON-empty needle
-    // that matches nothing is still a hard error, exactly like legs 1/2.
+             "                            (upmix-guarded: a stereo source's phantom FC is zeroed immediately)\n");
+    // v8.4.0 THE REAR LEGS; v8.4.11 THE ONE REAR LEG: an EMPTY device
+    // string = the leg is DISABLED -- no device is picked, no ring is
+    // built, no thread starts: the rears simply never play (empty in =
+    // empty out). output_device4 is retired -- the old leg4's slot is
+    // force-disabled and a stale output_device4 line is ignored. A
+    // NON-empty needle that matches nothing is still a hard error, exactly
+    // like legs 1/2.
     g_leg[2].disabled = g_cfg.outputDevice3.empty();
-    g_leg[3].disabled = g_cfg.outputDevice4.empty();
+    g_leg[3].disabled = true;   // v8.4.11: leg4 retired -- ONE rear device carries both rears
     if (!g_leg[2].disabled &&
         !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice3, &id3, &n3)) {
         tlog( "[twinspeak] output_device3 matching \"%s\" not found (--list)\n",
                 g_cfg.outputDevice3.c_str());
         return 1;
     }
-    if (!g_leg[3].disabled &&
-        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice4, &id4, &n4)) {
-        tlog( "[twinspeak] output_device4 matching \"%s\" not found (--list)\n",
-                g_cfg.outputDevice4.c_str());
-        return 1;
-    }
     if (g_leg[2].disabled)
-        tlog("[twinspeak] leg3 (rear L)   : output_device3 is EMPTY -- the leg stays SILENT (no device, no error)\n");
-    if (g_leg[3].disabled)
-        tlog("[twinspeak] leg4 (rear R)   : output_device4 is EMPTY -- the leg stays SILENT (no device, no error)\n");
+        tlog("[twinspeak] leg3 (rears)    : output_device3 is EMPTY -- the leg stays SILENT (no device, no error)\n");
 
     // per-leg periods -- one engine constant for both now. v8.1.0: the
     // capture burst system is GONE -- the capture opens with a fixed 4 ms
@@ -10182,8 +10405,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         Leg& L = g_leg[i];
         L.index = i;
         L.outCh = (i == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
-        L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3 : n4;
-        if (L.disabled) continue;                 // v8.4.0: no ring, no scratch
+        L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3 : std::string();
+        if (L.disabled) continue;                 // v8.4.0: no ring, no scratch (v8.4.11: leg4 always disabled)
         L.scratch.assign((size_t)kInCh * kScratchFrames, 0.0f);
     }
 
@@ -10255,7 +10478,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_cfg.out2First) { openOrder[0] = 1; openOrder[1] = 0; openOrder[2] = 2; openOrder[3] = 3; }
     else                 { openOrder[0] = 0; openOrder[1] = 1; openOrder[2] = 2; openOrder[3] = 3; }
     auto legIdPtr = [&](int i) -> ma_device_id* {
-        return (i == 0) ? &id1 : (i == 1) ? &id2 : (i == 2) ? &id3 : &id4;
+        return (i == 0) ? &id1 : (i == 1) ? &id2 : &id3;   // v8.4.11: leg4 never reaches here (disabled)
     };
     bool okLeg[4] = { false, false, false, false };
     for (int oi = 0; oi < 4; ++oi) {
@@ -10372,8 +10595,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         if (L.disabled) continue;   // v8.4.0: an empty rear leg owns no ring
         const float delayMs = (i == 0) ? g_cfg.delay1Ms
                           : (i == 1) ? g_cfg.delay2Ms
-                          : (i == 2) ? g_cfg.offset3Ms   // v8.4.0: the rears' own knob
-                                     : g_cfg.offset4Ms;
+                          : g_cfg.offset3Ms;           // v8.4.0: the rears' own knob (v8.4.11: ONE rear leg)
         const size_t devPeriodFr  = (L.backend == 1)
                                   ? (size_t)kKsPeriodFrames
                                   : (L.dev.playback.internalPeriodSizeInFrames
@@ -10401,6 +10623,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.syncBase.store(kSyncUnlatched, std::memory_order_relaxed);   // v8.4.7: the sync baseline
         L.syncDrops = 0;                                               // (per run, like the clocks)
         L.syncPads  = 0;
+        L.syncOffValid = false;                                        // v8.4.11: the step-jump tracker + the warden bite
+        L.lastSyncOff  = 0;
+        L.lastBiteMs   = 0;
+        L.wardenDrops  = 0;
+        L.wardenPads   = 0;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -10408,8 +10635,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                && (!g_centerFold || g_cfg.gainCenter > 0.0f))   // v8.4.1: the fold term too
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
-            : (i == 2) ? (g_cfg.gainRl >= 0.0f)          // v8.4.0: the rear legs
-                       : (g_cfg.gainRr >= 0.0f);         // (g * 0 == 0, always)
+            : (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f); // v8.4.11: the one rear leg, both sides (g * 0 == 0, always)
     }
 
     // ---------------- v3.8 COM volume layer (setup on the main thread) -----
@@ -10689,9 +10915,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
-           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/3/4 hold\n"
+           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/out3 hold\n"
            "                            their settled offset to OUT1 (the first device, never adjusted) -- a\n"
-           "                            16-frame drop/pad at most every 100 ms past a 250 us dead-band (v8.4.9).\n");
+           "                            16-frame drop/pad at most every 100 ms past a 250 us dead-band (v8.4.9).\n"
+           "                            v8.4.11 THE WARDEN BITE: the old drift correction (5 ms per 2 s) rides\n"
+           "                            the same servo -- past 5 ms of accumulated drift a leg drops/pads up to\n"
+           "                            240 frames in one bite, and slow creep is corrected, NEVER accepted\n"
+           "                            (the old re-latch silently blessed it -- the raw2 climb to ~36 ms).\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
@@ -10701,8 +10931,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            averaged ~5-9 s after boot and re-arms after any reopen. v8.1.0: MEASUREMENT\n"
            "                            ONLY -- no skip, no pad, no correction; it LOGS when the drift leaves the\n"
            "                            %+.0f ms band for 3 s and the ears decide. v8.4.7: the INTER-LEG drift is\n"
-           "                            now slowly synced away (out2/3/4 hold their offset to out1 -- see clock\n"
-           "                            sync above); the cable clock itself stays measurement-only.\n",
+           "                            now slowly synced away (out2/out3 hold their offset to out1 -- see clock\n"
+           "                            sync above; v8.4.11: the warden bite corrects creep, never accepts it);\n"
+           "                            the cable clock itself stays measurement-only.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
     tlog("[twinspeak] power guard   : %s -- suspend parks the legs, resume rebuilds capture + both\n"
            "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
@@ -10716,7 +10947,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            g_leg[0].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs1);
     tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
                "[twinspeak] route out1     : FC + discrete LFE + the 5.1 side slots (out ch5/ch6) = driven digital\n"
-               "[twinspeak] route out1     : silence, hardcoded -- the sides ride leg3/leg4 through the v8.4.6 side fold\n"
+               "[twinspeak] route out1     : silence, hardcoded -- the sides ride leg3 through the v8.4.6 side fold\n"
                "[twinspeak] route out1     : + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
                g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
@@ -10724,22 +10955,23 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
            g_leg[1].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
            g_leg[1].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs2);
-    // v8.4.0: the rear legs' banner -- present only when a device is set.
-    for (int ri = 2; ri < 4; ++ri) {
-        if (g_leg[ri].disabled) continue;
-        tlog("[twinspeak] leg%d (rear %c)  : \"%s\" | %s | %s\n",
-               ri + 1, ri == 2 ? 'L' : 'R', g_leg[ri].name.c_str(),
-               g_leg[ri].backend == 1 ? "WDM-KS (kernel streaming)" :
-               g_leg[ri].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
-               g_leg[ri].isExclusive ? "EXCLUSIVE" : "shared",
-               g_leg[ri].backend == 1 ? "same bite/lead as leg1 (192 fr x 3 periods, BUILT IN)"
-                                      : "period 1 ms x2 (WASAPI fallback)");
+    // v8.4.11: the rear leg's banner -- present only when a device is set.
+    if (!g_leg[2].disabled) {
+        tlog("[twinspeak] leg3 (rears)   : \"%s\" | %s | %s\n",
+               g_leg[2].name.c_str(),
+               g_leg[2].backend == 1 ? "WDM-KS (kernel streaming)" :
+               g_leg[2].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
+               g_leg[2].isExclusive ? "EXCLUSIVE" : "shared",
+               g_leg[2].backend == 1 ? "same bite/lead as leg1 (BUILT IN)"
+                                     : "period 1 ms x2 (WASAPI fallback)");
     }
-    tlog("[twinspeak] route out3     : L = R = %.2f*ch7 (cable RL) + %.2f*ch5 (cable SL, the v8.4.6 side fold) -- every\n"
-               "[twinspeak] route out4     : L = R = %.2f*ch8 (cable RR) + %.2f*ch6 (cable SR, side fold) -- each lane gated\n"
-               "[twinspeak] route rears    : BY ITSELF (an all-zero lane mutes its own term; the mix skips only when BOTH\n"
-               "[twinspeak] route rears    : are zero) + the universal 20 Hz @ 0.1%% keep-alive; an unconfigured rear leg =\n"
-               "[twinspeak] route rears    : silent by design (empty device = empty out; the rears AND sides ride ONLY here)\n",
+    tlog("[twinspeak] route out3     : L = %.2f*ch7 (cable RL) + %.2f*ch5 (cable SL, the v8.4.6 side fold)\n"
+               "[twinspeak] route out3     : R = %.2f*ch8 (cable RR) + %.2f*ch6 (cable SR, side fold) -- ONE rear\n"
+               "[twinspeak] route rears    : device carries both rears (v8.4.11), each lane gated BY ITSELF (an\n"
+               "[twinspeak] route rears    : all-zero lane mutes its own output's term; the mix skips only when ALL\n"
+               "[twinspeak] route rears    : FOUR lanes are zero) + the universal 20 Hz @ 0.1%% keep-alive; an\n"
+               "[twinspeak] route rears    : unconfigured rear leg = silent by design (empty device = empty out; the\n"
+               "[twinspeak] route rears    : rears AND sides ride ONLY here)\n",
                g_cfg.gainRl, g_cfg.gainRl, g_cfg.gainRr, g_cfg.gainRr);
     // v8.4.1: the route banner tells the truth for BOTH shapes -- a live
     // out2 (ch3 on its own device) and the fold (leg2 EMPTY, ch3 onto FL/FR).
@@ -10809,26 +11041,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                "printed paths are EQUAL -- any offset left is device silicon");
     }
     // v8.4.0: the rear legs' est paths against the mains -- trim
-    // offset3_ms/offset4_ms from this number (a rear that arrives EARLY
-    // takes the offset).
-    if (!g_leg[2].disabled || !g_leg[3].disabled) {
-        const double ep3 = g_leg[2].disabled ? 0.0 : estPathOf(2);
-        const double ep4 = g_leg[3].disabled ? 0.0 : estPathOf(3);
-        tlog("[twinspeak] align rears   : offset3 +%d ms, offset4 +%d ms -- the rear legs' bit-exact delays\n"
-             "                            est path vs leg1: leg3 %+.1f ms, leg4 %+.1f ms (positive = the rear\n"
-             "                            arrives later; trim the offset of a rear that arrives EARLY)\n",
-             (int)(g_cfg.offset3Ms + 0.5f), (int)(g_cfg.offset4Ms + 0.5f),
-             ep3 - ep1, ep4 - ep1);
+    // offset3_ms from this number (a rear that arrives EARLY takes the
+    // offset).
+    if (!g_leg[2].disabled) {
+        const double ep3 = estPathOf(2);
+        tlog("[twinspeak] align rears   : offset3 +%d ms -- the rear leg's bit-exact delay\n"
+             "                            est path vs leg1: leg3 %+.1f ms (positive = the rear arrives later;\n"
+             "                            trim the offset of a rear that arrives EARLY)\n",
+             (int)(g_cfg.offset3Ms + 0.5f), ep3 - ep1);
     }
     if (g_centerFold)
         tlog("[twinspeak] route check    : out2 is EMPTY -- center (ch3) FOLDS onto out1's FL/FR at gain_center, the\n"
              "                            same upmix guard protecting it; out1 plays ch1/ch2 + the LFE fold + the\n"
              "                            center fold; the rears (ch7/ch8) and the sides (ch5/ch6, the v8.4.6 fold)\n"
-             "                            play ONLY on out3/out4, devices permitting\n");
+             "                            play ONLY on out3, devices permitting\n");
     else
         tlog("[twinspeak] route check    : center (ch3) plays ONLY on out2; out1 plays ONLY ch1/ch2 + the LFE fold;\n"
                "                            the rears (ch7/ch8) and the sides (ch5/ch6, the v8.4.6 fold) play ONLY on\n"
-               "                            out3/out4, and ONLY when their devices are set\n");
+               "                            out3, and ONLY when its device is set\n");
     if (g_cfg.volumeFollow) {
         if (g_srcVol)
             tlog("[twinspeak] volume        : following \"%ls\" (the cable's playback side) -- now %.0f%%%s -- drives every leg\n",
