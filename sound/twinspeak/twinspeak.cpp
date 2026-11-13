@@ -62,6 +62,26 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.14 THE DEFERRED REOPEN LANDING (field-directed, with the log:
+//            "Just heard a second ding which raised raw2 to 43. This is
+//            getting me suspicious."). The ding is the reopen chime
+//            (armChime fires on every leg2 reopen); the 43 was the
+//            v8.4.12 landing being UNDONE: dropReopenBacklog trimmed the
+//            ring to its anchor AT REOPEN TIME, but the new device takes
+//            hundreds of ms to actually start consuming, and in that
+//            window the capture kept pushing and refilled the ring back
+//            toward its cap -- the field log's own sequence (stall resync
+//            + watchdog reopen on the S5, then "sync out2: 2064 fr late"
+//            = exactly 43 ms, mid-grind). The first pop saw ~160 ms of
+//            backlog and the servo spent ~25 s grinding it. THE FIX: a
+//            reopen only MARKS the leg (relandPending); the NEW device
+//            thread lands its own ring at its FIRST buffer switch
+//            (landReopenedRing, called from bufferSwitchFill) -- the
+//            discard and the first pop are one instant apart, nothing can
+//            refill in between, and the landing target is the servo's own
+//            (r2 = max(r1, anchor) + own prefill), floored at the depth
+//            guard's 10 ms anchor so the restart's first fill cannot
+//            starve on a capture gap. NO new ini key, NO UI row.
 //    v8.4.13 NO BASELINE (field-directed, eight idle minutes + one glance:
 //            "I do see a slow creep in delay on both raw1 and raw2 ... raw1
 //            is at 8 and raw2 is at 12-16 ... I just saw raw2 jump to like
@@ -2145,7 +2165,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.13"
+#define TWS_VERSION "8.4.14"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2795,6 +2815,14 @@ struct Leg {
     unsigned long long     wardenDrops   = 0;
     unsigned long long     wardenPads    = 0;
     unsigned long long     depthDrops    = 0;
+    // v8.4.14 THE DEFERRED REOPEN LANDING: set by tryRestartLeg (the health
+    // thread, BEFORE the new device thread exists -- the write happens-
+    // before the thread creation, and the old thread is already joined);
+    // consumed and cleared by that new device thread at its FIRST buffer
+    // switch, where landReopenedRing discards the refill-bloated backlog
+    // with the first pop one instant away. Plain bool: one writer before
+    // the thread, one reader after.
+    bool                   relandPending = false;
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -3492,6 +3520,7 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void centerGuard(Leg& L, float* sc, size_t n, bool fold);   // v6.1 gates (v8.4.1: fold = the leg1 center-fold variant)
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
+static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
 
 // v8.1.0 playback core -- THE STRIPPED SWITCH, bit-exact, ONE code path for
@@ -3512,6 +3541,15 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     if (g_stopSilence.load(std::memory_order_relaxed)) {
         if (frameCount) memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
         return;
+    }
+    // v8.4.14 THE DEFERRED REOPEN LANDING: a reopened leg's NEW device
+    // thread trims its ring HERE, at its first switch -- the discard and
+    // the first pop are one instant apart, so the capture cannot refill
+    // the vacuum the way it did when the landing ran at reopen time (the
+    // field's "second ding raised raw2 to 43"). See landReopenedRing.
+    if (L.relandPending) {
+        L.relandPending = false;
+        landReopenedRing(idx);
     }
     // v7.1.5 START ALIGN: stamp the FIRST switch of this run before the pop
     // counter moves (release store, then the relaxed fetch_add -- the start
@@ -5219,7 +5257,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.13 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.14 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6007,55 +6045,42 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     return true;
 }
 
-// v8.4.10 THE REOPEN BACKLOG DISCARD (field-directed: "I still get this
-// eventual bug sometimes that there's this loopback sounding sound that
-// plays within the current twinspeak stream that goes away on reset").
-// While a leg is down (the scheduled deep resync, the watchdog, a USB
-// re-enumeration) the capture keeps pushing; the raw ring fills to its
-// cap (delayFrames + 150 ms) and every further push EVICTS the oldest,
-// dragging the leg's read position cap-frames behind the freshest
-// capture. A leg resumed from there plays a permanent delayed copy of
-// the stream -- the loopback-sounding echo -- and the v8.4.7 sync servo
-// RE-LATCHES the >2000-fr offset (a jump, not a drift), holding the echo
-// for the rest of the run; only a reset cleared it. The v8.1.0 strip
-// removed the old stall-resync backlog discards with the rest of the
-// ring machinery; this is their successor. Called in the reopen's
-// dead-consumer window (the old device thread is joined; tail advances
-// are monotonic CAS, a discipline the producer's evictions already
-// share). The leg resumes at the FRESHEST capture, and the discard LANDS
-// ON THE SERVO'S TARGET: the servo's error is the raw offset (v8.4.13: no
-// baseline), so the clean landing is r2 = r1 -- leg1's REAL BACKLOG (its
-// depth minus its delay prefill -- v8.4.12: the original full-depth target
-// leaked delay1_ms into the landing, the field's "raw2 sits at 62") plus
-// this leg's own prefill. The user's calibration lives in the delay
-// prefills and needs no baseline to survive a reopen. The fallback (the
-// master leg -- never servoed) keeps the delay prefill + one WaveRT loop
-// of live margin; a margin floor keeps the restart's first fill from
-// starving.
-static void dropReopenBacklog(int idx) {
+// v8.4.13/v8.4.14 THE DEFERRED REOPEN LANDING (the v8.4.10 reopen backlog
+// discard, moved to where it can actually stick). Field, v8.4.13: "Just
+// heard a second ding which raised raw2 to 43." The ding is the reopen
+// chime (armChime fires on every leg2 reopen); the 43 was the landing
+// being UNDONE: the old dropReopenBacklog trimmed the ring to its anchor
+// AT REOPEN TIME -- but the new device takes hundreds of ms to actually
+// start consuming, and in that window the capture kept pushing and
+// refilled the ring right back toward its cap. The first pop then saw
+// ~160 ms of backlog: off jumped, and the servo spent the next ~25 s
+// grinding it (the log's "2064 fr late" = the field's 43 ms, mid-grind).
+// THE FIX: a reopen only MARKS the leg (relandPending, set by
+// tryRestartLeg before the new device thread exists); the NEW device
+// thread lands its own ring at its FIRST buffer switch -- the discard and
+// the first pop are the same instant, nothing can refill in between, and
+// the producer races are already covered by the tail's monotonic CAS (the
+// capture callback's evictions share it).
+// The landing target is the servo's own: its error is the raw offset
+// (v8.4.13: no baseline), so the clean landing is r2 = r1 -- leg1's REAL
+// BACKLOG (its depth minus its delay prefill -- v8.4.12: the original
+// full-depth target leaked delay1_ms into the landing, the field's
+// "raw2 sits at 62") plus this leg's own prefill, floored at the depth
+// guard's anchor so the restart's first fill cannot starve on a capture
+// gap. The user's calibration lives in the delay prefills and needs no
+// baseline to survive a reopen. The master lands at its own anchor.
+static void landReopenedRing(int idx) {
     Leg& L = g_leg[idx];
-    const size_t have = L.raw.count();
-    long long want;
-    if (idx != 0)
-        // v8.4.12 THE DELAY-CORRECTED LANDING (the field's "maybe delay1_ms
-        // is being added to the drift corrector" -- CONFIRMED, here): the
-        // landing target is leg1's REAL backlog (its depth minus its delay
-        // prefill) + THIS leg's own prefill. The original leg1.count() +
-        // held used leg1's FULL depth, delay prefill included -- with
-        // delay1_ms = 68 every reopen put ~68 ms of phantom backlog on the
-        // slave (the field's "raw2 sits at 62"), and the servo then spent
-        // the next ~11 s grinding it back off. v8.4.13: no baseline to add
-        // -- the servo's error is the raw offset, so the clean landing is
-        // r2 = r1 exactly.
-        want = ((long long)g_leg[0].raw.count() - (long long)g_leg[0].delayFrames)
-             + (long long)L.delayFrames;
-    else
-        want = (long long)(L.delayFrames + (size_t)kKsPeriods * kKsPeriodFrames);
-    const long long margin = (long long)kKsPeriods * (long long)kKsPeriodFrames;
-    if (want < margin) want = margin;                    // never starve the restart's first fill
-    if (want > (long long)have) want = (long long)have;  // cannot un-discard
-    if (have > (size_t)want)
-        L.raw.discardOldest(have - (size_t)want);   // advances tail AND seqTail, ledger-true
+    const long long have     = (long long)L.raw.count();
+    const long long rMaster  = (long long)g_leg[0].raw.count()
+                             - (long long)g_leg[0].delayFrames;
+    const long long backlog  = (idx != 0)
+                             ? (rMaster > (long long)kDepthAnchorFr ? rMaster
+                                                                    : (long long)kDepthAnchorFr)
+                             : (long long)kDepthAnchorFr;
+    const long long want     = (long long)L.delayFrames + backlog;
+    if (have > want)
+        L.raw.discardOldest((size_t)(have - want));   // advances tail AND seqTail, ledger-true
 }
 
 // ------------------------------------------------- v3.8 watchdog restarts --
@@ -6082,7 +6107,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
     // to the WASAPI path below (and stay there for subsequent restarts).
     if (L.backend == 1) {
         ksCloseLeg(idx);
-        dropReopenBacklog(idx);   // v8.4.10: resume at the freshest capture, not cap-stale
+        L.relandPending = true;   // v8.4.14: the NEW device thread lands the ring at its first switch
         if (ksOpenLeg(idx, needle)) {
             L.name = L.ks.filterName;
             L.ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)idx, 0, nullptr);
@@ -6103,7 +6128,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
 
     if (L.dev.pContext) ma_device_uninit(&L.dev);
     memset(&L.dev, 0, sizeof(L.dev));
-    dropReopenBacklog(idx);   // v8.4.10: the same fresh resume on the WASAPI path
+    L.relandPending = true;   // v8.4.14: the NEW device thread lands the ring at its first switch
     ma_device_id id; std::string nm;
     if (!pickDevice(ctx, ma_device_type_playback, needle, &id, &nm)) return false;
     bool ok = initLegDevice(idx, ctx, &id, periodMs, L.isExclusive);
@@ -10740,6 +10765,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.und.store(0, std::memory_order_relaxed);
         L.cmUpmix.store(0, std::memory_order_relaxed);
         L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
+        L.relandPending = false;                                       // v8.4.14: fresh run, nothing pending
         L.syncDrops = 0;                                               // (per run, like the clocks)
         L.syncPads  = 0;
         L.lastBiteMs   = 0;                                            // v8.4.11/8.4.12: the bite + depth-guard clocks
