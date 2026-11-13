@@ -1,0 +1,2 @@
+Open x64 Native Tools Command Prompt for VS 2022 as Administrator and run this:
+cl.exe /EHsc /O2 /std:c++17 /D_CRT_SECURE_NO_WARNINGS /Fe"F:\jerem\NewDownloads\fun\sound\twinspeak\myprogram.exe" "F:\jerem\NewDownloads\fun\sound\twinspeak\twinspeak.cpp" /link /SUBSYSTEM:WINDOWS

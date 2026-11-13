@@ -1,5 +1,5 @@
 // ============================================================================
-//  twinspeak v8.4.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.10 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -55,6 +55,39 @@
 //            GAIN column compacts to a four-element quad (gain_l/gain_r/
 //            gain_rl/gain_rr, gain_lfe below); TIMING gets the same quad
 //            for delay1/delay2/offset3/offset4.
+//    v8.4.10 THE INSTANT CENTER GATE + THE REOPEN BACKLOG DISCARD
+//            (field-directed: "I found that the chattering comes from the
+//            center channel still playing the l+r mono mix, which makes me
+//            think the absolute center gate is being delayed by exactly one
+//            buffer frame, so I want that fixed and that's it ... I want
+//            the center gate to just play the moment the input frame is
+//            detected to have it, which means before you play the output
+//            data to the selected device" + "I still get this eventual bug
+//            sometimes that there's this loopback sounding sound that plays
+//            within the current twinspeak stream that goes away on reset,
+//            and that's what I want you to fix as well"). THE INSTANT GATE:
+//            the upmix guard's v7.8.4 hysteresis (engage after 2 hits,
+//            release after 8 misses) retired -- it left the verdict whole
+//            buffers behind the evidence, so a genuine center onset stayed
+//            muted 12-48 ms and an upmix leaked a block the other way (the
+//            chattering at every content transition): a fingerprint HIT now
+//            mutes the chunk it was measured on, a MISS plays it, and ch3
+//            alive against fronts too quiet to fit (a*0 + b*0 = 0) is a
+//            definitive real center, released on the spot; the 2.5 ms fade
+//            stays as the anti-click at a flip, not a delay; cgHits/cgMiss
+//            retire. THE BACKLOG DISCARD: while a leg is down (the 30-min
+//            deep resync, the watchdog, a re-enumeration) the capture fills
+//            its raw ring to cap and eviction pins the read position ~170 ms
+//            behind the freshest capture -- the reopened leg played a
+//            permanent delayed copy of the stream (the loopback-sounding
+//            echo) and the sync servo re-latched the >2000-fr offset,
+//            holding it until reset; every reopen now discards the backlog
+//            in its dead-consumer window (the old device thread is joined;
+//            tail advances are monotonic CAS) and resumes at the freshest
+//            capture, the discard LANDING ON THE OFFSET THE SERVO WAS
+//            HOLDING (syncBase: the user's delay calibration survives the
+//            reopen; the fallback keeps the delay prefill + one loop of
+//            margin). NO new ini key, NO UI row.
 //    v8.4.9 THE WIDE NUDGE + THE POWER BITE (field-directed: "I would
 //            also do a slow sample-level nudge every 100ms and have the
 //            buffer be 288 samples and 2 buffers (since it's slower but
@@ -1952,6 +1985,20 @@
 //  Fixed 48 kHz (the cable's rate). Build: bash build.sh  (zig c++, WASAPI).
 // ============================================================================
 
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "propsys.lib")
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -1984,7 +2031,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.9"
+#define TWS_VERSION "8.4.10"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2546,17 +2593,16 @@ struct Leg {
     size_t              delayFrames = 0;         // extra ring depth = delay_ms * 48
     float               delayMs     = 0.0f;      // as configured (banner)
     std::atomic<unsigned long long> cmUpmix{0}; // blocks muted by the upmix guard
-    // v7.8.4: the upmix guard is a STATE MACHINE now -- engage after 2
-    // consecutive full-test fingerprint hits, release after 8 consecutive
-    // misses (a definitive real-center verdict counts 4 toward release),
-    // and the ch3 mute is a 2.5 ms per-frame FADE, never a block-boundary
-    // hard zero: the old hit/miss flicker chopped the center into 10-20 ms
-    // slices -- the static-ey center gate crackle. Leg2's device thread
-    // owns it (single writer, no atomics needed).
+    // v8.4.10: the upmix guard is INSTANT -- each chunk's verdict is that
+    // chunk's own fingerprint evidence, applied to that chunk BEFORE it is
+    // mixed (the v7.8.4 2-hit/8-miss hysteresis retired with the field's
+    // diagnosis: it left the gate whole buffers behind the evidence, and
+    // the late verdict chopped the center at every content transition --
+    // the chattering). The ch3 mute stays a 2.5 ms per-frame FADE (the
+    // anti-click at a flip, not a delay). Leg2's device thread owns the
+    // state (single writer, no atomics needed).
     bool                cgMuted = false;         // guard engaged: ch3 fades toward 0
     float               cgGain  = 1.0f;          // current ch3 fade gain (1 = pass)
-    int                 cgHits  = 0;             // consecutive full-test hits
-    int                 cgMiss  = 0;             // consecutive full-test misses
     unsigned long long  lastGateLogMs = 0;       // rate-limited gate/guard logs
     unsigned long long  lastUpmixLogMs = 0;
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: this block's verdict + the log
@@ -3761,11 +3807,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 //      b*ch2; residual < -30 dB with the gains inside the upmix band and
 //      the fronts active -> the block is engine upmix, not center -> muted.
 //      Genuine 5.1 dialogue is an INDEPENDENT track and always passes.
-//      v7.8.4: the verdict is a hysteresis state machine -- engage after 2
-//      consecutive hits, release after 8 consecutive misses -- and the
-//      mute is a 2.5 ms fade, so a decision that flickers near the
-//      threshold can no longer chop the center into slices (that was the
-//      static-ey center gate crackle).
+//      v8.4.10: the verdict is INSTANT (field-directed: "the center gate
+//      to just play the moment the input frame is detected to have it,
+//      which means before you play the output data") -- a HIT mutes the
+//      chunk it was measured on, a MISS plays it, and ch3 alive against
+//      fronts too quiet to fit (a*0 + b*0 = 0) is a definitive real
+//      center, released on the spot. The v7.8.4 2-hit/8-miss hysteresis
+//      retired with the field's diagnosis: it left the gate whole buffers
+//      behind the evidence and the late verdict chopped the center at
+//      every content transition (the chattering). The 2.5 ms fade stays
+//      as the anti-click at a flip.
 // v8.4.1: fold = THE CENTER FOLD variant -- the same two gates run on
 // LEG1's pump and guard the FL/FR fold instead of out2's mix. The state
 // (hysteresis, fade, counters) lives on the caller's Leg (g_leg[0]), fully
@@ -3784,24 +3835,25 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
         return;                      // nothing left to classify on a silent block
     }
 
-    // ---- gate 2: engine upmix fingerprint (v7.8.4: hysteresis + fade) ------
-    // The old guard hard-zeroed ch3 at a block boundary on every hit and
-    // disarmed on every miss -- a decision that flickers near the threshold
-    // chopped the center into 10-20 ms slices, which reads as a static-ey
-    // crackle. Now it is a state machine: ENGAGE after 2 consecutive
-    // full-test hits, RELEASE after 8 consecutive full-test misses (a
-    // definitive real-center verdict counts 4 toward release), and the ch3
-    // mute itself is a 2.5 ms per-frame fade -- never a hard on/off. The
-    // fade advances on EVERY block size, so the ramp never stalls.
+    // ---- gate 2: engine upmix fingerprint (v8.4.10: INSTANT) ---------------
+    // The verdict is the CHUNK's OWN evidence, applied to that chunk before
+    // it is mixed (centerGuard runs ahead of mixBlock in the switch): a HIT
+    // mutes this chunk, a MISS plays it. The v7.8.4 2-hit/8-miss hysteresis
+    // retired with the field's diagnosis ("the absolute center gate is
+    // being delayed by exactly one buffer frame") -- it left the verdict
+    // whole buffers behind the evidence and the late gate chopped the
+    // center at every content transition. The 2.5 ms per-frame fade stays:
+    // it is the anti-click at a verdict flip, not a delay -- the ramp
+    // starts inside the same chunk that produced the evidence.
     if (!g_cfg.centerUpmixGuard) return;
     constexpr float kCgFadeFr = 120.0f;             // 2.5 ms @ 48 kHz
-    float target = L.cgMuted ? 0.0f : 1.0f;         // this block's fade goal
+    float target = L.cgMuted ? 0.0f : 1.0f;         // the held verdict (this chunk may flip it)
     // v8.4.4: the fit runs at EVERY bite size. The old n >= 64 floor
     // silently disabled the guard the day v8.4.3 made the default bite 32
     // frames (and a sub-64 WASAPI period had never run it either) -- a
     // stereo source's upmix phantom played through untouched. 16 = the
-    // clamp floor; the 2-hit/8-miss hysteresis and the 2.5 ms fade absorb
-    // the noisier short-window fit.
+    // clamp floor; the 2.5 ms fade absorbs the noisier short-window fit
+    // (v8.4.10: the hysteresis is gone).
     if (n >= 16) {
         // full test (the fit is verbatim v6.1)
         double S11 = 0, S22 = 0, S12 = 0, S31 = 0, S32 = 0, S33 = 0;
@@ -3836,45 +3888,53 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
             if (res2 < 0.0) res2 = 0.0;  // float noise below the fit
             if (!outside && res2 / S33 < 1e-3) {         // HIT: exact upmix fingerprint
                 if (!L.cgMuted) {
-                    if (++L.cgHits >= 2) {               // engage: 2 consecutive hits
-                        L.cgMuted = true;
-                        L.cgMiss = 0;
-                        L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
-                        const unsigned long long now = GetTickCount64();
-                        if (now - L.lastUpmixLogMs >= 5000) {
-                            L.lastUpmixLogMs = now;
-                            if (fold) tlog("[twinspeak] out1 fold guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
-                                           "                            (stereo source: the engine fills FC = a*FL + b*R; the phantom center\n"
-                                           "                            fades OUT of the FL/FR fold over 2.5 ms)\n",
-                                           a, b);
-                            else     tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
-                                          "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
-                                          a, b);
-                        }
+                    L.cgMuted = true;                    // v8.4.10: engage THIS chunk
+                    L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                    const unsigned long long now = GetTickCount64();
+                    if (now - L.lastUpmixLogMs >= 5000) {
+                        L.lastUpmixLogMs = now;
+                        if (fold) tlog("[twinspeak] out1 fold guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                       "                            (stereo source: the engine fills FC = a*FL + b*R; the phantom center\n"
+                                       "                            fades OUT of the FL/FR fold over 2.5 ms)\n",
+                                       a, b);
+                        else     tlog("[twinspeak] out2 upmix guard: ch3 matches %.2f*ch1 + %.2f*ch2 -- guard ENGAGED\n"
+                                      "                            (stereo source: the engine fills FC = a*FL + b*R; ch3 fades out over 2.5 ms)\n",
+                                      a, b);
                     }
                 } else {
-                    L.cgMiss = 0;                        // stays engaged
-                    L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
+                    L.cmUpmix.fetch_add(1, std::memory_order_relaxed);   // stays engaged
                 }
                 target = 0.0f;
             } else {                                     // miss or definitive real center
-                L.cgHits = 0;
                 if (L.cgMuted) {
-                    L.cgMiss += outside ? 4 : 1;         // real center releases 4x faster
-                    if (L.cgMiss >= 8) {
-                        L.cgMuted = false;               // release: ch3 fades back in
-                        L.cgMiss = 0;
-                        const unsigned long long now = GetTickCount64();
-                        if (now - L.lastUpmixLogMs >= 5000) {
-                            L.lastUpmixLogMs = now;
-                            if (fold) tlog("[twinspeak] out1 fold guard: independent center content -- guard released\n"
-                                           "                            (the real center fades back into the FL/FR fold over 2.5 ms)\n");
-                            else     tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
-                                          "                            (ch3 fades back in over 2.5 ms)\n");
-                        }
+                    L.cgMuted = false;                   // v8.4.10: release THIS chunk
+                    const unsigned long long now = GetTickCount64();
+                    if (now - L.lastUpmixLogMs >= 5000) {
+                        L.lastUpmixLogMs = now;
+                        if (fold) tlog("[twinspeak] out1 fold guard: independent center content -- guard released\n"
+                                       "                            (the real center fades back into the FL/FR fold over 2.5 ms)\n");
+                        else     tlog("[twinspeak] out2 upmix guard: independent center content -- guard released\n"
+                                      "                            (ch3 fades back in over 2.5 ms)\n");
                     }
                 }
+                target = 1.0f;                           // v8.4.10: the miss plays THIS chunk
             }
+        } else if (ms3 >= 1e-8) {
+            // v8.4.10: ch3 ALIVE against fronts too quiet to fit -- a*0 +
+            // b*0 = 0, so this cannot be engine upmix: definitive real
+            // center, released on the spot (the old code held whatever
+            // verdict it carried -- a dialogue-over-silent-fronts onset
+            // stayed muted behind the hysteresis).
+            if (L.cgMuted) {
+                L.cgMuted = false;
+                const unsigned long long now = GetTickCount64();
+                if (now - L.lastUpmixLogMs >= 5000) {
+                    L.lastUpmixLogMs = now;
+                    if (fold) tlog("[twinspeak] out1 fold guard: ch3 alive over silent fronts -- released\n");
+                    else     tlog("[twinspeak] out2 upmix guard: ch3 alive over silent fronts -- released\n");
+                }
+            }
+            target = 1.0f;
         }
     }
     // apply the fade to the block (any size -- the ramp never stalls)
@@ -4825,7 +4885,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.10 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3/out4 = the rear pair + the v8.4.6 side folds\n"
         "; (ch5 onto out3, ch6 onto out4; optional; an EMPTY device keeps that\n"
         "; rear leg silent), no resampler anywhere.\n"
@@ -5158,15 +5218,13 @@ static void writeTemplate(const char* path) {
         "; excess beyond the raw cap evicts the OLDEST frames (counted in\n"
         "; 'evict'), so the path can only ever run late -- never torn.\n"
         "\n"
-        "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg's device\n"
-        "; thread starves (an interrupt storm, a 100%% CPU hog) the leg falls\n"
-        "; behind while the pump kept feeding its ring (v7.8.3: a drop-correct\n"
-        "; hold-off counts as starvation evidence too). The health loop\n"
-        "; recovers both ways: stale backlog above the leg's anchor is\n"
-        "; discarded immediately (bit-exact skip, logged as 'stall resync'),\n"
-        "; and starvation lasting 3 consecutive seconds reopens the leg fresh\n"
-        "; -- which also resets whatever the device's own silicon accumulated\n"
-        "; during the storm.\n"
+        "; STALL RESYNC (v6.5.11, always on -- no ini key): if a leg starves\n"
+        "; (an interrupt storm, a 100%% CPU hog) the shortfall rule counts it\n"
+        "; ('short' climbs every second). Starvation lasting 3 consecutive\n"
+        "; seconds reopens the leg fresh -- which also resets whatever the\n"
+        "; device's own silicon accumulated during the storm. v8.4.10: every\n"
+        "; reopen first discards the raw ring's backlog -- the leg resumes at\n"
+        "; the freshest capture (see DEEP RESYNC).\n"
         "\n"
         "; KS LAPSE GUARD (v6.5.13, always on): if the KS pacing thread is\n"
         "; ever descheduled past one full WaveRT loop lap, the play\n"
@@ -5189,7 +5247,13 @@ static void writeTemplate(const char* path) {
         "; reopen of the center leg re-primes it. Each resync is a brief\n"
         "; center gap and the warden re-arms ~9 s later; your delay1_ms\n"
         "; calibration holds across it. v8.3.0: hardcoded -- 30 min, the\n"
-        "; long-movie setting (was deep_resync_min).\n"
+        "; long-movie setting (was deep_resync_min). v8.4.10: every reopen\n"
+        "; first discards the raw ring's backlog -- while the leg was down\n"
+        "; the ring filled to cap and eviction pinned its read position\n"
+        "; ~170 ms behind the freshest capture, and a leg resumed from\n"
+        "; there played a permanent delayed copy of the stream (the\n"
+        "; loopback-sounding echo only a reset cleared). The leg now\n"
+        "; resumes at the freshest capture, its delay calibration intact.\n"
         "\n"
         "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
         "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
@@ -5232,7 +5296,13 @@ static void writeTemplate(const char* path) {
         ";     INDEPENDENT track and never matches; it always passes. The health\n"
         ";     line counts guarded blocks ('cm') -- with real 5.1 content it\n"
         ";     must read 0. v6.6.8: center_gate and center_upmix_guard are\n"
-        ";     part of the engine now -- ALWAYS ON.\n"
+        ";     part of the engine now -- ALWAYS ON. v8.4.10: the verdict is\n"
+        ";     INSTANT -- the v7.8.4 2-hit/8-miss hysteresis retired (it\n"
+        ";     left the gate whole buffers behind the evidence and the late\n"
+        ";     verdict chopped the center at every content transition -- the\n"
+        ";     chattering); a hit mutes the chunk it was measured on, a\n"
+        ";     miss plays it, and ch3 alive over silent fronts is released\n"
+        ";     on the spot. The 2.5 ms fade stays as the anti-click.\n"
         "; v8.4.1: the same two gates ride THE CENTER FOLD -- when\n"
         ";     output_device2 is EMPTY and ch3 folds onto leg1's FL/FR, the\n"
         ";     upmix fingerprint fades the phantom center out of the fronts;\n"
@@ -5593,6 +5663,46 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     return true;
 }
 
+// v8.4.10 THE REOPEN BACKLOG DISCARD (field-directed: "I still get this
+// eventual bug sometimes that there's this loopback sounding sound that
+// plays within the current twinspeak stream that goes away on reset").
+// While a leg is down (the scheduled deep resync, the watchdog, a USB
+// re-enumeration) the capture keeps pushing; the raw ring fills to its
+// cap (delayFrames + 150 ms) and every further push EVICTS the oldest,
+// dragging the leg's read position cap-frames behind the freshest
+// capture. A leg resumed from there plays a permanent delayed copy of
+// the stream -- the loopback-sounding echo -- and the v8.4.7 sync servo
+// RE-LATCHES the >2000-fr offset (a jump, not a drift), holding the echo
+// for the rest of the run; only a reset cleared it. The v8.1.0 strip
+// removed the old stall-resync backlog discards with the rest of the
+// ring machinery; this is their successor. Called in the reopen's
+// dead-consumer window (the old device thread is joined; tail advances
+// are monotonic CAS, a discipline the producer's evictions already
+// share). The leg resumes at the FRESHEST capture, and the discard LANDS
+// ON THE OFFSET THE SERVO WAS HOLDING: syncBase is the settled inter-leg
+// offset this leg held before the reopen (the user's calibration, written
+// by this leg's now-joined device thread -- a relaxed read here is sound),
+// so the target level is leg1's current level + held and the offset the
+// servo re-latches 2 s after the reopen is the offset it held before: the
+// calibration survives. The fallback (no baseline yet, or the master leg
+// -- never servoed) keeps the delay prefill + one WaveRT loop of live
+// margin; a margin floor keeps the restart's first fill from starving.
+static void dropReopenBacklog(int idx) {
+    Leg& L = g_leg[idx];
+    const size_t have = L.raw.count();
+    const long long held = L.syncBase.load(std::memory_order_relaxed);
+    long long want;
+    if (idx != 0 && held != kSyncUnlatched)
+        want = (long long)g_leg[0].raw.count() + held;   // land on the held offset
+    else
+        want = (long long)(L.delayFrames + (size_t)kKsPeriods * kKsPeriodFrames);
+    const long long margin = (long long)kKsPeriods * (long long)kKsPeriodFrames;
+    if (want < margin) want = margin;                    // never starve the restart's first fill
+    if (want > (long long)have) want = (long long)have;  // cannot un-discard
+    if (have > (size_t)want)
+        L.raw.discardOldest(have - (size_t)want);   // advances tail AND seqTail, ledger-true
+}
+
 // ------------------------------------------------- v3.8 watchdog restarts --
 // The "output shut off by itself" class: a device thread silently stops
 // (endpoint invalidated, USB replug, driver reset). The health loop reopens
@@ -5617,6 +5727,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
     // to the WASAPI path below (and stay there for subsequent restarts).
     if (L.backend == 1) {
         ksCloseLeg(idx);
+        dropReopenBacklog(idx);   // v8.4.10: resume at the freshest capture, not cap-stale
         if (ksOpenLeg(idx, needle)) {
             L.name = L.ks.filterName;
             L.ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)idx, 0, nullptr);
@@ -5637,6 +5748,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
 
     if (L.dev.pContext) ma_device_uninit(&L.dev);
     memset(&L.dev, 0, sizeof(L.dev));
+    dropReopenBacklog(idx);   // v8.4.10: the same fresh resume on the WASAPI path
     ma_device_id id; std::string nm;
     if (!pickDevice(ctx, ma_device_type_playback, needle, &id, &nm)) return false;
     bool ok = initLegDevice(idx, ctx, &id, periodMs, L.isExclusive);
