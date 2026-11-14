@@ -62,6 +62,34 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.24 THE STREAM WINDOW + THE NEVER-ZERO WOBBLE + THE 128x3 BITE
+//            (field-directed: "I want to just access all of the streams
+//            active right now that are coming from the input and basically
+//            keepalive all of the output's channels by 20hz with 0.1%
+//            volume whilst also making it so that a single keepalive
+//            sample never lands at a 0 (if it does, land it at a 1) ...
+//            I would now like a kOutPeriodMs of 1 instead of 4 because now
+//            I want 128 fr x 3"). (1) THE STREAM WINDOW: every 10 s the
+//            health tick enumerates the ACTIVE audio sessions on the
+//            cable's playback endpoint (pid per session) -- the streams
+//            audiodg is mixing into the cable this second. THE PHANTOM
+//            EXPLAINED: the mask faithfully delivers what the cable
+//            carries, and the cable's ch3 carries audiodg's stereo->8ch
+//            channel matrix (FC = (L+R)/2) for every stereo app stream --
+//            the transport (WDM-KS/WaveRT) is not the upmixer; audiodg's
+//            shared-mode matrix is, on the cable's playback side. The
+//            stream list names the sources, so an L+R ghost in ch3 traces
+//            to the exact app producing it. THE SOURCE-SIDE KILL: set the
+//            cable's Windows endpoint format to stereo (Sound panel ->
+//            Line 1 -> Advanced -> 2ch 48000 Hz) -- audiodg then mixes
+//            stereo->stereo (no matrix) and VAC zeroes the unused channels
+//            into the 8ch capture. (2) THE NEVER-ZERO WOBBLE: the
+//            keep-alive table's exact zero-crossing samples (two per
+//            cycle) are bumped to one s16 LSB -- a driven output never
+//            carries an exact-zero sample for any silence detector to key
+//            on. (3) kOutPeriodMs back to 1 and the KS bite 128 fr x 3
+//            (loop 384, lead 256) on the same 100 ns poller. NO new ini
+//            key, NO UI row.
 //    v8.4.23 THE MASK-COPY-MASK FAN-OUT (field-directed: "make sure that
 //            there are copies of the input 8-channel audio data for every
 //            single device you're sending the data to so that there's no
@@ -2404,7 +2432,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.23"
+#define TWS_VERSION "8.4.24"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2591,7 +2619,7 @@ static constexpr unsigned kReplayMaxPeriods   = 4;      // lastBlock size (the K
 // are read-and-ignored (like cap_ms). Both legs request 1 ms (the floor
 // every modern exclusive driver negotiates around); a KS leg -- the
 // default -- ignores the request whole. Equal by construction.
-static constexpr unsigned kOutPeriodMs       = 4;      // WASAPI leg request (v8.4.23: the 4 ms frame callback)
+static constexpr unsigned kOutPeriodMs       = 1;      // WASAPI leg request (v8.4.24: back to 1 ms; the driver negotiates the floor)
 
 // v8.4.11 THE 384x3 BITE (field-directed: "I think the audio device drifting
 // is from the fact the sample size is still a tad too small ... I want it so
@@ -2604,8 +2632,8 @@ static constexpr unsigned kOutPeriodMs       = 4;      // WASAPI leg request (v8
 // register pacing, no resampler anywhere; the est-path banner prints the
 // lead live. No ini key, no GUI row, no clamp; stale ks_period_frames /
 // ks_periods lines load clean and are ignored.
-static constexpr unsigned kKsPeriodFrames    = 192;  // the bite: 4.0 ms of service @ 48 kHz (v8.4.23: the 4 ms frame callback)
-static constexpr unsigned kKsPeriods         = 3;    // the WaveRT loop: 576 fr (12.0 ms), lead 384 fr (8.0 ms)
+static constexpr unsigned kKsPeriodFrames    = 128;  // the bite: 2.67 ms of service @ 48 kHz (v8.4.24: the field's 128 fr x 3)
+static constexpr unsigned kKsPeriods         = 3;    // the WaveRT loop: 384 fr (8.0 ms), lead 256 fr (5.3 ms)
 
 // v6.4 drift warden pacing: the observe log never fires more than once per
 // drift_interval_ms (v6.5.8; was the hardcoded 30 s), only after the drift
@@ -3148,6 +3176,12 @@ static const PROPERTYKEY kPKEY_Device_FriendlyName =
 // the enumerator/control objects come back from plain method calls.)
 static const IID kIID_IAudioSessionManager2 =
     { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
+// v8.4.24 THE STREAM WINDOW: IAudioSessionControl2 (pid per session) --
+// the app-level visibility the phantom hunt needed: the sessions audiodg
+// is mixing into the cable are listed on the health tick, so an L+R mono
+// ghost in ch3 can be traced to the exact streams that produced it.
+static const IID kIID_IAudioSessionControl2 =
+    { 0x26E49CDA, 0x24B9, 0x4B03, { 0x8F, 0x60, 0x6C, 0x10, 0xA8, 0x18, 0xED, 0xA9 } };
 
 static std::atomic<float>    g_vol{1.0f};             // Line 1 endpoint scalar (0..1)
 static std::atomic<bool>     g_volMuted{false};
@@ -5245,7 +5279,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.23 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.24 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5907,6 +5941,88 @@ static bool defaultRenderName(std::string* outName) {
 // The release path re-grabs only a QUIET device.
 // Returns >= 0 foreign active sessions; -1 the probe failed (caller fails
 // OPEN -- pre-v6.5.16 behavior, logged).
+// v8.4.24 THE STREAM WINDOW (field-directed: "access all of the streams
+// active right now that are coming from the input"): enumerate the audio
+// sessions on the cable's PLAYBACK endpoint -- the apps whose streams
+// audiodg is mixing into the cable this second. This is the visibility the
+// phantom hunt needed: the mask faithfully delivers whatever the cable
+// carries, and the cable's ch3 carries audiodg's stereo->8ch channel
+// matrix for every stereo app stream (FC = (L+R)/2 -- the automatic L+R
+// mono mix). The stream list names the sources, so an L+R ghost in ch3
+// can be traced to the exact app that produced it. Pure visibility: the
+// mask architecture needs no correction here -- it delivers what the
+// cable carries, whatever that is.
+static void logCableStreams(const std::string& nameNeedle) {
+    const std::wstring wNeedle = narrowToWide(nameNeedle);
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return;
+    IMMDeviceCollection* col = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col) {
+        UINT n = 0;
+        if (SUCCEEDED(col->GetCount(&n))) {
+            for (UINT i = 0; i < n; ++i) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(col->Item(i, &dev)) || !dev) continue;
+                IPropertyStore* ps = nullptr;
+                bool match = false;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+                    PROPVARIANT var; PropVariantInit(&var);
+                    if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
+                        var.vt == VT_LPWSTR && var.pwszVal)
+                        match = wContainsCI(var.pwszVal, wNeedle);
+                    PropVariantClear(&var);
+                    ps->Release();
+                }
+                if (match) {
+                    IAudioSessionManager2* sm2 = nullptr;
+                    if (SUCCEEDED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL,
+                                                nullptr, (void**)&sm2)) && sm2) {
+                        IAudioSessionEnumerator* se = nullptr;
+                        if (SUCCEEDED(sm2->GetSessionEnumerator(&se)) && se) {
+                            int sn = 0;
+                            if (SUCCEEDED(se->GetCount(&sn))) {
+                                int active = 0;
+                                for (int s = 0; s < sn; ++s) {
+                                    IAudioSessionControl* sc = nullptr;
+                                    if (FAILED(se->GetSession(s, &sc)) || !sc) continue;
+                                    AudioSessionState st = AudioSessionStateInactive;
+                                    sc->GetState(&st);
+                                    if (st == AudioSessionStateActive) {
+                                        ++active;
+                                        DWORD pid = 0;
+                                        IAudioSessionControl2* sc2 = nullptr;
+                                        if (SUCCEEDED(sc->QueryInterface(kIID_IAudioSessionControl2,
+                                                                         (void**)&sc2)) && sc2) {
+                                            sc2->GetProcessId(&pid);
+                                            sc2->Release();
+                                        }
+                                        tlog("[twinspeak] streams     : #%d pid %lu ACTIVE on the cable's playback side\\n",
+                                             s + 1, (unsigned long)pid);
+                                    }
+                                    sc->Release();
+                                }
+                                tlog("[twinspeak] streams     : %d active session(s) on the cable's playback side --\\n"
+                                     "                            these are the streams audiodg is mixing into the 8ch cable\\n"
+                                     "                            (a stereo-only list means the ch3 content is audiodg's\\n"
+                                     "                            FC = (L+R)/2 matrix, not center content)\\n", active);
+                            }
+                            se->Release();
+                        }
+                        sm2->Release();
+                    }
+                    dev->Release();
+                    break;   // the first needle match wins, like the volume pin
+                }
+                dev->Release();
+            }
+        }
+        col->Release();
+    }
+    en->Release();
+}
+
 static int foreignActiveSessions(const std::string& nameNeedle) {
     const std::wstring wNeedle = narrowToWide(nameNeedle);
     IMMDeviceEnumerator* en = nullptr;
@@ -10470,6 +10586,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     for (unsigned i = 0; i < g_kaLen; ++i)
         g_kaTable[i] = (float)(sin(kTwoPi * (double)g_kaHz * (double)i / (double)kSampleRate)
                                * (double)g_kaGain);
+    // v8.4.24 THE NEVER-ZERO WOBBLE (field-directed: "keepalive all of the
+    // output's channels by 20hz with 0.1% volume whilst also making it so
+    // that a single keepalive sample never lands at a 0 (if it does, land
+    // it at a 1)"): the sine's exact zero-crossings (two per cycle) are
+    // bumped to one s16 LSB (1/32768) -- a driven output never carries an
+    // exact-zero sample for any silence detector (an amp, a DSP, a driver
+    // power-save) to key on. One LSB is far below the wobble's own
+    // amplitude (33 LSB) and inaudible.
+    for (unsigned i = 0; i < g_kaLen; ++i)
+        if (g_kaTable[i] == 0.0f) g_kaTable[i] = 1.0f / 32768.0f;
 
     // v6.5.18: center dialogue EQ coefficients (ini: center_eq*)
     centerEqInit();
@@ -11737,6 +11863,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (anyLapse)
                 tlog("                            KS lapse guard: %llu / %llu / %llu / %llu write-cursor re-pin(s) since boot\n",
                      laps[0], laps[1], laps[2], laps[3]);
+            // v8.4.24 THE STREAM WINDOW: the active sessions audiodg is
+            // mixing into the cable this second (the phantom-hunt
+            // visibility).
+            {
+                std::string fxNeedle;
+                if (!g_cfg.volumeEndpoint.empty()) fxNeedle = g_cfg.volumeEndpoint;
+                else fxNeedle = g_cfg.inputDevice;
+                logCableStreams(fxNeedle);
+            }
         }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
         tlog(g_logToFile
