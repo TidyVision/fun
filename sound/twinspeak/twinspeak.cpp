@@ -62,6 +62,18 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.27 THE WIDE SURROUND FOLD + THE 287 HZ PICK (field-directed:
+//            "fold the rear and surround onto the mains (l and r) if leg3
+//            [is empty] ... the rears get their own specific type and the
+//            surround gets the wide stuff ... have the default center eq
+//            frequency be 287 instead"). (1) THE FOLD TAKES THE REARS TOO:
+//            an empty leg3 folds RL (ch7) direct onto L and RR (ch8)
+//            direct onto R -- the rears' own specific type. (2) THE WIDE
+//            SURROUND: SL (ch5) and SR (ch6) fold with the matrix-encoding
+//            phase trick -- in-phase on their own side, INVERTED at half
+//            gain on the opposite side -- so the surround pushes outward
+//            instead of smearing the front image. (3) The default center
+//            EQ frequency is 287 Hz. NO new ini key, NO UI row.
 //    v8.4.26 THE FLOOR GUARD, EVERY LEG + THE REAR FOLD (field-directed:
 //            "on vlc, I got hit with this staticey noise whenever the
 //            center channel started actually playing there ... whenever
@@ -2474,7 +2486,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.26"
+#define TWS_VERSION "8.4.27"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2715,7 +2727,7 @@ struct Config {
     // default OFF (off = bit-exact single multiply). KS pins bypass every
     // APO, so the dialogue boost must live in the engine.
     bool        centerEq       = false;
-    float       centerEqFreq   = 1800.0f; // peak frequency (Hz, clamped 20..20000)
+    float       centerEqFreq   = 287.0f;  // peak frequency (Hz, clamped 20..20000; v8.4.27: the field's pick)
     float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
     float       centerEqQ      = 0.8f;    // peak Q (clamped 0.1..10)
     // v7.1.8 CENTER EQ SAVE SLOTS: the four built-in presets are retired --
@@ -4022,7 +4034,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                     // SL / ch6 SR, leg3 empty) -- the folds fold INTO the
                     // stereo output, never onto another device's slots.
                     if (idx == 0 && c == 2 && g_centerFold) keep = 1;
-                    if (idx == 0 && g_rearFold && (c == 4 || c == 5)) keep = 1;
+                    if (idx == 0 && g_rearFold && (c == 4 || c == 5 || c == 6 || c == 7)) keep = 1;
                     if (!keep) sc[i * kInCh + c] = 0.0f;
                 }
         }
@@ -4342,11 +4354,14 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // silence slots, no channel conversion anywhere downstream: there
         // is no upmix risk by construction.
         const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
-        // v8.4.26 THE REAR FOLD (leg3 empty): SL rides L, SR rides R at the
-        // rears' own gains -- the surround content still plays through the
-        // fronts, the matrix-encoding effect, with no delay.
-        const float gSL = g_rearFold ? g_cfg.gainRl : 0.0f;
-        const float gSR = g_rearFold ? g_cfg.gainRr : 0.0f;
+        // v8.4.26/27 THE REAR + SURROUND FOLD (leg3 empty): the rears (ch7
+        // RL, ch8 RR) fold DIRECT to their own sides -- their own specific
+        // type. The surrounds (ch5 SL, ch6 SR) fold WIDE -- the
+        // matrix-encoding phase trick: each surround feeds its own side
+        // in-phase and the opposite side INVERTED at half gain, so the
+        // surround pushes outward instead of smearing the front image.
+        const float gRL = g_rearFold ? g_cfg.gainRl : 0.0f;
+        const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             for (size_t i = 0; i < n; ++i) {
@@ -4354,16 +4369,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
                 const float cf  = gC * f[2];            // the center fold (leg2 empty)
-                o[0] = gL * f[0] + lfe + cf + gSL * f[4];   // L + center + SL folds
-                o[1] = gR * f[1] + lfe + cf + gSR * f[5];   // R + center + SR folds
+                o[0] = gL * f[0] + lfe + cf + gRL * f[6] + gRL * f[4] - 0.5f * gRR * f[5];
+                o[1] = gR * f[1] + lfe + cf + gRR * f[7] + gRR * f[5] - 0.5f * gRL * f[4];
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
                 const float* f = sc + i * kInCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
-                o[0] = gL * f[0] + lfe + gSL * f[4];    // L + the SL fold
-                o[1] = gR * f[1] + lfe + gSR * f[5];    // R + the SR fold
+                o[0] = gL * f[0] + lfe + gRL * f[6] + gRL * f[4] - 0.5f * gRR * f[5];
+                o[1] = gR * f[1] + lfe + gRR * f[7] + gRR * f[5] - 0.5f * gRL * f[4];
             }
         }
     } else if (idx == 1) {
@@ -5367,7 +5382,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.26 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.27 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5480,14 +5495,15 @@ static void writeTemplate(const char* path) {
         "; pins, and KS bypasses the Windows audio engine (and every APO) whole.\n"
         "; center_eq = off keeps out2 bit-exact (the default). When on:\n"
         ";   center_eq_freq -- the peak's center in Hz. Dialogue presence and\n"
-        ";     intelligibility live around 1.5-3 kHz; 1800 Hz is the general pick.\n"
+        ";     intelligibility live around 1.5-3 kHz (v8.4.27: the field pick is\n"
+        ";     287 Hz).\n"
         ";   center_eq_gain -- boost in dB. +2..+4 subtle, +6 obvious; the path\n"
         ";     clamps at full scale and gain_center stacks on top, so loud\n"
         ";     center peaks may clip first -- lower gain_center if they do.\n"
         ";   center_eq_q    -- sharpness. 0.7-1.0 = broad musical bump; 2+ = a\n"
         ";     narrow spike (harsh faster).\n"
         "center_eq = off\n"
-        "center_eq_freq = 1800\n"
+        "center_eq_freq = 287\n"
         "center_eq_gain = 4.0\n"
         "center_eq_q = 0.8\n"
         "; v7.1.9 EQ SAVE SLOTS: five user slots replace the old built-in\n"
