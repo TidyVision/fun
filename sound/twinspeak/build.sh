@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# twinspeak v7.8.1 build -- llvm-mingw when present, pip zig otherwise.
+# twinspeak v8.5.0 build -- llvm-mingw when present, pip zig otherwise.
 #
 # v7.8.0: the link line grows the GUI's real import set -- the shipped script
 # was still the v6.5.1 engine-only list (no GDI+/D2D/D3D/DWrite/comctl32/
@@ -32,6 +32,10 @@ elif ls -d /home/z/my-project/work/toolchain/llvm-mingw*/bin >/dev/null 2>&1; th
 elif [ -x /home/z/my-project/venv-zig/bin/python ]; then
     echo "[build] resources: zig rc"
     /home/z/my-project/venv-zig/bin/python -m ziglang rc twinspeak.rc
+    RESOBJ="twinspeak.res"   # v8.5.0: zig rc writes twinspeak.res; the venv-zig
+                             # branch omitted this (only venv-zig-check set it),
+                             # leaving RESOBJ="" and zig c++ choking on the empty
+                             # arg ("unrecognized file extension").
 elif [ -x /home/z/my-project/venv-zig-check/bin/python ]; then
     echo "[build] resources: zig rc (venv-zig-check)"
     /home/z/my-project/venv-zig-check/bin/python -m ziglang rc twinspeak.rc
