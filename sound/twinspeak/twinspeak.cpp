@@ -62,6 +62,22 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.18 THE ANCHOR IS THE DEVICE BUFFER (field-directed: "I want to
+//            erase that 10ms delay" -- after seeing raw1 ride 71.7-75.7
+//            over delay1_ms = 68). The flat 10 ms anchor (capture delivery
+//            + device buffer + slack) is replaced by the LEG'S REAL DEVICE
+//            BUFFER: L.anchorFrames = 2 x the negotiated period -- 192 fr
+//            = 4.0 ms on the field's WASAPI legs, 768 fr on a KS leg --
+//            set once at ring init. THAT buffer is the sound card's own
+//            pre-load and the floor physics allows: a margin-0 pipeline is
+//            the DAC reading silence (the "crossed into stale audio"
+//            static), so 4 ms is the honest minimum, not a chosen one.
+//            The 6 ms of former slack is erased: the guard's band is now
+//            [device buffer, device buffer + 5 ms] -- LATE bites above it,
+//            the EARLY pad at the floor itself (over <= 0), so a leg can
+//            never sink under its card's appetite. raw1 = 68 + 4-9 ms with
+//            delay1_ms = 68; the start trim and the reopen landing target
+//            the same floor. NO new ini key, NO UI row.
 //    v8.4.17 EVERY LEG SYNCED TO THE CABLE CLOCK (field-directed: "Why
 //            would I sync each leg to the cable clock instead of to leg1?
 //            Yes, it's what I'd want, but how come? I would most
@@ -2247,7 +2263,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.17"
+#define TWS_VERSION "8.4.18"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2371,22 +2387,24 @@ static constexpr unsigned kSampleRate    = 48000;
 static constexpr unsigned kSyncNudgeMs    = 100;    // the depth guard's look window (one look per 100 ms)
 static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
 static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
-// v8.4.12/8.4.17 THE DEPTH GUARD: ring depth must have an owner. A
+// v8.4.12/8.4.17/8.4.18 THE DEPTH GUARD: ring depth must have an owner. A
 // shared-mode capture burst (audiodg under load: OBS, a game) permanently
 // added its size to EVERY ring, ratchet by ratchet (the field's raw creep
 // to 62 ms over an hour, and the jump to the ring's power-of-two cap --
 // 8192 fr = 170.7 ms at delay 0 -- when OBS opens). Nothing in the
 // stripped path ever drained depth back down. Each leg's real backlog is
 // now PINNED to its anchor (v8.4.17: EVERY leg, against the CABLE clock;
-// the master-only guard and the cross-leg servo are merged): past the
-// 5 ms bite threshold the oldest frames are dropped, and a ring 5 ms
-// UNDER the anchor takes a held-sample pad, at the warden's pacing.
-// Re-latches are GONE (v8.4.12): a jump is ground back like any other
-// error. kSyncSettleMs/kSyncRefDeadMs/kDepthDeadbandFr retired with the
-// cross-leg servo (v8.4.17) -- the start trim and the v8.4.14 landing
-// already land the ring at the anchor, and there is no leg1 reference
-// anymore.
-static constexpr unsigned kDepthAnchorFr   = 480;  // 10 ms: capture delivery + device buffer + slack
+// the master-only guard and the cross-leg servo are merged). v8.4.18: THE
+// ANCHOR IS THE LEG'S REAL DEVICE BUFFER (L.anchorFrames = 2 x the
+// negotiated period -- 192 fr = 4.0 ms on the field's WASAPI legs, 768 fr
+// on a KS leg), not a flat 10 ms: that buffer is the SOUND CARD'S OWN
+// PRE-LOAD and the floor physics allows -- a margin-0 pipeline is the DAC
+// reading silence (the "crossed into stale audio" static). The 6 ms of
+// former slack is erased (field-directed: "I want to erase that 10ms
+// delay"): past the 5 ms bite threshold the oldest frames are dropped,
+// and a ring AT the floor takes a held-sample pad, at the warden's
+// pacing. Re-latches are GONE (v8.4.12): a jump is ground back like any
+// other error.
 
 // v8.4.5 THE UNIVERSAL KEEP-ALIVE tone: 20 Hz at 0.1% gain (0.001,
 // ~-60 dBFS -- 14 dB under v7.1.24's 40 Hz @ 0.5%) summed onto EVERY
@@ -2862,6 +2880,13 @@ struct Leg {
     bool                gateWasMuted4 = false;
     unsigned long long  lastSide2LogMs = 0;      // v8.4.11: rear R gate's own rate limit
     unsigned long long  lastSide3LogMs = 0;      // v8.4.11: side R gate's own rate limit
+    // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
+    // negotiated period -- 192 fr = 4.0 ms on the field's WASAPI legs, 768
+    // fr on a KS leg) -- the sound card's own pre-load and the floor the
+    // pipeline physically allows. Set once at ring init, on the main
+    // thread, before any device thread exists. The guard holds the ring at
+    // delayFrames + anchorFrames; margin 0 is the DAC reading silence.
+    size_t              anchorFrames = 0;
     // ---- v8.4.7 -> v8.4.17 THE DEPTH GUARD state (per leg, no key, no UI).
     // v8.4.17: each leg pins its OWN boundary to the CABLE clock (its ring
     // depth above its own delay + the anchor) -- the cross-leg servo is
@@ -3415,24 +3440,27 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // v8.4.15 servo bug cannot be written anymore. A yielded or hung leg1 no
 // longer freezes anything; there is no master specialness at all.
 //
-// The meter, per leg: over = depth - delayFrames - anchor -- the real
-// backlog above the leg's OWN configured delay and the anchor (10 ms: the
-// capture delivery plus the device buffer plus slack). LATE (over >= 5
+// The meter, per leg: over = depth - delayFrames - anchorFrames -- the real
+// backlog above the leg's OWN configured delay and its OWN device buffer
+// (v8.4.18: the anchor is L.anchorFrames, 2 x the negotiated period -- 4 ms
+// on the field's WASAPI legs -- the sound card's own pre-load, the floor
+// physics allows; margin 0 is the DAC reading silence). LATE (over >= 5
 // ms: the DAC runs slow or a capture burst bloated the ring): the warden
 // bite drops 240 frames, at most one per 2 s -- the leg catches up to the
 // freshest capture, nothing is ever accepted (the v8.4.12 ratchet story).
-// EARLY (over <= -5 ms: the DAC runs fast, the ring drains): the warden
-// bite pads up to 240 frames -- the switch pops fewer frames and holds
-// its last mixed frame across them, the boundary stalls and the ring
-// refills; the DAC always receives its full frameCount, a held sample,
-// never a hole. BITE-ONLY (v8.4.16: the 16-frame nudge chased the two
-// rings' capture-burst phase jitter ten skips a second -- THE CRACKLE).
-// Between bites each leg's margin rides within ~5 ms of the anchor -- at
-// realistic ppm rates a correction is a rare, gentle event. No cross-leg
-// reads, no settle gate (the start trim and the v8.4.14 landing already
-// land the ring at the anchor). Returns the number of pad frames the
-// switch must synthesize (0, or up to kDriftCorrectFr, clamped under the
-// block). No ini key, no UI row: the constants are the engine's truth.
+// EARLY (over <= 0: the ring is AT or under the device-buffer floor -- the
+// DAC runs fast, the ring drains): the warden bite pads up to 240 frames --
+// the switch pops fewer frames and holds its last mixed frame across them,
+// the boundary stalls and the ring refills; the DAC always receives its
+// full frameCount, a held sample, never a hole. BITE-ONLY (v8.4.16: the
+// 16-frame nudge chased the two rings' capture-burst phase jitter ten
+// skips a second -- THE CRACKLE). Between bites each leg's margin rides in
+// [device buffer, device buffer + 5 ms] -- at realistic ppm rates a
+// correction is a rare, gentle event. No cross-leg reads, no settle gate
+// (the start trim and the v8.4.14 landing already land the ring at the
+// anchor). Returns the number of pad frames the switch must synthesize
+// (0, or up to kDriftCorrectFr, clamped under the block). No ini key, no
+// UI row: the constants are the engine's truth.
 static size_t depthGuard(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
@@ -3440,7 +3468,7 @@ static size_t depthGuard(int idx, Leg& L, size_t frameCount)
     L.lastSyncMs = nowMs;
     const long long over = (long long)L.raw.count()
                          - (long long)L.delayFrames     // the real backlog above the leg's own delay
-                         - (long long)kDepthAnchorFr;
+                         - (long long)L.anchorFrames;   // v8.4.18: the leg's own device-buffer floor
     if (over >= (long long)kDriftCorrectFr) {           // LATE: the warden bite (drain)
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
@@ -3458,7 +3486,7 @@ static size_t depthGuard(int idx, Leg& L, size_t frameCount)
         }
         return 0;
     }
-    if (over <= -(long long)kDriftCorrectFr) {          // EARLY: the warden bite (held samples)
+    if (over <= 0) {                                    // EARLY: at/below the device-buffer floor
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             // clamp under the block: the pad region must repeat a REAL mixed
             // frame (holdSrc = the last popped frame), never read past it.
@@ -5230,7 +5258,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6040,7 +6068,7 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 static void landReopenedRing(int idx) {
     Leg& L = g_leg[idx];
     const long long have = (long long)L.raw.count();
-    const long long want = (long long)L.delayFrames + (long long)kDepthAnchorFr;
+    const long long want = (long long)L.delayFrames + (long long)L.anchorFrames;
     if (have > want)
         L.raw.discardOldest((size_t)(have - want));   // advances tail AND seqTail, ledger-true
 }
@@ -10728,6 +10756,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                      ? L.dev.playback.internalPeriodSizeInFrames : 480);
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
+        // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
+        // negotiated period) -- the sound card's own pre-load and the floor
+        // the pipeline physically allows. On the field's WASAPI legs
+        // (period 96 fr x2) that is 192 fr = 4.0 ms; on a KS leg the pacer's
+        // own 768-fr lead. The depth guard holds the ring at delay + this;
+        // margin 0 is the DAC reading silence.
+        L.anchorFrames = devPeriodFr * 2;
         L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 150), kInCh);
         L.raw.pushSilence(L.delayFrames);   // the delay: bit-exact, seq-less
         L.prefillRemaining = L.delayFrames; // v6.4 lineage: prefill carries no sequence
@@ -10861,9 +10896,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         Leg& SL = g_leg[li];
         if (!SL.raw.cap) continue;                     // ring not built
         const long long level = (long long)SL.raw.count();
-        if (level > (long long)(SL.delayFrames + 96)) {
+        if (level > (long long)(SL.delayFrames + SL.anchorFrames)) {
             const size_t dropped =
-                SL.raw.discardOldest((size_t)(level - (long long)SL.delayFrames - 96));
+                SL.raw.discardOldest((size_t)(level - (long long)SL.delayFrames - (long long)SL.anchorFrames));
             tlog("[twinspeak] leg%d sync     : start trim: dropped %llu fr of pre-playback backlog -- the first buffer opens at the delay anchor\n",
                  li + 1, (unsigned long long)dropped);
         }
@@ -11041,9 +11076,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
            "                            DAC's register paces it all. v8.4.17 EVERY LEG PINS ITSELF TO THE\n"
-           "                            CABLE CLOCK: each leg holds its ring at its own delay + a 10 ms\n"
-           "                            anchor off the freshest capture -- the inter-leg sync IS the\n"
-           "                            calibration by construction, no cross-leg servo, no master.\n"
+           "                            CABLE CLOCK: each leg holds its ring at its own delay + its own\n"
+           "                            device-buffer anchor (v8.4.18: 2 x the negotiated period -- 4.0 ms\n"
+           "                            on the field's WASAPI legs, the sound card's own pre-load and the\n"
+           "                            floor physics allows) -- the inter-leg sync IS the calibration by\n"
+           "                            construction, no cross-leg servo, no master.\n"
            "                            v8.4.11/16/17 THE WARDEN BITE, BITE-ONLY: the 16-frame nudge is\n"
            "                            RETIRED (it chased the two rings' capture-burst phase jitter ten\n"
            "                            skips a second -- the center crackle); a leg 5 ms over its anchor\n"
