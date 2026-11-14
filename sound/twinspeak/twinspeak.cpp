@@ -62,6 +62,35 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.17 EVERY LEG SYNCED TO THE CABLE CLOCK (field-directed: "Why
+//            would I sync each leg to the cable clock instead of to leg1?
+//            Yes, it's what I'd want, but how come? I would most
+//            definitely implement this to the c++ to remove the need to
+//            account for delayNms values manually."). The cross-leg servo
+//            (syncToFirst) and the master-only depth guard are MERGED
+//            into ONE depthGuard that runs for EVERY leg: each leg pins
+//            its own play boundary to THE CABLE CLOCK -- freshest capture
+//            minus (its own delay + the 10 ms anchor) -- by dropping
+//            (late) or held-sample padding (early) in 5 ms warden bites.
+//            WHY: leg1's boundary was only ever a proxy for the cable
+//            with leg1's own drift and margin noise folded in -- the
+//            servo imported both into every slave's error and coupled the
+//            corrections (a master bite forced slave bites). The cable is
+//            the content; each leg now corrects only its own hardware's
+//            drift, once, independently, and the inter-leg sync the servo
+//            chased falls out BY CONSTRUCTION (two legs at the same
+//            anchor are separated by exactly delay1 - delay2). THE DELAY
+//            ACCOUNTING SHRINKS TO ONE LOCAL SUBTRACTION PER LEG in one
+//            function -- the cross-terms behind the v8.4.12 landing bug
+//            and the v8.4.15 servo bug cannot be written anymore. The
+//            reopen landing lands every leg at its OWN delay + anchor (no
+//            cross-leg read), leg1's master specialness is gone (a
+//            yielded or hung leg1 freezes nothing), syncToFirst /
+//            kSyncSettleMs / kSyncRefDeadMs / kDepthDeadbandFr are
+//            deleted, and the EARLY pad now self-heals a fast crystal's
+//            shallow ring on every leg instead of starving it. Trade:
+//            inter-leg offset tolerance is the 5 ms bite dead-band --
+//            inaudible between speakers. NO new ini key, NO UI row.
 //    v8.4.16 THE WIDE NUDGE IS RETIRED (field-directed: "I see the center
 //            channel crackling ... I would legitimately remove the
 //            16-sample drift corrector and see what happens. Because at
@@ -2218,7 +2247,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.16"
+#define TWS_VERSION "8.4.17"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2339,34 +2368,25 @@ static constexpr unsigned kSampleRate    = 48000;
 // a 240-frame bite (drop or held-sample pad) at most once per 2 s -- no
 // nudge beneath it, so a correction is a rare 5 ms event, not ten skips
 // a second; between bites the offset rides at most ~5 ms of true drift.
-static constexpr unsigned kSyncNudgeMs    = 100;    // the servo/depth-guard look window (one look per 100 ms)
-static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.13: a pure startup hush past the last (re)open (no baseline)
+static constexpr unsigned kSyncNudgeMs    = 100;    // the depth guard's look window (one look per 100 ms)
 static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
 static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
-// v8.4.12 THE DEPTH GUARD: the servo holds the SLAVES to the master's play
-// boundary, but off = r2 - r1 (the REAL-backlog difference, prefill
-// excluded) is blind to COMMON-MODE ring growth -- a shared-mode capture
-// burst (audiodg under load: OBS, a game) permanently added its size to
-// EVERY ring, ratchet by ratchet (the field's raw creep to 62 ms over an
-// hour, and the jump to the ring's power-of-two cap -- 8192 fr = 170.7 ms
-// at delay 0 -- when OBS opens). Nothing ever drained depth back down.
-// The master's real backlog is now PINNED to its anchor: past the
-// dead-band the oldest frames are dropped, at the warden's pacing, and
-// the err loop drags every slave to the same anchor. Re-latches are GONE
-// (v8.4.12): a jump is ground back like any other error -- only a reopen
-// re-arms the baseline (the settle gate).
+// v8.4.12/8.4.17 THE DEPTH GUARD: ring depth must have an owner. A
+// shared-mode capture burst (audiodg under load: OBS, a game) permanently
+// added its size to EVERY ring, ratchet by ratchet (the field's raw creep
+// to 62 ms over an hour, and the jump to the ring's power-of-two cap --
+// 8192 fr = 170.7 ms at delay 0 -- when OBS opens). Nothing in the
+// stripped path ever drained depth back down. Each leg's real backlog is
+// now PINNED to its anchor (v8.4.17: EVERY leg, against the CABLE clock;
+// the master-only guard and the cross-leg servo are merged): past the
+// 5 ms bite threshold the oldest frames are dropped, and a ring 5 ms
+// UNDER the anchor takes a held-sample pad, at the warden's pacing.
+// Re-latches are GONE (v8.4.12): a jump is ground back like any other
+// error. kSyncSettleMs/kSyncRefDeadMs/kDepthDeadbandFr retired with the
+// cross-leg servo (v8.4.17) -- the start trim and the v8.4.14 landing
+// already land the ring at the anchor, and there is no leg1 reference
+// anymore.
 static constexpr unsigned kDepthAnchorFr   = 480;  // 10 ms: capture delivery + device buffer + slack
-static constexpr int      kDepthDeadbandFr = 240;  // 5 ms: healthy jitter is never touched
-static constexpr unsigned kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be a reference
-// v8.4.13 NO BASELINE: the settled-offset latch (syncBase) is RETIRED -- it
-// was the last acceptance path. Two seconds after any reopen it captured
-// whatever off happened to be, and a burst still in the rings became the
-// servo's truth FOREVER (the field's "raw2 jumped to like 70 after raw1
-// went to 11 and then 7" -- the servo defending raw1 + bloat), and the
-// baseline random-walked up a few ms per event (raw2 creeping 4-8 ms over
-// raw1 in eight idle minutes). The user's calibration lives in the delay
-// prefills, which off never sees; a nonzero settled offset is startup
-// skew, and startup skew is drift to be corrected, not held. err = off.
 
 // v8.4.5 THE UNIVERSAL KEEP-ALIVE tone: 20 Hz at 0.1% gain (0.001,
 // ~-60 dBFS -- 14 dB under v7.1.24's 40 Hz @ 0.5%) summed onto EVERY
@@ -2842,26 +2862,25 @@ struct Leg {
     bool                gateWasMuted4 = false;
     unsigned long long  lastSide2LogMs = 0;      // v8.4.11: rear R gate's own rate limit
     unsigned long long  lastSide3LogMs = 0;      // v8.4.11: side R gate's own rate limit
-    // ---- v8.4.7 SLOW SYNC TO LEG1: the drift servo state (no key, no UI).
-    // v8.4.13: NO BASELINE -- the servo's error IS the measured offset
-    // (the settled-baseline latch was the last acceptance path: 2 s after
-    // any reopen it captured whatever off happened to be, and a burst
-    // still in the rings became the servo's truth forever -- raw2 parked
-    // at raw1 + bloat, and the baseline random-walked up a few ms per
-    // event). The settle gate in syncToFirst is a pure startup hush now.
-    // Written by this leg's device thread ONLY (the syncToFirst call
-    // inside its buffer switch); lastSyncMs rate-limits the servo look;
-    // syncDrops/syncPads count the nudges (logged rate-limited, per-run
-    // like the ledger clocks).
+    // ---- v8.4.7 -> v8.4.17 THE DEPTH GUARD state (per leg, no key, no UI).
+    // v8.4.17: each leg pins its OWN boundary to the CABLE clock (its ring
+    // depth above its own delay + the anchor) -- the cross-leg servo is
+    // gone, so there is no baseline, no settle gate, no leg1 heartbeat
+    // reference, and no delay cross-terms anywhere. Written by this leg's
+    // device thread ONLY (the depthGuard call inside its buffer switch);
+    // lastSyncMs rate-limits the guard look; syncDrops/syncPads and
+    // depthDrops count the bites (logged rate-limited, per-run like the
+    // ledger clocks).
     unsigned long long     lastSyncMs    = 0;
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
     unsigned long long     lastSyncLogMs = 0;
-    // v8.4.11/8.4.12: the warden bite state (this leg's device thread only,
-    // the same single-writer discipline). lastBiteMs rate-limits the
-    // 240-frame bite to one per 2 s (the slave's err bites AND the master's
-    // depth-guard bites -- a leg never runs both); wardenDrops/wardenPads
-    // count the bites, depthDrops counts the v8.4.12 depth-guard drops.
+    // v8.4.11/8.4.16/8.4.17: the warden bite state (this leg's device
+    // thread only, the same single-writer discipline). lastBiteMs
+    // rate-limits the 240-frame bite to one per 2 s (LATE drop and EARLY
+    // pad share it -- a leg never takes both in one window);
+    // wardenDrops/wardenPads count the bites, depthDrops counts the
+    // dropped frames.
     unsigned long long     lastBiteMs    = 0;
     unsigned long long     wardenDrops   = 0;
     unsigned long long     wardenPads    = 0;
@@ -3371,130 +3390,78 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     }
 }
 
-// ------------------------------------------------- v8.4.7 slow sync --------
-// THE PROBLEM (field-directed): every output device carries its own
-// crystal, and the crystals disagree by a few ppm -- over an hour the
-// legs' relative offset walks by tens of milliseconds (one device slowly
-// delays the others) until the raw cap evicts or the stream starves and
-// the offset jumps. THE FIX: every leg EXCEPT the first servos to LEG1's
-// play boundary -- the FIRST device is the master, never adjusted, and
-// all the others sync together to exactly it. The metric is the two
-// seqTails' difference with EACH LEG'S OWN DELAY SUBTRACTED (v8.4.15:
-// the master's delay1_ms sat inside the raw difference and the servo
-// padded the slaves up to its delayed boundary -- the field's "raw2
-// climbs to roughly that delay"; the error is now the backlogs ABOVE
-// each leg's configured delay): pure frame arithmetic, no clock, no
-// resampler. v8.4.13: the servo's ERROR IS that difference -- no settled baseline
-// (the latch was an acceptance path; see the constants block). v8.4.16:
-// THE WIDE NUDGE IS RETIRED -- corrections are the WARDEN BITE ONLY:
-// LATE (its crystal runs slow, err accumulates past 5 ms): one
-// discardOldest(240) per 2 s -- the boundary jumps 5 ms, the drift keeps
-// walking, the next bite waits for the pacing window. EARLY (crystal
-// fast, ring shallow): the switch pops up to 240 frames less and holds
-// its last mixed frame across them -- the DAC always receives its full
-// frameCount, and the pad is a held sample, not a hole. Between bites
-// the offset rides at most ~5 ms of true drift -- inaudible between two
-// speakers -- and the center stops taking ten skips a second (THE
-// CRACKLE, field-directed).
-// v8.4.11 THE WARDEN BITE: the old version's drift correction (the
-// shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000) rides the
-// same servo -- past 5 ms of accumulated drift a leg takes up to a
-// 240-frame drop or held-sample pad, at most once per 2 s. v8.4.12: NO
-// RE-LATCH of any kind -- a jump is ground back like any other error
-// (the old |err| test AND the v8.4.11 step test both silently ACCEPTED
-// bloat as a new baseline; only a reopen re-arms, through the settle
-// gate), and the master's DEPTH GUARD (masterDepthGuard, below) owns
-// common-mode ring growth, which this difference metric cannot see.
-// A yielded or heart-silent leg1 freezes
-// the sync whole (a parked leg's ring still evicts, and eviction jitter
-// is not a clock to follow). Returns the number of pad frames the switch
-// must synthesize (0, or up to kDriftCorrectFr, clamped under the block).
-// No ini key, no UI row: the constants are the engine's truth.
-static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
+// ------------------------------------------------- v8.4.17 the depth guard --
+// ONE drift-correction mechanism for EVERY leg, each pinning its own play
+// boundary to THE CABLE CLOCK (the capture) instead of to leg1 (v8.4.17,
+// field-directed: "sync each leg to the cable clock instead of to leg1 ...
+// remove the need to account for delayNms values manually"). The v8.4.7
+// cross-leg servo and the v8.4.12 master-only guard are MERGED into this
+// one function; syncToFirst is GONE.
+//
+// WHY THE CABLE: leg1's boundary was only ever a PROXY for the cable clock,
+// with leg1's own drift and margin noise folded in -- the cross-leg servo
+// imported both into every slave's error, and coupled the corrections
+// (the master's bite moved off, which forced a bite on each slave). The
+// cable IS the content: every leg consumes the same frames, so the only
+// meaningful error for a leg is how far its boundary sits from
+// freshest-capture minus (its own delay + the anchor). Each leg now
+// corrects ONLY its own hardware's drift, once, independently -- no
+// propagation, no coupling. The inter-leg sync the servo chased falls out
+// BY CONSTRUCTION: two legs holding the same anchor are separated by
+// exactly delay1 - delay2, the calibration, held indefinitely within the
+// 5 ms bite dead-band (inaudible between speakers). And the delay
+// accounting shrinks to ONE local subtraction per leg in this one
+// function -- the cross-terms behind the v8.4.12 landing bug and the
+// v8.4.15 servo bug cannot be written anymore. A yielded or hung leg1 no
+// longer freezes anything; there is no master specialness at all.
+//
+// The meter, per leg: over = depth - delayFrames - anchor -- the real
+// backlog above the leg's OWN configured delay and the anchor (10 ms: the
+// capture delivery plus the device buffer plus slack). LATE (over >= 5
+// ms: the DAC runs slow or a capture burst bloated the ring): the warden
+// bite drops 240 frames, at most one per 2 s -- the leg catches up to the
+// freshest capture, nothing is ever accepted (the v8.4.12 ratchet story).
+// EARLY (over <= -5 ms: the DAC runs fast, the ring drains): the warden
+// bite pads up to 240 frames -- the switch pops fewer frames and holds
+// its last mixed frame across them, the boundary stalls and the ring
+// refills; the DAC always receives its full frameCount, a held sample,
+// never a hole. BITE-ONLY (v8.4.16: the 16-frame nudge chased the two
+// rings' capture-burst phase jitter ten skips a second -- THE CRACKLE).
+// Between bites each leg's margin rides within ~5 ms of the anchor -- at
+// realistic ppm rates a correction is a rare, gentle event. No cross-leg
+// reads, no settle gate (the start trim and the v8.4.14 landing already
+// land the ring at the anchor). Returns the number of pad frames the
+// switch must synthesize (0, or up to kDriftCorrectFr, clamped under the
+// block). No ini key, no UI row: the constants are the engine's truth.
+static size_t depthGuard(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
     if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
     L.lastSyncMs = nowMs;
-    // leg1 must be ALIVE as a reference: not yielded, its device callback
-    // heartbeating. Otherwise freeze (keep the baseline, nudge nothing).
-    if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
-    if (nowMs - hbOutGet(0) > kSyncRefDeadMs) return 0;
-    // v8.4.15 THE DELAY-NEUTRAL METRIC (field-directed: "make sure that
-    // leg1, leg2, and leg3 all be subtracted by their individual delays
-    // (delay1_ms, delay2_ms, and delay3_ms) ... so that measurements are
-    // accurate"). Each leg's play boundary sits delay_i_ms behind the
-    // capture BY CALIBRATION -- the v8.4.13 metric (the raw seqTail
-    // difference) included the MASTER's delay, so with delay1_ms = 68 the
-    // servo read the center 68 ms EARLY and padded raw2 up ~68 ms to
-    // "sync" it to the mains' DELAYED boundary -- the calibration defeated
-    // by its own servo. The error is now measured between the UNDELAYED
-    // boundaries: each seqTail is shifted forward by its own delay, i.e.
-    // err = (depth2 - delay2) - (depth1 - delay1) -- the backlogs ABOVE
-    // each leg's configured delay, the user's prefill untouched.
-    const long long off =
-        (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
-                    + (long long)g_leg[0].delayFrames)
-        - (long long)(L.raw.seqTail.load(std::memory_order_relaxed)
-                      + (long long)L.delayFrames);
-    // settle: kSyncSettleMs past the last (re)open AND kSyncSettleMs of
-    // this leg's own switches -- the prefills and the start-align pads are
-    // through. v8.4.13: a pure STARTUP HUSH -- no baseline to arm or latch
-    // (the settled latch captured mid-grind bloat as the servo's truth; see
-    // the constants block).
-    const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
-    if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) return 0;
-    LARGE_INTEGER fsw;
-    QueryPerformanceCounter(&fsw);
-    const unsigned long long nowUs =
-        (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
-    if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) return 0;
-    // v8.4.13: NO BASELINE -- the error IS the offset. A nonzero settled
-    // offset was startup skew, and startup skew is drift to be corrected,
-    // not held.
-    const long long err = off;   // + = this leg is LATE vs leg1
-    // NO RE-LATCH anywhere below (v8.4.12/8.4.13). A jump (a stall, an
-    // eviction batch, a hiccup) is GROUND BACK like any other error --
-    // accepting it was the ratchet that parked raw2 at 36, then 62, then
-    // the ring cap, then parked it at raw1 + bloat via the settle latch.
-    // The master's depth guard owns common-mode ring growth; this loop
-    // owns the difference; nothing is ever blessed.
-    // v8.4.16 THE WIDE NUDGE IS RETIRED (field-directed: "I would
-    // legitimately remove the 16-sample drift corrector and see what
-    // happens ... at this point it's probably causing the crackling").
-    // Confirmed: the nudges corrected every 100 ms window against an err
-    // that carries the two rings' capture-burst PHASE jitter (both rings
-    // eat identical bursts, each device pops on its own cadence, so the
-    // margins' difference wanders several ms with ZERO clock drift) -- the
-    // center took a 333 us skip up to ten times a second. THE CRACKLE.
-    // The servo is BITE-ONLY now: a correction is a 240-frame bite at the
-    // warden's pacing (at most one per 2 s), taken only when the drift has
-    // actually accumulated past 5 ms -- at realistic ppm rates that is one
-    // gentle correction every many minutes, and between bites the
-    // inter-leg offset rides at most ~5 ms of true drift, far inside what
-    // two speakers resolve.
-    if (err >= (long long)kDriftCorrectFr) {          // LATE: the warden bite
+    const long long over = (long long)L.raw.count()
+                         - (long long)L.delayFrames     // the real backlog above the leg's own delay
+                         - (long long)kDepthAnchorFr;
+    if (over >= (long long)kDriftCorrectFr) {           // LATE: the warden bite (drain)
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
-                L.syncDrops++;
-                L.wardenDrops++;
+                L.depthDrops += kDriftCorrectFr;
                 L.lastBiteMs = nowMs;
                 if (nowMs - L.lastSyncLogMs >= 10000) {
                     L.lastSyncLogMs = nowMs;
-                    tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- the warden bit %d frames\n"
-                         "                            (%llu bite(s), %llu total dropped; the old drift correction:\n"
-                         "                            %d fr / %u ms, creep corrected, never accepted)\n",
-                         idx + 1, err, kDriftCorrectFr,
-                         (unsigned long long)L.wardenDrops, (unsigned long long)L.syncDrops,
+                    tlog("[twinspeak] depth out%d    : ring %lld fr over its anchor -- the guard bit %d frames\n"
+                         "                            (%llu total; burst bloat or slow-crystal drift is drained,\n"
+                         "                            never kept; the %d fr / %u ms warden pacing)\n",
+                         idx + 1, over, kDriftCorrectFr, (unsigned long long)L.depthDrops,
                          kDriftCorrectFr, kDriftIntervalMs);
                 }
             }
         }
         return 0;
     }
-    if (err <= -(long long)kDriftCorrectFr) {         // EARLY: the warden bite (held samples)
-        // clamp under the block: the pad region must repeat a REAL mixed
-        // frame (holdSrc = the last popped frame), never read past it.
+    if (over <= -(long long)kDriftCorrectFr) {          // EARLY: the warden bite (held samples)
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            // clamp under the block: the pad region must repeat a REAL mixed
+            // frame (holdSrc = the last popped frame), never read past it.
             const size_t pad = (frameCount > (size_t)kDriftCorrectFr)
                              ? (size_t)kDriftCorrectFr
                              : (frameCount >= 2) ? frameCount - 1 : 0;
@@ -3504,9 +3471,10 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
                 L.lastBiteMs = nowMs;
                 if (nowMs - L.lastSyncLogMs >= 10000) {
                     L.lastSyncLogMs = nowMs;
-                    tlog("[twinspeak] sync out%d     : %lld fr early vs out1 -- the warden padded %d frames\n"
-                         "                            (%llu bite(s), %llu total padded; a held sample, never a hole)\n",
-                         idx + 1, err, kDriftCorrectFr,
+                    tlog("[twinspeak] depth out%d    : ring %lld fr under its anchor -- the guard padded %d frames\n"
+                         "                            (%llu total; a fast crystal's shallow ring is refilled by\n"
+                         "                            stalling the boundary -- a held sample, never a hole)\n",
+                         idx + 1, over, kDriftCorrectFr,
                          (unsigned long long)L.wardenPads, (unsigned long long)L.syncPads);
                 }
             }
@@ -3514,62 +3482,7 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
         }
         return 0;
     }
-    return 0;                                         // below the bite threshold: hold
-}
-
-// v8.4.12 THE DEPTH GUARD -- the master's own drift correction (no key, no
-// UI row). The servo measures the REAL-backlog difference (r = ring depth
-// minus the leg's OWN delay prefill, v8.4.15: both legs delay-subtracted):
-// it holds every slave to
-// the master's boundary but is BY CONSTRUCTION blind to common-mode ring
-// growth -- both seqTails move together, off does not move, and a
-// shared-mode capture burst (audiodg starved under load: OBS, a game, a
-// browser) permanently added its size to EVERY ring. Nothing in the
-// stripped path ever drained depth: small bursts ratcheted the latency up
-// burst by burst (the field's "raw2 increasing over time ... to 62 ms"),
-// and a load spike big enough pinned the rings at their power-of-two caps
-// (8192 fr = 170.7 ms at delay 0 -- the field's "jumps to 162 when I open
-// OBS") and kept them there. THE FIX: the master's real backlog is pinned
-// to its anchor -- kDepthAnchorFr (10 ms: the capture delivery plus the
-// device buffer plus slack) -- past a kDepthDeadbandFr (5 ms) dead-band,
-// dropping the OLDEST frames at the warden's exact pacing (the 16 fr /
-// 100 ms wide nudge, the 240 fr / 2 s bite, the shipped ini's drift
-// correction). The skip is the correction: the leg catches up to the
-// freshest capture, the latency returns to the anchor, nothing is
-// accepted. The SLAVES ride it for free through the servo: draining the
-// master's r1 raises off, the err loop drops each slave by the same
-// amount, and off itself never moves -- the legs drain TOGETHER, the
-// user's calibration intact. A healthy ring (jitter inside the dead-band)
-// is never touched. Master-only by design: the err loop already owns each
-// slave's depth relative to the master, and one owner per quantity keeps
-// the two corrections from fighting.
-static void masterDepthGuard(Leg& L) {
-    const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return;   // slow: one look per window (the servo's clock)
-    L.lastSyncMs = nowMs;
-    const long long over = (long long)L.raw.count()
-                         - (long long)L.delayFrames   // real backlog, prefill excluded
-                         - (long long)kDepthAnchorFr;
-    if (over < (long long)kDepthDeadbandFr) return;    // healthy jitter: hold
-    if (over >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-        // v8.4.16: BITE-ONLY, like the servo -- the guard's 16-frame nudge
-        // took the same ten-skips-a-second crackle path the servo did, on
-        // the MAINS. A burst's bloat now drains in 5 ms bites at the
-        // warden's pacing (2.5 ms/s) -- slower, and silent.
-        if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
-            L.depthDrops += kDriftCorrectFr;
-            L.lastBiteMs = nowMs;
-            if (nowMs - L.lastSyncLogMs >= 10000) {
-                L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] depth out1    : ring %lld fr over its anchor -- the guard bit %d frames\n"
-                     "                            (%llu total; a capture burst's bloat is drained, never kept;\n"
-                     "                            the %d fr / %u ms warden pacing, the slaves follow through the\n"
-                     "                            sync loop)\n",
-                     over, kDriftCorrectFr, (unsigned long long)L.depthDrops,
-                     kDriftCorrectFr, kDriftIntervalMs);
-            }
-        }
-    }
+    return 0;                                           // inside the bite dead-band: hold
 }
 
 // v8.1.0 forward declarations: the stripped switch sits at the TOP of the
@@ -3633,17 +3546,15 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
     float* sc = L.scratch.data();
     size_t done = 0;
-    // v8.4.12 THE DEPTH GUARD: the master's real backlog is pinned to its
-    // anchor (the slaves follow through the servo's err loop -- off IS the
-    // real-backlog difference). Then v8.4.7 SLOW SYNC: out2/out3 servo to
-    // leg1's play boundary. A drop happened inside one of the two guards
-    // (the oldest frames are gone); a PAD is applied below -- this switch
+    // v8.4.17 THE DEPTH GUARD, EVERY LEG: each leg pins its own play
+    // boundary to the CABLE clock (the capture) at its own delay + the
+    // anchor -- the cross-leg servo is gone, and the inter-leg sync is the
+    // calibration by construction. A drop happened inside the guard (the
+    // oldest frames are gone); a PAD is applied below -- this switch
     // deliberately pops padFr frames less and holds its last mixed frame
     // across the pad region (up to kDriftCorrectFr frames, the warden
-    // bite -- v8.4.16: the 16-frame nudge is retired). Leg1 is
-    // never SERVOED (it is the master) but its DEPTH is guarded.
-    if (idx == 0) masterDepthGuard(L);
-    const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
+    // bite -- v8.4.16: the 16-frame nudge is retired).
+    const size_t padFr = depthGuard(idx, L, frameCount);
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
     // per leg -- the center reads ch3 (idx==1); v8.4.11: the ONE rear leg
     // (idx==2) reads FOUR lanes, each BY ITSELF -- rear L ch7 and side L
@@ -5319,7 +5230,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.17 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5632,20 +5543,16 @@ static void writeTemplate(const char* path) {
         "; invalidates the drift baseline and re-arms it once the path settles\n"
         "; (~9 s: 5 s settle + a 4-sample average) -- a boot-time-only\n"
         "; baseline went stale against exactly those events.\n"
-        "; v8.4.7 SLOW SYNC (v8.4.9 THE WIDE NUDGE; v8.4.11 THE WARDEN\n"
-        "; BITE; v8.4.12 THE DEPTH GUARD; v8.4.13 NO BASELINE): the\n"
-        "; INTER-LEG drift is synced away -- out2/out3 sync their boundary\n"
-        "; to OUT1, the first device (the master, never servoed): a\n"
-        "; 16-frame drop/pad at most every 100 ms, only past a 250 us\n"
-        "; dead-band, NO baseline at all (the servo's error is the measured\n"
-        "; offset -- the settled latch was an acceptance path and is\n"
-        "; retired); past 5 ms of accumulated drift the old warden bite\n"
-        "; takes over (up to 240 frames per 2 s); creep is CORRECTED, never\n"
-        "; accepted, and no re-latch exists. v8.4.12: the MASTER's ring\n"
-        "; depth is guarded too (a capture burst's bloat is drained to a\n"
-        "; 10 ms anchor, the slaves follow through the sync loop), and\n"
-        "; reopens land delay-corrected. No key, no UI row. The cable\n"
-        "; clock itself stays observe-only.\n"
+        "; v8.4.7 SLOW SYNC -> v8.4.17 EVERY LEG PINS ITSELF TO THE CABLE\n"
+        "; CLOCK: each leg holds its ring at its OWN delay + a 10 ms anchor\n"
+        "; off the freshest capture -- a leg 5 ms over its anchor drops 240\n"
+        "; frames (the warden bite), a leg 5 ms under pads 240 held frames,\n"
+        "; at most one bite per 2 s; no cross-leg servo, no master, no\n"
+        "; baseline, no delay cross-terms -- the inter-leg sync IS the\n"
+        "; calibration by construction. The 16-frame nudge (v8.4.9) is\n"
+        "; retired: it chased the two rings' capture-burst phase jitter ten\n"
+        "; skips a second (the center crackle). creep is CORRECTED, never\n"
+        "; accepted, and no re-latch exists. No key, no UI row.\n"
         "\n"
         "; UNDERRUN RULE (v8.1.0, built in -- no key, no switch): a buffer\n"
         "; switch the raw ring cannot fully fill plays SILENCE for the hole\n"
@@ -6123,24 +6030,17 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
 // the first pop are the same instant, nothing can refill in between, and
 // the producer races are already covered by the tail's monotonic CAS (the
 // capture callback's evictions share it).
-// The landing target is the servo's own: its error is the raw offset
-// (v8.4.13: no baseline), so the clean landing is r2 = r1 -- leg1's REAL
-// BACKLOG (its depth minus its delay prefill -- v8.4.12: the original
-// full-depth target leaked delay1_ms into the landing, the field's
-// "raw2 sits at 62") plus this leg's own prefill, floored at the depth
-// guard's anchor so the restart's first fill cannot starve on a capture
-// gap. The user's calibration lives in the delay prefills and needs no
-// baseline to survive a reopen. The master lands at its own anchor.
+// The landing target is the guard's own anchor (v8.4.17: NO cross-leg
+// read at all -- each leg lands at ITS OWN delay + the anchor, the exact
+// depth the depth guard holds; the earlier targets -- leg1's full depth
+// (the v8.4.12 delay1_ms leak, the field's "raw2 sits at 62"), then
+// leg1's real backlog -- are all obsolete with the per-leg cable-clock
+// pinning). The user's calibration lives in the delay prefills and needs
+// no baseline and no master to survive a reopen.
 static void landReopenedRing(int idx) {
     Leg& L = g_leg[idx];
-    const long long have     = (long long)L.raw.count();
-    const long long rMaster  = (long long)g_leg[0].raw.count()
-                             - (long long)g_leg[0].delayFrames;
-    const long long backlog  = (idx != 0)
-                             ? (rMaster > (long long)kDepthAnchorFr ? rMaster
-                                                                    : (long long)kDepthAnchorFr)
-                             : (long long)kDepthAnchorFr;
-    const long long want     = (long long)L.delayFrames + backlog;
+    const long long have = (long long)L.raw.count();
+    const long long want = (long long)L.delayFrames + (long long)kDepthAnchorFr;
     if (have > want)
         L.raw.discardOldest((size_t)(have - want));   // advances tail AND seqTail, ledger-true
 }
@@ -11140,14 +11040,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
-           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/out3 sync\n"
-           "                            their boundary to OUT1 (the first device, never adjusted), each leg's\n"
-           "                            own delay subtracted (v8.4.15).\n"
-           "                            v8.4.11/16 THE WARDEN BITE, BITE-ONLY: the 16-frame nudge is RETIRED\n"
-           "                            (it chased the two rings' capture-burst phase jitter ten skips a\n"
-           "                            second -- the center crackle); past 5 ms of ACCUMULATED drift a leg\n"
-           "                            drops/pads up to 240 frames in one bite, at most one per 2 s -- at\n"
-           "                            realistic ppm rates, one gentle correction every many minutes.\n"
+           "                            DAC's register paces it all. v8.4.17 EVERY LEG PINS ITSELF TO THE\n"
+           "                            CABLE CLOCK: each leg holds its ring at its own delay + a 10 ms\n"
+           "                            anchor off the freshest capture -- the inter-leg sync IS the\n"
+           "                            calibration by construction, no cross-leg servo, no master.\n"
+           "                            v8.4.11/16/17 THE WARDEN BITE, BITE-ONLY: the 16-frame nudge is\n"
+           "                            RETIRED (it chased the two rings' capture-burst phase jitter ten\n"
+           "                            skips a second -- the center crackle); a leg 5 ms over its anchor\n"
+           "                            drops 240 frames, a leg 5 ms under pads 240 held frames, at most\n"
+           "                            one bite per 2 s -- at realistic ppm rates, one gentle correction\n"
+           "                            every many minutes.\n"
            "                            v8.4.12 THE DEPTH GUARD: the master's ring depth is pinned to a 10 ms\n"
            "                            anchor (past a 5 ms dead-band, the same warden pacing) -- a capture\n"
            "                            burst's bloat is DRAINED, never kept, and the slaves follow through\n"
