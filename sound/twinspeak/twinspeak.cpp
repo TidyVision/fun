@@ -62,6 +62,37 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.15 THE DELAY-NEUTRAL METRIC + THE STALL RESYNC RETIRED + THE
+//            REALTIME PRIVILEGE ENABLE (field-directed: "Make sure that
+//            leg1, leg2, and leg3 all be subtracted by their individual
+//            delays (delay1_ms, delay2_ms, and delay3_ms) ... so that
+//            measurements are accurate ... I don't want a device being
+//            silent to reopen (if at all) ... make setting the process
+//            priority to real-time work"). (1) THE DELAY-NEUTRAL METRIC:
+//            the user set delay1_ms = 68 and watched raw2 climb to
+//            roughly 68 -- CONFIRMED in code: the servo's raw seqTail
+//            difference included the MASTER's calibration delay, so it
+//            read the center 68 ms early and padded raw2 up to the
+//            mains' DELAYED boundary -- the calibration defeated by its
+//            own servo. The error is now measured between the UNDELAYED
+//            boundaries: each leg's seqTail is shifted forward by its
+//            own delay (leg1 = delay1_ms, leg2 = delay2_ms, leg3 =
+//            offset3_ms), i.e. err = (depth2 - delay2) - (depth1 -
+//            delay1) -- the backlogs ABOVE the configured delays, the
+//            prefills untouched. The depth guard and the reopen landing
+//            already measured delay-subtracted; the servo was the last
+//            delay-contaminated meter. (2) THE STALL RESYNC IS RETIRED:
+//            a starved leg plays the keep-alive through the hole and a
+//            silent stream loses nothing -- the 3 s starvation reopen
+//            was pure churn (the ding, the restart window, the landing).
+//            The heartbeat WATCHDOG still reopens a thread that stopped
+//            SWITCHING entirely (a dead device never returns alone); a
+//            leg that merely starves rides the next capture burst.
+//            (3) THE REALTIME PRIVILEGE: SeIncreaseBasePriorityPrivilege
+//            is now explicitly ENABLED before SetPriorityClass -- the
+//            privilege is often held-but-disabled at launch, which made
+//            REALTIME refuse even under an administrator. NO new ini
+//            key, NO UI row.
 //    v8.4.14 THE DEFERRED REOPEN LANDING (field-directed, with the log:
 //            "Just heard a second ding which raised raw2 to 43. This is
 //            getting me suspicious."). The ding is the reopen chime
@@ -2165,7 +2196,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.14"
+#define TWS_VERSION "8.4.15"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3328,8 +3359,12 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // the offset jumps. THE FIX: every leg EXCEPT the first servos to LEG1's
 // play boundary -- the FIRST device is the master, never adjusted, and
 // all the others sync together to exactly it. The metric is the two
-// seqTails' difference (pure frame arithmetic, no clock, no resampler):
-// v8.4.13: the servo's ERROR IS that difference -- no settled baseline
+// seqTails' difference with EACH LEG'S OWN DELAY SUBTRACTED (v8.4.15:
+// the master's delay1_ms sat inside the raw difference and the servo
+// padded the slaves up to its delayed boundary -- the field's "raw2
+// climbs to roughly that delay"; the error is now the backlogs ABOVE
+// each leg's configured delay): pure frame arithmetic, no clock, no
+// resampler. v8.4.13: the servo's ERROR IS that difference -- no settled baseline
 // (the latch was an acceptance path; see the constants block) -- corrected
 // with kSyncNudgeFr-frame nudges, at most one
 // per kSyncNudgeMs and only past kSyncDeadBandFr (v8.4.9: 16 fr /
@@ -3363,9 +3398,23 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     // heartbeating. Otherwise freeze (keep the baseline, nudge nothing).
     if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
     if (nowMs - hbOutGet(0) > kSyncRefDeadMs) return 0;
+    // v8.4.15 THE DELAY-NEUTRAL METRIC (field-directed: "make sure that
+    // leg1, leg2, and leg3 all be subtracted by their individual delays
+    // (delay1_ms, delay2_ms, and delay3_ms) ... so that measurements are
+    // accurate"). Each leg's play boundary sits delay_i_ms behind the
+    // capture BY CALIBRATION -- the v8.4.13 metric (the raw seqTail
+    // difference) included the MASTER's delay, so with delay1_ms = 68 the
+    // servo read the center 68 ms EARLY and padded raw2 up ~68 ms to
+    // "sync" it to the mains' DELAYED boundary -- the calibration defeated
+    // by its own servo. The error is now measured between the UNDELAYED
+    // boundaries: each seqTail is shifted forward by its own delay, i.e.
+    // err = (depth2 - delay2) - (depth1 - delay1) -- the backlogs ABOVE
+    // each leg's configured delay, the user's prefill untouched.
     const long long off =
-        (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed) -
-                    L.raw.seqTail.load(std::memory_order_relaxed));
+        (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
+                    + (long long)g_leg[0].delayFrames)
+        - (long long)(L.raw.seqTail.load(std::memory_order_relaxed)
+                      + (long long)L.delayFrames);
     // settle: kSyncSettleMs past the last (re)open AND kSyncSettleMs of
     // this leg's own switches -- the prefills and the start-align pads are
     // through. v8.4.13: a pure STARTUP HUSH -- no baseline to arm or latch
@@ -3452,8 +3501,9 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 }
 
 // v8.4.12 THE DEPTH GUARD -- the master's own drift correction (no key, no
-// UI row). The servo measures off = r2 - r1, the REAL-backlog difference
-// (r = ring depth minus the leg's delay prefill): it holds every slave to
+// UI row). The servo measures the REAL-backlog difference (r = ring depth
+// minus the leg's OWN delay prefill, v8.4.15: both legs delay-subtracted):
+// it holds every slave to
 // the master's boundary but is BY CONSTRUCTION blind to common-mode ring
 // growth -- both seqTails move together, off does not move, and a
 // shared-mode capture burst (audiodg starved under load: OBS, a game, a
@@ -5257,7 +5307,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.14 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -10430,8 +10480,26 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v8.0.0: REALTIME process priority class -- the field directive, and
     // the right weight for a kernel-level loop: at REALTIME the engine's
     // TIME_CRITICAL threads sit at base 31, above every non-realtime thread
-    // the OS has. Without SeIncreaseBasePriorityPrivilege (a non-admin
-    // token) the call refuses -- fall back to HIGH and say so.
+    // the OS has. v8.4.15: SeIncreaseBasePriorityPrivilege is EXPLICITLY
+    // ENABLED first -- the privilege is often held by the token but
+    // disabled at launch, and an unenabled privilege makes
+    // SetPriorityClass(REALTIME) refuse even under an administrator
+    // (field-directed: "make setting the process priority to real-time
+    // work"). Without the privilege at all (a standard user token) the
+    // call still refuses -- fall back to HIGH and say so.
+    {
+        HANDLE tok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp;
+            if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege",
+                                      &tp.Privileges[0].Luid)) {
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+            }
+            CloseHandle(tok);
+        }
+    }
     if (SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
         tlog("[twinspeak] priority      : REALTIME process class -- the engine's threads sit at the\n"
              "                            scheduler's top band; the KS pacer owns its core against\n"
@@ -10439,9 +10507,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     } else {
         const DWORD pclErr = GetLastError();
         SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-        tlog("[twinspeak] priority      : REALTIME class refused (err %lu) -- HIGH engaged. Run once\n"
-             "                            as administrator for the full realtime band; MMCSS still\n"
-             "                            orders the audio threads inside it.\n", pclErr);
+        tlog("[twinspeak] priority      : REALTIME class refused (err %lu) -- HIGH engaged. The token\n"
+             "                            does not hold SeIncreaseBasePriorityPrivilege: launch elevated\n"
+             "                            once for the full realtime band; MMCSS still orders the audio\n"
+             "                            threads inside it.\n", pclErr);
     }
 
     timeBeginPeriod(1);
@@ -11071,7 +11140,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            the sync loop; reopens land delay-corrected; no re-latch anywhere.\n"
            "                            v8.4.13 NO BASELINE: the servo's error IS the measured offset -- the\n"
            "                            settled latch (an acceptance path) is retired; the settle gate is a\n"
-           "                            startup hush only; nothing is ever blessed as the new truth.\n");
+           "                            startup hush only; nothing is ever blessed as the new truth.\n"
+           "                            v8.4.15 THE DELAY-NEUTRAL METRIC: each leg's own delay is subtracted\n"
+           "                            from its boundary before the diff (err = (depth2-delay2) -\n"
+           "                            (depth1-delay1)) -- a delay on one leg can never drag the others;\n"
+           "                            and a STARVED leg is never reopened (only a thread that stopped\n"
+           "                            switching entirely is).\n");
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
@@ -11301,7 +11375,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     unsigned sec = 0;
     int hintStreak = 0;
     long prevDom = 0;
-    unsigned stallSec[4] = { 0, 0, 0, 0 };   // v6.5.11: consecutive starved seconds per leg (v8.4.0: four)
+    // v8.4.15: stallSec is RETIRED with the stall resync (starvation never
+    // reopens; see the STALL RESYNC note below).
     unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
     // v8.1.0: the first-second fast tier is GONE (it existed only to fire
     // the warden's re-pin early; the re-pin is gone with the ring system).
@@ -11408,7 +11483,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     const bool mine = containsCI(defName, yneedle);
                     if (mine && !Y.yielded.load(std::memory_order_relaxed)) {
                         Y.yielded.store(true, std::memory_order_relaxed);
-                        stallSec[i] = 0;
                         tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
                              "                            this leg's needle (\"%s\") -- releasing the DAC now so the\n"
                              "                            main device plays; it reopens the moment the default\n"
@@ -11529,38 +11603,17 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 }
             }
         }
-        // ---------------- v6.5.11 STALL RESYNC (v8.1.0: reopen only) ----------
-        // A starved leg trips the shortfall rule (silence, counted in 'und');
-        // with the ring machinery gone there is no backlog to discard -- the
-        // only recovery that still makes sense is the DEEP one: 3 s of
-        // sustained starvation reopens the leg fresh (also resets whatever
-        // the device's own silicon accumulated during the storm). Gated on
-        // the baseline + the suspend park; the reopen respects the 10 s
-        // per-leg spacing.
-        if (driftBaseOK && !g_powerPark.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < 4; ++i) {
-                Leg& SLeg = g_leg[i];
-                if (SLeg.disabled) { stallSec[i] = 0; continue; }   // v8.4.0: no leg, no stall
-                if (SLeg.yielded.load(std::memory_order_relaxed)) {   // v6.5.14: released by choice
-                    stallSec[i] = 0;
-                    continue;
-                }
-                const unsigned long long undPrev = uB[i];
-                const unsigned long long undNow = undN[i];
-                const bool starved = undNow > undPrev;
-                stallSec[i] = starved ? stallSec[i] + 1 : 0;
-                if (!starved) continue;
-                // DEEP PATH: sustained starvation -> fresh reopen
-                if (stallSec[i] >= 3 && nowMs - SLeg.lastReopenMs > 10000) {
-                    tlog("[twinspeak] stall resync : leg%d starved %u s running (short switches every\n"
-                         "                            second) -- reopening fresh (also resets the device-side\n"
-                         "                            FIFO the storm disturbed)\n",
-                         i + 1, stallSec[i]);
-                    stallSec[i] = 0;
-                    tryRestartLeg(i, &ctx, kOutPeriodMs);
-                }
-            }
-        }
+        // ---------------- v6.5.11 STALL RESYNC -- RETIRED (v8.4.15) ----------
+        // Field-directed: "I don't want a device being silent to reopen (if
+        // at all). The device being silent doesn't 'put the usb to sleep'
+        // and cause a drift." A starved leg trips the shortfall rule
+        // (silence, counted in 'und') and plays the keep-alive through the
+        // hole -- the amp stays fed and a SILENT stream loses nothing, so
+        // the 3 s starvation reopen was pure churn (the ding, the restart
+        // window, the landing). The heartbeat WATCHDOG above still reopens
+        // a thread that stopped SWITCHING entirely (a dead device never
+        // returns on its own); a leg that merely starves -- switches alive,
+        // ring dry -- is left alone to ride the next capture burst.
         // ---------------- v6.5.12 DEEP RESYNC (optional, deep_resync_min) --
         // The S5's below-packetizer layer (endpoint FIFO + amp DSP) can
         // deepen silently over hours: the ledger stays pinned while the
