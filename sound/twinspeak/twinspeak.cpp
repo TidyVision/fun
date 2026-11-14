@@ -62,6 +62,44 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.22 THE PAPER CRINKLE, KILLED TWICE (field-directed: "I still
+//            hear crackling coming from specific types of sound. It's
+//            like a paper crinkling type sound except it's distortion ...
+//            whenever twinspeak mixes ambient sky noise with another
+//            game's scroll sound that it distorts really badly ... I
+//            think this only happens on the center channel. Although,
+//            how do you disable that windows upmix I get to begin with
+//            so I don't have to do that center gate anymore?"). TWO
+//            mechanisms, both fixed: (1) THE GUARD'S FALSE POSITIVES --
+//            the log showed the upmix guard ENGAGING with coefficients
+//            that SWUNG per block (1.84/0.13 -> 0.45/0.70 -> 2.00/1.54
+//            within a minute): the true engine phantom is a FIXED matrix
+//            (its fit recovers the same a/b every hit), so those swings
+//            were GENUINE game center content falsely matching the
+//            fingerprint -- and every false engagement hard-zeroed the
+//            center mid-sound (the paper-crinkle chop). A hit now
+//            engages only when the fit is STABLE against the previous
+//            hit (|a-a'| <= 0.15 && |b-b'| <= 0.15): the fixed phantom
+//            engages on the second consecutive hit (~2 ms -- still the
+//            moment it is detected), swinging content never engages at
+//            all. (2) TPDF DITHER for 16-bit device legs: the mix
+//            pipeline is f32 and miniaudio's f32->s16 conversion
+//            truncates -- the error is correlated with the signal, and
+//            at volume_follow's reduced levels it reads as paper
+//            crinkling on quiet sounds (the S5 negotiates 16-bit; leg1's
+//            24-bit never crinkled). Two uniform draws summed, +-1 LSB
+//            of the s16 target, applied after the mix on non-skipped
+//            chunks: the truncation error decorrelates into benign
+//            broadband noise ~-90 dBFS. (3) THE UPMIX KILL SWITCH: the
+//            cable's playback endpoint runs its SysFx chain (Speaker
+//            Fill et al) which spreads stereo app streams INTO the
+//            phantom -- PKEY_AudioEndpoint_Disable_SysFx is now written
+//            to the cable's playback endpoint once per engine start (the
+//            Sound control panel's "Disable all enhancements" checkbox,
+//            automated; the manual path remains). The upmix guard STAYS
+//            -- it is still the only thing that can kill the basic
+//            engine matrix phantom (FC = (L+R)/2), but it now does so
+//            without touching genuine center. NO new ini key, NO UI row.
 //    v8.4.21 THE QUIET-WINDOW DRIFT CORRECTION + THE TRAY DIES WITH THE
 //            PROCESS (field-directed: "have a drift correction method
 //            that doesn't cause any crackling whatsoever ... upon exit
@@ -2341,7 +2379,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.21"
+#define TWS_VERSION "8.4.22"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3002,6 +3040,22 @@ struct Leg {
     // hours). Consumed + cleared by the switch loop.
     size_t                 biteDue       = 0;
     bool                   biteForced    = false;
+    // v8.4.22 TPDF DITHER for 16-bit device legs: the mix pipeline is f32
+    // and miniaudio's f32->s16 conversion truncates -- the error is
+    // CORRELATED with the signal, and at volume_follow's reduced levels it
+    // reads as paper crinkling on quiet sounds (the field's "a paper
+    // crinkling type sound except it's distortion", on the center only --
+    // leg1 negotiates 24-bit and never crinkled). ditherS16 is set at
+    // device init/open; ditherSeed is this leg's private xorshift state.
+    bool                   ditherS16     = false;
+    unsigned               ditherSeed    = 1;
+    // v8.4.22 THE COEFFICIENT-STABILITY DISCRIMINATOR: the true engine
+    // phantom is a FIXED matrix -- its fit recovers the same a/b every
+    // hit -- while genuine center content (a game's own mix) fits with
+    // coefficients that swing per block. The upmix guard engages only on
+    // a STABLE fit; cgPa/cgPb hold the previous hit's coefficients.
+    float                  cgPa          = 0.0f;
+    float                  cgPb          = 0.0f;
     // v8.4.19 THE PAD BUDGET: one EARLY bite = 240 frames of boundary stall,
     // delivered across consecutive switches (each capped at frameCount-1 by
     // the hold-region clamp). Set by the guard once per 2 s; consumed by
@@ -3343,6 +3397,87 @@ static IAudioEndpointVolume* findRenderEndpointVolume(const std::string& nameNee
     }
     en->Release();
     return result;
+}
+
+// v8.4.22 THE UPMIX KILL SWITCH: Windows' shared-mode engine upmixes a
+// stereo app stream into the cable's multi-channel endpoint, and the
+// endpoint's SysFx chain (Speaker Fill et al) spreads it further -- the
+// phantom center the upmix guard was built to kill. This writes the
+// "Disable all enhancements" flag (PKEY_AudioEndpoint_Disable_SysFx) on
+// the cable's playback endpoint -- the same flag the Sound control
+// panel's checkbox flips -- so the APO chain stops feeding the phantom at
+// the source. Best effort: logged, never fatal (a failure leaves the
+// upmix guard's fingerprint doing the same job, and the Sound control
+// panel checkbox remains the manual path).
+static void disableEndpointSysFx(const std::string& nameNeedle) {
+    static const PROPERTYKEY kPKEY_AudioEndpoint_Disable_SysFx = {
+        { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 5 };
+    const std::wstring wNeedle = narrowToWide(nameNeedle);
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return;
+    IMMDeviceCollection* col = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col) {
+        UINT n = 0;
+        if (SUCCEEDED(col->GetCount(&n))) {
+            for (UINT i = 0; i < n; ++i) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(col->Item(i, &dev)) || !dev) continue;
+                IPropertyStore* ps = nullptr;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+                    PROPVARIANT var; PropVariantInit(&var);
+                    bool match = false;
+                    if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
+                        var.vt == VT_LPWSTR && var.pwszVal)
+                        match = wContainsCI(var.pwszVal, wNeedle);
+                    PropVariantClear(&var);
+                    ps->Release();
+                    if (!match) { dev->Release(); continue; }
+                    // matched: reopen READWRITE and flip the flag
+                    IPropertyStore* psW = nullptr;
+                    if (SUCCEEDED(dev->OpenPropertyStore(STGM_READWRITE, &psW)) && psW) {
+                        PROPVARIANT cur; PropVariantInit(&cur);
+                        bool already = false;
+                        if (SUCCEEDED(psW->GetValue(kPKEY_AudioEndpoint_Disable_SysFx, &cur)) &&
+                            cur.vt == VT_UI4)
+                            already = (cur.ulVal != 0);
+                        PropVariantClear(&cur);
+                        if (already) {
+                            tlog("[twinspeak] upmix kill    : SysFx already disabled on the cable's playback\n"
+                                 "                            endpoint (\"%ls\") -- Speaker Fill/enhancements are\n"
+                                 "                            not feeding the phantom center\n", dev ? L"" : L"");
+                        } else {
+                            PROPVARIANT var2; PropVariantInit(&var2);
+                            var2.vt = VT_UI4;
+                            var2.ulVal = 1;
+                            if (SUCCEEDED(psW->SetValue(kPKEY_AudioEndpoint_Disable_SysFx, var2)) &&
+                                SUCCEEDED(psW->Commit())) {
+                                tlog("[twinspeak] upmix kill    : SysFx DISABLED on the cable's playback endpoint\n"
+                                     "                            -- Speaker Fill/enhancements stop feeding the\n"
+                                     "                            phantom center at the source (new streams pick it\n"
+                                     "                            up; the Sound control panel checkbox is the manual\n"
+                                     "                            equivalent)\n");
+                            } else {
+                                tlog("[twinspeak] upmix kill    : writing SysFx on the cable's playback endpoint\n"
+                                     "                            FAILED (err %lu) -- the Sound control panel's\n"
+                                     "                            \"Disable all enhancements\" checkbox is the manual\n"
+                                     "                            equivalent\n",
+                                     (unsigned long)GetLastError());
+                            }
+                            PropVariantClear(&var2);
+                        }
+                        psW->Release();
+                    }
+                    dev->Release();
+                    break;   // the first needle match wins, like the volume pin
+                }
+                dev->Release();
+            }
+        }
+        col->Release();
+    }
+    en->Release();
 }
 
 // v3.9: when the volume endpoint cannot be matched, show the user EVERY
@@ -3828,9 +3963,10 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // the merged rear chunk skips only when ALL FOUR of its lanes are
         // all-zero (a live side plays through a silent rear on the same
         // output; a live right plays through a silent left).
-        if ((L.zeroFast && bitZero8(sc, n)) ||
+        const bool skipMix = (L.zeroFast && bitZero8(sc, n)) ||
             (gateLane >= 0 && zLane && (gateLane2 < 0 || zLane2) &&
-             (gateLane3 < 0 || zLane3) && (gateLane4 < 0 || zLane4))) {
+             (gateLane3 < 0 || zLane3) && (gateLane4 < 0 || zLane4));
+        if (skipMix) {
             if (idx == 1) centerEqFlushZ();
             // dst is already silence
         } else {
@@ -3838,6 +3974,26 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         }
         if (g_tickOn.load(std::memory_order_relaxed))
             tickSum(idx, dst, n, seqBefore);   // v7.0.0: the sync tick, both legs
+        // v8.4.22 TPDF DITHER for 16-bit device legs: the mix pipeline is
+        // f32 and miniaudio's f32->s16 conversion truncates -- the error is
+        // CORRELATED with the signal, and at volume_follow's reduced levels
+        // it reads as paper crinkling on quiet sounds (the field's "a paper
+        // crinkling type sound except it's distortion", on the center only
+        // -- leg1 negotiates 24-bit and never crinkled). TPDF (two uniform
+        // draws summed, +-1 LSB of the s16 target) decorrelates the error
+        // into benign broadband noise ~-90 dBFS. Skipped-mix chunks stay
+        // bit-exact silence (the gate contract); 24/32-bit legs skip it.
+        if (L.ditherS16 && !skipMix) {
+            unsigned r = L.ditherSeed;
+            const size_t tot = n * (size_t)L.outCh;
+            for (size_t s = 0; s < tot; ++s) {
+                r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+                const float u1 = (float)(r & 0xFFFFU) * (1.0f / 65536.0f);
+                const float u2 = (float)((r >> 16) & 0xFFFFU) * (1.0f / 65536.0f);
+                dst[s] += (u1 + u2 - 1.0f) * (1.0f / 32768.0f);
+            }
+            L.ditherSeed = r;
+        }
         // v6.4: advance the play boundary by the REAL frames just played.
         // The delay prefill (pushSilence) carries no sequence -- it is
         // subtracted here exactly once per frame, so the boundary lives in
@@ -4455,7 +4611,22 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
             }
             if (res2 < 0.0) res2 = 0.0;  // float noise below the fit
             if (!outside && res2 / S33 < 1e-3) {         // HIT: exact upmix fingerprint
-                if (!L.cgMuted) {
+                // v8.4.22 THE COEFFICIENT-STABILITY DISCRIMINATOR: the TRUE
+                // engine phantom is a FIXED matrix -- its fit recovers the
+                // same a/b every hit -- while genuine center content (a
+                // game's own mix) fits with coefficients that SWING per
+                // block (the field's 1.84/0.13 -> 0.45/0.70 -> 2.00/1.54
+                // within a minute), and every false engagement hard-zeroed
+                // the center mid-sound (the paper-crinkle chop). A hit now
+                // engages only when the fit is STABLE against the previous
+                // hit: the fixed phantom engages on the second consecutive
+                // hit (~2 ms -- still the moment it is detected), swinging
+                // content never engages at all.
+                const bool stable = (fabsf((float)a - L.cgPa) <= 0.15f &&
+                                     fabsf((float)b - L.cgPb) <= 0.15f);
+                L.cgPa = (float)a;
+                L.cgPb = (float)b;
+                if (!L.cgMuted && stable) {
                     L.cgMuted = true;                    // v8.4.10: engage THIS chunk (v8.4.11: zeroed on the spot)
                     L.cmUpmix.fetch_add(1, std::memory_order_relaxed);
                     const unsigned long long now = GetTickCount64();
@@ -4470,7 +4641,7 @@ static void centerGuard(Leg& L, float* sc, size_t n, bool fold) {
                                       "                            immediately -- no fade, no leak)\n",
                                       a, b);
                     }
-                } else {
+                } else if (L.cgMuted) {
                     L.cmUpmix.fetch_add(1, std::memory_order_relaxed);   // stays engaged
                 }
             } else {                                     // miss or definitive real center
@@ -5071,6 +5242,9 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     K.fmt         = f.id;
     K.fmtName     = f.name;
     K.outCh       = outCh;
+    // v8.4.22: dither only a 16-bit KS pin (fmt 4 = pcm16).
+    g_leg[idx].ditherS16  = (f.id == 4);
+    g_leg[idx].ditherSeed = ((unsigned)GetTickCount64() ^ (unsigned)(size_t)rtBuf) | 1u;
     K.pinId       = (int)usedPin;
     K.filterName  = fl[chosen].name;
     K.periodFrames = periodFrames;
@@ -5451,7 +5625,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.21 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.22 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6233,6 +6407,10 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     }
     L.isExclusive = wantExcl;
     L.id = *id;
+    // v8.4.22: dither only a 16-bit device leg -- 24/32-bit legs have the
+    // headroom and need no dither; the seed is per leg, per open.
+    L.ditherS16 = (L.dev.playback.format == ma_format_s16);
+    L.ditherSeed = ((unsigned)GetTickCount64() ^ (unsigned)(size_t)(void*)&L) | 1u;
     return true;
 }
 
@@ -11072,6 +11250,27 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             g_volFollowLive.store(true, std::memory_order_relaxed);
         } else {
             logRenderEndpoints();   // v3.9: every render endpoint + its state
+        }
+    }
+    // v8.4.22 THE UPMIX KILL SWITCH: the cable's playback endpoint runs its
+    // SysFx chain (Speaker Fill et al) which spreads stereo app streams
+    // INTO the phantom center the upmix guard hunts -- disable it at the
+    // source, once per engine start, on the same needle cascade the volume
+    // follow uses (volume_endpoint, then input_device, then the generic
+    // cable match). Best effort and logged.
+    if (g_cfg.volumeFollow || !g_cfg.volumeEndpoint.empty()) {
+        std::string fxNeedles[3];
+        int nFx = 0;
+        if (!g_cfg.volumeEndpoint.empty()) fxNeedles[nFx++] = g_cfg.volumeEndpoint;
+        fxNeedles[nFx++] = g_cfg.inputDevice;
+        fxNeedles[nFx++] = "virtual audio cable";
+        for (int k = 0; k < nFx; ++k) {
+            bool dup = false;
+            for (int j = 0; j < k; ++j)
+                if (lower(fxNeedles[j]) == lower(fxNeedles[k])) dup = true;
+            if (dup || fxNeedles[k].empty()) continue;
+            disableEndpointSysFx(fxNeedles[k]);
+            break;   // the first cascade match wins, like the volume pin
         }
     }
     if (g_cfg.pinOutputs) {
