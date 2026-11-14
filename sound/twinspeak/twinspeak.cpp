@@ -62,6 +62,25 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.25 THE PROOF METER (field-directed: "Even then, I still get the
+//            center channel l+r automatic l+r mono mix if said center's
+//            zero. Why is this so complicated?"). The center leak was never
+//            twinspeak's code -- the mask provably delivers only ch3 to the
+//            S5, and the phantom lives in the CAPTURED ch3 itself:
+//            audiodg's stereo->8ch channel matrix (FC = (L+R)/2) on the
+//            cable's shared playback side, written BEFORE twinspeak's
+//            capture reads it. No engine-side mask can subtract a signal
+//            the engine never received separately. THE METER: the peak
+//            |ch3| of the raw captured data is measured pre-volume
+//            pre-mask on every leg1 chunk and reported every 10 s
+//            ('center in'): 0.0 = the cable's ch3 is genuinely silent (any
+//            L+R heard on the center is NOT in twinspeak's data path);
+//            nonzero with a stereo-only stream list = audiodg's matrix
+//            phantom, named by the v8.4.24 streams window. THE KILL is one
+//            Windows setting outside twinspeak: the cable's endpoint
+//            format -> stereo (Sound panel -> Line 1 -> Advanced -> 2ch
+//            48000 Hz) -- audiodg then mixes stereo->stereo (no matrix)
+//            and VAC zeroes the unused channels into the 8ch capture.
 //    v8.4.24 THE STREAM WINDOW + THE NEVER-ZERO WOBBLE + THE 128x3 BITE
 //            (field-directed: "I want to just access all of the streams
 //            active right now that are coming from the input and basically
@@ -2432,7 +2451,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.24"
+#define TWS_VERSION "8.4.25"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3198,6 +3217,14 @@ static OutPin g_pin[4];                               // v8.4.0: per-leg endpoin
 // v3.8 watchdog heartbeats: each device callback refreshes its timestamp;
 // the health loop reopens any thread that goes silent >5 s.
 static std::atomic<unsigned long long> g_hbCap{0};
+// v8.4.25 THE PROOF METER: the peak |ch3| level of the CAPTURED data,
+// measured pre-volume pre-mask on leg1's popped chunks and read+reset by
+// the 10 s health tick. This splits the center-leak question into two
+// provable states: 0.0 = the cable's ch3 is genuinely silent (any L+R
+// mono mix heard on the center is NOT in twinspeak's data path), nonzero
+// with a stereo-only stream list = audiodg's channel-matrix phantom,
+// named by the streams window.
+static std::atomic<float> g_ch3InPeak{0.0f};
 // v8.4.0: one heartbeat slot per leg (was the two scalars g_hbOut0/g_hbOut1).
 static std::atomic<unsigned long long> g_hbOutTab[4];
 // v6.5.8: set by every successful device reopen -- the health loop invalidates
@@ -3923,6 +3950,17 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         if (n == 0) break;
         const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
         L.raw.pop(sc, n);
+        // v8.4.25 THE PROOF METER: the peak |ch3| of the RAW capture,
+        // measured before volume and before the mask -- the level the cable
+        // actually carries, untouched by anything twinspeak does to it.
+        if (idx == 0) {
+            float pk = g_ch3InPeak.load(std::memory_order_relaxed);
+            for (size_t i = 0; i < n; ++i) {
+                const float a = fabsf(sc[i * kInCh + 2]);
+                if (a > pk) pk = a;
+            }
+            g_ch3InPeak.store(pk, std::memory_order_relaxed);
+        }
         // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint volume
         // -- applied to the raw 8ch block BEFORE the per-leg mix. Both legs
         // track the same knob; the ini gains still stack on it.
@@ -5279,7 +5317,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.24 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.25 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -11837,6 +11875,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             }
         }
         if ((sec % 10) == 0) {   // same cadence as the log-file health line
+            // v8.4.25 THE PROOF METER READOUT: the peak |ch3| the cable
+            // actually carried over the last second. 0.0 = ch3 is genuinely
+            // silent (any L+R mono mix heard on the center is NOT in
+            // twinspeak's data path); nonzero with a stereo-only stream
+            // list = audiodg's channel-matrix phantom, named above.
+            const float c3pk = g_ch3InPeak.exchange(0.0f, std::memory_order_relaxed);
+            tlog("[twinspeak] center in    : ch3 input peak over the last second %.5f (%s)\\n"
+                 "                            %s -- cross-check with the streams window above: a nonzero\\n"
+                 "                            peak with a stereo-only session list is audiodg's FC = (L+R)/2\\n"
+                 "                            matrix, not center content\\n",
+                 c3pk,
+                 c3pk > 0.0f ? "the cable's ch3 is CARRYING content" : "the cable's ch3 is genuinely zero",
+                 c3pk > 0.0f ? "phantom evidence" : "clean");
             const double path1 = padMs[0] + (double)g_leg[0].raw.count() * 1000.0 / kSampleRate;
             const double path2 = padMs[1] + (double)g_leg[1].raw.count() * 1000.0 / kSampleRate;
             tlog("\n[twinspeak] devbuf      : leg1 %5.1f ms (%s) + raw %5.1f = %5.1f ms\n"
