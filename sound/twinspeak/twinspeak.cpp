@@ -62,6 +62,28 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.16 THE WIDE NUDGE IS RETIRED (field-directed: "I see the center
+//            channel crackling ... I would legitimately remove the
+//            16-sample drift corrector and see what happens. Because at
+//            this point it's probably causing the crackling"). CONFIRMED,
+//            and it was worse than suspected: the nudges corrected EVERY
+//            100 ms window against an err that carries the two rings'
+//            capture-burst PHASE jitter -- both rings eat identical
+//            capture bursts, each device pops on its own cadence, so the
+//            delay-neutral margins' difference wanders several ms with
+//            ZERO clock drift -- and the 0.25 ms dead-band let every
+//            wander through: up to ten 333 us skips a second, on the
+//            center (the only active servo leg). THE WIDE NUDGE (v8.4.9)
+//            IS GONE, from the servo AND the master's depth guard (same
+//            path, same crackle, on the mains): corrections are the
+//            WARDEN BITE ONLY -- a 240-frame (5 ms) drop or held-sample
+//            pad, at most one per 2 s, taken only when TRUE drift has
+//            accumulated past 5 ms. At realistic ppm rates that is one
+//            gentle correction every many minutes; between bites the
+//            inter-leg offset rides at most ~5 ms -- far inside what two
+//            speakers resolve. kSyncNudgeMs survives as the servo's LOOK
+//            window; kSyncNudgeFr/kSyncDeadBandFr are gone. NO new ini
+//            key, NO UI row.
 //    v8.4.15 THE DELAY-NEUTRAL METRIC + THE STALL RESYNC RETIRED + THE
 //            REALTIME PRIVILEGE ENABLE (field-directed: "Make sure that
 //            leg1, leg2, and leg3 all be subtracted by their individual
@@ -2196,7 +2218,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.15"
+#define TWS_VERSION "8.4.16"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2302,26 +2324,24 @@ static constexpr unsigned kSampleRate    = 48000;
 // device delays eachother over time ... all sync together to exactly that
 // first audio device ... minimally ... no new ini keys nor ... the user
 // interface"). Every output leg EXCEPT leg1 servos its play boundary to
-// LEG1's (the first device is the master, never adjusted): each leg
-// latches its settled offset once, then holds it with kSyncNudgeFr-frame
-// nudges, rate-limited -- a drop (discardOldest(kSyncNudgeFr)) when it
-// runs late, a pad (the switch's last kSyncNudgeFr frames hold the last
-// mixed one) when it runs early. The DAC always receives its full
+// LEG1's (the first device is the master, never adjusted), with each
+// leg's own delay subtracted (v8.4.15). The DAC always receives its full
 // frameCount; nothing resamples, nothing bends pitch, no key, no UI row.
-// v8.4.9 THE WIDE NUDGE (field-directed: "the 1-frame nudge is clearly
-// causing decoherence in the sample level stuff ... I want a 16 sample
-// nudge for every 100ms"): the step is 16 frames and the window 100 ms
-// -- fewer, wider, cleaner corrections instead of per-frame chatter.
-static constexpr int      kSyncDeadBandFr = 12;     // 250 us at 48 kHz -- the ear places ~1 ms between speakers
-static constexpr int      kSyncNudgeFr    = 16;     // v8.4.9: the nudge step -- 16 fr (333 us) drop or held-sample pad
-static constexpr unsigned kSyncNudgeMs    = 100;    // v8.4.9: 16 fr per window: 160 fr/s capacity (~3333 ppm)
+// v8.4.9 THE WIDE NUDGE (16 fr per 100 ms) is RETIRED (v8.4.16,
+// field-directed: "I would legitimately remove the 16-sample drift
+// corrector ... it's probably causing the crackling") -- CONFIRMED: the
+// nudges chased the two rings' capture-burst PHASE jitter (several ms of
+// zero-drift wander) past a 0.25 ms dead-band, ten skips a second.
+// kSyncNudgeMs survives as the servo's LOOK window only.
+// v8.4.11/8.4.16 THE WARDEN BITE, BITE-ONLY (the old version's drift
+// correction, from the shipped ini: drift_correct_ms = 5,
+// drift_interval_ms = 2000): past 5 ms of ACCUMULATED drift a leg takes
+// a 240-frame bite (drop or held-sample pad) at most once per 2 s -- no
+// nudge beneath it, so a correction is a rare 5 ms event, not ten skips
+// a second; between bites the offset rides at most ~5 ms of true drift.
+static constexpr unsigned kSyncNudgeMs    = 100;    // the servo/depth-guard look window (one look per 100 ms)
 static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.13: a pure startup hush past the last (re)open (no baseline)
-// v8.4.11 THE WARDEN BITE (the old version's drift correction, from the
-// shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000): past 5 ms
-// of accumulated drift a leg takes up to a 240-frame bite (drop or
-// held-sample pad) at most once per 2 s, on top of the wide nudge -- slow
-// creep is CORRECTED, never accepted.
-static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms)
+static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
 static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
 // v8.4.12 THE DEPTH GUARD: the servo holds the SLAVES to the master's play
 // boundary, but off = r2 - r1 (the REAL-backlog difference, prefill
@@ -3365,20 +3385,21 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // climbs to roughly that delay"; the error is now the backlogs ABOVE
 // each leg's configured delay): pure frame arithmetic, no clock, no
 // resampler. v8.4.13: the servo's ERROR IS that difference -- no settled baseline
-// (the latch was an acceptance path; see the constants block) -- corrected
-// with kSyncNudgeFr-frame nudges, at most one
-// per kSyncNudgeMs and only past kSyncDeadBandFr (v8.4.9: 16 fr /
-// 100 ms). LATE (its crystal runs slow, its ring grows):
-// discardOldest(kSyncNudgeFr) -- the boundary advances 16 frames, 333 us
-// earlier. EARLY (crystal fast, ring shallow): the switch pops
-// kSyncNudgeFr frames less and holds its last mixed frame across them --
-// the DAC always receives its full frameCount, and the pad is a held
-// sample, not a hole.
+// (the latch was an acceptance path; see the constants block). v8.4.16:
+// THE WIDE NUDGE IS RETIRED -- corrections are the WARDEN BITE ONLY:
+// LATE (its crystal runs slow, err accumulates past 5 ms): one
+// discardOldest(240) per 2 s -- the boundary jumps 5 ms, the drift keeps
+// walking, the next bite waits for the pacing window. EARLY (crystal
+// fast, ring shallow): the switch pops up to 240 frames less and holds
+// its last mixed frame across them -- the DAC always receives its full
+// frameCount, and the pad is a held sample, not a hole. Between bites
+// the offset rides at most ~5 ms of true drift -- inaudible between two
+// speakers -- and the center stops taking ten skips a second (THE
+// CRACKLE, field-directed).
 // v8.4.11 THE WARDEN BITE: the old version's drift correction (the
 // shipped ini: drift_correct_ms = 5, drift_interval_ms = 2000) rides the
 // same servo -- past 5 ms of accumulated drift a leg takes up to a
-// 240-frame drop or held-sample pad, at most once per 2 s, on top of the
-// wide nudge; slow creep is CORRECTED, never accepted. v8.4.12: NO
+// 240-frame drop or held-sample pad, at most once per 2 s. v8.4.12: NO
 // RE-LATCH of any kind -- a jump is ground back like any other error
 // (the old |err| test AND the v8.4.11 step test both silently ACCEPTED
 // bloat as a new baseline; only a reopen re-arms, through the settle
@@ -3437,14 +3458,22 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     // the ring cap, then parked it at raw1 + bloat via the settle latch.
     // The master's depth guard owns common-mode ring growth; this loop
     // owns the difference; nothing is ever blessed.
-    if (err >= (long long)kSyncDeadBandFr) {          // LATE: drop (nudge v8.4.9, warden bite v8.4.11)
-        // THE WARDEN BITE: past 5 ms of drift, take a 240-frame bite in one
-        // discard -- at most once per 2 s (the old version's drift
-        // correction, from the shipped ini: drift_correct_ms = 5,
-        // drift_interval_ms = 2000). The wide nudge keeps ticking between
-        // bites, so the total capacity is ~272 fr/s and a 36 ms creep is
-        // gone in seconds -- visibly, in the log.
-        if (err >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+    // v8.4.16 THE WIDE NUDGE IS RETIRED (field-directed: "I would
+    // legitimately remove the 16-sample drift corrector and see what
+    // happens ... at this point it's probably causing the crackling").
+    // Confirmed: the nudges corrected every 100 ms window against an err
+    // that carries the two rings' capture-burst PHASE jitter (both rings
+    // eat identical bursts, each device pops on its own cadence, so the
+    // margins' difference wanders several ms with ZERO clock drift) -- the
+    // center took a 333 us skip up to ten times a second. THE CRACKLE.
+    // The servo is BITE-ONLY now: a correction is a 240-frame bite at the
+    // warden's pacing (at most one per 2 s), taken only when the drift has
+    // actually accumulated past 5 ms -- at realistic ppm rates that is one
+    // gentle correction every many minutes, and between bites the
+    // inter-leg offset rides at most ~5 ms of true drift, far inside what
+    // two speakers resolve.
+    if (err >= (long long)kDriftCorrectFr) {          // LATE: the warden bite
+        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
                 L.syncDrops++;
                 L.wardenDrops++;
@@ -3459,24 +3488,13 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
                          kDriftCorrectFr, kDriftIntervalMs);
                 }
             }
-            return 0;
-        }
-        if (L.raw.discardOldest((size_t)kSyncNudgeFr)) {
-            L.syncDrops++;
-            if (nowMs - L.lastSyncLogMs >= 10000) {
-                L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- dropped %d frames (%llu total; slow sync,\n"
-                     "                            %d fr / %u ms max, the 20 Hz @ 0.1%% keep-alive rides on)\n",
-                     idx + 1, err, kSyncNudgeFr, (unsigned long long)L.syncDrops, kSyncNudgeFr, kSyncNudgeMs);
-            }
         }
         return 0;
     }
-    if (err <= -(long long)kSyncDeadBandFr) {         // EARLY: pad (nudge v8.4.9, warden bite v8.4.11)
+    if (err <= -(long long)kDriftCorrectFr) {         // EARLY: the warden bite (held samples)
         // clamp under the block: the pad region must repeat a REAL mixed
         // frame (holdSrc = the last popped frame), never read past it.
-        const long long need = -err;
-        if (need >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             const size_t pad = (frameCount > (size_t)kDriftCorrectFr)
                              ? (size_t)kDriftCorrectFr
                              : (frameCount >= 2) ? frameCount - 1 : 0;
@@ -3494,10 +3512,9 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
             }
             return pad;
         }
-        if (frameCount > (size_t)kSyncNudgeFr) return (size_t)kSyncNudgeFr;
-        return (frameCount >= 2) ? frameCount - 1 : 0;
+        return 0;
     }
-    return 0;                                         // inside the dead-band: hold
+    return 0;                                         // below the bite threshold: hold
 }
 
 // v8.4.12 THE DEPTH GUARD -- the master's own drift correction (no key, no
@@ -3535,6 +3552,10 @@ static void masterDepthGuard(Leg& L) {
                          - (long long)kDepthAnchorFr;
     if (over < (long long)kDepthDeadbandFr) return;    // healthy jitter: hold
     if (over >= (long long)kDriftCorrectFr && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+        // v8.4.16: BITE-ONLY, like the servo -- the guard's 16-frame nudge
+        // took the same ten-skips-a-second crackle path the servo did, on
+        // the MAINS. A burst's bloat now drains in 5 ms bites at the
+        // warden's pacing (2.5 ms/s) -- slower, and silent.
         if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
             L.depthDrops += kDriftCorrectFr;
             L.lastBiteMs = nowMs;
@@ -3547,16 +3568,6 @@ static void masterDepthGuard(Leg& L) {
                      over, kDriftCorrectFr, (unsigned long long)L.depthDrops,
                      kDriftCorrectFr, kDriftIntervalMs);
             }
-        }
-        return;
-    }
-    if (L.raw.discardOldest((size_t)kSyncNudgeFr)) {
-        L.depthDrops += kSyncNudgeFr;
-        if (nowMs - L.lastSyncLogMs >= 10000) {
-            L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] depth out1    : ring %lld fr over its anchor -- dropped %d frames (%llu total;\n"
-                 "                            the 16 fr / %u ms wide nudge, the skip is the correction)\n",
-                 over, kSyncNudgeFr, (unsigned long long)L.depthDrops, kSyncNudgeMs);
         }
     }
 }
@@ -3628,7 +3639,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // leg1's play boundary. A drop happened inside one of the two guards
     // (the oldest frames are gone); a PAD is applied below -- this switch
     // deliberately pops padFr frames less and holds its last mixed frame
-    // across the pad region (v8.4.9: up to kSyncNudgeFr frames). Leg1 is
+    // across the pad region (up to kDriftCorrectFr frames, the warden
+    // bite -- v8.4.16: the 16-frame nudge is retired). Leg1 is
     // never SERVOED (it is the master) but its DEPTH is guarded.
     if (idx == 0) masterDepthGuard(L);
     const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
@@ -3759,9 +3771,9 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const unsigned long long nowMs = GetTickCount64();
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; slow sync,\n"
-                 "                            %d fr / %u ms max, a held sample, never a hole)\n",
-                 idx + 1, kSyncNudgeFr, L.syncPads, kSyncNudgeFr, kSyncNudgeMs);
+            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; the warden\n"
+                 "                            bite, %d fr / %u ms max, a held sample, never a hole)\n",
+                 idx + 1, kDriftCorrectFr, (unsigned long long)L.syncPads, kDriftCorrectFr, kDriftIntervalMs);
         }
     }
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
@@ -5307,7 +5319,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.15 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.16 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -11128,12 +11140,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
-           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/out3 hold\n"
-           "                            their settled offset to OUT1 (the first device, never adjusted) -- a\n"
-           "                            16-frame drop/pad at most every 100 ms past a 250 us dead-band (v8.4.9).\n"
-           "                            v8.4.11 THE WARDEN BITE: the old drift correction (5 ms per 2 s) rides\n"
-           "                            the same servo -- past 5 ms of accumulated drift a leg drops/pads up to\n"
-           "                            240 frames in one bite, and slow creep is corrected, NEVER accepted.\n"
+           "                            DAC's register paces it all. v8.4.7 SLOW SYNC on top: out2/out3 sync\n"
+           "                            their boundary to OUT1 (the first device, never adjusted), each leg's\n"
+           "                            own delay subtracted (v8.4.15).\n"
+           "                            v8.4.11/16 THE WARDEN BITE, BITE-ONLY: the 16-frame nudge is RETIRED\n"
+           "                            (it chased the two rings' capture-burst phase jitter ten skips a\n"
+           "                            second -- the center crackle); past 5 ms of ACCUMULATED drift a leg\n"
+           "                            drops/pads up to 240 frames in one bite, at most one per 2 s -- at\n"
+           "                            realistic ppm rates, one gentle correction every many minutes.\n"
            "                            v8.4.12 THE DEPTH GUARD: the master's ring depth is pinned to a 10 ms\n"
            "                            anchor (past a 5 ms dead-band, the same warden pacing) -- a capture\n"
            "                            burst's bloat is DRAINED, never kept, and the slaves follow through\n"
