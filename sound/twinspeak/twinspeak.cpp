@@ -5990,12 +5990,17 @@ static bool defaultRenderName(std::string* outName) {
 // can be traced to the exact app that produced it. Pure visibility: the
 // mask architecture needs no correction here -- it delivers what the
 // cable carries, whatever that is.
-static void logCableStreams(const std::string& nameNeedle) {
+static bool logCableStreams(const std::string& nameNeedle) {
+    // v8.4.26: returns true when a matching endpoint was found and the
+    // window logged -- the caller walks the same needle cascade the volume
+    // pin uses (the first needle alone never matches the endpoint's real
+    // name, and that silent miss cost the whole window).
     const std::wstring wNeedle = narrowToWide(nameNeedle);
     IMMDeviceEnumerator* en = nullptr;
     if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
                                 kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
-        return;
+        return false;
+    bool logged = false;
     IMMDeviceCollection* col = nullptr;
     if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col) {
         UINT n = 0;
@@ -6036,15 +6041,16 @@ static void logCableStreams(const std::string& nameNeedle) {
                                             sc2->GetProcessId(&pid);
                                             sc2->Release();
                                         }
-                                        tlog("[twinspeak] streams     : #%d pid %lu ACTIVE on the cable's playback side\\n",
+                                        tlog("[twinspeak] streams     : #%d pid %lu ACTIVE on the cable's playback side\n",
                                              s + 1, (unsigned long)pid);
                                     }
                                     sc->Release();
                                 }
-                                tlog("[twinspeak] streams     : %d active session(s) on the cable's playback side --\\n"
-                                     "                            these are the streams audiodg is mixing into the 8ch cable\\n"
-                                     "                            (a stereo-only list means the ch3 content is audiodg's\\n"
-                                     "                            FC = (L+R)/2 matrix, not center content)\\n", active);
+                                tlog("[twinspeak] streams     : %d active session(s) on the cable's playback side --\n"
+                                     "                            these are the streams audiodg is mixing into the 8ch cable\n"
+                                     "                            (a stereo-only list means the ch3 content is audiodg's\n"
+                                     "                            FC = (L+R)/2 matrix, not center content)\n", active);
+                                logged = true;
                             }
                             se->Release();
                         }
@@ -11011,7 +11017,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 if (lower(fxNeedles[j]) == lower(fxNeedles[k])) dup = true;
             if (dup || fxNeedles[k].empty()) continue;
             disableEndpointSysFx(fxNeedles[k]);
-            break;   // the first cascade match wins, like the volume pin
         }
     }
     if (g_cfg.pinOutputs) {
@@ -11881,10 +11886,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // twinspeak's data path); nonzero with a stereo-only stream
             // list = audiodg's channel-matrix phantom, named above.
             const float c3pk = g_ch3InPeak.exchange(0.0f, std::memory_order_relaxed);
-            tlog("[twinspeak] center in    : ch3 input peak over the last second %.5f (%s)\\n"
-                 "                            %s -- cross-check with the streams window above: a nonzero\\n"
-                 "                            peak with a stereo-only session list is audiodg's FC = (L+R)/2\\n"
-                 "                            matrix, not center content\\n",
+            tlog("[twinspeak] center in    : ch3 input peak over the last second %.5f (%s)\n"
+                 "                            %s -- cross-check with the streams window above: a nonzero\n"
+                 "                            peak with a stereo-only session list is audiodg's FC = (L+R)/2\n"
+                 "                            matrix, not center content\n",
                  c3pk,
                  c3pk > 0.0f ? "the cable's ch3 is CARRYING content" : "the cable's ch3 is genuinely zero",
                  c3pk > 0.0f ? "phantom evidence" : "clean");
@@ -11918,10 +11923,22 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // mixing into the cable this second (the phantom-hunt
             // visibility).
             {
-                std::string fxNeedle;
-                if (!g_cfg.volumeEndpoint.empty()) fxNeedle = g_cfg.volumeEndpoint;
-                else fxNeedle = g_cfg.inputDevice;
-                logCableStreams(fxNeedle);
+                // v8.4.26: the FULL needle cascade -- the first needle alone
+                // ("Line 1 (Virtual Audio Cable)") never contains-matches the
+                // endpoint's real name ("Speakers (Virtual Audio Cable)"),
+                // and that silent miss cost the whole window in the field.
+                std::string fxNeedles[3];
+                int nFx = 0;
+                if (!g_cfg.volumeEndpoint.empty()) fxNeedles[nFx++] = g_cfg.volumeEndpoint;
+                fxNeedles[nFx++] = g_cfg.inputDevice;
+                fxNeedles[nFx++] = "virtual audio cable";
+                for (int k = 0; k < nFx; ++k) {
+                    bool dup = false;
+                    for (int j = 0; j < k; ++j)
+                        if (fxNeedles[j] == fxNeedles[k]) dup = true;
+                    if (dup || fxNeedles[k].empty()) continue;
+                    if (logCableStreams(fxNeedles[k])) break;   // the first cascade match wins
+                }
             }
         }
         if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
