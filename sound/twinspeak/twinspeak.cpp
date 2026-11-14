@@ -62,6 +62,28 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.0 THE FOLD THAT FINALLY FOLDS + THE SURROUND GAINS
+//            (field-directed: "I have the output leg3 device name set to
+//            be empty and the rear and surround channels are not folding
+//            to the mains (leg1) by their left and right ... include a new
+//            gain_sl and gain_sr (surround volumes) just so I have a
+//            second four-element compacted group below the first one with
+//            the l/r/rl/rr"). (1) THE FOLD-FLAG BOOT-ORDER BUG -- THE
+//            ACTUAL LEAK: g_rearFold was read from g_leg[2].disabled
+//            BEFORE the flag was ever assigned (the assignment sat 20
+//            lines below), so the fold was born false forever and the
+//            rear/surround channels never folded to the mains regardless
+//            of the ini. The flag is now read AFTER the assignment.
+//            (2) THE REARS JOIN THE FOLD: an empty leg3 folds RL (ch7)
+//            direct onto L and RR (ch8) direct onto R -- the rears' own
+//            specific type -- plus the surrounds (ch5 SL, ch6 SR) folding
+//            WIDE (in-phase on their own side, inverted at half gain on
+//            the opposite side -- the matrix-encoding phase trick). (3)
+//            THE SURROUND GAINS: new gain_sl/gain_sr keys scale the
+//            surround channels wherever they play (leg3's own mix and the
+//            mains fold), and the GAIN column gains a SECOND compacted
+//            quad -- gain_lfe / gain_center / gain_sl / gain_sr -- below
+//            the first. NO UI row beyond the quad itself.
 //    v8.4.27 THE WIDE SURROUND FOLD + THE 287 HZ PICK (field-directed:
 //            "fold the rear and surround onto the mains (l and r) if leg3
 //            [is empty] ... the rears get their own specific type and the
@@ -2486,7 +2508,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.27"
+#define TWS_VERSION "8.5.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2721,8 +2743,12 @@ struct Config {
     float       gainCenter     = 1.0f;
     // v8.4.0: the rear gains; v8.4.11: leg3's ONE stereo device --
     // out L = gain_rl * (ch7 + ch5), out R = gain_rr * (ch8 + ch6).
+    // v8.5.0: the surround gains -- gain_sl/gain_sr scale SL (ch5) / SR
+    // (ch6) wherever they play (leg3's own mix AND the mains fold).
     float       gainRl         = 1.0f;
     float       gainRr         = 1.0f;
+    float       gainSl         = 1.0f;
+    float       gainSr         = 1.0f;
     // v6.5.18 CENTER DIALOGUE EQ: RBJ peaking biquad on ch3, out2 mix only,
     // default OFF (off = bit-exact single multiply). KS pins bypass every
     // APO, so the dialogue boost must live in the engine.
@@ -4362,6 +4388,8 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // surround pushes outward instead of smearing the front image.
         const float gRL = g_rearFold ? g_cfg.gainRl : 0.0f;
         const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
+        const float gSL = g_rearFold ? g_cfg.gainSl : 0.0f;   // v8.5.0: the surround gains
+        const float gSR = g_rearFold ? g_cfg.gainSr : 0.0f;
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             for (size_t i = 0; i < n; ++i) {
@@ -4369,16 +4397,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
                 const float cf  = gC * f[2];            // the center fold (leg2 empty)
-                o[0] = gL * f[0] + lfe + cf + gRL * f[6] + gRL * f[4] - 0.5f * gRR * f[5];
-                o[1] = gR * f[1] + lfe + cf + gRR * f[7] + gRR * f[5] - 0.5f * gRL * f[4];
+                o[0] = gL * f[0] + lfe + cf + gRL * f[6] + gSL * f[4] - 0.5f * gSR * f[5];
+                o[1] = gR * f[1] + lfe + cf + gRR * f[7] + gSR * f[5] - 0.5f * gSL * f[4];
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
                 const float* f = sc + i * kInCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
-                o[0] = gL * f[0] + lfe + gRL * f[6] + gRL * f[4] - 0.5f * gRR * f[5];
-                o[1] = gR * f[1] + lfe + gRR * f[7] + gRR * f[5] - 0.5f * gRL * f[4];
+                o[0] = gL * f[0] + lfe + gRL * f[6] + gSL * f[4] - 0.5f * gSR * f[5];
+                o[1] = gR * f[1] + lfe + gRR * f[7] + gSR * f[5] - 0.5f * gSL * f[4];
             }
         }
     } else if (idx == 1) {
@@ -5382,7 +5410,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.27 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5485,6 +5513,8 @@ static void writeTemplate(const char* path) {
         "gain_r = 1.0\n"
         "gain_rl = 1.0\n"
         "gain_rr = 1.0\n"
+        "gain_sl = 1.0\n"
+        "gain_sr = 1.0\n"
         "gain_lfe = 0.4\n"
         "gain_center = 1.0\n"
         "\n"
@@ -5917,6 +5947,8 @@ static bool loadIni(const char* path) {
         else if (key == "gain_center")    g_cfg.gainCenter = (float)atof(val.c_str());
         else if (key == "gain_rl")        g_cfg.gainRl     = (float)atof(val.c_str()); // v8.4.0
         else if (key == "gain_rr")        g_cfg.gainRr     = (float)atof(val.c_str()); // v8.4.0
+        else if (key == "gain_sl")        g_cfg.gainSl     = (float)atof(val.c_str()); // v8.5.0: the surround gains
+        else if (key == "gain_sr")        g_cfg.gainSr     = (float)atof(val.c_str());
         else if (key == "center_eq")      g_cfg.centerEq     = !isOff(val);          // v6.5.18
         else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
         else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
@@ -6558,6 +6590,7 @@ enum {
     // v8.4.0: the four-leg controls -- the rear device combos, the gain
     // quad's two new edits, the timing quad's two offset edits.
     IDC_OUT3, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3,   // v8.4.11: IDC_OUT4/IDC_OFF4 retired with leg4
+    IDC_GAIN_SL, IDC_GAIN_SR,                       // v8.5.0: the surround gains (the second quad)
 };
 
 // ---- gui state -------------------------------------------------------------
@@ -7452,6 +7485,8 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "gain_center")       { snprintf(b, 64, "%g", g_cfg.gainCenter);return b; }
     else if (key == "gain_rl")           { snprintf(b, 64, "%g", g_cfg.gainRl);   return b; }   // v8.4.0
     else if (key == "gain_rr")           { snprintf(b, 64, "%g", g_cfg.gainRr);   return b; }   // v8.4.0
+    else if (key == "gain_sl")           { snprintf(b, 64, "%g", g_cfg.gainSl);   return b; }   // v8.5.0
+    else if (key == "gain_sr")           { snprintf(b, 64, "%g", g_cfg.gainSr);   return b; }
     else if (key == "chime_gain")        { snprintf(b, 64, "%g", g_cfg.chimeGain); return b; }
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
@@ -7495,7 +7530,7 @@ static const char* kIniKeys[] = {
     "delay1_ms", "delay2_ms", "offset3_ms",                    // v8.4.0 rears (v8.4.11: offset4_ms retired)
     "input_device", "output_device1", "output_device2",
     "output_device3",                                          // v8.4.0 rears (v8.4.11: output_device4 retired)
-    "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_lfe", "gain_center",
+    "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
     "eq_slot2_on", "eq_slot2_freq", "eq_slot2_gain", "eq_slot2_q",
@@ -7588,6 +7623,8 @@ static void cfgFromControls(HWND w) {
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
     g_cfg.gainRl    = editFloat(w, IDC_GAIN_RL, 1.0f);   // v8.4.0 gain quad
     g_cfg.gainRr    = editFloat(w, IDC_GAIN_RR, 1.0f);
+    g_cfg.gainSl    = editFloat(w, IDC_GAIN_SL, 1.0f);   // v8.5.0: the surround gains
+    g_cfg.gainSr    = editFloat(w, IDC_GAIN_SR, 1.0f);
     g_cfg.gainLfe   = editFloat(w, IDC_GAIN_LFE, 0.4f);
     g_cfg.gainCenter= editFloat(w, IDC_GAIN_CTR, 1.0f);
     // v8.4.0: lfeFold is INTEGRATED (always on) -- no control reads it.
@@ -7623,6 +7660,8 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
     snprintf(b, 64, "%g", g_cfg.gainRl);     SetDlgItemTextA(w, IDC_GAIN_RL, b);
     snprintf(b, 64, "%g", g_cfg.gainRr);     SetDlgItemTextA(w, IDC_GAIN_RR, b);
+    snprintf(b, 64, "%g", g_cfg.gainSl);     SetDlgItemTextA(w, IDC_GAIN_SL, b);
+    snprintf(b, 64, "%g", g_cfg.gainSr);     SetDlgItemTextA(w, IDC_GAIN_SR, b);
     snprintf(b, 64, "%g", g_cfg.gainLfe);    SetDlgItemTextA(w, IDC_GAIN_LFE, b);
     snprintf(b, 64, "%g", g_cfg.gainCenter); SetDlgItemTextA(w, IDC_GAIN_CTR, b);
     // v8.4.0: no LFEFOLD pill to sync -- the fold is built in (always on).
@@ -7872,8 +7911,20 @@ static void guiBuildPages(HWND w) {
         const char* vals[4] = { bL, bR, bRL, bRR };
         quadRow(w, COLB_X, 118, 4, lbl, ids, vals);
     }
-    row(w, COLB_X, 170, "gain_lfe", IDC_GAIN_LFE, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainLfe); return std::string(b); }().c_str());
-    row(w, COLB_X, 204, "gain_center", IDC_GAIN_CTR, []{ char b[32]; snprintf(b,32,"%g",g_cfg.gainCenter); return std::string(b); }().c_str());
+    // v8.5.0 THE SECOND QUAD: the remaining gains compacted below the
+    // first -- gain_lfe / gain_center / gain_sl / gain_sr (the surround
+    // volumes, new keys).
+    {
+        char bLfe[32], bCtr[32], bSL[32], bSR[32];
+        snprintf(bLfe, 32, "%g", g_cfg.gainLfe);
+        snprintf(bCtr, 32, "%g", g_cfg.gainCenter);
+        snprintf(bSL,  32, "%g", g_cfg.gainSl);
+        snprintf(bSR,  32, "%g", g_cfg.gainSr);
+        const char* lbl[4]  = { "gain_lfe", "gain_center", "gain_sl", "gain_sr" };
+        const int   ids[4]  = { IDC_GAIN_LFE, IDC_GAIN_CTR, IDC_GAIN_SL, IDC_GAIN_SR };
+        const char* vals[4] = { bLfe, bCtr, bSL, bSR };
+        quadRow(w, COLB_X, 156, 4, lbl, ids, vals);
+    }
     // v6.6.8: capture_exclusive / exclusive / align_modes pills are gone --
     // the share-mode design is part of the engine now (always on).
     // v8.3.0: THE SETTINGS PAGE IS GONE -- its three survivors moved HERE.
@@ -10745,7 +10796,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // exactly like leg1.
     g_leg[1].disabled = g_cfg.outputDevice2.empty();
     g_centerFold      = g_leg[1].disabled;
-    g_rearFold        = g_leg[2].disabled;   // v8.4.26: the surround folds onto the mains when leg3 is empty
     if (!g_leg[1].disabled &&
         !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice2, &id2, &n2)) {
         tlog( "[twinspeak] output_device2 matching \"%s\" not found (--list)\n",
@@ -10765,6 +10815,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // like legs 1/2.
     g_leg[2].disabled = g_cfg.outputDevice3.empty();
     g_leg[3].disabled = true;   // v8.4.11: leg4 retired -- ONE rear device carries both rears
+    // v8.4.28 THE FOLD FLAG, FIXED: it MUST be read AFTER the disabled flag
+    // is assigned. The v8.4.26 code read g_leg[2].disabled BEFORE the
+    // assignment ever ran -- g_rearFold was born false forever, and the
+    // rear/surround fold never activated regardless of the ini (the field's
+    // "the rear and surround channels are not folding to the mains").
+    g_rearFold        = g_leg[2].disabled;
     if (!g_leg[2].disabled &&
         !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice3, &id3, &n3)) {
         tlog( "[twinspeak] output_device3 matching \"%s\" not found (--list)\n",
@@ -11028,7 +11084,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.zeroFast = (i == 0)
             ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f
                && (!g_centerFold || g_cfg.gainCenter > 0.0f)
-               && (!g_rearFold || (g_cfg.gainRl > 0.0f && g_cfg.gainRr > 0.0f)))   // v8.4.26: the rear fold terms too
+               && (!g_rearFold || (g_cfg.gainRl > 0.0f && g_cfg.gainRr > 0.0f
+                                   && g_cfg.gainSl > 0.0f && g_cfg.gainSr > 0.0f)))   // v8.4.26/28: the rear + surround fold terms
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f); // v8.4.11: the one rear leg, both sides (g * 0 == 0, always)
