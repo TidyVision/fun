@@ -62,6 +62,29 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.26 THE FLOOR GUARD, EVERY LEG + THE REAR FOLD (field-directed:
+//            "on vlc, I got hit with this staticey noise whenever the
+//            center channel started actually playing there ... whenever
+//            the leg3's audio device is blank, it should automatically
+//            fold onto the mains (no delaying, just have it so you
+//            basically recreate matrix encoding effect for both surround
+//            left and surround right)"). (1) THE FLOOR GUARD, EVERY LEG:
+//            the log caught leg2's ring riding 0-4 ms with troughs at 0.0
+//            (raw2 = 0.0) -- the servo's +-5 ms dead-band tolerated a
+//            margin BELOW the device-buffer floor, and the starved
+//            switches played silence holes INTO the center content the
+//            moment it got loud enough to hear (the staticey noise on
+//            VLC's center). The floor guard now runs for EVERY leg: a
+//            margin at/below the device-buffer floor takes the pad budget
+//            immediately, 5 ms over takes the bite -- the servo keeps
+//            tracking leg1 above the floor, and the floor itself can
+//            never starve. (2) THE REAR FOLD: an EMPTY leg3 folds the
+//            surround onto the mains -- SL onto L, SR onto R at
+//            gain_rl/gain_rr, the LFE fold's pattern with no delay -- so
+//            the surround content plays through the fronts (the
+//            matrix-encoding effect) with no rear device at all. The
+//            first mask opens ch5/ch6 for leg1 when the fold is active.
+//            NO new ini key, NO UI row.
 //    v8.4.25 THE PROOF METER (field-directed: "Even then, I still get the
 //            center channel l+r automatic l+r mono mix if said center's
 //            zero. Why is this so complicated?"). The center leak was never
@@ -2362,7 +2385,7 @@
 //    v6.3.1  leftover Adesso delay closed.
 //    v6.3    WDM-KS backend inside twinspeak (lowest latency, 256 samples).
 //    v6.2    background start, chimes, more field directives.
-//    v6.1    bit-exact per-leg ring delay (delay1/2_ms) + center gates.
+//    v6.1    bit-exact per-leg ring delay (delay1/2_ms). (The center gates retired v8.4.23.)
 //    v6.0    no pitch shift: 8ch shared capture + two bit-exact pipelines,
 //            implemented as structure, not options.
 //    v5.0    the ASIO model (buffer-switch semantics) -- the real crackle fix.
@@ -2451,7 +2474,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.25"
+#define TWS_VERSION "8.4.26"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3152,13 +3175,19 @@ static Leg g_leg[4];
 // v8.4.1 THE CENTER FOLD: an EMPTY output_device2 (no center device) means
 // leg2 never opens AND ch3 (center) folds onto leg1's FL/FR at gain_center
 // -- the LFE fold's pattern: FL = gain_l*L + gain_lfe*LFE + gain_center*C,
-// FR the mirror. The SAME center gates ride the fold (the upmix guard fades
+// FR the mirror. (The center gates retired v8.4.23 -- the mask isolates
 // a stereo source's phantom FC out of the fronts; genuine 5.1 center always
 // plays). Plain bool on the g_leg[].disabled discipline: written once per
 // engine start on the main thread before any device thread exists. With
 // output_device2 set, leg2 plays ch3 on its own device exactly as before
 // and the fold stays off.
 static bool g_centerFold = false;
+// v8.4.26 THE REAR FOLD: leg3 (output_device3) EMPTY -> the surround
+// channels fold onto the mains (SL onto L, SR onto R at gain_rl/gain_rr --
+// the LFE fold's pattern), so the surround content still plays when no
+// rear device is configured. Written once per engine start on the main
+// thread, before any device thread exists.
+static bool g_rearFold = false;
 
 // v8.4.0: one place answers "which ini needle opens leg i" -- every open /
 // reopen / yield path asks here, so a rear leg can never fall back to a
@@ -3915,8 +3944,16 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // this switch deliberately pops padFr frames less and holds its last
     // mixed frame across the pad region (up to kDriftCorrectFr frames, the
     // warden pad budget).
-    const size_t padFr = (idx == 0) ? masterDepthGuard(L, frameCount)
-                                    : syncToFirst(idx, L, frameCount);
+    // v8.4.26 THE FLOOR GUARD, EVERY LEG: the servo's +-5 ms dead-band let
+    // a slave's margin ride BELOW its device-buffer floor (the field's
+    // leg2 raw2 = 0.0 trough -- staticey silence holes whenever the center
+    // content started). The per-leg floor guard pads at the floor itself
+    // and bites 5 ms over it; the servo still tracks leg1 above the floor.
+    size_t padFr = masterDepthGuard(L, frameCount);
+    if (idx != 0) {
+        const size_t servoPad = syncToFirst(idx, L, frameCount);
+        if (servoPad > padFr) padFr = servoPad;
+    }
     // v8.4.23 THE MASK-COPY-MASK FAN-OUT (field-directed: "make sure that
     // there are copies of the input 8-channel audio data for every single
     // device you're sending the data to so that there's no possible upmix
@@ -3978,8 +4015,16 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         {
             const unsigned char* mk = kLegMask[idx];
             for (size_t i = 0; i < n; ++i)
-                for (int c = 0; c < kInCh; ++c)
-                    if (!mk[c]) sc[i * kInCh + c] = 0.0f;
+                for (int c = 0; c < kInCh; ++c) {
+                    unsigned char keep = mk[c];
+                    // v8.4.26 THE FOLD CHANNELS: leg1's mask opens for the
+                    // center fold (ch3, leg2 empty) and the rear fold (ch5
+                    // SL / ch6 SR, leg3 empty) -- the folds fold INTO the
+                    // stereo output, never onto another device's slots.
+                    if (idx == 0 && c == 2 && g_centerFold) keep = 1;
+                    if (idx == 0 && g_rearFold && (c == 4 || c == 5)) keep = 1;
+                    if (!keep) sc[i * kInCh + c] = 0.0f;
+                }
         }
         // v6.6.9: silence compression -- a bit-zero masked chunk needs no
         // mix: same bytes out, none of the work. Post-mask, a bit-zero
@@ -4297,6 +4342,11 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // silence slots, no channel conversion anywhere downstream: there
         // is no upmix risk by construction.
         const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
+        // v8.4.26 THE REAR FOLD (leg3 empty): SL rides L, SR rides R at the
+        // rears' own gains -- the surround content still plays through the
+        // fronts, the matrix-encoding effect, with no delay.
+        const float gSL = g_rearFold ? g_cfg.gainRl : 0.0f;
+        const float gSR = g_rearFold ? g_cfg.gainRr : 0.0f;
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             for (size_t i = 0; i < n; ++i) {
@@ -4304,16 +4354,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
                 const float cf  = gC * f[2];            // the center fold (leg2 empty)
-                o[0] = gL * f[0] + lfe + cf;            // L + the center fold
-                o[1] = gR * f[1] + lfe + cf;            // R + the center fold
+                o[0] = gL * f[0] + lfe + cf + gSL * f[4];   // L + center + SL folds
+                o[1] = gR * f[1] + lfe + cf + gSR * f[5];   // R + center + SR folds
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
                 const float* f = sc + i * kInCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
-                o[0] = gL * f[0] + lfe;                 // L
-                o[1] = gR * f[1] + lfe;                 // R
+                o[0] = gL * f[0] + lfe + gSL * f[4];    // L + the SL fold
+                o[1] = gR * f[1] + lfe + gSR * f[5];    // R + the SR fold
             }
         }
     } else if (idx == 1) {
@@ -5317,7 +5367,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.25 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.26 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -10679,6 +10729,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // exactly like leg1.
     g_leg[1].disabled = g_cfg.outputDevice2.empty();
     g_centerFold      = g_leg[1].disabled;
+    g_rearFold        = g_leg[2].disabled;   // v8.4.26: the surround folds onto the mains when leg3 is empty
     if (!g_leg[1].disabled &&
         !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice2, &id2, &n2)) {
         tlog( "[twinspeak] output_device2 matching \"%s\" not found (--list)\n",
@@ -10960,7 +11011,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
             ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f
-               && (!g_centerFold || g_cfg.gainCenter > 0.0f))   // v8.4.1: the fold term too
+               && (!g_centerFold || g_cfg.gainCenter > 0.0f)
+               && (!g_rearFold || (g_cfg.gainRl > 0.0f && g_cfg.gainRr > 0.0f)))   // v8.4.26: the rear fold terms too
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f); // v8.4.11: the one rear leg, both sides (g * 0 == 0, always)
@@ -11311,10 +11363,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            g_leg[0].yielded.load(std::memory_order_relaxed) ? "RELEASED (boot yield)" :
            g_leg[0].isExclusive ? "EXCLUSIVE" : "shared", (unsigned)periodMs1);
     tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
-               "[twinspeak] route out1     : the output is STEREO L+R only (the second mask -- no channel\n"
-               "[twinspeak] route out1     : conversion anywhere downstream, no upmix risk by construction)\n"
-               "[twinspeak] route out1     : + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
-               g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
+         "                            the output is STEREO L+R only (the second mask -- no channel\n"
+         "                            conversion anywhere downstream, no upmix risk by construction)\n"
+         "                            + the rear fold (SL onto L, SR onto R at gain_rl/gain_rr) when\n"
+         "                            leg3 is EMPTY (v8.4.26, the matrix-encoding effect, no delay)\n"
+         "                            + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
+         g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
            n2.c_str(),
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
@@ -11403,13 +11457,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
     if (g_centerFold)
         tlog("[twinspeak] route check    : out2 is EMPTY -- center (ch3) FOLDS onto out1's FL/FR at gain_center, the\n"
-             "                            same upmix guard protecting it; out1 plays ch1/ch2 + the LFE fold + the\n"
+             "                            same mask protecting it; out1 plays ch1/ch2 + the LFE fold + the\n"
              "                            center fold; the rears (ch7/ch8) and the sides (ch5/ch6, the v8.4.6 fold)\n"
              "                            play ONLY on out3, devices permitting\n");
     else
         tlog("[twinspeak] route check    : center (ch3) plays ONLY on out2; out1 plays ONLY ch1/ch2 + the LFE fold;\n"
-               "                            the rears (ch7/ch8) and the sides (ch5/ch6, the v8.4.6 fold) play ONLY on\n"
-               "                            out3, and ONLY when its device is set\n");
+             "                            the rears (ch7/ch8) and the sides (ch5/ch6, the v8.4.6 fold) play ONLY on\n"
+             "                            out3 when its device is set -- an EMPTY leg3 folds the surround onto\n"
+             "                            out1's L/R (the v8.4.26 rear fold, no delay)\n");
     if (g_cfg.volumeFollow) {
         if (g_srcVol)
             tlog("[twinspeak] volume        : following \"%ls\" (the cable's playback side) -- now %.0f%%%s -- drives every leg\n",
