@@ -62,6 +62,34 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.21 THE QUIET-WINDOW DRIFT CORRECTION + THE TRAY DIES WITH THE
+//            PROCESS (field-directed: "have a drift correction method
+//            that doesn't cause any crackling whatsoever ... upon exit
+//            the system tray icon just gets killed along with it so
+//            there aren't so many whenever you open up system tray ...
+//            they're all stale from last sessions"). (1) THE
+//            QUIET-WINDOW DRIFT CORRECTION: a LATE bite is now ARMED by
+//            the guard/servo (biteDue) and EXECUTED by the switch loop
+//            only inside a digital-silence window -- the chunk whose mix
+//            produces zero (leg0: the whole 8ch block bit-zero; the
+//            gated legs: their own lane verdicts). A skip inside
+//            silence is bit-silent and cannot click. The valve: past
+//            10 ms of accumulated drift (2 x the bite) the drop
+//            executes regardless -- 10 ms of desync is worse than one
+//            gentle skip per hours of continuous content. The EARLY
+//            pad stays immediate: a held sample cannot click, and it
+//            is the anti-starvation tool. Also fixed in passing: the
+//            master's EARLY pad budget armed but was never delivered
+//            (the v8.4.20 signature change) -- masterDepthGuard now
+//            returns the pad like the servo. (2) THE TRAY DIES WITH
+//            THE PROCESS: logoff/shutdown kill the process without
+//            WM_DESTROY, and every such session left a stale icon
+//            behind -- the field's tray full of dead twinspeak icons.
+//            WM_ENDSESSION removes the icon first (both the panel and
+//            the tray surrogate share the handler), the console
+//            control handler removes it on CTRL_SHUTDOWN/CTRL_LOGOFF,
+//            and atexit(trayRemove) is the belt for every other normal
+//            exit. NO new ini key, NO UI row.
 //    v8.4.20 THE REFERENCE IS LEG1 AGAIN (field-directed: "I would just go
 //            back to having the cable clock be leg1, because I think the
 //            mains are the better choice of matter anyway ... you're
@@ -2313,7 +2341,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.20"
+#define TWS_VERSION "8.4.21"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2965,6 +2993,15 @@ struct Leg {
     unsigned long long     wardenDrops   = 0;
     unsigned long long     wardenPads    = 0;
     unsigned long long     depthDrops    = 0;
+    // v8.4.21 QUIET-WINDOW DRIFT CORRECTION: the LATE bite is ARMED here
+    // (biteDue = the frames to drop, by the guard or the servo) and
+    // EXECUTED by the switch loop inside a digital-silence window -- a
+    // skip inside silence is bit-silent and cannot click. biteForced is
+    // the valve: past 10 ms of accumulated drift the drop executes
+    // regardless (10 ms of desync is worse than one gentle skip per
+    // hours). Consumed + cleared by the switch loop.
+    size_t                 biteDue       = 0;
+    bool                   biteForced    = false;
     // v8.4.19 THE PAD BUDGET: one EARLY bite = 240 frames of boundary stall,
     // delivered across consecutive switches (each capped at frameCount-1 by
     // the hold-region clamp). Set by the guard once per 2 s; consumed by
@@ -3502,37 +3539,36 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
 // BUDGET (the EARLY bite delivers 240 frames of stall across consecutive
 // switches -- five times the measured Realtek-vs-cable sink), THE
 // DEFERRED LANDING and the device-buffer floor anchor (v8.4.18).
-static void masterDepthGuard(Leg& L)
+static size_t masterDepthGuard(Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return;   // slow: one look per window
+    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
     L.lastSyncMs = nowMs;
     const long long over = (long long)L.raw.count()
                          - (long long)L.delayFrames     // the real backlog above the leg's own delay
                          - (long long)L.anchorFrames;   // v8.4.18: the leg's own device-buffer floor
-    if (over >= (long long)kDriftCorrectFr) {           // LATE: the warden bite (drain)
+    if (over >= (long long)kDriftCorrectFr) {           // LATE: the warden bite -- ARMED, executed quiet
+        // v8.4.21 QUIET-WINDOW EXECUTION: the drop is armed here and lands
+        // inside a digital-silence window in the switch loop (see
+        // bufferSwitchFill) -- a skip inside silence is bit-silent and
+        // cannot click. The valve: past 10 ms of accumulated drift the
+        // bite executes regardless (10 ms of desync is worse than one
+        // gentle skip per hours).
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
-                L.depthDrops += kDriftCorrectFr;
-                L.lastBiteMs = nowMs;
-                if (nowMs - L.lastSyncLogMs >= 10000) {
-                    L.lastSyncLogMs = nowMs;
-                    tlog("[twinspeak] depth out1    : ring %lld fr over its anchor -- the guard bit %d frames\n"
-                         "                            (%llu total; burst bloat or slow-crystal drift is drained,\n"
-                         "                            never kept; the %d fr / %u ms warden pacing)\n",
-                         over, kDriftCorrectFr, (unsigned long long)L.depthDrops,
-                         kDriftCorrectFr, kDriftIntervalMs);
-                }
-            }
+            L.biteDue    = (size_t)kDriftCorrectFr;
+            L.biteForced = (over >= (long long)(2 * kDriftCorrectFr));
+            L.lastBiteMs = nowMs;
         }
-        return;
+        return 0;
     }
     if (over <= 0) {                                    // EARLY: at/below the device-buffer floor
         // v8.4.19 THE PAD BUDGET: one bite = 240 frames of boundary stall,
         // delivered across consecutive switches (each capped at
         // frameCount-1 by the hold-region clamp). At the field's 48-frame
         // WASAPI callbacks a single-pad-per-2-s refills only ~47 frames --
-        // five times weaker than the sink the budget now overpowers.
+        // five times weaker than the sink the budget now overpowers. The
+        // pad is NOT deferred: a held sample cannot click, and it is the
+        // anti-starvation tool.
         if (L.padBudget == 0 && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
             L.padBudget = (size_t)kDriftCorrectFr;
             L.wardenPads++;
@@ -3544,8 +3580,14 @@ static void masterDepthGuard(Leg& L)
                      over, kDriftCorrectFr, (unsigned long long)L.wardenPads);
             }
         }
-        return;
+        if (L.padBudget && frameCount >= 2) {
+            const size_t pad = (frameCount - 1 < L.padBudget)
+                             ? (frameCount - 1) : L.padBudget;
+            return pad;
+        }
+        return 0;
     }
+    return 0;                                           // inside the bite dead-band: hold
 }
 
 // v8.4.20 THE CROSS-LEG SERVO, RESTORED (the v8.4.7-8.4.16 lineage, carrying
@@ -3596,22 +3638,14 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     // correction is a 240-frame warden bite, at most one per 2 s, taken
     // only when the drift has actually accumulated past 5 ms. v8.4.12: NO
     // RE-LATCH anywhere -- a jump is ground back like any other error.
-    if (err >= (long long)kDriftCorrectFr) {            // LATE: the warden bite (drain)
+    if (err >= (long long)kDriftCorrectFr) {            // LATE: the warden bite -- ARMED, executed quiet
+        // v8.4.21 QUIET-WINDOW EXECUTION (see bufferSwitchFill): the drop
+        // lands inside a digital-silence window and cannot click. The
+        // valve: past 10 ms of accumulated drift it executes regardless.
         if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            if (L.raw.discardOldest((size_t)kDriftCorrectFr)) {
-                L.syncDrops++;
-                L.wardenDrops++;
-                L.lastBiteMs = nowMs;
-                if (nowMs - L.lastSyncLogMs >= 10000) {
-                    L.lastSyncLogMs = nowMs;
-                    tlog("[twinspeak] sync out%d     : %lld fr late vs out1 -- the warden bit %d frames\n"
-                         "                            (%llu bite(s), %llu total dropped; the old drift correction:\n"
-                         "                            %d fr / %u ms, creep corrected, never accepted)\n",
-                         idx + 1, err, kDriftCorrectFr,
-                         (unsigned long long)L.wardenDrops, (unsigned long long)L.syncDrops,
-                         kDriftCorrectFr, kDriftIntervalMs);
-                }
-            }
+            L.biteDue    = (size_t)kDriftCorrectFr;
+            L.biteForced = (err >= (long long)(2 * kDriftCorrectFr));
+            L.lastBiteMs = nowMs;
         }
         return 0;
     }
@@ -3703,12 +3737,13 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // v8.4.20 THE REFERENCE IS LEG1 AGAIN: the master's own DEPTH GUARD
     // (leg1's ring bloat + the mains' own drift) runs first, then the
     // cross-leg servo for the slaves (delay-neutral, bite-only,
-    // pad-budgeted). A drop happened inside one of the two (the oldest
-    // frames are gone); a PAD is applied below -- this switch deliberately
-    // pops padFr frames less and holds its last mixed frame across the pad
-    // region (up to kDriftCorrectFr frames, the warden pad budget).
-    if (idx == 0) masterDepthGuard(L);
-    const size_t padFr = (idx != 0) ? syncToFirst(idx, L, frameCount) : 0;
+    // pad-budgeted). A LATE bite is ARMED here and executed in the loop
+    // below, inside a digital-silence window; a PAD comes back as padFr --
+    // this switch deliberately pops padFr frames less and holds its last
+    // mixed frame across the pad region (up to kDriftCorrectFr frames, the
+    // warden pad budget).
+    const size_t padFr = (idx == 0) ? masterDepthGuard(L, frameCount)
+                                    : syncToFirst(idx, L, frameCount);
     // v8.4.4/v8.4.5 THE ABSOLUTE LANE GATE: the whole-block lane verdict,
     // per leg -- the center reads ch3 (idx==1); v8.4.11: the ONE rear leg
     // (idx==2) reads FOUR lanes, each BY ITSELF -- rear L ch7 and side L
@@ -3814,8 +3849,38 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 L.prefillRemaining -= p;
                 real -= p;
             }
-            if (real)
-                L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed) + real);
+        if (real)
+            L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed) + real);
+        }
+        // v8.4.21 QUIET-WINDOW DRIFT CORRECTION: the armed drop lands HERE,
+        // inside a chunk whose mix is digital silence -- a skip inside
+        // silence is bit-silent and cannot click. leg0's silence test is
+        // the whole 8ch block (its driven slots are already digital
+        // silence); the gated legs use their own lane verdicts. The valve
+        // (biteForced, past 10 ms of accumulated drift) executes
+        // regardless -- 10 ms of desync is worse than one gentle skip.
+        if (L.biteDue) {
+            const bool chunkQuiet =
+                (idx == 0) ? (L.zeroFast && bitZero8(sc, n))
+                           : (zLane && (gateLane2 < 0 || zLane2)
+                                    && (gateLane3 < 0 || zLane3)
+                                    && (gateLane4 < 0 || zLane4));
+            if (chunkQuiet || L.biteForced) {
+                const size_t drop = L.biteDue;
+                L.raw.discardOldest(drop);
+                L.biteDue = 0;
+                L.biteForced = false;
+                L.syncDrops++;
+                L.wardenDrops++;
+                L.depthDrops += drop;
+                const unsigned long long dbn = GetTickCount64();
+                if (dbn - L.lastSyncLogMs >= 10000) {
+                    L.lastSyncLogMs = dbn;
+                    tlog("[twinspeak] drift out%d    : %llu fr of drift dropped inside a silent window\n"
+                         "                            (%llu total; a skip inside digital silence cannot click)\n",
+                         idx + 1, (unsigned long long)drop, (unsigned long long)L.syncDrops);
+                }
+            }
         }
         done += n;
     }
@@ -5386,7 +5451,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.20 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.21 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -9353,8 +9418,12 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v7.1.20: logoff/shutdown -- remember where the window was and give
         // the engine a chance to release its devices cleanly (the threads
         // watch g_run at every buffer switch; no blocking here, Windows
-        // allows only seconds).
+        // allows only seconds). v8.4.21: the tray icon goes WITH the
+        // session -- logoff kills the process without WM_DESTROY, and
+        // every such session left a stale icon behind (the field's tray
+        // full of dead twinspeak icons).
         if (wp) {
+            trayRemove();
             guiCaptureWindowPos(w);
             if (g_engState.load() != 0) { g_engState.store(3); g_run.store(false); }
         }
@@ -10352,7 +10421,16 @@ static int guiMain(const std::string& iniPath, bool startTray) {
 }
 
 // ---------------------------------------------------------------- main ------
-static BOOL WINAPI ctrlHandler(DWORD) { g_run.store(false); return TRUE; }
+// v8.4.21: the console control handler also removes the tray icon on
+// logoff/shutdown -- those events kill the process without WM_DESTROY,
+// and every killed session left a stale icon behind. (The GUI path gets
+// the same cleanup from WM_ENDSESSION; this covers the console-attached
+// runs. Harmless no-op when no icon is ours.)
+static BOOL WINAPI ctrlHandler(DWORD ev) {
+    if (ev == CTRL_SHUTDOWN_EVENT || ev == CTRL_LOGOFF_EVENT) trayRemove();
+    g_run.store(false);
+    return TRUE;
+}
 
 // v7.1.20 CONSOLE, GUI-SUBSYSTEM EDITION: the exe no longer allocates a
 // console at load (that was the black window flashing on every double-click
@@ -10385,6 +10463,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
 int main(int argc, char** argv) {
     InitializeCriticalSection(&g_logCS);   // v5.0 logger
+    // v8.4.21: the tray icon is removed on EVERY normal exit, whatever path
+    // takes us down -- the scheduled cleanup ("upon exit the system tray
+    // icon just gets killed along with it"): logoff/shutdown kill the
+    // process without WM_DESTROY, and every such session left a stale icon
+    // behind. The immediate paths (Exit, WM_ENDSESSION, the console
+    // shutdown event) remove it themselves; this is the belt.
+    atexit(trayRemove);
     tsEnsureConsole(false);                // v7.1.20: ride the parent terminal, if any
     std::string iniPath;
     bool doList = false, doListKS = false, fgForce = false, allowMulti = false;
@@ -10944,6 +11029,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.wardenPads   = 0;
         L.depthDrops   = 0;
         L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
+        L.biteDue      = 0;                                            // v8.4.21: no armed drift bite either
+        L.biteForced   = false;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
