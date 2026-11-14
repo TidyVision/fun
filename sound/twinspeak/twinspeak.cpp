@@ -62,6 +62,34 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.4.19 THE OFFICIAL POLISH (field-directed: "surprisingly enough,
+//            that's all I want to fix for a full official polish").
+//            THREE pieces: (1) THE PAD BUDGET -- the center crackle was
+//            the EARLY pad refilling only ~47 frames per 2 s at the
+//            field's 48-frame WASAPI callbacks (the hold-region clamp
+//            caps a pad at frameCount-1), which the Realtek-vs-cable
+//            sink (~500 ppm) cancelled exactly -- the ring sank under
+//            its own prefill ("it's reading 60ms as the baseline at
+//            minimum") and the content crackled at the troughs. One
+//            EARLY bite is now a 240-frame PAD BUDGET delivered across
+//            consecutive switches: 5 ms/s of refill, five times the
+//            sink -- the floor recovers in seconds and the budget
+//            stands down. (2) THE TWO-BUFFER CONSOLE: the log pane's
+//            history lives in two string buffers -- A (older) and B
+//            (newer); appends land in B, and when B passes its cap A is
+//            DELETED and B moves into A's slot (a pointer move -- the
+//            first element is set to the second), B starting empty: the
+//            earliest text dies with the rotation, exactly like a
+//            command prompt shedding its oldest rows. The edit's text
+//            is rebuilt only on a rotation; between rotations an append
+//            is the cheap end-insert. (3) THE LOG PANE GREW 140 px
+//            (client 620 -> 760, the pane 114 -> 254 -- same watermark
+//            band below), and the CONFIGURATION tab's description is
+//            the tick-test prep note: "We recommend you wait 10 seconds
+//            before doing the tick test to prepare the audio buffer
+//            preload for accurate latency compensation measurements
+//            between each audio device." NO new ini key, NO UI row
+//            beyond the note's own text.
 //    v8.4.18 THE ANCHOR IS THE DEVICE BUFFER (field-directed: "I want to
 //            erase that 10ms delay" -- after seeing raw1 ride 71.7-75.7
 //            over delay1_ms = 68). The flat 10 ms anchor (capture delivery
@@ -2263,7 +2291,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.4.18"
+#define TWS_VERSION "8.4.19"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2910,6 +2938,15 @@ struct Leg {
     unsigned long long     wardenDrops   = 0;
     unsigned long long     wardenPads    = 0;
     unsigned long long     depthDrops    = 0;
+    // v8.4.19 THE PAD BUDGET: one EARLY bite = 240 frames of boundary stall,
+    // delivered across consecutive switches (each capped at frameCount-1 by
+    // the hold-region clamp). Set by the guard once per 2 s; consumed by
+    // bufferSwitchFill as each pad lands. At the field's 48-frame WASAPI
+    // callbacks a single-pad bite refilled only ~47 frames -- the
+    // Realtek-vs-cable sink cancelled it exactly and the ring sank under
+    // its own prefill (the field's "reading 60 ms as the baseline" + the
+    // crackle). 240 fr per 2 s = 5 ms/s of refill, five times the sink.
+    size_t                 padBudget     = 0;
     // v8.4.14 THE DEFERRED REOPEN LANDING: set by tryRestartLeg (the health
     // thread, BEFORE the new device thread exists -- the write happens-
     // before the thread creation, and the old thread is already joined);
@@ -3487,25 +3524,31 @@ static size_t depthGuard(int idx, Leg& L, size_t frameCount)
         return 0;
     }
     if (over <= 0) {                                    // EARLY: at/below the device-buffer floor
-        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+        // v8.4.19 THE PAD BUDGET: one bite = 240 frames of boundary stall,
+        // delivered across consecutive switches (each capped at
+        // frameCount-1 by the hold-region clamp). At the field's 48-frame
+        // WASAPI callbacks the old single-pad-per-2-s refilled only ~47
+        // frames, which the Realtek-vs-cable sink (~500 ppm) cancelled
+        // exactly: the ring sank under its own prefill (the field's
+        // "reading 60 ms as the baseline") and the content crackled. 240
+        // fr per 2 s = 5 ms/s of refill, five times the sink -- the floor
+        // recovers in seconds and the budget stands down.
+        if (L.padBudget == 0 && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            L.padBudget = (size_t)kDriftCorrectFr;
+            L.wardenPads++;
+            if (nowMs - L.lastSyncLogMs >= 10000) {
+                L.lastSyncLogMs = nowMs;
+                tlog("[twinspeak] depth out%d    : ring %lld fr under its anchor -- the guard armed a %d-frame pad\n"
+                     "                            budget (%llu total; the stall is delivered across the next\n"
+                     "                            switches -- a held sample, never a hole)\n",
+                     idx + 1, over, kDriftCorrectFr, (unsigned long long)L.wardenPads);
+            }
+        }
+        if (L.padBudget && frameCount >= 2) {
             // clamp under the block: the pad region must repeat a REAL mixed
             // frame (holdSrc = the last popped frame), never read past it.
-            const size_t pad = (frameCount > (size_t)kDriftCorrectFr)
-                             ? (size_t)kDriftCorrectFr
-                             : (frameCount >= 2) ? frameCount - 1 : 0;
-            if (pad) {
-                L.syncPads++;
-                L.wardenPads++;
-                L.lastBiteMs = nowMs;
-                if (nowMs - L.lastSyncLogMs >= 10000) {
-                    L.lastSyncLogMs = nowMs;
-                    tlog("[twinspeak] depth out%d    : ring %lld fr under its anchor -- the guard padded %d frames\n"
-                         "                            (%llu total; a fast crystal's shallow ring is refilled by\n"
-                         "                            stalling the boundary -- a held sample, never a hole)\n",
-                         idx + 1, over, kDriftCorrectFr,
-                         (unsigned long long)L.wardenPads, (unsigned long long)L.syncPads);
-                }
-            }
+            const size_t pad = (frameCount - 1 < L.padBudget)
+                             ? (frameCount - 1) : L.padBudget;
             return pad;
         }
         return 0;
@@ -3707,6 +3750,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             memcpy(out + (frameCount - padApplied + i) * L.outCh, holdSrc,
                    L.outCh * sizeof(float));
         L.syncPads++;
+        if (L.padBudget >= padApplied) L.padBudget -= padApplied;   // v8.4.19: the pad budget spends as it lands
+        else                           L.padBudget = 0;
         const unsigned long long nowMs = GetTickCount64();
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
@@ -5258,7 +5303,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.4.18 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.4.19 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6420,6 +6465,17 @@ static bool      g_applyRestart  = false;   // v7.1.20: APPLY+RESTART chains off
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
 static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
+// v8.4.19 THE TWO-BUFFER CONSOLE: the pane's history lives in TWO string
+// buffers -- g_logA (the older half) and g_logB (the newer half). Appends
+// land in B; the moment B passes its cap, A is DELETED and B moves into
+// A's slot (a pointer move -- the first element is set to the second), and
+// B starts empty: the earliest text dies with A, exactly like a command
+// prompt shedding its oldest rows. The edit control's text is rebuilt
+// (A + B) only on that rotation; between rotations an append is the cheap
+// end-insert it always was. GUI-thread only (the ring handoff above is the
+// only cross-thread leg).
+static std::string g_logA;                     // the pane's older history half
+static std::string g_logB;                     // the pane's newer history half (appends land here)
 static std::string g_lastHealth;               // latest "out1 ..." health line
 static std::atomic<bool> g_logDirty{false};
 // v6.6.1: tray + startup
@@ -6532,9 +6588,9 @@ static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
 static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
-static int KCLI_W     = 880, KCLI_H      = 620;        // designed client size
+static int KCLI_W     = 880, KCLI_H      = 760;        // designed client size (v8.4.19: the log pane grew 140 px)
 static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
-static int KLOG_BOTTOM= 594;                            // log pane bottom
+static int KLOG_BOTTOM= 734;                            // log pane bottom
 static int kTabW[3]   = { 283, 283, 283 };   // v8.3.0: three faces fill the strip (3*283+2*4 = 857)
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // v7.8.0: the in-client caption band is RETIRED with the custom chrome --
@@ -6547,10 +6603,10 @@ static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // "system-aware, fixed for the process lifetime" rule is retired.
 static void guiApplyDpi() {
     KCLI_W     = S(880);
-    KCLI_H     = S(620);
+    KCLI_H     = S(760);
     KPANEL_T   = S(66);
     KPANEL_B   = S(402);
-    KLOG_BOTTOM= S(594);
+    KLOG_BOTTOM= S(734);
     kTabW[0] = kTabW[1] = kTabW[2] = S(283);
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
@@ -7502,17 +7558,30 @@ static void guiAppendLog(const std::string& s) {
             norm += s[i];
         }
     }
-    int len = GetWindowTextLengthA(e);
-    // v7.1.5: the append is WM_SETREDRAW-batched -- one repaint per chunk,
-    // then the subclassed pane lands it as a single blit.
-    SendMessageA(e, WM_SETREDRAW, FALSE, 0);
-    if (len > 131072) {                               // keep the pane bounded
-        SendMessageA(e, EM_SETSEL, 0, len / 2);
-        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)"");
-        len = GetWindowTextLengthA(e);
+    // v8.4.19 THE TWO-BUFFER CONSOLE: the append lands in B; the moment B
+    // passes its cap, A is deleted, B moves into A's slot (a pointer move
+    // -- the first element is set to the second) and B starts empty, so
+    // the pane holds exactly two buffers of history and the earliest text
+    // dies with the rotation -- the command-prompt shed. The edit's text
+    // is rebuilt (A + B) only on a rotation; every other append is the
+    // WM_SETREDRAW-batched end-insert (one repaint per chunk, the
+    // subclassed pane lands it as a single blit).
+    g_logB += norm;
+    const bool rotated = g_logB.size() > 65536;
+    if (rotated) {
+        g_logA = std::move(g_logB);                   // the first slot takes the second's buffer...
+        g_logB.clear();                               // ...and the old first half is deleted with the move
     }
-    SendMessageA(e, EM_SETSEL, len, len);
-    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
+    SendMessageA(e, WM_SETREDRAW, FALSE, 0);
+    if (rotated) {
+        const std::string full = g_logA + g_logB;     // the edit always mirrors A + B exactly
+        SendMessageA(e, EM_SETSEL, 0, -1);
+        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)full.c_str());
+    } else {
+        const int len = GetWindowTextLengthA(e);
+        SendMessageA(e, EM_SETSEL, len, len);
+        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
+    }
     SendMessageA(e, EM_SCROLLCARET, 0, 0);
     SendMessageA(e, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(e, nullptr, FALSE);
@@ -7651,10 +7720,7 @@ static void guiBuildPages(HWND w) {
     HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 290, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
     note(w, COLA_X, 318,
-         "leg1 = FL/FR + the LFE fold; an EMPTY leg2 folds the center onto\n"
-         "FL/FR (gain_center). leg3 = the cable's rears on ONE stereo device\n"
-         "(out L = ch7+ch5 at gain_rl, out R = ch8+ch6 at gain_rr, v8.4.11);\n"
-         "an EMPTY device row = the rears stay silent. volume_endpoint = master.", 4);
+         "We recommend you wait 10 seconds before doing the tick test to prepare the audio buffer preload for accurate latency compensation measurements between each audio device.", 3);
     header(w, COLB_X, KHDR_Y, "GAIN");
     // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
     // narrow edits in one group (the field's ask), gain_lfe just below,
@@ -8290,9 +8356,9 @@ static void guiBuildControls(HWND w) {
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        S(14), S(480), S(852), S(114), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), S(480), S(852), S(254), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(log, 14, 480, 852, 114, &g_fMono);   // the dpi ledger
+    tsTrackChild(log, 14, 480, 852, 254, &g_fMono);   // the dpi ledger (v8.4.19: the pane grew 140 px)
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -10788,6 +10854,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.wardenDrops  = 0;
         L.wardenPads   = 0;
         L.depthDrops   = 0;
+        L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
