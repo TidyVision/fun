@@ -2,19 +2,11 @@ Disclaimer: This tool was made for free, bypassing the requirement of paying for
 
 A GUI should come with twinspeak.exe. And there should be a built-in E.Q. setting to use instead of utilizing Equalizer APO, as that software uses shared-mode, where as this software bypasses all of that by WASAPI Exclusive/KS.
 
-### What happened to the custom window?
-
-v7.5.0 through v7.7.9 faked the whole Windows 10 title bar and borders in-client (learned from [this github repository](https://github.com/grassator/win32-window-custom-titlebar/tree/main)) — an entire one-file window API, a decompiled-uDWM button replica, glass-sheet byte patching, the works.
-
-v7.8.0 retires ALL of it. The panel is now a stock `WS_OVERLAPPEDWINDOW`: the flat default Windows 10 frame with the native caption, icon, title, min/max/close buttons, system menu and resize edges, exactly as Windows draws them. The only DWM touches left are a square-corner preference and one attribute: `DWMWA_USE_IMMERSIVE_DARK_MODE`, which the app re-dials from the active theme's background lightness on every theme click — so the dark themes (DARK CYAN, DARK BLUE, DARK YELLOW, DARK GREEN, DARK RED, DARK ORANGE) flip the native title bar to dark with white ink, and the light themes flip it back. The DPI child ledger (the one piece worth keeping) moved into twinspeak.cpp itself; there is no window header to include anymore.
-
-v7.8.1 fixes the one gap that remained: on Windows 10 the theme click set the attribute but the title bar kept the old mode until the window state changed (minimize/restore) — the Win10 DWM only repaints its caption when the caption's render state actually changes. The flip now lands in the same click: `guiApplyDwmMode` pings the `WM_NCACTIVATE(FALSE)`/`WM_NCACTIVATE(TRUE)` pair (the pair a minimize/restore really rides) right after the attribute set, so the caption re-renders against the new mode immediately — no flash, no focus or z-order side effects.
-
 ## Overview & Metadata
 
 PROPERTY OF TIDYVISION, GENERATED FROM GLM 5.3 FLASH
 
-POST-POLISH DONE THROUGH OCT. 28 2026 to NOV. 14 12:48AM | PROJECT STARTED ON SEPT. 28 at around 1:00PM
+POST-POLISH DONE THROUGH OCT. 28 2026 to NOV. 14 12:48AM | PROJECT STARTED ON SEPT. 28 at around 3:50PM
 
 FORMERLY CENTERFOLD
 
@@ -32,10 +24,10 @@ twinspeak captures the 8-channel / 48 kHz stream of a VB-Audio **Virtual Audio C
                         +--> out1  mains (e.g. Realtek)        = FL + FR + 0.4 x LFE (folded)
 apps --> VAC Line 1 ----+         center / sub / surrounds      = driven DIGITAL SILENCE
       (8ch @ 48 kHz)    +--> out2  center speaker (e.g.         = L = R = ch3 ONLY
-                                 Adesso Xtream S5)             + 40 Hz @ 1% keep-alive
+                                 Adesso Xtream S5)             + 20 Hz @ 0.1% keep-alive (still keeps it alive somehow)
 ```
 
-It exists for the machine that cannot do analog multichannel — a Lenovo M720q with one combo jack — but has an onboard DAC for the mains and a USB speaker for the center. The 5.1 stream arrives digitally; twinspeak routes it with the guarantees below and never gets in the way of the samples.
+It exists for the machine that cannot do analog multichannel — a Lenovo M720q with one combo jack — but has an onboard DAC for the realtek and some USB speaker for the center. The 5.1 stream arrives digitally; twinspeak routes it with the guarantees below and never gets in the way of the samples.
 
 ## The guarantees
 
