@@ -73,17 +73,20 @@
 //            bass at the seat (bass is omnidirectional and the polarity
 //            survives the air path at 200 Hz: the two speakers sum
 //            coherently to ~0.5x, a ~6 dB dip in the surround's low band --
-//            THE HOLLOW). THE PATCH: new surround_bass keys -- an RBJ
-//            peaking biquad (default 200 Hz, +2.0 dB, Q 0.8, ON) run on
-//            ch5/ch6's ORIGINAL pre-trick samples BEFORE the fold; ONE
-//            filter feeds BOTH fold paths (own side and cross) so the
-//            matrix ratios stay exact. The center EQ's silence contract,
-//            per lane: an all-zero surround block RESETS its filter and
-//            never feeds it, so a silent lane still contributes exactly
-//            zero (the fold stays bit-exact on silence); off = the
-//            bit-exact fold. Fold-path only: with a rear device set the
+//            THE HOLLOW). THE PATCH IS BUILT IN -- NO ini keys, NO UI (the
+//            field: "I wanted the ini keys how they are, with no
+//            configuration of surround bass, which is quite weird in final
+//            production"): an RBJ peaking biquad HARDCODED at 200 Hz,
+//            +2.0 dB, Q 0.5 -- the Q measured so the boost's half-gain
+//            skirt lands AT 80 Hz (the boost spreads all the way down to
+//            80 Hz) -- run on ch5/ch6's ORIGINAL pre-trick samples BEFORE
+//            the fold; ONE filter feeds BOTH fold paths (own side and
+//            cross) so the matrix ratios stay exact. The center EQ's
+//            silence contract, per lane: an all-zero surround block RESETS
+//            its filter and never feeds it, so a silent lane still
+//            contributes exactly zero (the fold stays bit-exact on
+//            silence). Fold-path only: with a rear device set the
 //            surround plays natively -- no trick, no hollow, no boost.
-//            NO UI row.
 //    v8.5.0 THE FOLD THAT FINALLY FOLDS + THE SURROUND GAINS
 //            (field-directed: "I have the output leg3 device name set to
 //            be empty and the rear and surround channels are not folding
@@ -2778,16 +2781,9 @@ struct Config {
     float       centerEqFreq   = 287.0f;  // peak frequency (Hz, clamped 20..20000; v8.4.27: the field's pick)
     float       centerEqGain   = 4.0f;    // peak gain (dB, clamped +-12)
     float       centerEqQ      = 0.8f;    // peak Q (clamped 0.1..10)
-    // v8.5.1 SURROUND BASS RESTORE: RBJ peaking biquad on ch5/ch6 (SL/SR),
-    // the leg1 wide fold ONLY -- taken from the ORIGINAL pre-trick samples
-    // so the matrix-encoding phase trick's inverted half-gain cross stops
-    // hollowing the surround's bass (a ~6 dB dip at the seat; +2 dB hands
-    // 2 of those back). Default ON: the fold is built in and ships hollow;
-    // off = the bit-exact fold.
-    bool        surroundBass     = true;
-    float       surroundBassFreq = 200.0f;  // peak center (Hz, clamped 20..20000; the field's pick)
-    float       surroundBassGain = 2.0f;    // peak gain (dB, clamped +-12)
-    float       surroundBassQ    = 0.8f;    // peak Q (clamped 0.1..10)
+    // v8.5.1 SURROUND BASS RESTORE is BUILT IN -- hardcoded constants next to
+    // g_sbeq (200 Hz, +2.0 dB, spread down to 80 Hz), NO ini keys: the field
+    // wanted no configuration of surround bass in final production.
     // v7.1.8 CENTER EQ SAVE SLOTS: the four built-in presets are retired --
     // five user slots persist in the ini (eq_slotN_on/freq/gain/q). Slot 1
     // ships reserved with the field's dialogue curve; freq <= 0 = empty slot.
@@ -4386,25 +4382,35 @@ static void centerEqInit() {
 }
 
 // ------------------------------ v8.5.1 surround bass restore (the hollow) ----
-// RBJ peaking biquad on the cable's SURROUND channels (ch5 SL / ch6 SR), taken
-// from their ORIGINAL pre-trick samples, riding leg1's wide fold ONLY. The
-// v8.4.26/27 fold is the matrix-encoding phase trick -- each surround feeds
-// its own side in-phase and the opposite side INVERTED at half gain -- and
-// the inverted copy partially CANCELS the surround's own bass at the seat
-// (bass is omnidirectional and the polarity survives the air path at 200 Hz,
-// so the two speakers sum coherently to ~0.5x -- a ~6 dB dip in the
-// surround's low band: THE HOLLOW the field reported). The boost reinforces
-// the surround's low band FIRST, so the cancellation starts from a fuller
-// signal while the matrix ratios themselves stay untouched (the same filter
-// feeds both fold paths, own side and cross). ONE filter, TWO state pairs --
-// the surrounds are independent channels. Coefficients computed ONCE at
-// startup; transposed DF2 -- no division in the hot loop. Touched only by
+// BUILT IN -- no ini keys, no UI (the field wanted the ini keys how they are:
+// "no configuration of surround bass, which is quite weird in final
+// production"). RBJ peaking biquad on the cable's SURROUND channels (ch5 SL /
+// ch6 SR), taken from their ORIGINAL pre-trick samples, riding leg1's wide
+// fold ONLY. The v8.4.26/27 fold is the matrix-encoding phase trick -- each
+// surround feeds its own side in-phase and the opposite side INVERTED at half
+// gain -- and the inverted copy partially CANCELS the surround's own bass at
+// the seat (bass is omnidirectional and the polarity survives the air path at
+// these frequencies, so the two speakers sum coherently to ~0.5x -- a ~6 dB
+// dip in the surround's low band: THE HOLLOW the field reported). The boost
+// reinforces the surround's low band FIRST, so the cancellation starts from a
+// fuller signal while the matrix ratios themselves stay untouched (the same
+// filter feeds both fold paths, own side and cross). ONE filter, TWO state
+// pairs -- the surrounds are independent channels. Coefficients computed ONCE
+// at startup; transposed DF2 -- no division in the hot loop. Touched only by
 // leg1's switch thread (the fold and leg3's native mix are mutually
 // exclusive -- g_rearFold == g_leg[2].disabled -- so a block is never
 // double-processed).
+//
+// THE CURVE, HARDCODED: +2.0 dB peaking at 200 Hz with Q 0.5 -- the Q was
+// measured (scripts/qsweep) so the boost's half-gain skirt lands AT 80 Hz:
+// +2.06 dB at 200, +0.95 dB at 80, +0.61 at 60 -- the boost spreads all the
+// way down to 80 Hz, to counteract the natural act of cancelling out.
+static const float kSbFreq   = 200.0f;   // the boost's center (Hz)
+static const float kSbGainDb = 2.0f;     // the boost at its center (dB)
+static const float kSbQ      = 0.5f;     // the spread: half-gain skirt at 80 Hz
+
 struct SurroundBassEq {
-    bool    on     = false;
-    float   f0     = 0.0f;   // clamped values, for the banner
+    float   f0     = 0.0f;   // for the banner
     float   gainDb = 0.0f;
     float   q      = 0.0f;
     float   b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
@@ -4418,10 +4424,8 @@ static SurroundBassEq g_sbeq;
 // starts clean.
 static void surroundBassFlushZ()
 {
-    if (g_sbeq.on) {
-        g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f;
-        g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f;
-    }
+    g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f;
+    g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f;
 }
 
 // One sample through the peaking section (transposed DF2, the center EQ's
@@ -4435,25 +4439,13 @@ static inline float sbPeak(const float x, float& z1, float& z2)
 }
 
 static void surroundBassInit() {
-    g_sbeq.on = g_cfg.surroundBass;
-    if (!g_sbeq.on) return;
-    // clamp to sane bands so a typo in the ini cannot nuke the coefficients
-    const float f0  = g_cfg.surroundBassFreq < 20.0f    ? 20.0f
-                    : g_cfg.surroundBassFreq > 20000.0f ? 20000.0f
-                    : g_cfg.surroundBassFreq;
-    const float gdb = g_cfg.surroundBassGain < -12.0f   ? -12.0f
-                    : g_cfg.surroundBassGain > 12.0f    ? 12.0f
-                    : g_cfg.surroundBassGain;
-    const float qv  = g_cfg.surroundBassQ < 0.1f        ? 0.1f
-                    : g_cfg.surroundBassQ > 10.0f       ? 10.0f
-                    : g_cfg.surroundBassQ;
-    // RBJ audio-EQ-cookbook peaking section
-    const double A     = pow(10.0, (double)gdb / 40.0);
-    const double w0    = kTwoPi * (double)f0 / (double)kSampleRate;
-    const double alpha = sin(w0) / (2.0 * (double)qv);
+    // RBJ audio-EQ-cookbook peaking section, from the hardcoded constants
+    const double A     = pow(10.0, (double)kSbGainDb / 40.0);
+    const double w0    = kTwoPi * (double)kSbFreq / (double)kSampleRate;
+    const double alpha = sin(w0) / (2.0 * (double)kSbQ);
     const double b0 = 1.0 + alpha * A, b1 = -2.0 * cos(w0), b2 = 1.0 - alpha * A;
     const double a0 = 1.0 + alpha / A, a1 = -2.0 * cos(w0), a2 = 1.0 - alpha / A;
-    g_sbeq.f0 = f0; g_sbeq.gainDb = gdb; g_sbeq.q = qv;
+    g_sbeq.f0 = kSbFreq; g_sbeq.gainDb = kSbGainDb; g_sbeq.q = kSbQ;
     g_sbeq.b0 = (float)(b0 / a0); g_sbeq.b1 = (float)(b1 / a0);
     g_sbeq.b2 = (float)(b2 / a0); g_sbeq.a1 = (float)(a1 / a0);
     g_sbeq.a2 = (float)(a2 / a0);
@@ -4500,18 +4492,18 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
         const float gSL = g_rearFold ? g_cfg.gainSl : 0.0f;   // v8.5.0: the surround gains
         const float gSR = g_rearFold ? g_cfg.gainSr : 0.0f;
-        // v8.5.1 THE SURROUND BASS RESTORE: the fold's surround lanes run
-        // through the peaking biquad FIRST (surround_bass_gain dB @
-        // surround_bass_freq, from the ORIGINAL pre-trick samples -- the
-        // SAME filter feeds both fold paths, own side and cross, so the
-        // matrix ratios stay exact). The center EQ's silence contract, per
-        // LANE: a block whose surround lane is all-zero RESETS that lane's
-        // filter instead of feeding it (a biquad fed zeros still rings; a
-        // silent lane must contribute exactly zero -- g * 0 = 0, the fold's
-        // bit-exactness). Nonzero lanes run every sample, internal zeros
-        // included.
+        // v8.5.1 THE SURROUND BASS RESTORE (BUILT IN, no ini keys): the
+        // fold's surround lanes run through the peaking biquad FIRST (+2.0 dB
+        // @ 200 Hz spread down to 80 Hz, from the ORIGINAL pre-trick samples
+        // -- the SAME filter feeds both fold paths, own side and cross, so
+        // the matrix ratios stay exact). The center EQ's silence contract,
+        // per LANE: a block whose surround lane is all-zero RESETS that
+        // lane's filter instead of feeding it (a biquad fed zeros still
+        // rings; a silent lane must contribute exactly zero -- g * 0 = 0,
+        // the fold's bit-exactness). Nonzero lanes run every sample,
+        // internal zeros included.
         bool slLive = false, srLive = false;
-        if (g_rearFold && g_sbeq.on) {
+        if (g_rearFold) {
             for (size_t i = 0; i < n; ++i) {
                 if (sc[i * kInCh + 4] != 0.0f) slLive = true;
                 if (sc[i * kInCh + 5] != 0.0f) srLive = true;
@@ -5700,37 +5692,24 @@ static void writeTemplate(const char* path) {
         "eq_slot5_gain = 0\n"
         "eq_slot5_q = 0\n"
         "\n"
-        "; SURROUND BASS RESTORE (v8.5.1): a peaking boost on the cable's\n"
-        "; SURROUND channels (ch5 SL / ch6 SR), taken from their ORIGINAL\n"
-        "; samples BEFORE the wide fold applies the matrix-encoding phase\n"
-        "; trick (each surround in-phase on its own side, inverted at half\n"
-        "; gain on the opposite side). The trick keeps the surround off the\n"
-        "; front image, but the inverted copy partially CANCELS the\n"
-        "; surround's own bass at the seat -- bass is omnidirectional and\n"
-        "; the polarity survives the air path at these frequencies, so the\n"
-        "; two speakers sum coherently to ~0.5x, a ~6 dB dip in the\n"
-        "; surround's low band: THE HOLLOW. The boost reinforces the\n"
-        "; surround's low band first so the cancellation starts from a\n"
+        "; SURROUND BASS RESTORE (v8.5.1, BUILT IN -- no keys, no UI):\n"
+        "; the surround channel samples are audio phased and have a bass boost of\n"
+        "; 200hz, spread all the way down to 80hz to fabricate premium voice\n"
+        "; fidelity to counteract the natural act of cancelling out.\n"
+        "; HOW: a peaking boost on the cable's SURROUND channels (ch5 SL / ch6\n"
+        "; SR), taken from their ORIGINAL samples BEFORE the wide fold applies\n"
+        "; the matrix-encoding phase trick (each surround in-phase on its own\n"
+        "; side, inverted at half gain on the opposite side). The trick keeps\n"
+        "; the surround off the front image, but the inverted copy partially\n"
+        "; CANCELS the surround's own bass at the seat -- bass is\n"
+        "; omnidirectional and the polarity survives the air path at these\n"
+        "; frequencies, so the two speakers sum coherently to ~0.5x, a ~6 dB\n"
+        "; dip in the surround's low band: THE HOLLOW. The boost reinforces\n"
+        "; the surround's low band first so the cancellation starts from a\n"
         "; fuller signal; the matrix ratios themselves are untouched. It\n"
         "; rides the fold ONLY: the mains, center, LFE and rears are\n"
         "; untouched, and with a rear device set (leg3) the surround plays\n"
         "; natively with no trick -- the boost stays off there too.\n"
-        "; surround_bass       -- on/off (default ON: the fold is built in\n"
-        ";                        and ships hollow; off restores the\n"
-        ";                        bit-exact fold).\n"
-        "; surround_bass_freq  -- the peak's center in Hz (default 200).\n"
-        "; surround_bass_gain  -- boost in dB (default 2.0). The fold's bass\n"
-        ";                        dip is ~6 dB deep at the seat; +2 hands two\n"
-        ";                        of those back (subtle), raise toward +6 to\n"
-        ";                        fully even it out. Stacks with gain_sl /\n"
-        ";                        gain_sr like the center EQ stacks with\n"
-        ";                        gain_center.\n"
-        "; surround_bass_q     -- sharpness (default 0.8, a broad musical\n"
-        ";                        bump covering roughly 100-500 Hz).\n"
-        "surround_bass = on\n"
-        "surround_bass_freq = 200\n"
-        "surround_bass_gain = 2.0\n"
-        "surround_bass_q = 0.8\n"
         "\n"
         "; VOLUME (v8.3.0: volume_follow is BUILT IN, hardcoded on): the\n"
         "; Windows volume of the cable's PLAYBACK side (the Line 1 slider in\n"
@@ -6121,11 +6100,7 @@ static bool loadIni(const char* path) {
         else if (key == "center_eq_freq") g_cfg.centerEqFreq = (float)atof(val.c_str());
         else if (key == "center_eq_gain") g_cfg.centerEqGain = (float)atof(val.c_str());
         else if (key == "center_eq_q")    g_cfg.centerEqQ    = (float)atof(val.c_str());
-        // v8.5.1: the surround bass restore (the fold's phase trick, patched)
-        else if (key == "surround_bass")      g_cfg.surroundBass     = !isOff(val);
-        else if (key == "surround_bass_freq") g_cfg.surroundBassFreq = (float)atof(val.c_str());
-        else if (key == "surround_bass_gain") g_cfg.surroundBassGain = (float)atof(val.c_str());
-        else if (key == "surround_bass_q")    g_cfg.surroundBassQ    = (float)atof(val.c_str());
+        // v8.5.1: the surround bass restore is BUILT IN -- no ini keys.
         // v7.1.8: the five EQ save slots (eq_slotN_on / _freq / _gain / _q)
         else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
                  key[7] >= '1' && key[7] <= '5') {
@@ -7664,10 +7639,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", g_cfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
     else if (key == "center_eq_q")       { snprintf(b, 64, "%g", g_cfg.centerEqQ); return b; }
-    else if (key == "surround_bass")     return boolText(g_cfg.surroundBass);              // v8.5.1
-    else if (key == "surround_bass_freq"){ snprintf(b, 64, "%g", g_cfg.surroundBassFreq); return b; }
-    else if (key == "surround_bass_gain"){ snprintf(b, 64, "%g", g_cfg.surroundBassGain); return b; }
-    else if (key == "surround_bass_q")   { snprintf(b, 64, "%g", g_cfg.surroundBassQ); return b; }
+    // v8.5.1: the surround bass restore is BUILT IN -- no ini keys.
     // v7.1.8: the five EQ save slots
     else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
              key[7] >= '1' && key[7] <= '5') {
@@ -7709,7 +7681,7 @@ static const char* kIniKeys[] = {
     "output_device3",                                          // v8.4.0 rears (v8.4.11: output_device4 retired)
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
-    "surround_bass", "surround_bass_freq", "surround_bass_gain", "surround_bass_q",   // v8.5.1
+    // v8.5.1: the surround bass restore is BUILT IN -- no ini keys.
     "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
     "eq_slot2_on", "eq_slot2_freq", "eq_slot2_gain", "eq_slot2_q",
     "eq_slot3_on", "eq_slot3_freq", "eq_slot3_gain", "eq_slot3_q",
@@ -10939,7 +10911,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v6.5.18: center dialogue EQ coefficients (ini: center_eq*)
     centerEqInit();
 
-    // v8.5.1: surround bass restore coefficients (ini: surround_bass*)
+    // v8.5.1: surround bass restore coefficients (BUILT IN, no ini keys)
     surroundBassInit();
 
     // v6.2 chimes: render the modernized signature ONCE -- C7 42 ms -> G7
@@ -11624,19 +11596,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
          "                            + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
          g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
     // v8.5.1: the surround bass restore's banner -- the wide fold's own
-    // patch, printed right under the out1 route it rides.
-    if (g_rearFold) {
-        if (g_sbeq.on)
-            tlog("[twinspeak] route out1     : surround bass ON -- peaking %.0f Hz %+.1f dB Q %.2f on ch5/ch6 (SL/SR),\n"
-                 "                            taken from the ORIGINAL samples BEFORE the wide fold applies the\n"
-                 "                            phase trick: the trick's inverted half-gain cross dips the surround's\n"
-                 "                            own bass ~6 dB at the seat (the hollow sound) -- the boost hands some\n"
-                 "                            back first (raise surround_bass_gain toward 6 to fully even it;\n"
-                 "                            surround_bass = off restores the bit-exact fold)\n",
-                 g_sbeq.f0, g_sbeq.gainDb, g_sbeq.q);
-        else
-            tlog("[twinspeak] route out1     : surround bass off -- the wide fold is bit-exact (surround_bass = off)\n");
-    }
+    // BUILT-IN patch, printed right under the out1 route it rides.
+    if (g_rearFold)
+        tlog("[twinspeak] route out1     : surround bass ON (BUILT IN) -- peaking %.0f Hz %+.1f dB Q %.2f on\n"
+             "                            ch5/ch6 (SL/SR), the boost spread all the way down to 80 Hz,\n"
+             "                            taken from the ORIGINAL samples BEFORE the wide fold applies the\n"
+             "                            phase trick: the trick's inverted half-gain cross dips the surround's\n"
+             "                            own bass ~6 dB at the seat (the hollow sound) -- the boost hands it\n"
+             "                            back first, to counteract the natural act of cancelling out\n",
+             g_sbeq.f0, g_sbeq.gainDb, g_sbeq.q);
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
            n2.c_str(),
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
