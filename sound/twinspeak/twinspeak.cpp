@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,27 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.5 THE NEEDLE BRIDGE (field-directed, with the --list-ks output:
+//            "I ran --list-ks"). THE CAUSE OF EVERY KS REFUSAL, BOTH
+//            SYSTEMS, ALL ALONG: the ini's output_deviceN values are the
+//            WASAPI ENDPOINT names ("Speakers (Realtek(R) Audio)") while
+//            the KS wave filters carry the FILTER's own names ("Realtek HD
+//            Audio output", "Adesso Xtream S5  ") -- two different naming
+//            schemes, and the match asked the filter name to CONTAIN the
+//            endpoint name. It never did: KS has been refusing on every
+//            system since the backend keys existed, falling back to WASAPI
+//            exclusive silently -- both machines have been running the
+//            fallback the whole time. THE BRIDGE: a three-layer needle
+//            score, strongest wins -- (3) the filter name contains the
+//            needle (the old exact rule), (2) the needle contains the
+//            filter name (the endpoint name embeds the filter name: the
+//            S5), (1) >=2 shared alphanumeric tokens (the wrapper-differ
+//            case: "Realtek(R) Audio" vs "Realtek HD Audio output" share
+//            realtek+audio). The --list-ks dataranges on the new system
+//            say the pins WILL open once matched: the S5's KS pin is
+//            16-bit/48k/2ch (int16, the fourth proposal), the Realtek's is
+//            16..32-bit/44.1..48k (float32, the first). The match rule is
+//            logged. NO new ini key, NO UI row.
 //    v8.6.4 THE KS INTERROGATION (field-directed: "I want to chase the KS
 //            refusal right now. I want to know why it's always refusing").
 //            THE PROBE LOOP WAS SILENT: every failed KsCreatePin discarded
@@ -2811,7 +2832,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.4"
+#define TWS_VERSION "8.6.5"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5231,7 +5252,17 @@ static void ksListKs() {
 //   1: >= 2 shared alphanumeric tokens (the wrapper-differ case:
 //      "Realtek(R) Audio" vs "Realtek HD Audio output" share realtek+audio).
 static int ksNeedleScore(const std::string& filterName, const std::string& needle) {
-    const std::string fn = lower(trim(filterName)), nd = lower(trim(needle));
+    auto norm = [](const std::string& s) {
+        std::string o;
+        bool sp = true;
+        for (unsigned char ch : s) {
+            if (isspace(ch)) { if (!sp) { o += ' '; sp = true; } }
+            else { o += (char)tolower(ch); sp = false; }
+        }
+        while (!o.empty() && o.back() == ' ') o.pop_back();
+        return o;
+    };
+    const std::string fn = norm(filterName), nd = norm(needle);
     if (fn.empty() || nd.empty()) return 0;
     if (fn.find(nd) != std::string::npos) return 3;
     if (nd.find(fn) != std::string::npos) return 2;
@@ -5282,17 +5313,25 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     for (size_t i = 0; i < fl.size(); ++i)
         tlog("[twinspeak] leg%d KS        :   [%zu] \"%s\"%s\n",
              idx + 1, i, fl[i].name.c_str(),
-             containsCI(fl[i].name, needle) ? "  <-- matches" : "");
-    int chosen = -1;
+             ksNeedleScore(fl[i].name, needle) ? "  <-- scores" : "");
+    // v8.6.5: the layered needle score (see ksNeedleScore) -- the BEST
+    // scoring filter wins, ties go to the first.
+    int chosen = -1, chosenScore = 0;
     for (size_t i = 0; i < fl.size(); ++i) {
         if (fl[i].name.empty()) continue;
-        if (containsCI(fl[i].name, needle)) { chosen = (int)i; break; }
+        const int sc = ksNeedleScore(fl[i].name, needle);
+        if (sc > chosenScore) { chosen = (int)i; chosenScore = sc; }
     }
     if (chosen < 0) {
         tlog("[twinspeak] leg%d KS        : no filter name matches \"%s\" -- use twinspeak --list-ks\n",
              idx + 1, needle.c_str());
         return false;
     }
+    tlog("[twinspeak] leg%d KS        : chose [%d] \"%s\" (match rule %d%s)\n",
+         idx + 1, chosen, fl[chosen].name.c_str(), chosenScore,
+         chosenScore == 3 ? ": filter contains the needle"
+         : chosenScore == 2 ? ": needle contains the filter name"
+         : ": 2+ shared name tokens");
 
     HANDLE fh = CreateFileW(fl[chosen].path.c_str(), GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -5762,7 +5801,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
