@@ -62,15 +62,19 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v9.0.1 THE WASAPI-ONLY ENGINE + THE CONSTANT BUFFER SIZE AGAIN
-//            (field-directed: "I'd just remove WDM-KS from c++ and find any
-//            issues that could potentially ruin the audio flow's perfect
-//            state, like a lag. Just something minimal that would make it
-//            turn into the optimum state that it is. I favor a constant
-//            buffer size again. Make this v9.0.1."). THREE changes, nothing
-//            else touched -- the mix, the mask fan-out, the delay prefills,
-//            the keep-alive and the center/surround EQs are byte-identical
-//            to v8.5.1:
+//    v9.0.1 THE WASAPI-ONLY ENGINE + THE CONSTANT BUFFER SIZE AGAIN + THE
+//            3-LINE STATUS + THE FIXED WINDOW (field-directed: "I'd just
+//            remove WDM-KS from c++ and find any issues that could
+//            potentially ruin the audio flow's perfect state, like a lag.
+//            Just something minimal that would make it turn into the optimum
+//            state that it is. I favor a constant buffer size again. Make
+//            this v9.0.1." -- then, same session: "make the console status
+//            have three lines instead of just one"; "I don't want the
+//            console to cut off anymore. I want it so the text is always
+//            culled down to the precise line number"; "Also make the window
+//            unresizable too."). FIVE changes, nothing else touched -- the
+//            mix, the mask fan-out, the delay prefills, the keep-alive and
+//            the center/surround EQs are byte-identical to v8.5.1:
 //            1) WDM-KS IS REMOVED WHOLE: the KsCreatePin/WaveRT pin block,
 //               the pacing thread, the lapse guard, the backendN keys and
 //               their one-time migration, --list-ks and every KS branch in
@@ -101,6 +105,29 @@
 //               backend. One memcpy + bookkeeping per switch removed from
 //               the hot path; the fields stay (lastCap/lastN/haveLast keep
 //               the Leg layout) but are inert. NO new ini key, NO UI row.
+//            4) THE THREE-LINE CONSOLE STATUS, NEVER CUT OFF: the single
+//               \r health line is retired on the console; the same fields
+//               paint as a three-line block -- line 1 the buffers (raw1/
+//               raw2/vol), line 2 the clocks (off/drift/err), line 3 the
+//               faults (short/evict) -- culled to the LIVE console width
+//               (whole fields drop, least important first, never a mid-
+//               field cut, never a wrap), redrawn in place at its anchor
+//               row, exactly three lines at every width including 80 cols.
+//               Event lines (reopen, warden, hint) land above the block;
+//               the next tick re-anchors below them. The GUI status bar
+//               keeps its ONE line and twinspeak.log keeps the 10 s single
+//               line -- both byte-identical to v8.5.1 (the "raw1 " prefix
+//               contract and grep-ability stand). g_logGen counts every
+//               print under g_logCS for the re-anchor test.
+//            5) THE FIXED WINDOW: WS_THICKFRAME and WS_MAXIMIZEBOX are off
+//               the control window's style -- a classic fixed-size frame
+//               (thin border, caption, minimize + close; no resize edges,
+//               no maximize, no snap, no caption-double-click). The
+//               WM_GETMINMAXINFO min==max track (v7.5.3c stood it down for
+//               the resize test) returns, pinned to the designed client
+//               size at the current DPI; WM_DPICHANGED re-derives the
+//               scale and sizes the window itself, so a monitor change
+//               still lands the right frame. Tray surrogate untouched.
 //    v8.5.1 THE SURROUND BASS RESTORE (field-directed: "add a sort of 200hz
 //            bass boost taking from the original audio with a 2db boost to
 //            the audio phase specific to the two surround channels ... the
@@ -3325,6 +3352,12 @@ static void boostDeviceThread() {
 // here now: one critical section, one stream, ASCII only.
 static CRITICAL_SECTION g_logCS;
 static bool g_logToFile = false;   // v6.2: stdout is twinspeak.log (background = on)
+// v9.0.1: bumped by EVERY tlog print, under the same lock. The three-line
+// console status compares its draw-time snapshot against this to know whether
+// any event line landed since the last block -- if one did, the next block
+// re-anchors on the fresh line below it instead of overwriting the event
+// (the freeze-then-scroll idiom the single \r line always had).
+static unsigned g_logGen = 0;
 
 // v6.6.0: GUI log tap. When the control window owns the process, every tlog
 // line is handed to this sink INSTEAD of stdout (the console is detached and
@@ -3334,6 +3367,7 @@ static void (*g_logSink)(const char* line) = nullptr;
 static void tlog(const char* fmt, ...) {
     va_list ap;
     EnterCriticalSection(&g_logCS);
+    ++g_logGen;   // v9.0.1: one per print -- the console status reads it above
     if (g_logSink) {
         char buf[8192];
         va_start(ap, fmt);
@@ -3355,6 +3389,111 @@ static void tlog(const char* fmt, ...) {
         va_end(ap);
         fflush(stdout);
     }
+    LeaveCriticalSection(&g_logCS);
+}
+
+// v9.0.1 THE THREE-LINE CONSOLE STATUS (field-directed: "make the console
+// status have three lines instead of just one" + "I don't want the console
+// to cut off anymore. I want it so the text is always culled down to the
+// precise line number"). The single \r health line is retired on the
+// console: the fields paint as a three-line block (buffers / clocks /
+// faults) that redraws IN PLACE at its anchor row, and every line is
+// culled to the LIVE console width before it is written -- whole fields
+// drop off (least important first, right to left) until the line fits, so
+// the block can never wrap onto a fourth line, never scrolls the buffer by
+// itself and is never cut off mid-field: it is ALWAYS exactly three lines,
+// at every width, including the default 80-column console where the old
+// ~100-column single line wrapped and jittered under its own \r.
+static int conWidth() {
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE
+        && GetConsoleScreenBufferInfo(h, &ci)) {
+        const int w = ci.srWindow.Right - ci.srWindow.Left + 1;
+        if (w >= 8) return w;          // the window the user actually sees
+        if (ci.dwSize.X > 0) return ci.dwSize.X;
+    }
+    return 80;                         // redirected / detached: the classic default
+}
+
+// joins fields with " | ", dropping whole trailing fields until the joined
+// line fits the budget; a lone field that still overflows is truncated.
+static std::string cullLine(const char* const* f, int n, int budget) {
+    std::string s;
+    if (budget <= 0) return s;
+    for (int k = n; k >= 1; --k) {
+        s.clear();
+        for (int i = 0; i < k; ++i) { if (i) s += " | "; s += f[i]; }
+        if ((int)s.size() <= budget) return s;
+    }
+    s.resize((size_t)budget);
+    return s;
+}
+
+// the block's redraw anchor (buffer coords of line 1) + the g_logGen
+// snapshot taken right after the last block -- both live under g_logCS
+// like every other console mutation.
+static bool     g_stAnchorOK = false;
+static COORD    g_stAnchor   = { 0, 0 };
+static unsigned g_stGen      = 0;
+
+// paints the three culled lines as one in-place block. Runs under g_logCS
+// start to finish (like every tlog print) so no event line can interleave
+// mid-block, and counts as ONE g_logGen bump. When anything else logged
+// since the last block (g_logGen moved) the block lands fresh BELOW that
+// text instead of over it -- the event line stays readable, and the next
+// ticks redraw on the new anchor. No console at all (pipe / no-console
+// service): append-only, unpadded -- still exactly three lines.
+static void statusBlock3(const char* const* f1, int n1,
+                         const char* const* f2, int n2,
+                         const char* const* f3, int n3) {
+    const int w      = conWidth();
+    const int budget = w - 1;          // never write the last column -- the
+                                       // console's wrap-pending state stays
+                                       // unset and every '\n' is a clean linefeed
+    std::string ln[3];
+    ln[0] = cullLine(f1, n1, budget);
+    ln[1] = cullLine(f2, n2, budget);
+    ln[2] = cullLine(f3, n3, budget);
+    EnterCriticalSection(&g_logCS);
+    fflush(stdout);                    // anything still in the CRT buffer must
+                                       // land BEFORE the cursor moves, or it
+                                       // would flush onto the block's rows
+    const HANDLE hc = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    const bool conOK = hc && hc != INVALID_HANDLE_VALUE
+                       && GetConsoleScreenBufferInfo(hc, &ci);
+    bool inPlace = conOK && g_stAnchorOK && g_stGen == g_logGen;
+    if (inPlace && (g_stAnchor.Y < ci.srWindow.Top
+                    || g_stAnchor.Y > ci.srWindow.Bottom - 2)) {
+        // v9.0.1: the stored anchor scrolled out of sight (a very long
+        // event-free run eating the whole buffer) -- do NOT redraw up
+        // there; drop to append so the block follows the live cursor.
+        inPlace = false;
+        g_stAnchorOK = false;
+    }
+    if (inPlace)
+        SetConsoleCursorPosition(hc, g_stAnchor);     // the same three rows again
+    for (int i = 0; i < 3; ++i) {
+        std::string s = ln[i];
+        if ((int)s.size() > budget)
+            s.resize((size_t)budget);
+        else if (inPlace && (int)s.size() < budget)
+            s.append((size_t)(budget - (int)s.size()), ' ');  // blank stale chars
+        s += '\n';
+        fwrite(s.data(), 1, s.size(), stdout);
+    }
+    ++g_logGen;                        // the block is one print, tlog-style
+    if (conOK && GetConsoleScreenBufferInfo(hc, &ci)
+        && ci.dwCursorPosition.X == 0 && ci.dwCursorPosition.Y >= 3) {
+        g_stAnchor.X = 0;              // line 1 sits three rows above the cursor
+        g_stAnchor.Y = (SHORT)(ci.dwCursorPosition.Y - 3);
+        g_stAnchorOK = true;
+    } else {
+        g_stAnchorOK = false;          // no console / odd cursor: append-only
+    }
+    g_stGen = g_logGen;
+    fflush(stdout);
     LeaveCriticalSection(&g_logCS);
 }
 
@@ -8023,10 +8162,23 @@ static bool guiCreateRealWindow() {
     // extend, no painted band -- everything the v7.6.x/v7.7.x line grew to
     // fake the frame is retired. The outer size comes from AdjustWindowRectEx
     // around the designed 880x620 client, exactly what a plain app does.
+    // v9.0.1 THE FIXED WINDOW (field-directed: "Also make the window
+    // unresizable too."). WS_THICKFRAME and WS_MAXIMIZEBOX are OFF the style:
+    // the frame is the classic fixed-size dialog -- thin border, caption,
+    // minimize + close buttons, no resize edges, no maximize button, no
+    // caption-double-click maximize, no snap (drag-to-edge and Win+arrows
+    // resize, so they are gone with the edges). The rest of the v7.8.0 plain
+    // native frame story stands: the system owns the caption, the icon, the
+    // buttons, the shadow and the DPI story. The outer size still comes from
+    // AdjustWindowRectEx around the designed 880x760 client, and
+    // WM_GETMINMAXINFO pins min==max track to that size at the CURRENT DPI
+    // (see guiWndProc) -- WM_DPICHANGED re-derives the scale first and sizes
+    // the window itself, so a monitor change still lands the right frame.
     // v7.1.26 THE WINDOW IS UNICODE, END TO END: CreateWindowExW +
     // DefWindowProcW -- the title is the full brand the taskbar, Alt-Tab
     // and Task Manager's app entry read.
-    DWORD kstyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    DWORD kstyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU
+                   | WS_MINIMIZEBOX | WS_CLIPCHILDREN;   // v9.0.1: fixed size
     RECT krc = { 0, 0, KCLI_W, KCLI_H };
     AdjustWindowRectEx(&krc, kstyle, FALSE, 0);
     const int kww = krc.right - krc.left;
@@ -8592,12 +8744,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // and the tracked children re-seat through the local ledger (its
         // S() reads the same g_dpi96 the scale just stored). No guards, no
         // deferrals, no zoomed-host special cases.
+        // v9.0.1 ORDERING: the scale lands BEFORE the resize, not after --
+        // the fixed window's WM_GETMINMAXINFO track reads KCLI_W/KCLI_H,
+        // which guiApplyDpi() just re-derived; if the suggested rect were
+        // applied first, the clamp would pin the OLD scale's pixels. The
+        // DWM's suggested rect is computed for the NEW dpi, so the two
+        // agree by construction and the resize is a no-op clamp.
+        g_dpi96 = (UINT)HIWORD(wp);
+        guiApplyDpi();
         const RECT* sug = (const RECT*)lp;
         SetWindowPos(w, nullptr, sug->left, sug->top,
                      sug->right - sug->left, sug->bottom - sug->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        g_dpi96 = (UINT)HIWORD(wp);
-        guiApplyDpi();
         guiMakeFonts();
         guiStripGpuRelease();
         tsRelayoutChildren();
@@ -8607,15 +8765,16 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     // ---- v7.8.0: NO NC OVERRIDES AT ALL ---------------------------------
     // The plain frame needs none of it: no WM_NCCALCSIZE insets (the
     // system computes the real frame), no WM_NCHITTEST bands (the caption,
-    // the buttons, the resize edges and the corners answer DefWindowProc),
-    // no WM_NCACTIVATE dance (the DWM re-renders its own active/inactive
-    // titlebar), no band mouse routing (the buttons are the real native
-    // ones). Every handler below the custom chrome served is retired.
+    // the buttons and the corners answer DefWindowProc), no WM_NCACTIVATE
+    // dance (the DWM re-renders its own active/inactive titlebar), no band
+    // mouse routing (the buttons are the real native ones). Every handler
+    // below the custom chrome served is retired.
     // v7.5.3c: WM_WINDOWPOSCHANGING (the size lock's second belt -- it
-    // pinned every sizing pass to the designed 880x620+insets) stands down
-    // for the resize test. The shell may size the window freely now; the
-    // system's own WM_NCCALCSIZE owns the insets and WM_PAINT regrows the
-    // frame buffers at whatever client size results.
+    // pinned every sizing pass to the designed client size + insets) stays
+    // retired: v9.0.1's fixed style + the WM_GETMINMAXINFO min==max track
+    // (the lock's third belt, back) refuse every user resize at the source,
+    // and WM_DPICHANGED is the only size-changing path left -- it must NOT
+    // be pinned (it carries the new scale's own frame).
     case WM_SYSCOMMAND: {
         // v7.6.12: the built-in SC_ values ride DefWindowProc now -- the
         // native caption buttons, Win+arrows and SC_CLOSE are the system's
@@ -9047,11 +9206,26 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break; }
-    case WM_GETMINMAXINFO:
-        // v7.5.3c: the min==max track (v6.6.3..v7.1.24 -- the size lock's
-        // third belt) stands down for the resize test; DefWindowProc's
-        // defaults own the tracking now.
-        break;
+    case WM_GETMINMAXINFO: {
+        // v9.0.1: THE SIZE LOCK RETURNS (field-directed: "make the window
+        // unresizable"). v7.5.3c stood the min==max track down for the resize
+        // test; the test is over and the lock is back, pinned to the designed
+        // client size at the CURRENT scale (g_dpi96 re-derives in
+        // WM_DPICHANGED, which resizes the window itself before any tracking
+        // can see the stale scale). With WS_THICKFRAME/WS_MAXIMIZEBOX off the
+        // style already refuses every user resize; this is the belt under
+        // that suspend: drag-the-caption tricks, Alt+Enter-ish shell paths,
+        // anything else that would try to size the window to something else.
+        // The hidden tray surrogate (WS_OVERLAPPED, no caption) is EXEMPT --
+        // it must stay 0x0, and the create-time WM_GETMINMAXINFO it also
+        // receives would otherwise clamp it up to the panel's full size.
+        if (!(GetWindowLongPtrW(w, GWL_STYLE) & WS_CAPTION)) break;
+        RECT rc = { 0, 0, KCLI_W, KCLI_H };
+        AdjustWindowRectEx(&rc, (DWORD)GetWindowLongPtrW(w, GWL_STYLE), FALSE, 0);
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        mmi->ptMaxTrackSize.x = mmi->ptMinTrackSize.x = rc.right - rc.left;
+        mmi->ptMaxTrackSize.y = mmi->ptMinTrackSize.y = rc.bottom - rc.top;
+        return 0; }
     case WM_TIMER: {
         // v7.4.10: the second activation -- the unfocus + refocus replay
         // (tsReplayActivation above), armed two ticks (~500 ms) after the
@@ -10686,7 +10860,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_logToFile)
         tlog("[twinspeak] running in BACKGROUND -- health line every 10 s (live counters every second):\n\n");
     else
-        tlog("[twinspeak] running -- Ctrl+C to stop. health line every second:\n\n");
+        tlog("[twinspeak] running -- Ctrl+C to stop. 3-line status every second (fits the console width, always):\n\n");
 
     // v8.4.0: per-leg state, four slots (a disabled rear's counters never
     // move and its streaks stay zero -- it can never fire anything).
@@ -11141,18 +11315,47 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 }
             }
         }
-        if (!g_logToFile || (sec % 10) == 0)      // v6.2: the log gets a line every 10 s
-        tlog(g_logToFile
-             ? "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | drift %s | err %s\n"
-             : "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | drift %s | err %s   \r",
-               g_leg[0].raw.count() * 1000.0f / kSampleRate,
-               g_leg[1].raw.count() * 1000.0f / kSampleRate,
-               volStr,   // v3.9 NOTE: this argument WAS missing in v3.8 (the crash);
-                         // every conversion here is argument-checked since (v6.5.1 added err).
-               offV[0], offV[1],   // v8.4.0: the rear legs' offsets live in the devbuf line
-               undN[0] - uB[0], undN[1] - uB[1], undN[2] - uB[2], undN[3] - uB[3],
-               dropN[0] - dB[0], dropN[1] - dB[1], dropN[2] - dB[2], dropN[3] - dB[3],
-               driftStr, errStr);
+        if (!g_logToFile || (sec % 10) == 0) {      // v6.2: the log gets a line every 10 s
+        // v9.0.1: THE THREE-LINE STATUS. On the console the single \r health
+        // line is retired; the same fields paint as a 3-line block (buffers /
+        // clocks / faults), culled to the live console width, redrawn in
+        // place (statusBlock3). The GUI status bar keeps its ONE line and the
+        // log file keeps its 10 s cadence -- both print the ORIGINAL single-
+        // line format below, byte-identical to v8.5.1, so the sink's
+        // "raw1 " prefix match and the log's grep-ability are untouched.
+        {
+            char b1[3][32], b2[3][32], b3[2][32];
+            snprintf(b1[0], 32, "raw1 %5.1f", g_leg[0].raw.count() * 1000.0f / kSampleRate);
+            snprintf(b1[1], 32, "raw2 %5.1f", g_leg[1].raw.count() * 1000.0f / kSampleRate);
+            snprintf(b1[2], 32, "vol %s",     volStr);
+            snprintf(b2[0], 32, "off %+6ld/%+6ld", offV[0], offV[1]);
+            snprintf(b2[1], 32, "drift %s",   driftStr);
+            snprintf(b2[2], 32, "err %s",     errStr);
+            snprintf(b3[0], 32, "short +%llu/%llu/%llu/%llu",
+                     undN[0] - uB[0], undN[1] - uB[1], undN[2] - uB[2], undN[3] - uB[3]);
+            snprintf(b3[1], 32, "evict +%llu/%llu/%llu/%llu",
+                     dropN[0] - dB[0], dropN[1] - dB[1], dropN[2] - dB[2], dropN[3] - dB[3]);
+            const char* l1[3] = { b1[0], b1[1], b1[2] };
+            const char* l2[3] = { b2[0], b2[1], b2[2] };
+            const char* l3[2] = { b3[0], b3[1] };
+            if (g_logSink || g_logToFile) {
+                // GUI pane / log file: the ORIGINAL single line, unchanged
+                // (the sink's "raw1 " match and the file's cadence are the
+                // contract); the file variant rides the 10 s gate above.
+                tlog("raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | drift %s | err %s\n",
+                     g_leg[0].raw.count() * 1000.0f / kSampleRate,
+                     g_leg[1].raw.count() * 1000.0f / kSampleRate,
+                     volStr,   // v3.9 NOTE: this argument WAS missing in v3.8 (the crash);
+                               // every conversion here is argument-checked since (v6.5.1 added err).
+                     offV[0], offV[1],   // v8.4.0: the rear legs' offsets live in the devbuf line
+                     undN[0] - uB[0], undN[1] - uB[1], undN[2] - uB[2], undN[3] - uB[3],
+                     dropN[0] - dB[0], dropN[1] - dB[1], dropN[2] - dB[2], dropN[3] - dB[3],
+                     driftStr, errStr);
+            } else {
+                statusBlock3(l1, 3, l2, 3, l3, 2);
+            }
+        }
+        }
         fflush(stdout);
         for (int k = 0; k < 4; ++k) { uB[k] = undN[k]; dB[k] = dropN[k]; }
     }
