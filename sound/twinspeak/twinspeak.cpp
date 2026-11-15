@@ -62,6 +62,32 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.4 THE SIDE ANGLE (field-directed: "Invert the surround pair's
+//            phase effect when leg3's device is present, so that way it
+//            moves the speaker more to the approximate 90 degree angle I
+//            want" -- three speakers total: the 2.1 Realtek fronts, the
+//            S5 center, a USB pair at 110-120 degrees). THE MECHANISM: a
+//            discrete speaker images at its own position, and a phantom
+//            can only sit BETWEEN speakers -- a surround on the rear pair
+//            alone can never read as 90 degrees, and cross-talk
+//            cancellation (the sub-ms, direction-specific kind) is out of
+//            the bit-exact religion. The front-wide matrix trick is the
+//            one bit-exact tool that pulls an image outward past its pair
+//            (own side in-phase, opposite side inverted at half gain --
+//            the v8.4.27 mechanism), so it now RUNS ALWAYS: (1) THE MASK
+//            opens ch5 SL / ch6 SR for leg1 with or without leg3; ch7/ch8
+//            stay fold-gated (the rears never double onto the fronts).
+//            (2) THE MIX: gain_sl/gain_sr are no longer fold-gated -- with
+//            leg3 SET the fronts carry the surround wide (the phantom
+//            pushed outward toward ~90) WHILE the rear speakers play
+//            ch5-ch8 natively; the blend sits at the approximate side
+//            angle, gain_sl/gain_sr pulling it forward and gain_rl/
+//            gain_rr holding it back. (3) THE BOOST rides along (it
+//            patches the trick's own hollow wherever the trick runs) --
+//            still on leg1's copy ONLY: leg3's native mix reads the RAW
+//            samples untouched, so the rear path stays bit-exact and
+//            nothing is double-processed. The fold path (leg3 empty) is
+//            byte-identical to v8.5.3. NO new ini key, NO UI row.
 //    v8.5.3 THE ELEVATED BAND (field-directed: "I want realtime priority to
 //            just show up on task manager instead of high priority like it's
 //            still doing."). THE DIAGNOSIS: the v8.0.0 REALTIME class has
@@ -2579,7 +2605,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.3"
+#define TWS_VERSION "8.5.4"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4099,11 +4125,18 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 for (int c = 0; c < kInCh; ++c) {
                     unsigned char keep = mk[c];
                     // v8.4.26 THE FOLD CHANNELS: leg1's mask opens for the
-                    // center fold (ch3, leg2 empty) and the rear fold (ch5
-                    // SL / ch6 SR, leg3 empty) -- the folds fold INTO the
+                    // center fold (ch3, leg2 empty) and the rear fold (ch7
+                    // RL / ch8 RR, leg3 empty) -- the folds fold INTO the
                     // stereo output, never onto another device's slots.
+                    // v8.5.4 THE SIDE ANGLE: ch5 SL / ch6 SR are open for
+                    // leg1 ALWAYS -- the front-wide matrix trick now runs
+                    // with leg3 SET too (the surround pulls toward the ~90
+                    // degree side angle off the front pair while the rear
+                    // speakers carry it natively); ch7/ch8 stay fold-gated
+                    // (the rears never double onto the fronts).
                     if (idx == 0 && c == 2 && g_centerFold) keep = 1;
-                    if (idx == 0 && g_rearFold && (c == 4 || c == 5 || c == 6 || c == 7)) keep = 1;
+                    if (idx == 0 && (c == 4 || c == 5)) keep = 1;
+                    if (idx == 0 && g_rearFold && (c == 6 || c == 7)) keep = 1;
                     if (!keep) sc[i * kInCh + c] = 0.0f;
                 }
         }
@@ -4400,7 +4433,9 @@ static void centerEqInit() {
 // "no configuration of surround bass, which is quite weird in final
 // production"). RBJ peaking biquad on the cable's SURROUND channels (ch5 SL /
 // ch6 SR), taken from their ORIGINAL pre-trick samples, riding leg1's wide
-// fold ONLY. The v8.4.26/27 fold is the matrix-encoding phase trick -- each
+// trick (v8.5.4: ALWAYS -- with or without leg3; leg3's own native mix
+// reads the RAW samples untouched, so the rear path keeps its exactness).
+// The v8.4.26/27 trick is the matrix-encoding phase trick -- each
 // surround feeds its own side in-phase and the opposite side INVERTED at half
 // gain -- and the inverted copy partially CANCELS the surround's own bass at
 // the seat (bass is omnidirectional and the polarity survives the air path at
@@ -4411,9 +4446,9 @@ static void centerEqInit() {
 // filter feeds both fold paths, own side and cross). ONE filter, TWO state
 // pairs -- the surrounds are independent channels. Coefficients computed ONCE
 // at startup; transposed DF2 -- no division in the hot loop. Touched only by
-// leg1's switch thread (the fold and leg3's native mix are mutually
-// exclusive -- g_rearFold == g_leg[2].disabled -- so a block is never
-// double-processed).
+// leg1's switch thread (the trick now runs on leg1's copy with or without
+// leg3 -- v8.5.4 -- and leg3's native mix reads the RAW samples, so a block
+// is never double-processed).
 //
 // THE CURVE, HARDCODED: +2.0 dB peaking at 200 Hz with Q 0.5 -- the Q was
 // measured (scripts/qsweep) so the boost's half-gain skirt lands AT 80 Hz:
@@ -4480,12 +4515,17 @@ static void surroundBassInit() {
 // gain_rr * ch8, the leg2 pattern (one source per output). v8.4.6: the
 // SIDES (ch5 SL / ch6 SR -- the slots a 5.1 movie's surround lands on)
 // FOLD onto their same-side rear OUTPUT at that side's gain: out L =
-// gain_rl*(ch7 + ch5), out R = gain_rr*(ch8 + ch6); out1's side slots stay
-// hard 0.0f so the sides never play anywhere but the rears. A rear leg
-// with an EMPTY device never runs -- empty in = empty out (stereo content
-// plays with silent rears; that is the truth), and an empty leg3 takes its
-// side fold down with it. A 5.1 movie (surround on ch5/ch6) plays its
-// surround on the rear speakers natively now.
+// gain_rl*(ch7 + ch5), out R = gain_rr*(ch8 + ch6). v8.5.4 THE SIDE
+// ANGLE: the sides no longer stay rear-only -- leg1 carries them WIDE
+// (the matrix trick) with or without leg3, so the surround image pulls
+// toward the ~90 degree side angle between the front pair and the rear
+// pair; leg3's own mix still reads the RAW samples (the boost and the
+// trick live on leg1's copy only). A rear leg with an EMPTY device
+// never runs -- empty in = empty out (stereo content plays with silent
+// rears; that is the truth), and an empty leg3 takes its REAR-DIRECT
+// fold down with it (the wide trick stays). A 5.1 movie (surround on
+// ch5/ch6) plays its surround wide off the fronts AND natively on the
+// rear speakers.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // v8.4.23 leg1 = THE MASKED STEREO COPY: the chunk arrives with
@@ -4502,30 +4542,36 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // matrix-encoding phase trick: each surround feeds its own side
         // in-phase and the opposite side INVERTED at half gain, so the
         // surround pushes outward instead of smearing the front image.
+        // v8.5.4 THE SIDE ANGLE: the WIDE TRICK RUNS ALWAYS -- with leg3
+        // SET the front pair still carries the surround wide (pushing its
+        // phantom outward toward the ~90 degree side angle) while the rear
+        // speakers play ch5-ch8 natively; the blend sits near the side
+        // angle (gain_sl/gain_sr pull it forward, gain_rl/gain_rr hold it
+        // back). The REAR-DIRECT terms stay fold-gated: with leg3 set the
+        // rears carry ch7/ch8, and they never double onto the fronts.
         const float gRL = g_rearFold ? g_cfg.gainRl : 0.0f;
         const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
-        const float gSL = g_rearFold ? g_cfg.gainSl : 0.0f;   // v8.5.0: the surround gains
-        const float gSR = g_rearFold ? g_cfg.gainSr : 0.0f;
+        const float gSL = g_cfg.gainSl;                       // v8.5.4: always wide
+        const float gSR = g_cfg.gainSr;
         // v8.5.1 THE SURROUND BASS RESTORE (BUILT IN, no ini keys): the
-        // fold's surround lanes run through the peaking biquad FIRST (+2.0 dB
-        // @ 200 Hz spread down to 80 Hz, from the ORIGINAL pre-trick samples
-        // -- the SAME filter feeds both fold paths, own side and cross, so
-        // the matrix ratios stay exact). The center EQ's silence contract,
-        // per LANE: a block whose surround lane is all-zero RESETS that
-        // lane's filter instead of feeding it (a biquad fed zeros still
-        // rings; a silent lane must contribute exactly zero -- g * 0 = 0,
-        // the fold's bit-exactness). Nonzero lanes run every sample,
-        // internal zeros included.
+        // wide trick's surround lanes run through the peaking biquad FIRST
+        // (+2.0 dB @ 200 Hz spread down to 80 Hz, from the ORIGINAL
+        // pre-trick samples -- the SAME filter feeds both trick paths, own
+        // side and cross, so the matrix ratios stay exact; v8.5.4: with or
+        // without leg3 -- leg3's native mix reads the RAW samples). The
+        // center EQ's silence contract, per LANE: a block whose surround
+        // lane is all-zero RESETS that lane's filter instead of feeding it
+        // (a biquad fed zeros still rings; a silent lane must contribute
+        // exactly zero -- g * 0 = 0, the fold's bit-exactness). Nonzero
+        // lanes run every sample, internal zeros included.
         bool slLive = false, srLive = false;
-        if (g_rearFold) {
-            for (size_t i = 0; i < n; ++i) {
-                if (sc[i * kInCh + 4] != 0.0f) slLive = true;
-                if (sc[i * kInCh + 5] != 0.0f) srLive = true;
-                if (slLive && srLive) break;
-            }
-            if (!slLive) { g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f; }
-            if (!srLive) { g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f; }
+        for (size_t i = 0; i < n; ++i) {
+            if (sc[i * kInCh + 4] != 0.0f) slLive = true;
+            if (sc[i * kInCh + 5] != 0.0f) srLive = true;
+            if (slLive && srLive) break;
         }
+        if (!slLive) { g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f; }
+        if (!srLive) { g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f; }
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             for (size_t i = 0; i < n; ++i) {
@@ -5552,7 +5598,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5724,9 +5770,10 @@ static void writeTemplate(const char* path) {
         "; dip in the surround's low band: THE HOLLOW. The boost reinforces\n"
         "; the surround's low band first so the cancellation starts from a\n"
         "; fuller signal; the matrix ratios themselves are untouched. It\n"
-        "; rides the fold ONLY: the mains, center, LFE and rears are\n"
-        "; untouched, and with a rear device set (leg3) the surround plays\n"
-        "; natively with no trick -- the boost stays off there too.\n"
+        "; rides leg1's wide copy ALWAYS (v8.5.4): with a rear device set\n"
+        "; (leg3) the surround ALSO plays natively on the rears -- the raw\n"
+        "; samples there are untouched, the boost lives on the front-wide\n"
+        "; copy only. The mains, center and LFE are never touched.\n"
         "\n"
         "; VOLUME (v8.3.0: volume_follow is BUILT IN, hardcoded on): the\n"
         "; Windows volume of the cable's PLAYBACK side (the Line 1 slider in\n"
@@ -11270,8 +11317,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.zeroFast = (i == 0)
             ? (g_cfg.gainL > 0.0f && g_cfg.gainR > 0.0f && g_cfg.gainLfe > 0.0f
                && (!g_centerFold || g_cfg.gainCenter > 0.0f)
-               && (!g_rearFold || (g_cfg.gainRl > 0.0f && g_cfg.gainRr > 0.0f
-                                   && g_cfg.gainSl > 0.0f && g_cfg.gainSr > 0.0f)))   // v8.4.26/28: the rear + surround fold terms
+               && g_cfg.gainSl > 0.0f && g_cfg.gainSr > 0.0f              // v8.5.4: the front-wide trick runs ALWAYS
+               && (!g_rearFold || (g_cfg.gainRl > 0.0f && g_cfg.gainRr > 0.0f)))   // v8.4.26: the rear fold terms
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f); // v8.4.11: the one rear leg, both sides (g * 0 == 0, always)
@@ -11618,20 +11665,23 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
          "                            the output is STEREO L+R only (the second mask -- no channel\n"
          "                            conversion anywhere downstream, no upmix risk by construction)\n"
-         "                            + the rear fold (SL onto L, SR onto R at gain_rl/gain_rr) when\n"
-         "                            leg3 is EMPTY (v8.4.26, the matrix-encoding effect, no delay)\n"
+         "                            + the surround WIDE (the matrix trick: own side in-phase, the\n"
+         "                            opposite side inverted at half gain, gain_sl/gain_sr) -- v8.5.4:\n"
+         "                            ALWAYS, even with leg3 set, pulling the surround image toward\n"
+         "                            the ~90 degree side angle; the rears carry ch5-ch8 natively\n"
+         "                            + the rear fold (ch7/ch8 direct) when leg3 is EMPTY (v8.4.26)\n"
          "                            + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
          g_cfg.gainL, g_cfg.gainLfe, g_cfg.gainR, g_cfg.gainLfe);
-    // v8.5.1: the surround bass restore's banner -- the wide fold's own
+    // v8.5.1: the surround bass restore's banner -- the wide trick's own
     // BUILT-IN patch, printed right under the out1 route it rides.
-    if (g_rearFold)
-        tlog("[twinspeak] route out1     : surround bass ON (BUILT IN) -- peaking %.0f Hz %+.1f dB Q %.2f on\n"
-             "                            ch5/ch6 (SL/SR), the boost spread all the way down to 80 Hz,\n"
-             "                            taken from the ORIGINAL samples BEFORE the wide fold applies the\n"
-             "                            phase trick: the trick's inverted half-gain cross dips the surround's\n"
-             "                            own bass ~6 dB at the seat (the hollow sound) -- the boost hands it\n"
-             "                            back first, to counteract the natural act of cancelling out\n",
-             g_sbeq.f0, g_sbeq.gainDb, g_sbeq.q);
+    // v8.5.4: unconditional -- the trick runs with or without leg3.
+    tlog("[twinspeak] route out1     : surround bass ON (BUILT IN) -- peaking %.0f Hz %+.1f dB Q %.2f on\n"
+         "                            ch5/ch6 (SL/SR), the boost spread all the way down to 80 Hz,\n"
+         "                            taken from the ORIGINAL samples BEFORE the wide trick applies the\n"
+         "                            phase matrix: the trick's inverted half-gain cross dips the surround's\n"
+         "                            own bass ~6 dB at the seat (the hollow sound) -- the boost hands it\n"
+         "                            back first, to counteract the natural act of cancelling out\n",
+         g_sbeq.f0, g_sbeq.gainDb, g_sbeq.q);
     tlog("[twinspeak] leg2 (center)  : \"%s\" | %s | period %u ms x2\n",
            n2.c_str(),
            g_leg[1].backend == 1 ? "WDM-KS (kernel streaming)" :
