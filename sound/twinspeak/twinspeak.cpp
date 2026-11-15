@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.4 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,23 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.4 THE KS INTERROGATION (field-directed: "I want to chase the KS
+//            refusal right now. I want to know why it's always refusing").
+//            THE PROBE LOOP WAS SILENT: every failed KsCreatePin discarded
+//            its error code, the pin dataranges were fetched but never
+//            printed, and the summary said only "refused every 48 kHz
+//            pin/format" -- a refusal named nothing. AND THE GOTCHA THE
+//            INTERROGATION EXPOSED: ksTryCreatePin opened every render pin
+//            GENERIC_WRITE | GENERIC_READ -- and many drivers (USB audio
+//            class in particular) refuse READ access on a render sink pin
+//            with ERROR_ACCESS_DENIED; the reference WDM-KS backends retry
+//            WRITE-only for exactly that. A driver with the gotcha refused
+//            EVERY pin/format unconditionally -- "always refusing". THE
+//            FALLBACK IS IN (WRITE-only on the access-denied path), and
+//            the interrogation prints per pin: the dataranges, each
+//            refused attempt's format/interface/error, the range-refused
+//            pins, and the attempt count + last error in the summary.
+//            NO new ini key, NO UI row.
 //    v8.6.3 THE RESYNC GUARD (field-directed, with the new-system log: "even
 //            when there's a new system, raw2's delay still wants to corrupt
 //            and jump up to insane values ... I had audio active by this
@@ -2794,7 +2811,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.3"
+#define TWS_VERSION "8.6.4"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4977,7 +4994,7 @@ static bool ksRangeAccepts(const std::vector<KsRange>& ranges, int outCh, const 
 // The driver reads the format at Connect + sizeof(KSPIN_CONNECT), so the
 // whole blob must be one contiguous struct.
 static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt& f,
-                             bool looped, int* usedLooped) {
+                             bool looped, int* usedLooped, DWORD* lastErr) {
     struct Blob {
         KSPIN_CONNECT        connect;
         KSDATAFORMAT         df;
@@ -5020,13 +5037,27 @@ static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt&
                      : (outCh == 8) ? (DWORD)KSAUDIO_SPEAKER_7POINT1_SURROUND : 0u;
 
     TS_KsCreatePinFn kp = ksCreatePinFn();
-    if (!kp) return nullptr;
+    if (!kp) { *lastErr = (DWORD)-1; return nullptr; }
     HANDLE pin = nullptr;
-    const DWORD err = kp(filter, c, GENERIC_WRITE | GENERIC_READ, &pin);
+    // v8.6.4 THE ACCESS FALLBACK: the classic WDM-KS gotcha -- many drivers
+    // (USB audio class in particular) refuse GENERIC_READ on a RENDER sink
+    // pin with ERROR_ACCESS_DENIED, and the reference WDM-KS backends
+    // retry WRITE-only for exactly that. The old path tried READ|WRITE
+    // alone: a driver with the gotcha refused EVERY pin/format
+    // unconditionally -- the field's "always refusing" new system.
+    DWORD err = kp(filter, c, GENERIC_WRITE | GENERIC_READ, &pin);
     if (err != ERROR_SUCCESS) {
         if (pin) CloseHandle(pin);
-        return nullptr;
+        pin = nullptr;
+        *lastErr = err;
+        err = kp(filter, c, GENERIC_WRITE, &pin);
+        if (err != ERROR_SUCCESS) {
+            if (pin) CloseHandle(pin);
+            *lastErr = err;
+            return nullptr;
+        }
     }
+    *lastErr = ERROR_SUCCESS;
     *usedLooped = looped ? 1 : 0;
     return pin;
 }
@@ -5186,6 +5217,42 @@ static void ksListKs() {
 // Open one leg's output on WDM-KS. Returns true with K.active = 1 and the
 // pin held in KSSTATE_PAUSE (the thread flips it to RUN). Every refusal is
 // logged with its reason; false simply means "use the WASAPI path here".
+// v8.6.5 THE NEEDLE BRIDGE: the KS filter names and the WASAPI endpoint
+// names are DIFFERENT naming schemes -- the ini's output_deviceN is the
+// endpoint's friendly name ("Speakers (Realtek(R) Audio)") while the KS
+// wave filter carries the FILTER's own name ("Realtek HD Audio output",
+// "Adesso Xtream S5  "). The old match asked the filter name to CONTAIN the
+// endpoint name -- it never did, so KS refused on EVERY system since the
+// backend keys existed and the WASAPI fallback ran silently on both
+// machines. Three layered rules, strongest wins:
+//   3: the filter name contains the needle (the old exact-substring rule).
+//   2: the needle contains the filter name (the endpoint name embeds the
+//      filter name: "Speakers (Adesso Xtream S5  )" embeds "Adesso Xtream S5  ").
+//   1: >= 2 shared alphanumeric tokens (the wrapper-differ case:
+//      "Realtek(R) Audio" vs "Realtek HD Audio output" share realtek+audio).
+static int ksNeedleScore(const std::string& filterName, const std::string& needle) {
+    const std::string fn = lower(trim(filterName)), nd = lower(trim(needle));
+    if (fn.empty() || nd.empty()) return 0;
+    if (fn.find(nd) != std::string::npos) return 3;
+    if (nd.find(fn) != std::string::npos) return 2;
+    auto toks = [](const std::string& s) {
+        std::vector<std::string> t;
+        std::string cur;
+        for (unsigned char ch : s) {
+            if (isalnum(ch)) cur += (char)tolower(ch);
+            else if (!cur.empty()) { t.push_back(cur); cur.clear(); }
+        }
+        if (!cur.empty()) t.push_back(cur);
+        return t;
+    };
+    const auto ft = toks(fn), nt = toks(nd);
+    int shared = 0;
+    for (const auto& a : nt)
+        for (const auto& b : ft)
+            if (a == b) { ++shared; break; }
+    return shared >= 2 ? 1 : 0;
+}
+
 static bool ksOpenLeg(int idx, const std::string& needle) {
     Leg& L = g_leg[idx];
     KsOut& K = L.ks;
@@ -5247,24 +5314,43 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
 
     // Walk the render sink pins; on each, try every format the dataranges
     // allow (float32 first -- bit-exact), looped-streaming interface first.
+    // v8.6.4 THE INTERROGATION: the dataranges print per pin, and every
+    // refused attempt names its format/interface/access error -- a refusal
+    // is a rare diagnostic event; it names itself now.
     HANDLE pin = nullptr;
     int usedLooped = 0, usedFmt = 0;
     ULONG usedPin = 0;
     unsigned char* rtBuf = nullptr; size_t rtGot = 0; BOOL rtBarrier = FALSE;
     std::vector<KsRange> ranges;
+    unsigned attempts = 0; DWORD lastErr = 0;
     for (ULONG p = 0; p < ctypes && !pin; ++p) {
         KSPIN_DATAFLOW df = (KSPIN_DATAFLOW)0;
         if (!ksPinPropGet(fh, KSPROPSETID_Pin, KSPROPERTY_PIN_DATAFLOW, p,
                           &df, sizeof(df))) continue;
         if (df != KSPIN_DATAFLOW_IN) continue;
         const bool haveRanges = ksPinAudioRanges(fh, p, ranges);
+        for (const KsRange& r : ranges)
+            tlog("[twinspeak] leg%d KS        : pin %lu datarange: up to %dch, %d..%d bit, %u..%u Hz\n",
+                 idx + 1, (unsigned long)p, r.maxCh, r.bitsMin, r.bitsMax, r.freqMin, r.freqMax);
+        if (haveRanges && ranges.empty())
+            tlog("[twinspeak] leg%d KS        : pin %lu: render sink, but no AUDIO dataranges\n",
+                 idx + 1, (unsigned long)p);
+        unsigned pinAttempts = 0;
         for (int fi = 0; fi < kKsFmtCount && !pin; ++fi) {
             const KsFmt& f = kKsFmts[fi];
             if (haveRanges && !ksRangeAccepts(ranges, outCh, f)) continue;
             for (int lp = 1; lp >= 0 && !pin; --lp) {
                 int ul = 0;
-                HANDLE hp = ksTryCreatePin(fh, p, outCh, f, lp != 0, &ul);
-                if (!hp) continue;
+                DWORD perr = 0;
+                ++attempts; ++pinAttempts;
+                HANDLE hp = ksTryCreatePin(fh, p, outCh, f, lp != 0, &ul, &perr);
+                if (!hp) {
+                    lastErr = perr;
+                    tlog("[twinspeak] leg%d KS        : pin %lu %s %s: refused (err %lu)\n",
+                         idx + 1, (unsigned long)p, f.name, lp ? "looped" : "streaming",
+                         (unsigned long)perr);
+                    continue;
+                }
                 unsigned char* buf = nullptr; size_t got = 0; BOOL barrier = FALSE;
                 const size_t wantBytes = (size_t)outCh * (size_t)f.container *
                                          (size_t)loopReqFrames;
@@ -5279,10 +5365,14 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
                 rtBuf = buf; rtGot = got; rtBarrier = barrier;
             }
         }
+        if (!pin && haveRanges && pinAttempts == 0 && !ranges.empty())
+            tlog("[twinspeak] leg%d KS        : pin %lu: its dataranges refuse all five 48 kHz proposals (%dch)\n",
+                 idx + 1, (unsigned long)p, outCh);
     }
     if (!pin) {
-        tlog("[twinspeak] leg%d KS        : \"%s\" refused every 48 kHz pin/format (%dch) -- WaveRT polling unavailable\n",
-             idx + 1, fl[chosen].name.c_str(), outCh);
+        tlog("[twinspeak] leg%d KS        : \"%s\" refused every 48 kHz pin/format (%dch) -- %u attempt(s), last err %lu\n"
+             "                            WaveRT polling unavailable -- the WASAPI path takes this leg\n",
+             idx + 1, fl[chosen].name.c_str(), outCh, attempts, (unsigned long)lastErr);
         CloseHandle(fh);
         return false;
     }
@@ -5672,7 +5762,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
