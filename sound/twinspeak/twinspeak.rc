@@ -2,14 +2,15 @@
 // No windows.h include: raw numeric constants only, so windres / zig rc both
 // compile it standalone. VERSIONINFO gives Task Manager its "TwinSpeak"
 // name; the icon is the tray/window icon; RT_MANIFEST (24) id 1 embeds
-// twinspeak.manifest (comctl32 v6 + PerMonitorV2 + asInvoker).
+// twinspeak.manifest (comctl32 v6 + PerMonitorV2 + requireAdministrator --
+// v8.5.3: the REALTIME band needs the elevated token).
 
 1 ICON "twinspeak.ico"
 1 24 "twinspeak.manifest"
 
 1 VERSIONINFO
-FILEVERSION     8,5,0,0
-PRODUCTVERSION  8,5,0,0
+FILEVERSION     8,5,3,0
+PRODUCTVERSION  8,5,3,0
 FILEOS          0x00040004L          // VOS_NT_WINDOWS32
 FILETYPE        0x1L                 // VFT_APP
 FILESUBTYPE     0x0L
@@ -20,8 +21,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription",   "TwinSpeak"
       VALUE "ProductName",       "TwinSpeak"
-      VALUE "FileVersion",       "8.5.0.0"
-      VALUE "ProductVersion",    "8.5.0.0"
+      VALUE "FileVersion",       "8.5.3.0"
+      VALUE "ProductVersion",    "8.5.3.0"
       VALUE "OriginalFilename",  "twinspeak.exe"
       VALUE "InternalName",      "twinspeak"
       VALUE "Comments",          "TidyVision TwinSpeak -- bit-exact ASIO-strict engine"

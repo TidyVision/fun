@@ -62,6 +62,31 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.3 THE ELEVATED BAND (field-directed: "I want realtime priority to
+//            just show up on task manager instead of high priority like it's
+//            still doing."). THE DIAGNOSIS: the v8.0.0 REALTIME class has
+//            been refused on EVERY launch -- the manifest ran asInvoker and
+//            the startup launch was the HKCU Run key, and Windows never
+//            grants SeIncreaseBasePriorityPrivilege to a non-elevated token
+//            (the v8.4.15 privilege-enable fixed the held-but-disabled case
+//            only), so SetPriorityClass(REALTIME) refused and the HIGH
+//            fallback engaged every time. THE FIX: (1) THE MANIFEST asks
+//            requireAdministrator -- a manual launch shows one UAC consent
+//            and the process is born elevated, where the privilege is held
+//            and enabled (the enable code itself was never the problem).
+//            (2) THE STARTUP PILL'S RUN KEY IS RETIRED for a scheduled
+//            task -- schtasks /Create /TN "TidyVision TwinSpeak" /TR
+//            "<exe>" --tray /SC ONLOGON /RL HIGHEST: the sign-in autostart
+//            runs elevated with NO prompt (a Run-key entry cannot elevate
+//            at logon; with the new manifest UAC would skip it whole), and
+//            the stale v6.6.1 Run-key value is deleted on sight at every
+//            boot (startupCleanLegacy). (3) THE PRIVILEGE ENABLE READS ITS
+//            RESULT now -- AdjustTokenPrivileges "succeeds" even when the
+//            token does not HOLD the privilege (it sets
+//            ERROR_NOT_ALL_ASSIGNED), and that state is logged by name
+//            instead of hiding inside the generic refusal line. The HIGH
+//            fallback stays for a non-elevated run and says so. NO new ini
+//            key, NO UI row (the pill manages the task, same row).
 //    v8.5.2 THE RESCUE IS RETIRED (field-directed: "I want to remove the
 //            watchdog, power guard, and deep resync. The audio clock is
 //            tuned to a hardware clock anyway."). ALL THREE auto-reopen
@@ -2554,7 +2579,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.2"
+#define TWS_VERSION "8.5.3"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5527,7 +5552,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -8742,31 +8767,71 @@ static HDC guiBtnBufEnsure(int w, int h) {
     return g_btnDc;
 }
 
-// ---- v6.6.1: "Run at Windows startup" (HKCU Run key, no shell:startup hack)
-static const char* kRunKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const char* kRunVal = "twinspeak";
+// ---- v6.6.1: "Run at Windows startup" -- v8.5.3: a SCHEDULED TASK --------
+// The HKCU Run key can never elevate at logon (and with the v8.5.3
+// requireAdministrator manifest UAC skips the entry whole), so the
+// autostarted engine never held SeIncreaseBasePriorityPrivilege and the
+// v8.0.0 REALTIME class refused on every launch -- HIGH forever, the
+// field's "Task Manager shows High". The pill now manages a scheduled
+// task instead: schtasks /SC ONLOGON /RL HIGHEST -- the sign-in launch
+// runs elevated with NO prompt and Task Manager shows Realtime. The
+// stale v6.6.1 Run-key value is deleted on sight (startupCleanLegacy,
+// once per boot): a surviving entry is either skipped by UAC or, worse,
+// a second non-elevated copy racing the task's.
+static const char* kTaskName = "TidyVision TwinSpeak";
+static const char* kRunKey   = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char* kRunVal   = "twinspeak";
+
+// one windowless schtasks run; TRUE on exit code 0
+static bool schtasksRun(const std::string& args) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+    std::string full = std::string("schtasks ") + args;
+    std::vector<char> cmd(full.begin(), full.end());
+    cmd.push_back('\0');
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return false;
+    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD ec = 1;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return ec == 0;
+}
+
+static void startupCleanLegacy() {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    RegDeleteValueA(k, kRunVal);
+    RegCloseKey(k);
+}
+
+static int g_startupCache = -1;   // -1 unknown, 0 off, 1 on (a query costs ~100 ms)
 
 static bool startupEnabled() {
-    HKEY k;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return false;
-    const LONG r = RegQueryValueExA(k, kRunVal, nullptr, nullptr, nullptr, nullptr);
-    RegCloseKey(k);
-    return r == ERROR_SUCCESS;
+    if (g_startupCache >= 0) return g_startupCache == 1;
+    g_startupCache = schtasksRun(std::string("/Query /TN \"") + kTaskName + "\"") ? 1 : 0;
+    return g_startupCache == 1;
 }
 static void startupSet(bool on) {
-    HKEY k;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
-                        nullptr, &k, nullptr) != ERROR_SUCCESS) return;
     if (on) {
         char exe[MAX_PATH];
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        std::string cmd = std::string("\"") + exe + "\" --tray";
-        RegSetValueExA(k, kRunVal, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)cmd.size() + 1);
+        const std::string cmd = std::string("/Create /F /TN \"") + kTaskName
+                              + "\" /TR \"\\\"" + exe + "\\\" --tray\" /SC ONLOGON /RL HIGHEST";
+        if (schtasksRun(cmd)) g_startupCache = 1;
     } else {
-        RegDeleteValueA(k, kRunVal);
+        if (schtasksRun(std::string("/Delete /F /TN \"") + kTaskName + "\""))
+            g_startupCache = 0;
     }
-    RegCloseKey(k);
+    startupCleanLegacy();
 }
 
 // ---- v6.6.1: the tray icon --------------------------------------------------
@@ -10624,8 +10689,8 @@ int main(int argc, char** argv) {
                  "                (closing it hides to the TRAY; the engine stays up)\n"
                  "  --tray        straight to the system tray -- NO window exists until you\n"
                  "                click the tray icon (never a taskbar button; this is what\n"
-                 "                the tray's 'Run at Windows startup' writes -- use it for\n"
-                 "                Task Scheduler sign-in tasks too)\n"
+                 "                the tray's 'launch at Windows startup' writes into its\n"
+                 "                scheduled task -- v8.5.3, elevated, no sign-in prompt)\n"
                  "  --exit        ask an already-running instance to exit CLEANLY -- tray icon\n"
                  "                removed, engine stopped (use this instead of taskkill /F,\n"
                  "                which orphans the tray icon until it is hovered)\n"
@@ -10636,6 +10701,11 @@ int main(int argc, char** argv) {
             return 0;
         } else iniPath = argv[i];
     }
+
+    // v8.5.3: the v6.6.1 HKCU Run-key entry is retired with the startup
+    // pill's scheduled task -- deleted on sight so a stale entry can never
+    // launch a second, non-elevated copy next to the task's launch.
+    if (!doList && !doListKS) startupCleanLegacy();
 
     char exePath[MAX_PATH] = {0};
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -10799,8 +10869,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // disabled at launch, and an unenabled privilege makes
     // SetPriorityClass(REALTIME) refuse even under an administrator
     // (field-directed: "make setting the process priority to real-time
-    // work"). Without the privilege at all (a standard user token) the
-    // call still refuses -- fall back to HIGH and say so.
+    // work"). v8.5.3: the manifest asks requireAdministrator and the
+    // startup launch is a /RL HIGHEST scheduled task -- the token always
+    // HOLDS the privilege now; the fallback below exists for a
+    // non-elevated run (--multi under a plain console, an old exe, a
+    // policy) and says so.
     {
         HANDLE tok = nullptr;
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
@@ -10809,7 +10882,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                       &tp.Privileges[0].Luid)) {
                 tp.PrivilegeCount = 1;
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+                // v8.5.3: the call "succeeds" even when the token does not
+                // HOLD the privilege (it sets ERROR_NOT_ALL_ASSIGNED) --
+                // read it so a refusal below names the real cause.
+                if (AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr)
+                    && GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+                    tlog("[twinspeak] priority      : SeIncreaseBasePriorityPrivilege is NOT in this\n"
+                         "                            token (non-elevated launch) -- REALTIME will refuse and\n"
+                         "                            HIGH engages. The v8.5.3 requireAdministrator manifest\n"
+                         "                            and the scheduled-task startup exist for exactly this.\n");
             }
             CloseHandle(tok);
         }
@@ -10822,9 +10903,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const DWORD pclErr = GetLastError();
         SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
         tlog("[twinspeak] priority      : REALTIME class refused (err %lu) -- HIGH engaged. The token\n"
-             "                            does not hold SeIncreaseBasePriorityPrivilege: launch elevated\n"
-             "                            once for the full realtime band; MMCSS still orders the audio\n"
-             "                            threads inside it.\n", pclErr);
+             "                            does not hold SeIncreaseBasePriorityPrivilege (a non-elevated\n"
+             "                            launch): the v8.5.3 manifest and the scheduled-task startup\n"
+             "                            run the engine elevated; MMCSS still orders the audio threads\n"
+             "                            inside it.\n", pclErr);
     }
 
     timeBeginPeriod(1);
