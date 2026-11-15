@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,41 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.7 THE KS CAPTURE (field-directed: "Every input device must also be
+//            WDM-KS"). THE CONTEXT: the v8.6.4 interrogation decoded the
+//            render-side refusals on the field's new system -- err 50
+//            (ERROR_NOT_SUPPORTED) on every LOOPED attempt, err 1169 (no
+//            matching Interface/Medium/DataFormat combination) on every
+//            streaming attempt, and the S5's streaming pin CREATED but with
+//            no RTAudio buffer: the render stacks there do not expose
+//            WaveRT KS pins, so the WASAPI fallback is the honest path for
+//            the legs on that box (the interrogation's summary says so in
+//            one line now). THE CABLE, THOUGH, IS A REAL KS DRIVER -- and
+//            the input side goes KS whole: (1) THE KS CAPTURE OPEN -- the
+//            input needle bridges to a KS filter ("Line 1 (Virtual Audio
+//            Cable)" scores "Virtual Cable 1" on three shared tokens), the
+//            filter's SOURCE (DATAFLOW_OUT) pin is created as a capture
+//            pin (READ|WRITE with a READ-only fallback), the RTAudio
+//            looped buffer (~300 ms) is allocated and the position
+//            register mapped -- the same machinery the render pins use.
+//            (2) THE KS CAPTURE THREAD -- polls the hardware's write
+//            position on the high-resolution timer, converts the PCM
+//            frames to f32 (exact: integer samples up to 24 bits are
+//            representable), and delivers through the SAME capDeliver path
+//            the WASAPI callback uses (the window, the off-meter, the ch3
+//            proof meter). A hardware lap over the unread loop logs the
+//            loss and resyncs to the freshest (the legs' trims re-align
+//            seamlessly). (3) THE FALLBACK -- a refusal anywhere falls
+//            back to the WASAPI capture (the legacy path, guarded whole).
+//            (4) THE CAPTURE LEDGER -- the window's head IS the capture's
+//            heartbeat: a 5-s stall announces "capture DOWN" (measure-
+//            only), recovery announces "capture alive". (5) THE MAP
+//            EVERYWHERE -- --list's CAPTURE section prints each capture
+//            endpoint's KS filter counterpart, and every device combo (the
+//            input included) lists the WDM-KS names. The pin is held in
+//            PAUSE until the window's cursors exist; the reader thread
+//            starts in the capture-first start order. NO new ini key, NO
+//            UI row.
 //    v8.6.6 THE NAME MAP (field-directed: "I want it so the device list has
 //            a map of a string where it translates the wasapi device name
 //            to the wdm-ks names. I'm serious. Actually, I want wdm-ks
@@ -2854,7 +2889,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.6"
+#define TWS_VERSION "8.6.7"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3596,6 +3631,33 @@ static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
 static float   g_capPeriodMsF = 5.0f;
+// v8.6.7 THE KS CAPTURE: the input side routes through WDM-KS too -- the
+// cable IS a KS driver; its source (DATAFLOW_OUT) pin reads the looped
+// RTAudio buffer directly, bypassing the WASAPI capture layer entirely.
+// A refusal falls back to the WASAPI capture (the legacy path). g_capIsKs
+// gates every WASAPI-capture-only branch (init/start/banner/cleanup).
+struct KsCap {
+    int           active      = 0;
+    HANDLE        filter      = nullptr;
+    HANDLE        pin         = nullptr;
+    unsigned char* loopBuf    = nullptr;   // the driver's own DMA memory (mapped)
+    size_t        loopBytes   = 0, loopFrames = 0;
+    unsigned      frameBytes  = 0;         // kInCh * container
+    int           fmt         = 0;         // 2 = int24-in-32, 3 = int24-packed, 4 = int16
+    int           container   = 0;
+    std::string   filterName, fmtName;
+    unsigned long long capFrames  = 0;     // the HW's write position (absolute frames)
+    unsigned long long readFrames = 0;     // the reader's absolute position
+    volatile ULONG* posReg    = nullptr;
+    bool          posMapped   = false;
+    ULONG         lastPosBytes = 0;
+    bool          havePos = false;
+    unsigned long long posGlitch = 0, lapses = 0;
+    HANDLE        thread      = nullptr;
+    std::vector<float>       conv;         // the PCM -> f32 conversion scratch (8ch)
+};
+static KsCap g_ksCap;
+static bool g_capIsKs = false;
 
 // MMCSS boost for the pump threads (v3.8): at 10 ms targets a normal-
 // priority thread that loses one scheduling quantum can miss a refill
@@ -3994,6 +4056,21 @@ static DWORD WINAPI volumeWatchThread(LPVOID) {
 // ------------------------------------------------------------- callbacks ----
 // capture callback: dumb fan-out. The less work happens here, the better --
 // each pump thread does its own leg's mixing, on its own thread, in parallel.
+// v8.6.7: the capture delivery -- ONE path for the WASAPI capture callback
+// and the KS capture thread: window push + the off-meter + the ch3 proof
+// meter. The KS thread converts its PCM frames into this same f32 layout.
+static void capDeliver(const float* in, ma_uint32 frameCount) {
+    g_win.push(in, frameCount);
+    for (int i = 0; i < 4; ++i)
+        g_leg[i].captured.fetch_add(frameCount, std::memory_order_relaxed); // v6.0 off-meter (cable clock)
+    float pk = g_ch3InPeak.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < frameCount; ++i) {
+        const float a = fabsf(in[i * kInCh + 2]);
+        if (a > pk) pk = a;
+    }
+    g_ch3InPeak.store(pk, std::memory_order_relaxed);
+}
+
 static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCount) {
     boostDeviceThread();                                          // v4.0 MMCSS
     if (!pInput || frameCount == 0) return;
@@ -4001,19 +4078,7 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     // v8.6.0 THE WINDOW: ONE write -- the capture lands in the shared
     // broadcast buffer and every leg reads it at its own cursor. (The old
     // fan-out memcpy'd every burst into four private rings.)
-    g_win.push(in, frameCount);
-    for (int i = 0; i < 4; ++i)
-        g_leg[i].captured.fetch_add(frameCount, std::memory_order_relaxed); // v6.0 off-meter (cable clock)
-    // v8.4.25 THE PROOF METER: the peak |ch3| of the RAW capture, measured
-    // before volume and before any mask -- the level the cable actually
-    // carries, untouched by anything twinspeak does to it. (v8.6.0: moved
-    // here from the per-leg pop path -- one measurement per burst.)
-    float pk = g_ch3InPeak.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < frameCount; ++i) {
-        const float a = fabsf(in[i * kInCh + 2]);
-        if (a > pk) pk = a;
-    }
-    g_ch3InPeak.store(pk, std::memory_order_relaxed);
+    capDeliver(in, frameCount);
 }
 
 // ------------------------------------------------ v8.6.0 THE DRIFT CORRECTOR
@@ -5037,7 +5102,8 @@ static bool ksRangeAccepts(const std::vector<KsRange>& ranges, int outCh, const 
 // The driver reads the format at Connect + sizeof(KSPIN_CONNECT), so the
 // whole blob must be one contiguous struct.
 static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt& f,
-                             bool looped, int* usedLooped, DWORD* lastErr) {
+                             bool looped, int* usedLooped, DWORD* lastErr,
+                             bool capture = false) {
     struct Blob {
         KSPIN_CONNECT        connect;
         KSDATAFORMAT         df;
@@ -5088,12 +5154,17 @@ static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt&
     // retry WRITE-only for exactly that. The old path tried READ|WRITE
     // alone: a driver with the gotcha refused EVERY pin/format
     // unconditionally -- the field's "always refusing" new system.
-    DWORD err = kp(filter, c, GENERIC_WRITE | GENERIC_READ, &pin);
+    // v8.6.7: the CAPTURE direction mirrors it -- READ|WRITE first, then
+    // READ-only (a capture source pin reads; some drivers refuse WRITE).
+    const DWORD acc1 = capture ? (DWORD)(GENERIC_READ | GENERIC_WRITE)
+                               : (DWORD)(GENERIC_WRITE | GENERIC_READ);
+    const DWORD acc2 = capture ? (DWORD)GENERIC_READ : (DWORD)GENERIC_WRITE;
+    DWORD err = kp(filter, c, acc1, &pin);
     if (err != ERROR_SUCCESS) {
         if (pin) CloseHandle(pin);
         pin = nullptr;
         *lastErr = err;
-        err = kp(filter, c, GENERIC_WRITE, &pin);
+        err = kp(filter, c, acc2, &pin);
         if (err != ERROR_SUCCESS) {
             if (pin) CloseHandle(pin);
             *lastErr = err;
@@ -5344,6 +5415,235 @@ static std::string ksCounterpartFromWasapi(const std::string& name) {
         if (sc > bestScore) { bestScore = sc; best = f.name; }
     }
     return best;
+}
+
+// --------------------------------------------------- v8.6.7 THE KS CAPTURE --
+// The capture side routes through WDM-KS: the input needle matches a KS
+// filter (the layered bridge -- "Line 1 (Virtual Audio Cable)" scores
+// "Virtual Cable 1" on three shared tokens), and the filter's SOURCE
+// (DATAFLOW_OUT) pin is created as a capture pin on the RTAudio looped
+// buffer, mapped and position-registered exactly like the render pins.
+// The thread polls the hardware's write position, converts the PCM frames
+// to f32 (exact -- integer samples up to 24 bits are representable), and
+// delivers through the same capDeliver path the WASAPI callback uses: the
+// window, the off-meter and the ch3 proof meter are shared. A refusal
+// falls back to the WASAPI capture (the legacy path).
+static DWORD WINAPI ksCapThread(LPVOID) {
+    boostAudioThreadEx(2 /*AVRT_PRIORITY_CRITICAL*/);
+    KsCap& C = g_ksCap;
+    HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
+                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!hTimer) hTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    LARGE_INTEGER due; due.QuadPart = kTickPollUs;
+    ksSetPinState(C.pin, KSSTATE_RUN);   // the cable's clock starts feeding the loop
+    while (g_run.load()) {
+        // the hardware's write position: how far the cable has filled the loop
+        ULONG raw = 0; bool ok = false;
+        if (C.posReg) { raw = *C.posReg; ok = true; }
+        else ok = ksReadPosIoctl(C.pin, &raw);
+        if (ok) {
+            const ULONG pb = raw % (ULONG)C.loopBytes;
+            ULONG d = pb;
+            if (pb < C.lastPosBytes) d += (ULONG)C.loopBytes;
+            d -= C.lastPosBytes;
+            if (d <= (ULONG)C.loopBytes) {
+                const ULONG dfr = d / C.frameBytes;
+                C.capFrames += dfr;
+                C.lastPosBytes = (C.lastPosBytes + dfr * C.frameBytes) % (ULONG)C.loopBytes;
+            } else ++C.posGlitch;   // wild register value: ignore
+        }
+        long long avail = (long long)C.capFrames - (long long)C.readFrames;
+        if (avail > (long long)C.loopFrames) {
+            // the hardware lapped the unread region: those frames are LOST --
+            // resync to the freshest (the legs' trims re-align seamlessly).
+            C.lapses++;
+            tlog("[twinspeak] capture KS   : the hardware lapped the unread loop -- resynced to the\n"
+                 "                            freshest (%lld fr lost; %llu lap(s) total)\n",
+                 avail - (long long)C.loopFrames, (unsigned long long)C.lapses);
+            C.readFrames = C.capFrames;
+            avail = 0;
+        }
+        while (avail > 0) {
+            const size_t n = (size_t)(avail < 2048 ? avail : 2048);
+            float* dst = C.conv.data();
+            for (size_t i = 0; i < n; ++i) {
+                const unsigned char* src = C.loopBuf +
+                    (((size_t)(C.readFrames + i) % C.loopFrames) * C.frameBytes);
+                float* o = dst + i * (size_t)kInCh;
+                switch (C.fmt) {
+                case 0: {   // float32 -- the engine's own format: straight copy
+                    memcpy(o, src, (size_t)kInCh * sizeof(float));
+                    break;
+                }
+                case 1: {   // int32
+                    for (int ch = 0; ch < kInCh; ++ch) {
+                        int32_t v; memcpy(&v, src + (size_t)ch * 4, 4);
+                        o[ch] = (float)((double)v / 2147483648.0);
+                    }
+                    break;
+                }
+                case 2: {   // int24 valid bits in 32-bit slots (left-justified)
+                    for (int ch = 0; ch < kInCh; ++ch) {
+                        int32_t v; memcpy(&v, src + (size_t)ch * 4, 4);
+                        o[ch] = (float)((double)(v >> 8) / 8388608.0);
+                    }
+                    break;
+                }
+                case 3: {   // int24 packed (3 bytes, little-endian, signed)
+                    for (int ch = 0; ch < kInCh; ++ch) {
+                        const unsigned char* s3 = src + (size_t)ch * 3;
+                        int32_t v = (int32_t)((UINT32)s3[0] | ((UINT32)s3[1] << 8)
+                                              | ((UINT32)s3[2] << 16));
+                        v = (v << 8) >> 8;   // sign-extend through 32 bits
+                        o[ch] = (float)((double)v / 8388608.0);
+                    }
+                    break;
+                }
+                default: {  // int16
+                    for (int ch = 0; ch < kInCh; ++ch) {
+                        int16_t v; memcpy(&v, src + (size_t)ch * 2, 2);
+                        o[ch] = (float)((double)v / 32768.0);
+                    }
+                    break;
+                }
+                }
+            }
+            capDeliver(C.conv.data(), (ma_uint32)n);
+            C.readFrames += n;
+            avail -= (long long)n;
+        }
+        if (hTimer) {
+            SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(hTimer, 5);
+        } else Sleep(2);
+    }
+    ksSetPinState(C.pin, KSSTATE_PAUSE);
+    if (hTimer) { CancelWaitableTimer(hTimer); CloseHandle(hTimer); }
+    return 0;
+}
+
+static bool ksCapOpen() {
+    const std::string& needle = g_cfg.inputDevice;
+    if (!ksCreatePinFn()) return false;
+    std::vector<KsFilterInfo> fl;
+    ksEnumerateRenderFilters(fl);
+    int chosen = -1, cs = 0;
+    for (size_t i = 0; i < fl.size(); ++i) {
+        if (fl[i].name.empty()) continue;
+        const int sc = ksNeedleScore(fl[i].name, needle);
+        if (sc > cs) { cs = sc; chosen = (int)i; }
+    }
+    if (chosen < 0) {
+        tlog("[twinspeak] capture KS   : no KS filter matches the input needle \"%s\"\n", needle.c_str());
+        return false;
+    }
+    HANDLE fh = CreateFileW(fl[chosen].path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) {
+        tlog("[twinspeak] capture KS   : cannot open filter \"%s\" (error %lu)\n",
+             fl[chosen].name.c_str(), (unsigned long)GetLastError());
+        return false;
+    }
+    ULONG ctypes = 0;
+    if (!ksPinPropGet(fh, KSPROPSETID_Pin, KSPROPERTY_PIN_CTYPES, 0,
+                      &ctypes, sizeof(ctypes)) || !ctypes) {
+        tlog("[twinspeak] capture KS   : \"%s\" exposes no pin factories\n", fl[chosen].name.c_str());
+        CloseHandle(fh);
+        return false;
+    }
+    // the capture proposals: the cable's dataranges are INTEGER (8..24 bit)
+    // -- float32/int32 drop out of the range check; 24-in-32, packed 24 and
+    // int16 are tried in that order, looped interface first. The loop
+    // request ~300 ms: a lazy poll + a descheduled reader must never lap.
+    HANDLE pin = nullptr;
+    int usedFmt = -1;
+    unsigned usedPin = 0, container = 0;
+    unsigned char* rtBuf = nullptr; size_t rtGot = 0; BOOL rtBarrier = FALSE;
+    std::vector<KsRange> ranges;
+    unsigned attempts = 0; DWORD lastErr = 0;
+    for (ULONG p = 0; p < ctypes && !pin; ++p) {
+        KSPIN_DATAFLOW df = (KSPIN_DATAFLOW)0;
+        if (!ksPinPropGet(fh, KSPROPSETID_Pin, KSPROPERTY_PIN_DATAFLOW, p,
+                          &df, sizeof(df))) continue;
+        if (df != KSPIN_DATAFLOW_OUT) continue;   // the CAPTURE source
+        const bool haveRanges = ksPinAudioRanges(fh, p, ranges);
+        for (const KsRange& r : ranges)
+            tlog("[twinspeak] capture KS   : pin %lu datarange: up to %dch, %d..%d bit, %u..%u Hz\n",
+                 (unsigned long)p, r.maxCh, r.bitsMin, r.bitsMax, r.freqMin, r.freqMax);
+        for (int fi = 0; fi < kKsFmtCount && !pin; ++fi) {
+            const KsFmt& f = kKsFmts[fi];
+            if (haveRanges && !ksRangeAccepts(ranges, kInCh, f)) continue;
+            for (int lp = 1; lp >= 0 && !pin; --lp) {
+                int ul = 0;
+                DWORD perr = 0;
+                ++attempts;
+                HANDLE hp = ksTryCreatePin(fh, p, kInCh, f, lp != 0, &ul, &perr, true);
+                if (!hp) {
+                    lastErr = perr;
+                    tlog("[twinspeak] capture KS   : pin %lu %s %s: refused (err %lu)\n",
+                         (unsigned long)p, f.name, lp ? "looped" : "streaming", (unsigned long)perr);
+                    continue;
+                }
+                unsigned char* buf = nullptr; size_t got = 0; BOOL barrier = FALSE;
+                const size_t wantBytes = (size_t)kInCh * (size_t)f.container *
+                                         (size_t)(kSampleRate * 3 / 10);   // ~300 ms of loop
+                if (!ksAllocRtBuffer(hp, (ULONG)(kInCh * f.container), wantBytes,
+                                     &buf, &got, &barrier)) {
+                    tlog("[twinspeak] capture KS   : pin %lu accepted %s but has no RTAudio buffer\n",
+                         (unsigned long)p, f.name);
+                    CloseHandle(hp);
+                    continue;
+                }
+                pin = hp; usedFmt = fi; usedPin = p; container = f.container;
+                rtBuf = buf; rtGot = got; rtBarrier = barrier;
+            }
+        }
+    }
+    if (!pin) {
+        tlog("[twinspeak] capture KS   : \"%s\" refused every capture pin/format -- %u attempt(s), last err %lu\n"
+             "                            the WASAPI capture takes the input\n",
+             fl[chosen].name.c_str(), attempts, (unsigned long)lastErr);
+        CloseHandle(fh);
+        return false;
+    }
+    const KsFmt& f = kKsFmts[usedFmt];
+    KsCap& C = g_ksCap;
+    C.active = 1;
+    C.filter = fh;
+    C.pin = pin;
+    C.loopBuf = rtBuf;
+    C.loopBytes = rtGot;
+    C.frameBytes = (unsigned)(kInCh * container);
+    C.loopFrames = C.loopBytes / C.frameBytes;
+    C.fmt = f.id;
+    C.container = container;
+    C.filterName = fl[chosen].name;
+    C.fmtName = f.name;
+    C.conv.assign((size_t)kInCh * 2048, 0.0f);
+    C.posReg = nullptr;
+    C.posMapped = ksMapPosRegister(pin, &C.posReg);
+    // the reader starts at the hardware's CURRENT write position: the
+    // pre-existing loop content is stale (the engine was not running).
+    ULONG posBytes = 0;
+    if (C.posReg) posBytes = *C.posReg;
+    else if (!ksReadPosIoctl(pin, &posBytes)) posBytes = 0;
+    const size_t posFrames = (size_t)(posBytes % (ULONG)C.loopBytes) / C.frameBytes;
+    C.capFrames = posFrames;
+    C.readFrames = posFrames;
+    C.lastPosBytes = (ULONG)(posFrames * C.frameBytes);
+    C.havePos = true;
+    tlog("[twinspeak] capture KS   : \"%s\" pin %lu, %s %dch @ %u Hz | loop %u fr (%.1f ms)%s\n"
+         "                            pin held in PAUSE -- the thread starts after the window opens\n",
+         C.filterName.c_str(), (unsigned long)usedPin, f.name, kInCh, (unsigned)kSampleRate,
+         (unsigned)C.loopFrames, (double)C.loopFrames * 1000.0 / (double)kSampleRate,
+         C.posMapped ? ", position register mapped" : ", position via IOCTL");
+    return true;
+}
+static bool ksCapStart() {
+    if (!g_ksCap.active || g_ksCap.thread) return false;
+    g_ksCap.thread = CreateThread(nullptr, 0, ksCapThread, nullptr, 0, nullptr);
+    return g_ksCap.thread != nullptr;
 }
 
 static bool ksOpenLeg(int idx, const std::string& needle) {
@@ -5863,7 +6163,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6480,9 +6780,14 @@ static void listDevices() {
                    pb[i].nativeDataFormats[k].sampleRate,
                    ma_get_format_name(pb[i].nativeDataFormats[k].format));
     }
-    tlog("\nCAPTURE devices (%u):\n", ncp);
+    tlog("\nCAPTURE devices (%u) -- each with its WDM-KS filter counterpart (v8.6.6):\n", ncp);
     for (ma_uint32 i = 0; i < ncp; ++i) {
         tlog("  [%u] %s%s\n", i, cp[i].name, cp[i].isDefault ? "   (default)" : "");
+        // v8.6.6 THE NAME MAP, capture side: the capture endpoint's KS
+        // filter counterpart (the cable's filter -- the KS capture reads it
+        // directly, v8.6.7).
+        const std::string ksn = ksCounterpartFromWasapi(cp[i].name);
+        tlog("        KS: %s\n", ksn.empty() ? "(no counterpart filter)" : ksn.c_str());
         for (ma_uint32 k = 0; k < cp[i].nativeDataFormatCount && k < 4; ++k)
             tlog("        native: %uch @ %u Hz, %s\n", cp[i].nativeDataFormats[k].channels,
                    cp[i].nativeDataFormats[k].sampleRate,
@@ -7889,11 +8194,11 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
 static void guiFillCombos(HWND w) {
     std::vector<std::string> pb, cp;
     guiEnumNames(pb, cp);
-    // v8.6.6 THE NAME MAP ON EVERYTHING: the output combos list the WDM-KS
-    // filter names (the field: "I want wdm-ks names on everything,
-    // including the output devices from the ini") -- pickDevice and
-    // ksOpenLeg both score the layered bridge, so a KS name drives either
-    // backend, and the edit keeps whatever the ini carries (either scheme).
+    // v8.6.6 THE NAME MAP ON EVERYTHING: the device combos list the WDM-KS
+    // filter names -- the outputs, AND the input (the field: "Every input
+    // device must also be WDM-KS"; the v8.6.7 KS capture reads the chosen
+    // filter's source pin directly). The edit keeps whatever the ini
+    // carries, either scheme, and both backends bridge both schemes.
     std::vector<std::string> ksNames;
     {
         std::vector<KsFilterInfo> fl;
@@ -7906,7 +8211,7 @@ static void guiFillCombos(HWND w) {
         HWND h = GetDlgItem(w, ids[k]);
         char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
         SendMessageA(h, CB_RESETCONTENT, 0, 0);
-        const std::vector<std::string>& v = (k < 3) ? ksNames : cp;   // v8.6.6: KS names on the outputs
+        const std::vector<std::string>& v = ksNames;   // v8.6.6/7: every combo lists the WDM-KS names
         for (size_t i = 0; i < v.size(); ++i)
             SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
         if (cur[0]) SetWindowTextA(h, cur);
@@ -11566,6 +11871,18 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
+    // v8.6.7 THE KS CAPTURE FIRST (field-directed: "Every input device must
+    // also be WDM-KS"): the input needle bridges to a KS filter, its SOURCE
+    // pin is created, and the RTAudio loop is read directly -- the WASAPI
+    // capture layer is bypassed whole. A refusal falls back to the legacy
+    // WASAPI capture below. The pin is held in PAUSE here; the reader
+    // thread starts after the window opens (the cursors must exist first).
+    bool capExclusive = false;
+    g_capIsKs = ksCapOpen();
+    if (g_capIsKs)
+        tlog("[twinspeak] capture KS   : the input routes through WDM-KS\n");
+
+    if (!g_capIsKs) {
     // v3.6: the CAPTURE side gets its own period + share mode, opened BEFORE
     // the rings (the ring floor needs the REAL negotiated burst). Exclusive
     // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
@@ -11582,7 +11899,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                                   : ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     memset(&g_capDev, 0, sizeof(g_capDev));   // v3.8: g_capDev is file-scope (watchdog)
-    bool capExclusive = false;
     ma_result cr = ma_device_init(&ctx, &cc, &g_capDev);
     if (cr == MA_SUCCESS) {
         capExclusive = (cc.capture.shareMode == ma_share_mode_exclusive);
@@ -11596,6 +11912,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (cr != MA_SUCCESS) {
         tlog( "[twinspeak] capture init failed: %s\n", ma_result_description(cr));
         return 1;
+    }
     }
 
     // v4.0: the REAL negotiated device period per leg feeds the ring floor
@@ -11794,7 +12111,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v3 start order (v8.1.0): capture FIRST, playbacks last -- the raw
     // rings hold real audio before the devices open their mouths (no startup
     // underrun). out2_first still orders the DEVICE starts (center first).
-    if (ma_device_start(&g_capDev) != MA_SUCCESS) {
+    // v8.6.7: the KS capture's thread starts HERE too -- after the window's
+    // cursors exist, before the legs open their mouths.
+    if (g_capIsKs) {
+        if (!ksCapStart()) {
+            tlog( "[twinspeak] capture KS thread failed to start\n");
+            return 1;
+        }
+    } else if (ma_device_start(&g_capDev) != MA_SUCCESS) {
         tlog( "[twinspeak] capture start failed\n");
         return 1;
     }
@@ -11878,6 +12202,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
+    if (g_capIsKs) {
+        // v8.6.7: the KS capture banner -- the input reads the pin directly.
+        tlog("[twinspeak] capture        : \"%s\" (WDM-KS filter \"%s\")  8ch @ %u Hz | %s | loop %.1f ms\n"
+             "                            the input reads the KS pin directly -- audiodg is out of the capture path\n",
+             g_cfg.inputDevice.c_str(), g_ksCap.filterName.c_str(), kSampleRate,
+             g_ksCap.fmtName.c_str(),
+             (double)g_ksCap.loopFrames * 1000.0 / (double)kSampleRate);
+    } else {
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
@@ -11886,6 +12218,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog( "[twinspeak] capture hint   : exclusive was refused -- the pin is held by the engine or the\n"
                         "            Line 1 port driver is WaveCyclic. The direct WaveRT capture path\n"
                         "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
+    }
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
@@ -12241,6 +12574,30 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     tlog("[twinspeak] leg%d alive     : the heartbeat returned -- the leg is switching again (the\n"
                          "                            trim's resync lands its cursor back at the target).\n", i + 1);
                 }
+            }
+        }
+        // v8.6.7 THE CAPTURE LEDGER: the window's head IS the capture's
+        // heartbeat -- a stalled head (nothing advancing for 5 s) means the
+        // capture is down (the KS capture pin froze, the cable died, or
+        // audiodg stopped delivering). The legs hold their last frames.
+        // Measure-only.
+        {
+            static unsigned long long lastHeadSeen = 0, lastHeadMs = 0;
+            static bool capDownAnnounced = false;
+            const unsigned long long hNow = g_win.head.load(std::memory_order_relaxed);
+            if (hNow != lastHeadSeen) {
+                lastHeadSeen = hNow;
+                lastHeadMs = nowMs;
+                if (capDownAnnounced) {
+                    capDownAnnounced = false;
+                    tlog("[twinspeak] capture alive : the window's head is advancing again -- the capture recovered.\n");
+                }
+            } else if (!capDownAnnounced && nowMs - lastHeadMs > 5000) {
+                capDownAnnounced = true;
+                lastHeadMs = nowMs;
+                tlog("[twinspeak] capture DOWN  : the window's head has not advanced for 5 s -- the capture is\n"
+                     "                            stalled (the KS capture pin froze, or the cable stopped\n"
+                     "                            delivering). The legs hold their last frames; measure-only.\n");
             }
         }
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
