@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.3 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,35 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.3 THE RESYNC GUARD (field-directed, with the new-system log: "even
+//            when there's a new system, raw2's delay still wants to corrupt
+//            and jump up to insane values ... I had audio active by this
+//            period"). THE LOG DECODED INTO THREE STACKED PROBLEMS: (1) THE
+//            NEW SYSTEM FELL BACK TO WASAPI -- the device lines print
+//            "1.00 ms period" with 82,499 / 81,178 late switches and
+//            NEGATIVE buffer margins (-2.12 / -6.86 ms: "the DAC crossed
+//            into stale audio") -- the KS pins were refused there, both
+//            legs run the 1 ms WASAPI fallback, and the device threads are
+//            served 4-9 ms late against a 2 ms buffer: the device-layer
+//            crackle (run --list-ks there to see why the pins refuse).
+//            (2) THE TRIM'S 2 s RATE LIMIT STARVED THE CORRECTION -- the
+//            aligned skip only fired every 2 s while leg2's lag grew
+//            ~40 ms/s, so raw2 oscillated target -> 172 ms -> forced
+//            resync -> target between bites: the "insane values". THE
+//            LIMIT IS RETIRED for the aligned skip -- the search IS the
+//            crackle protection now (the landing is value+slope matched,
+//            seamless by construction), so the trim fires PER SWITCH and
+//            the lag can never leave target +-the dead-band + search span
+//            (the dead-band still gates micro-drift; the EARLY pad keeps
+//            its budget pacing). (3) THE FORCED RESYNC FIRED PAST THE
+//            OVERWRITE HORIZON -- the old cap-64 margin let the lag reach
+//            cap + 64 (the log's exact 8256 on an 8192-fr window), and
+//            every callback between the wrap and the resync read
+//            OVERWRITTEN bytes -- garbage straight to the DAC, the second
+//            crackle. The threshold now keeps 1024 fr (21 ms) of headroom
+//            below the wrap: a full capture burst + a 9 ms-late callback
+//            fits in the margin, the resync fires before any byte is
+//            overwritten. NO new ini key, NO UI row.
 //    v8.6.2 THE TIGHT POLL (field-directed: "Now, I want to reduce the
 //            amount of late switches"). THE INVENTORY, first: the pacer
 //            already runs at the REALTIME process class, THREAD_PRIORITY_
@@ -2765,7 +2794,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.2"
+#define TWS_VERSION "8.6.3"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3983,7 +4012,13 @@ static size_t windowTrim(int idx, Leg& L, size_t frameCount)
     // device stalled, died, or was reopened -- landReopenedRing's old job).
     // The data it wanted is overwritten; jump to the target, count it, move
     // on. The next switch plays fresh content; the trim holds it there.
-    if (lag > (long long)(g_win.cap - (size_t)frameCount - 64)) {
+    // v8.6.3 THE OVERWRITE-HORIZON MARGIN: the threshold now keeps 1024 fr
+    // (21 ms) of headroom BELOW the wrap point -- the old cap-64 margin let
+    // the lag reach cap + 64 on the field's new system (the callbacks there
+    // run 4-9 ms late), and every callback between the wrap and the resync
+    // read OVERWRITTEN bytes -- garbage on the DAC, the crackle. The resync
+    // now fires with a full burst + late-callback budget to spare.
+    if (lag > (long long)(g_win.cap - (size_t)frameCount - 1024)) {
         const long long jump = lag - target;
         if (jump > 0) {
             L.cursor.store(c + (unsigned long long)jump, std::memory_order_relaxed);
@@ -3997,9 +4032,15 @@ static size_t windowTrim(int idx, Leg& L, size_t frameCount)
     }
 
     if (err >= (long long)kDriftCorrectFr) {            // LATE: the sample-aligned skip
-        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            L.lastBiteMs = nowMs;
-            long long lo = err - kWindowSearchFr, hi = err + kWindowSearchFr;
+        // v8.6.3: NO RATE LIMIT on the aligned skip. The 2 s pacing was the
+        // blind-drop era's crackle protection; the search IS the protection
+        // now (the landing is value+slope matched, seamless by
+        // construction) -- and the field's new-system log showed the limit
+        // STARVING the correction: a leg drifting ~40 ms/s oscillated
+        // target -> 172 ms -> forced resync -> target between bites, the
+        // "raw2 jumps to insane values" report. One trim per switch, any
+        // size -- the dead-band below still gates micro-drift.
+        long long lo = err - kWindowSearchFr, hi = err + kWindowSearchFr;
             if (lo < (long long)kDriftCorrectFr) lo = kDriftCorrectFr;
             if (hi > lag - (long long)frameCount) hi = lag - (long long)frameCount;   // published data only
             if (hi < lo) hi = lo;
@@ -4036,7 +4077,6 @@ static size_t windowTrim(int idx, Leg& L, size_t frameCount)
                      "                            landing (%llu skip(s) total; value+slope matched, no crackle)\n",
                      idx + 1, err, best, (unsigned long long)L.syncDrops);
             }
-        }
         return 0;
     }
     if (err <= -(long long)kDriftCorrectFr) {           // EARLY: the held-frame pad
@@ -5632,7 +5672,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.3 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
