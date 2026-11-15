@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,63 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.0 THE WINDOW (field-directed: "I found it tells you the slot is
+//            empty. Btw, identify as many issues within the audio flow as
+//            possible ... I also don't want a ring system anymore. I want
+//            something that's stutter proof and also the most stable" --
+//            with the field evidence "whenever raw2 was 166 its leg2 was
+//            crackling very badly, which prompts the rework"). THE FIELD
+//            FINDING, EXPLAINED: a KS WaveRT pin is a LOOPED DMA buffer the
+//            DAC clocks continuously -- when the write thread stalls (the
+//            S5's pin freezing during long idle), the DAC does not go
+//            silent, it SAWS: the last ~12 ms of audio looped at full
+//            volume, the crackle. The capture keeps pushing meanwhile, so
+//            the stalled leg's ring pinned at cap -- raw2's 166.7 was the
+//            ring one KS bite below its 8192-frame ceiling, frozen there
+//            forever (nothing reopens it, v8.5.2). THE REWORK: (1) THE
+//            SHARED WINDOW -- one broadcast buffer replaces the per-leg
+//            rings whole. The capture writes at head (ONE memcpy per burst,
+//            not four); every leg reads at its OWN cursor; the writer
+//            never blocks and never evicts per-reader. The delay prefill
+//            is the buffer's own zero-fill (pushSilence is gone): the head
+//            opens at the largest target and every cursor starts at
+//            head - target_i, so each leg's lag is EXACTLY its target from
+//            the first switch -- no start trim, no Sleep(30), no start
+//            align: the placement IS the alignment. (2) THE DRIFT
+//            CORRECTOR -- one cursor trim for every leg, replacing the
+//            two-mechanism servo (masterDepthGuard + syncToFirst) whole:
+//            the cursor distance is held at delay_i + the shared cushion,
+//            so the inter-leg sync falls out BY CONSTRUCTION (the
+//            v8.4.15 delay-neutral property, structural; no reference leg
+//            exists anymore -- a dead leg1 freezes nothing). BITE-ONLY,
+//            NO BASELINE, NO RE-LATCH (v8.4.13/16/12 stand). THE PERFECT
+//            SAMPLE SPOT (the field's own spec): a LATE skip SEARCHES
+//            +-2.5 ms around the required landing for the position where
+//            the waveform CONTINUES -- the incoming frame's value AND
+//            slope matched against the outgoing frame on the leg's own
+//            channels -- so a future peak or valley continues at the same
+//            speed and the splice cannot crackle. The v8.4.21
+//            quiet-window valve is obsolete (on silent content every
+//            candidate ties and the FULL excess lands in one bite). The
+//            forced resync (a cursor beyond the window -- the old
+//            landReopenedRing's job) jumps to the target and counts. (3)
+//            THE HOLD -- a shortfall no longer plays a silence hole: the
+//            switch holds the LAST PLAYED frame (a held sample cannot
+//            click; the keep-alive rides on top), stutter-proof by
+//            construction. (4) THE DEAD-LEG LEDGER -- with the rescue
+//            machinery retired (v8.5.2), a stalled device is ANNOUNCED,
+//            not chased: "legN DOWN: no device heartbeat for 5 s ... the
+//            DAC may be sawing stale audio ... restart the engine" on
+//            transition + every 60 s, and "legN alive" when a heartbeat
+//            returns (the trim's resync lands it). Measure-only -- the
+//            no-rescue policy stands. (5) The meters: raw1/raw2 are now
+//            the cursor lags (the backlog IS the lag); 'evict' counts the
+//            trim/resync skips; 'short' counts the holds. The trimmed
+//            code: the Ring struct, pushSilence, seqTail, the two-mechanism
+//            servo, the quiet-window bite arming, the deferred reopen
+//            landing, the start trim, the Sleep(30) fill and the start
+//            align -- the transport is one buffer, one write path, per-leg
+//            cursors, one corrector. NO new ini key, NO UI row.
 //    v8.5.6 THE DOUBLE STATE (field-directed: "do the fastest eq compute
 //            whilst also aiming for highest quality output", with "I don't
 //            want any simd -- simd's already in compilation anyway"). THE
@@ -2653,7 +2710,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.6"
+#define TWS_VERSION "8.6.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2772,18 +2829,25 @@ static constexpr unsigned kSampleRate    = 48000;
 // corrector ... it's probably causing the crackling") -- CONFIRMED: the
 // nudges chased the two rings' capture-burst PHASE jitter (several ms of
 // zero-drift wander) past a 0.25 ms dead-band, ten skips a second.
-// kSyncNudgeMs survives as the servo's LOOK window only.
+// v8.6.0: the trim keeps the bite-only discipline -- rate-limited,
+// dead-banded, and now sample-aligned (see the drift corrector).
 // v8.4.11/8.4.16 THE WARDEN BITE, BITE-ONLY (the old version's drift
 // correction, from the shipped ini: drift_correct_ms = 5,
 // drift_interval_ms = 2000): past 5 ms of ACCUMULATED drift a leg takes
 // a 240-frame bite (drop or held-sample pad) at most once per 2 s -- no
 // nudge beneath it, so a correction is a rare 5 ms event, not ten skips
 // a second; between bites the offset rides at most ~5 ms of true drift.
-static constexpr unsigned kSyncNudgeMs    = 100;    // the depth guard's look window (one look per 100 ms)
-static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.20: the servo's startup hush past the last (re)open
-static constexpr int      kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be the reference
-static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
-static constexpr unsigned kDriftIntervalMs = 2000; // (the shipped ini's drift_interval_ms)
+static constexpr unsigned kSyncSettleMs   = 2000;   // the trim's startup hush past the last (re)open
+static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz -- the dead-band AND the bite size
+static constexpr unsigned kDriftIntervalMs = 2000; // one correction per 2 s, max
+// v8.6.0 THE WINDOW: the shared cushion -- every leg's cursor distance from
+// the head is delay_i + this, sized above every leg's device-buffer anchor
+// (384 fr on a KS leg) so a healthy leg never starves; the inter-leg sync
+// falls out BY CONSTRUCTION (all boundaries sit delay_i + cushion behind
+// the same head). kWindowSearchFr: the sample-aligned landing's search
+// half-window (the drift corrector's +-2.5 ms splice-match span).
+static constexpr long long kWindowCushionFr = 576;   // 12 ms @ 48 kHz
+static constexpr long long kWindowSearchFr  = 120;   // +-2.5 ms around the required landing
 // v8.4.12/8.4.17/8.4.18 THE DEPTH GUARD: ring depth must have an owner. A
 // shared-mode capture burst (audiodg under load: OBS, a game) permanently
 // added its size to EVERY ring, ratchet by ratchet (the field's raw creep
@@ -3054,40 +3118,42 @@ static void armChime(bool force) {
     g_chimeSel.store(0, std::memory_order_release);
 }
 
-// ------------------------------------------------------------- SPSC ring ----
-struct Ring {
-    std::vector<float>     buf;
+// ------------------------------------------- v8.6.0 THE SHARED WINDOW ------
+// ONE broadcast buffer replaces the per-leg SPSC rings: the capture writes
+// at head; every leg reads at its OWN cursor. No per-leg copies (one memcpy
+// per capture burst instead of four), no evictions, no depth machinery --
+// the cursor's distance from head IS the backlog, and the drift corrector
+// (the cursor trim, in bufferSwitchFill) is the only thing that moves it.
+// A leg that stalls simply stops advancing its cursor while head advances;
+// when it resumes (or is reopened), the trim lands it back at its target
+// with a sample-aligned skip -- nothing to clean up, no ring to un-pin.
+// Thread discipline: head is written by the capture callback ONLY (release
+// after the data lands); each cursor is written by ITS leg's device thread
+// ONLY. A reader verifies head >= cursor + n before touching the data
+// (acquire), so the writer's regions are always disjoint from a live
+// reader's -- and a reader that fell further behind than the window
+// resyncs instead of reading overwritten bytes. The writer NEVER blocks.
+struct Window {
+    std::vector<float>     buf;                    // 8ch interleaved, zero-filled
     size_t                 cap = 0, mask = 0, stride = 0;
-    std::atomic<unsigned long long> head{0}, tail{0};
-    // v6.4 frame-interval ledger: seqTail is this ring's stream position in
-    // CAPTURE-sequence space (which capture frame the boundary sits at).
-    // Advanced by every consumer of real frames (pops, drops, skips) with
-    // the same monotonic CAS discipline as tail; NEVER by replays or pads.
-    std::atomic<unsigned long long> seqTail{0};
+    std::atomic<unsigned long long> head{0};       // absolute frames written
 
-    void init(size_t frames, size_t channels) {
+    void init(size_t frames, size_t channels, unsigned long long headStart) {
         stride = channels;
         size_t c = 256; while (c < frames) c <<= 1;
+        // The buffer opens ZERO-FILLED: the virtual region [0, headStart) is
+        // THE DELAY PREFILL -- bit-exact silence, no pushSilence anywhere.
         buf.assign(c * stride, 0.0f);
         cap = c; mask = c - 1;
-        head.store(0); tail.store(0);
-        // v7.0.1: the ledger re-arms with the ring on EVERY engine start -- a
-        // stale seqTail carried the previous run's leftover and moved the 120
-        // bpm tick's flam differently on every APPLY + RESTART.
-        seqTail.store(0, std::memory_order_release);
+        head.store(headStart, std::memory_order_release);
     }
-    size_t count() const {
-        return (size_t)(head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire));
-    }
-    // producer: append n frames; if full, drop the oldest (amount returned).
-    // v6.5: ONE wrap-aware bulk memcpy (two at the seam) instead of per-frame
-    // copies -- same bytes, same head/tail evolution (harness-proven).
-    size_t pushOverwrite(const float* src, size_t n) {
+    // producer (the capture callback, single writer): append n frames.
+    // Never blocks, never evicts per-reader: the oldest region is simply
+    // overwritten; a reader too far behind resyncs (bufferSwitchFill's
+    // forced-resync rule) instead of reading stale bytes.
+    void push(const float* src, size_t n) {
         const unsigned long long h = head.load(std::memory_order_relaxed);
-        const unsigned long long t = tail.load(std::memory_order_acquire);
-        const size_t used = (size_t)(h - t);
         if (n > cap) { src += (n - cap) * stride; n = cap; }
-        if (used + n > cap) tailAdvance(h + n - cap);
         const size_t off = ((size_t)h & mask) * stride;
         const size_t cnt = n * stride;
         if (off + cnt <= cap * stride) {
@@ -3098,76 +3164,29 @@ struct Ring {
             memcpy(&buf[0], src + a, (cnt - a) * sizeof(float));
         }
         head.store(h + n, std::memory_order_release);
-        return (used + n > cap) ? (used + n - cap) : 0;
     }
-    // v6.0: forward-only tail advance. The consumer (pop/discardOldest) and
-    // the producer's overwrite path BOTH advance tail; a plain store can
-    // regress it when the two race (a regressed tail = phantom frames =
-    // garbage audio). The CAS loop makes every advance strictly monotonic.
-    void tailAdvance(unsigned long long want) {
-        unsigned long long cur = tail.load(std::memory_order_relaxed);
-        while (cur < want) {
-            if (tail.compare_exchange_weak(cur, want, std::memory_order_release,
-                                           std::memory_order_relaxed)) break;
+    // consumer-side bulk read (each leg's device thread, single owner of its
+    // cursor): copy [cursor, cursor + n) into dst -- two memcpys at the wrap
+    // seam. The caller has verified head >= cursor + n and that the cursor
+    // is not beyond the window (the trim's forced-resync rule).
+    void read(float* dst, unsigned long long cursor, size_t n) const {
+        const size_t off = ((size_t)cursor & mask) * stride;
+        const size_t cnt = n * stride;
+        if (off + cnt <= cap * stride) {
+            memcpy(dst, &buf[off], cnt * sizeof(float));
+        } else {
+            const size_t a = cap * stride - off;
+            memcpy(dst, &buf[off], a * sizeof(float));
+            memcpy(dst + a, &buf[0], (cnt - a) * sizeof(float));
         }
     }
-    // v6.4: same monotonic discipline for the stream-position counter -- the
-    // pump's pops and producer-side overwrites can race on it exactly like
-    // on tail.
-    void seqTailAdvance(unsigned long long want) {
-        unsigned long long cur = seqTail.load(std::memory_order_relaxed);
-        while (cur < want) {
-            if (seqTail.compare_exchange_weak(cur, want, std::memory_order_release,
-                                              std::memory_order_relaxed)) break;
-        }
-    }
-    // consumer: pop up to n frames, returns how many. v6.5: bulk copy,
-    // two memcpys at the wrap seam (see pushOverwrite).
-    size_t pop(float* dst, size_t n) {
-        const unsigned long long t = tail.load(std::memory_order_relaxed);
-        const unsigned long long h = head.load(std::memory_order_acquire);
-        size_t avail = (size_t)(h - t);
-        if (n > avail) n = avail;
-        if (n) {
-            const size_t off = ((size_t)t & mask) * stride;
-            const size_t cnt = n * stride;
-            if (off + cnt <= cap * stride) {
-                memcpy(dst, &buf[off], cnt * sizeof(float));
-            } else {
-                const size_t a = cap * stride - off;
-                memcpy(dst, &buf[off], a * sizeof(float));
-                memcpy(dst + a, &buf[0], (cnt - a) * sizeof(float));
-            }
-            tailAdvance(t + n);
-        }
-        return n;
-    }
-    // v6.0 consumer-side discard of the OLDEST n frames (gated excess drop).
-    // Same thread discipline as pop() -- call from the playback callback only.
-    size_t discardOldest(size_t n) {
-        const unsigned long long t = tail.load(std::memory_order_relaxed);
-        const unsigned long long h = head.load(std::memory_order_acquire);
-        const size_t avail = (size_t)(h - t);
-        if (n > avail) n = avail;
-        if (n) {
-            tailAdvance(t + n);
-            seqTailAdvance(seqTail.load(std::memory_order_relaxed) + n);   // v6.4
-        }
-        return n;
-    }
-    // v6.5: bulk prefill in chunks -- a chunk must NEVER exceed cap:
-    // pushOverwrite clamps n > cap by dropping from src, which would
-    // silently lose the overshoot (the harness caught exactly that).
-    void pushSilence(size_t n) {
-        static const float z[kInCh * 512] = { 0 };
-        const size_t chunkMax = cap < 512 ? cap : 512;
-        while (n) {
-            const size_t chunk = n < chunkMax ? n : chunkMax;
-            pushOverwrite(z, chunk);
-            n -= chunk;
-        }
+    // one sample of one channel at an absolute frame position (the drift
+    // corrector's splice-match reads).
+    float at(unsigned long long pos, size_t ch) const {
+        return buf[((size_t)pos & mask) * stride + ch];
     }
 };
+static Window g_win;
 
 // ------------------------------------------------- v6.3 WDM-KS output -------
 // One KS output leg. KS replaces ONLY the device layer -- pumps, rings,
@@ -3221,11 +3240,15 @@ struct Leg {
     int                 outCh = kOutCh1;         // 6 for mains, 2 for center/rears
     // v8.4.0: an OPTIONAL leg (rear, output_device3/4 empty) -- set once on
     // the main thread at boot BEFORE any device thread exists; every loop
-    // that walks the legs skips a disabled one (no ring, no device, no
+    // that walks the legs skips a disabled one (no cursor, no device, no
     // watchdog, no yield -- nothing to do).
     bool                disabled = false;
     bool                zeroFast = false;        // v6.6.9: bit-zero blocks skip the mix (start-frozen gate)
-    Ring                raw;                     // 8ch: capture cb -> the buffer switch (v8.1.0)
+    // v8.6.0 THE WINDOW: the leg's read position in the shared broadcast
+    // buffer (absolute capture frames). Single owner = this leg's device
+    // thread; the drift corrector moves it, nothing else does. The old
+    // per-leg Ring is GONE -- the window is shared, the cursor is private.
+    std::atomic<unsigned long long> cursor{0};
     std::vector<float>  scratch;                 // switch-private 8ch work buffer (v8.1.0)
     // v6.0 replay state -- v8.1.0: the replay itself is GONE; lastBlock
     // survives ONLY as the KS lapse guard's re-prime source (the last played
@@ -3239,7 +3262,7 @@ struct Leg {
     bool                isExclusive = false;
     std::string         name;
 
-    std::atomic<unsigned long long> rawDrop{0}, und{0};   // v8.1.0: passive evictions / short switches
+    std::atomic<unsigned long long> rawDrop{0}, und{0};   // v8.6.0: frames the trim/resync skipped / short switches
     // v6.0 clock telemetry: captured = frames the cable delivered (cable
     // clock); popped = frames the playback callback consumed (device clock).
     // The 1 s health loop turns the pair into the measured offset ("off").
@@ -3252,62 +3275,26 @@ struct Leg {
     // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
     // negotiated period -- 192 fr = 4.0 ms on the field's WASAPI legs, 768
     // fr on a KS leg) -- the sound card's own pre-load and the floor the
-    // pipeline physically allows. Set once at ring init, on the main
-    // thread, before any device thread exists. The guard holds the ring at
-    // delayFrames + anchorFrames; margin 0 is the DAC reading silence.
+    // pipeline physically allows. Set once at start, on the main thread,
+    // before any device thread exists. The shared window cushion (v8.6.0)
+    // is sized above every leg's anchor; margin 0 is the DAC reading
+    // silence.
     size_t              anchorFrames = 0;
-    // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
-    // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
-    // mains are the anchor the ears calibrate against). Leg1's own ring
-    // depth is owned by masterDepthGuard; each slave's boundary is synced
-    // to leg1's by syncToFirst (the delay-neutral metric: every leg
-    // subtracts its own delay). No baseline exists (v8.4.13: the settled
-    // latch was an acceptance path), no re-latch (v8.4.12), bite-only
-    // (v8.4.16). Written by this leg's device thread ONLY (the
-    // masterDepthGuard / syncToFirst call inside its buffer switch);
-    // lastSyncMs rate-limits the look; syncDrops/syncPads and depthDrops
-    // count the bites (logged rate-limited, per-run like the ledger
-    // clocks).
-    unsigned long long     lastSyncMs    = 0;
+    // ---- v8.6.0 THE DRIFT CORRECTOR STATE (per leg, no key, no UI).
+    // One mechanism for every leg: the cursor's distance from the window's
+    // head is held at delay_i + the shared cushion; the inter-leg sync
+    // falls out BY CONSTRUCTION. lastBiteMs rate-limits a correction to
+    // one per 2 s; syncDrops/syncPads count them; lastSyncLogMs
+    // rate-limits the ledger lines. Written by this leg's device thread
+    // ONLY (the trim inside its buffer switch).
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
     unsigned long long     lastSyncLogMs = 0;
-    // v8.4.11/8.4.16/8.4.17: the warden bite state (this leg's device
-    // thread only, the same single-writer discipline). lastBiteMs
-    // rate-limits the 240-frame bite to one per 2 s (LATE drop and EARLY
-    // pad share it -- a leg never takes both in one window);
-    // wardenDrops/wardenPads count the bites, depthDrops counts the
-    // dropped frames.
     unsigned long long     lastBiteMs    = 0;
-    unsigned long long     wardenDrops   = 0;
-    unsigned long long     wardenPads    = 0;
-    unsigned long long     depthDrops    = 0;
-    // v8.4.21 QUIET-WINDOW DRIFT CORRECTION: the LATE bite is ARMED here
-    // (biteDue = the frames to drop, by the guard or the servo) and
-    // EXECUTED by the switch loop inside a digital-silence window -- a
-    // skip inside silence is bit-silent and cannot click. biteForced is
-    // the valve: past 10 ms of accumulated drift the drop executes
-    // regardless (10 ms of desync is worse than one gentle skip per
-    // hours). Consumed + cleared by the switch loop.
-    size_t                 biteDue       = 0;
-    bool                   biteForced    = false;
-    // v8.4.19 THE PAD BUDGET: one EARLY bite = 240 frames of boundary stall,
-    // delivered across consecutive switches (each capped at frameCount-1 by
-    // the hold-region clamp). Set by the guard once per 2 s; consumed by
-    // bufferSwitchFill as each pad lands. At the field's 48-frame WASAPI
-    // callbacks a single-pad bite refilled only ~47 frames -- the
-    // Realtek-vs-cable sink cancelled it exactly and the ring sank under
-    // its own prefill (the field's "reading 60 ms as the baseline" + the
-    // crackle). 240 fr per 2 s = 5 ms/s of refill, five times the sink.
+    // v8.4.19 THE PAD BUDGET (kept: the EARLY bite delivers its 240 frames
+    // across consecutive switches -- each capped at frameCount-1 by the
+    // hold-region clamp; 5 ms/s of refill).
     size_t                 padBudget     = 0;
-    // v8.4.14 THE DEFERRED REOPEN LANDING: set by tryRestartLeg (the health
-    // thread, BEFORE the new device thread exists -- the write happens-
-    // before the thread creation, and the old thread is already joined);
-    // consumed and cleared by that new device thread at its FIRST buffer
-    // switch, where landReopenedRing discards the refill-bloated backlog
-    // with the first pop one instant away. Plain bool: one writer before
-    // the thread, one reader after.
-    bool                   relandPending = false;
     // ---- v7.9.0 SPIN PACER telemetry (device-thread owned) -----------------
     // The playback callback IS the deadline: the exclusive buffer holds two
     // periods and the event fires with one period left to play, so a switch
@@ -3330,16 +3317,10 @@ struct Leg {
     // path that can open a device after boot.
     std::atomic<bool>   yielded{false};
     // ---- v6.4 DRIFT WARDEN: frame-interval ledger (v8.1.0: MEASUREMENT ONLY) --
-    // The RAW ring's seqTail IS this leg's stream position (the capture
-    // sequence of its play boundary). Pops and passive evictions advance it;
-    // silence prefills do not. The two legs' difference = the measured
-    // inter-speaker offset. The buffer switch owns the boundary, the health
-    // loop owns the baseline -- corrections are GONE (v8.1.0). v8.4.7: the
-    // INTER-LEG sync returns as a slow servo on this same boundary (see
-    // syncToFirst -- out2/3/4 hold their settled offset to leg1, 16 frames
-    // at a time (v8.4.9), no key, no UI); the cable clock itself stays
-    // measure-only.
-    size_t              prefillRemaining = 0;        // delay prefill: carries no sequence
+    // v8.6.0: the leg's CURSOR is its stream position (the absolute capture
+    // frame at its play boundary, inside the shared window). The two legs'
+    // cursor difference = the measured inter-speaker offset; the trim holds
+    // every cursor at delay_i + the shared cushion behind the same head.
     std::atomic<double> lagMs{0.0};                  // age of the newest played frame (ms)
     // v7.1.5 START ALIGN: the QPC microsecond stamp of this leg's FIRST buffer
     // switch of the run -- the moment THIS device began eating its ring. The
@@ -3856,131 +3837,68 @@ static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCo
     boostDeviceThread();                                          // v4.0 MMCSS
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
-    for (int i = 0; i < 4; ++i) {
-        // v8.4.0: a disabled rear leg owns no ring (pushOverwrite on an
-        // uninit ring would be UB) -- empty device = nothing to feed.
-        if (g_leg[i].disabled) continue;
-        size_t dropped = g_leg[i].raw.pushOverwrite(in, frameCount);
-        if (dropped) {
-            g_leg[i].rawDrop.fetch_add(dropped);
-            // v6.4: an overwrite silently consumed the oldest frames -- their
-            // sequence numbers are skipped with them (the stream is now that
-            // much fresher; the ledger must see the same skip).
-            g_leg[i].raw.seqTailAdvance(g_leg[i].raw.seqTail.load(std::memory_order_relaxed)
-                                        + dropped);
-        }
+    // v8.6.0 THE WINDOW: ONE write -- the capture lands in the shared
+    // broadcast buffer and every leg reads it at its own cursor. (The old
+    // fan-out memcpy'd every burst into four private rings.)
+    g_win.push(in, frameCount);
+    for (int i = 0; i < 4; ++i)
         g_leg[i].captured.fetch_add(frameCount, std::memory_order_relaxed); // v6.0 off-meter (cable clock)
+    // v8.4.25 THE PROOF METER: the peak |ch3| of the RAW capture, measured
+    // before volume and before any mask -- the level the cable actually
+    // carries, untouched by anything twinspeak does to it. (v8.6.0: moved
+    // here from the per-leg pop path -- one measurement per burst.)
+    float pk = g_ch3InPeak.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < frameCount; ++i) {
+        const float a = fabsf(in[i * kInCh + 2]);
+        if (a > pk) pk = a;
     }
+    g_ch3InPeak.store(pk, std::memory_order_relaxed);
 }
 
-// ------------------------------------------------- v8.4.20 the two halves ---
-// v8.4.20 THE REFERENCE IS LEG1 AGAIN (field-directed: "I would just go
-// back to having the cable clock be leg1, because I think the mains are
-// the better choice of matter anyway ... you're syncing against an
-// existing hardware device's clock (which has this crystal built inside it
-// anyway)"). The v8.4.17 cable-clock pinning is REVERTED: the CABLE's
-// shared-mode "clock" is audiodg's soft mix schedule -- no crystal, all
-// jitter -- while LEG1 is an existing hardware device with a real crystal
-// inside it, and the mains are the anchor the user's ears calibrate
-// against. The two-mechanism split returns, carrying every lesson since:
-// (1) masterDepthGuard, below -- LEG1's own ring depth (bloat + the
-// mains' own drift), which no difference metric can see; (2) syncToFirst,
-// below that -- the cross-leg servo for the slaves, sync to LEG1's
-// boundary with v8.4.15's delay-neutral metric standing (each leg
-// subtracts its own delay: err = (depth2 - delay2) - (depth1 - delay1),
-// so a delay on any leg can never drag the others). The v8.4.13+ rules
-// all stand: BITE-ONLY (the 16-frame nudge chased the two rings'
-// capture-burst phase jitter ten skips a second -- THE CRACKLE), NO
-// BASELINE (the error is the measured offset; nothing is ever blessed),
-// NO RE-LATCH (a jump is ground back like any other error), THE PAD
-// BUDGET (the EARLY bite delivers 240 frames of stall across consecutive
-// switches -- five times the measured Realtek-vs-cable sink), THE
-// DEFERRED LANDING and the device-buffer floor anchor (v8.4.18).
-static size_t masterDepthGuard(Leg& L, size_t frameCount)
+// ------------------------------------------------ v8.6.0 THE DRIFT CORRECTOR
+// ONE mechanism for every leg, replacing the two-mechanism split (v8.4.20's
+// masterDepthGuard + syncToFirst) and carrying every lesson since v8.4.13:
+// the cursor's distance from the window's head is held at target_i =
+// delay_i + the shared cushion (>= every leg's device-buffer anchor), so
+// the inter-leg sync falls out BY CONSTRUCTION -- every boundary sits
+// delay_i + cushion behind the same head, and a delay on any leg can never
+// drag the others (the v8.4.15 delay-neutral property, structural now).
+// BITE-ONLY (v8.4.16: rate-limited, dead-banded -- the nudge that chased
+// burst-phase jitter ten skips a second stays retired), NO BASELINE
+// (v8.4.13: the error is the measured lag), NO RE-LATCH (v8.4.12).
+// THE PERFECT SAMPLE SPOT (field-directed: "a drift corrector that finds
+// the perfect sample spot in the frame ... so you land at a position where
+// a future peak or valley is the same speed as in the current one,
+// preventing any crackling whatsoever"): a LATE skip no longer waits for a
+// quiet window (v8.4.21's valve is obsolete) -- the trim SEARCHES
+// +-kWindowSearchFr around the required landing for the position where the
+// waveform CONTINUES: the incoming frame's value AND slope matched against
+// the outgoing frame on the leg's own channels. A future peak or valley
+// continues at the same speed -- the splice cannot crackle. On silent
+// content every candidate ties and the FULL excess lands in one bite; on
+// live content the search lands on the best match. The EARLY side pads: a
+// held sample, never a hole (the shortfall hold too -- v8.1.0's
+// silence-hole is retired with the rings). Returns the pad frames this
+// switch must hold (0, or up to kDriftCorrectFr).
+// The splice-match listens to each leg's OWN played channels (the mix is
+// linear in them, so matching the inputs matches the output).
+static const int          kLegSyncCh[3]  = { 2, 1, 4 };
+static const size_t       kLegSyncMap[3][4] = {
+    { 0, 1, 0, 0 },    // leg1: ch1 ch2
+    { 2, 0, 0, 0 },    // leg2: ch3
+    { 4, 5, 6, 7 },    // leg3: ch5 ch6 ch7 ch8
+};
+static size_t windowTrim(int idx, Leg& L, size_t frameCount)
 {
+    const unsigned long long h = g_win.head.load(std::memory_order_acquire);
+    const unsigned long long c = L.cursor.load(std::memory_order_relaxed);
+    const long long lag = (long long)(h - c);
+    const long long target = (long long)L.delayFrames + kWindowCushionFr;
+    const long long err = lag - target;   // + = reads too-old (skip); - = too-fresh (pad)
     const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
-    L.lastSyncMs = nowMs;
-    const long long over = (long long)L.raw.count()
-                         - (long long)L.delayFrames     // the real backlog above the leg's own delay
-                         - (long long)L.anchorFrames;   // v8.4.18: the leg's own device-buffer floor
-    if (over >= (long long)kDriftCorrectFr) {           // LATE: the warden bite -- ARMED, executed quiet
-        // v8.4.21 QUIET-WINDOW EXECUTION: the drop is armed here and lands
-        // inside a digital-silence window in the switch loop (see
-        // bufferSwitchFill) -- a skip inside silence is bit-silent and
-        // cannot click. The valve: past 10 ms of accumulated drift the
-        // bite executes regardless (10 ms of desync is worse than one
-        // gentle skip per hours).
-        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            L.biteDue    = (size_t)kDriftCorrectFr;
-            L.biteForced = (over >= (long long)(2 * kDriftCorrectFr));
-            L.lastBiteMs = nowMs;
-        }
-        return 0;
-    }
-    if (over <= 0) {                                    // EARLY: at/below the device-buffer floor
-        // v8.4.19 THE PAD BUDGET: one bite = 240 frames of boundary stall,
-        // delivered across consecutive switches (each capped at
-        // frameCount-1 by the hold-region clamp). At the field's 48-frame
-        // WASAPI callbacks a single-pad-per-2-s refills only ~47 frames --
-        // five times weaker than the sink the budget now overpowers. The
-        // pad is NOT deferred: a held sample cannot click, and it is the
-        // anti-starvation tool.
-        if (L.padBudget == 0 && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            L.padBudget = (size_t)kDriftCorrectFr;
-            L.wardenPads++;
-            if (nowMs - L.lastSyncLogMs >= 10000) {
-                L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] depth out1    : ring %lld fr under its anchor -- the guard armed a %d-frame pad\n"
-                     "                            budget (%llu total; the stall is delivered across the next\n"
-                     "                            switches -- a held sample, never a hole)\n",
-                     over, kDriftCorrectFr, (unsigned long long)L.wardenPads);
-            }
-        }
-        if (L.padBudget && frameCount >= 2) {
-            const size_t pad = (frameCount - 1 < L.padBudget)
-                             ? (frameCount - 1) : L.padBudget;
-            return pad;
-        }
-        return 0;
-    }
-    return 0;                                           // inside the bite dead-band: hold
-}
-
-// v8.4.20 THE CROSS-LEG SERVO, RESTORED (the v8.4.7-8.4.16 lineage, carrying
-// every lesson since): out2/out3 sync their UNDELAYED boundaries to LEG1's
-// -- the first device is the master and the reference again, its own ring
-// depth owned by masterDepthGuard above. The metric is v8.4.15's
-// delay-neutral difference (each leg subtracts its own delay), the
-// corrections are v8.4.16's BITE-ONLY warden bites, the error is v8.4.13's
-// no-baseline measured offset, the EARLY side spends v8.4.19's PAD BUDGET,
-// and no re-latch exists anywhere (v8.4.12). A yielded or heart-silent
-// leg1 freezes the sync whole (a parked leg's ring still evicts, and
-// eviction jitter is not a clock to follow). Returns the number of pad
-// frames the switch must synthesize (0, or up to kDriftCorrectFr, clamped
-// under the block). No ini key, no UI row: the constants are the engine's
-// truth.
-static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
-{
-    const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
-    L.lastSyncMs = nowMs;
-    // leg1 must be ALIVE as a reference: not yielded, its device callback
-    // heartbeating. Otherwise freeze (nudge nothing).
-    if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
-    if (nowMs - hbOutGet(0) > kSyncRefDeadMs) return 0;
-    // v8.4.15 THE DELAY-NEUTRAL METRIC: each seqTail is shifted forward by
-    // its own delay -- err = (depth2 - delay2) - (depth1 - delay1), the
-    // backlogs ABOVE each leg's configured delay. The user's prefill is
-    // untouched and a delay on any leg can never drag the others.
-    const long long off =
-        (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
-                    + (long long)g_leg[0].delayFrames)
-        - (long long)(L.raw.seqTail.load(std::memory_order_relaxed)
-                      + (long long)L.delayFrames);
-    // settle: the pure startup hush -- the prefills and the start-align
-    // pads are through before the first correction (the prefill phase
-    // makes the raw difference meaningless; 2 s covers any delay).
+    // settle: the startup hush. The window opens with the lag AT target
+    // (the cursors are placed there), so this only hushes device-start
+    // jitter; 2 s covers any delay.
     const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
     if (fsUs == 0 || nowMs - L.lastReopenMs < kSyncSettleMs) return 0;
     LARGE_INTEGER fsw;
@@ -3988,46 +3906,89 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
     const unsigned long long nowUs =
         (unsigned long long)((double)fsw.QuadPart * 1e6 / g_qpf);
     if (nowUs - fsUs < (unsigned long long)kSyncSettleMs * 1000ull) return 0;
-    // v8.4.13: NO BASELINE -- the error IS the measured offset.
-    const long long err = off;   // + = this leg is LATE vs leg1
-    // v8.4.16 BITE-ONLY: the 16-frame nudge chased the two rings'
-    // capture-burst phase jitter ten skips a second -- THE CRACKLE. A
-    // correction is a 240-frame warden bite, at most one per 2 s, taken
-    // only when the drift has actually accumulated past 5 ms. v8.4.12: NO
-    // RE-LATCH anywhere -- a jump is ground back like any other error.
-    if (err >= (long long)kDriftCorrectFr) {            // LATE: the warden bite -- ARMED, executed quiet
-        // v8.4.21 QUIET-WINDOW EXECUTION (see bufferSwitchFill): the drop
-        // lands inside a digital-silence window and cannot click. The
-        // valve: past 10 ms of accumulated drift it executes regardless.
-        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            L.biteDue    = (size_t)kDriftCorrectFr;
-            L.biteForced = (err >= (long long)(2 * kDriftCorrectFr));
-            L.lastBiteMs = nowMs;
+
+    // v8.6.0 THE FORCED RESYNC: the cursor fell beyond the window (the
+    // device stalled, died, or was reopened -- landReopenedRing's old job).
+    // The data it wanted is overwritten; jump to the target, count it, move
+    // on. The next switch plays fresh content; the trim holds it there.
+    if (lag > (long long)(g_win.cap - (size_t)frameCount - 64)) {
+        const long long jump = lag - target;
+        if (jump > 0) {
+            L.cursor.store(c + (unsigned long long)jump, std::memory_order_relaxed);
+            L.rawDrop.fetch_add((unsigned long long)jump, std::memory_order_relaxed);
+            L.syncDrops++;
+            tlog("[twinspeak] resync out%d   : the cursor fell %lld fr behind the window -- jumped to the\n"
+                 "                            target (forced resync; the frames it wanted are overwritten)\n",
+                 idx + 1, lag);
         }
         return 0;
     }
-    if (err <= -(long long)kDriftCorrectFr) {           // EARLY: the pad budget (held samples)
-        if (L.padBudget == 0 && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
-            L.padBudget = (size_t)kDriftCorrectFr;
-            L.wardenPads++;
+
+    if (err >= (long long)kDriftCorrectFr) {            // LATE: the sample-aligned skip
+        if (nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            L.lastBiteMs = nowMs;
+            long long lo = err - kWindowSearchFr, hi = err + kWindowSearchFr;
+            if (lo < (long long)kDriftCorrectFr) lo = kDriftCorrectFr;
+            if (hi > lag - (long long)frameCount) hi = lag - (long long)frameCount;   // published data only
+            if (hi < lo) hi = lo;
+            long long best = lo;
+            double bestCost = -1.0;
+            // the splice-match: the outgoing boundary frame (c-1) and its
+            // slope, against each candidate landing (c+k) and its slope --
+            // on the leg's own channels. c >= 2 is guaranteed at runtime
+            // (the cursor starts at H0 - target >= 0 and only moves
+            // forward; the boot hush covers the first frames).
+            const bool canMatch = (c >= 2);
+            for (long long k = lo; canMatch && k <= hi; ++k) {
+                double cost = 0.0;
+                for (int chi = 0; chi < kLegSyncCh[idx]; ++chi) {
+                    const size_t base = kLegSyncMap[idx][chi];
+                    const float  outV = g_win.at(c - 1, base);
+                    const float  inV  = g_win.at(c + (unsigned long long)k, base);
+                    const float  outS = outV - g_win.at(c - 2, base);
+                    const float  inS  = inV - g_win.at(c + (unsigned long long)k - 1, base);
+                    const double dv = (double)(inV - outV);
+                    const double ds = (double)(inS - outS);
+                    cost += dv * dv + ds * ds;
+                }
+                if (bestCost < 0.0 || cost < bestCost) { bestCost = cost; best = k; }
+                if (bestCost == 0.0) break;   // an exact tie (silence): stop early
+            }
+            if (!canMatch) best = err;
+            L.cursor.store(c + (unsigned long long)best, std::memory_order_relaxed);
+            L.syncDrops++;
+            L.rawDrop.fetch_add((unsigned long long)best, std::memory_order_relaxed);
             if (nowMs - L.lastSyncLogMs >= 10000) {
                 L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] sync out%d     : %lld fr early vs out1 -- the guard armed a %d-frame pad\n"
-                     "                            budget (%llu total; the stall is delivered across the next\n"
-                     "                            switches -- a held sample, never a hole)\n",
-                     idx + 1, err, kDriftCorrectFr, (unsigned long long)L.wardenPads);
+                tlog("[twinspeak] trim out%d    : %lld fr behind -- skipped %lld fr at the sample-aligned\n"
+                     "                            landing (%llu skip(s) total; value+slope matched, no crackle)\n",
+                     idx + 1, err, best, (unsigned long long)L.syncDrops);
+            }
+        }
+        return 0;
+    }
+    if (err <= -(long long)kDriftCorrectFr) {           // EARLY: the held-frame pad
+        if (L.padBudget == 0 && nowMs - L.lastBiteMs >= kDriftIntervalMs) {
+            L.padBudget = (size_t)kDriftCorrectFr;
+            L.syncPads++;
+            if (nowMs - L.lastSyncLogMs >= 10000) {
+                L.lastSyncLogMs = nowMs;
+                tlog("[twinspeak] trim out%d    : %lld fr ahead of the head target -- pad budget %d fr armed\n"
+                     "                            (%llu pad bite(s) total; a held sample, never a hole)\n",
+                     idx + 1, err, kDriftCorrectFr, (unsigned long long)L.syncPads);
             }
         }
         if (L.padBudget && frameCount >= 2) {
             // clamp under the block: the pad region must repeat a REAL mixed
-            // frame (holdSrc = the last popped frame), never read past it.
+            // frame (the hold source = the last popped frame), never read
+            // past it.
             const size_t pad = (frameCount - 1 < L.padBudget)
                              ? (frameCount - 1) : L.padBudget;
             return pad;
         }
         return 0;
     }
-    return 0;                                           // below the bite threshold: hold
+    return 0;                                           // inside the dead-band: hold
 }
 
 // v8.1.0 forward declarations: the stripped switch sits at the TOP of the
@@ -4039,18 +4000,18 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
-static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
 
-// v8.1.0 playback core -- THE STRIPPED SWITCH, bit-exact, ONE code path for
+// v8.6.0 playback core -- THE WINDOW SWITCH, bit-exact, ONE code path for
 // both backends (WASAPI callback and KS pacing thread both land here):
-// pop the leg's raw fan-out ring DIRECTLY (the pumps and the out rings are
-// GONE), mix INLINE, and play SILENCE for any shortfall -- no replay tile,
-// no miss history, no escalation, no hold-off, no gated drops. The DAC hears
-// exactly what capture delivered, at the depth delay_ms set. A short switch
-// counts into 'und'; capture excess evicts oldest at the raw cap
-// (capCallback's pushOverwrite, ledger-true). frameCount = the REAL device
-// bite (period or KS bite).
+// read the leg's block from the SHARED WINDOW at its own cursor (the
+// per-leg rings and their fans-out are GONE), run the drift corrector, mix
+// INLINE, and HOLD the last played frame for any shortfall -- no silence
+// hole, no replay tile, no miss history, no escalation, no eviction. The
+// DAC hears exactly what capture delivered, at the distance delay_ms set
+// behind the live edge. A short switch holds and counts into 'und'; a lag
+// beyond the window resyncs; the trim's skips are sample-aligned.
+// frameCount = the REAL device bite (period or KS bite).
 static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     Leg& L = g_leg[idx];
     // v7.0.0: the STOP GAP. APPLY + RESTART (and STOP) silences the legs
@@ -4060,15 +4021,6 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     if (g_stopSilence.load(std::memory_order_relaxed)) {
         if (frameCount) memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
         return;
-    }
-    // v8.4.14 THE DEFERRED REOPEN LANDING: a reopened leg's NEW device
-    // thread trims its ring HERE, at its first switch -- the discard and
-    // the first pop are one instant apart, so the capture cannot refill
-    // the vacuum the way it did when the landing ran at reopen time (the
-    // field's "second ding raised raw2 to 43"). See landReopenedRing.
-    if (L.relandPending) {
-        L.relandPending = false;
-        landReopenedRing(idx);
     }
     // v7.1.5 START ALIGN: stamp the FIRST switch of this run before the pop
     // counter moves (release store, then the relaxed fetch_add -- the start
@@ -4083,32 +4035,21 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     }
     L.popped.fetch_add((unsigned long long)frameCount, std::memory_order_relaxed);    // device clock
 
-    // ---- the switch: raw -> master volume -> gates -> mix -> out, INLINE ---
-    // The hole default is silence; whatever raw holds lands on top of it.
-    // The universal keep-alive sums AFTER this at the device layer (v8.4.5),
-    // so even a starved leg keeps its wobble through a gap.
+    // ---- the switch: window -> master volume -> gates -> mix -> out, INLINE ---
+    // The hold default is the last played frame; whatever the window
+    // delivers lands on top of it. The universal keep-alive sums AFTER
+    // this at the device layer (v8.4.5), so even a starved leg keeps its
+    // wobble through a gap.
     if (frameCount)
         memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
     float* sc = L.scratch.data();
     size_t done = 0;
-    // v8.4.20 THE REFERENCE IS LEG1 AGAIN: the master's own DEPTH GUARD
-    // (leg1's ring bloat + the mains' own drift) runs first, then the
-    // cross-leg servo for the slaves (delay-neutral, bite-only,
-    // pad-budgeted). A LATE bite is ARMED here and executed in the loop
-    // below, inside a digital-silence window; a PAD comes back as padFr --
-    // this switch deliberately pops padFr frames less and holds its last
-    // mixed frame across the pad region (up to kDriftCorrectFr frames, the
-    // warden pad budget).
-    // v8.4.26 THE FLOOR GUARD, EVERY LEG: the servo's +-5 ms dead-band let
-    // a slave's margin ride BELOW its device-buffer floor (the field's
-    // leg2 raw2 = 0.0 trough -- staticey silence holes whenever the center
-    // content started). The per-leg floor guard pads at the floor itself
-    // and bites 5 ms over it; the servo still tracks leg1 above the floor.
-    size_t padFr = masterDepthGuard(L, frameCount);
-    if (idx != 0) {
-        const size_t servoPad = syncToFirst(idx, L, frameCount);
-        if (servoPad > padFr) padFr = servoPad;
-    }
+    // v8.6.0 THE DRIFT CORRECTOR: one cursor trim for every leg -- the
+    // sample-aligned skip (LATE) or the held-frame pad (EARLY); the forced
+    // resync (a cursor beyond the window) ran inside it. A trim pad comes
+    // back as padFr -- this switch deliberately leaves padFr frames for the
+    // hold region (up to kDriftCorrectFr frames, the pad budget).
+    size_t padFr = windowTrim(idx, L, frameCount);
     // v8.4.23 THE MASK-COPY-MASK FAN-OUT (field-directed: "make sure that
     // there are copies of the input 8-channel audio data for every single
     // device you're sending the data to so that there's no possible upmix
@@ -4137,22 +4078,14 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     while (done + padFr < frameCount) {
         const size_t want = frameCount - padFr - done;
         const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
-        const size_t avail = L.raw.count();
-        const size_t n = (avail < take) ? avail : take;
-        if (n == 0) break;
-        const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
-        L.raw.pop(sc, n);
-        // v8.4.25 THE PROOF METER: the peak |ch3| of the RAW capture,
-        // measured before volume and before the mask -- the level the cable
-        // actually carries, untouched by anything twinspeak does to it.
-        if (idx == 0) {
-            float pk = g_ch3InPeak.load(std::memory_order_relaxed);
-            for (size_t i = 0; i < n; ++i) {
-                const float a = fabsf(sc[i * kInCh + 2]);
-                if (a > pk) pk = a;
-            }
-            g_ch3InPeak.store(pk, std::memory_order_relaxed);
-        }
+        const unsigned long long h = g_win.head.load(std::memory_order_acquire);
+        const unsigned long long cNow = L.cursor.load(std::memory_order_relaxed);
+        const unsigned long long lag = h - cNow;
+        const size_t n = ((size_t)lag < take) ? (size_t)lag : take;
+        if (n == 0) break;   // caught the writer: the hold below covers it
+        const unsigned long long seqBefore = cNow;
+        g_win.read(sc, cNow, n);
+        L.cursor.store(cNow + n, std::memory_order_relaxed);
         // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint volume
         // -- applied to the raw 8ch block BEFORE the per-leg mix. Both legs
         // track the same knob; the ini gains still stack on it.
@@ -4202,76 +4135,31 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         }
         if (g_tickOn.load(std::memory_order_relaxed))
             tickSum(idx, dst, n, seqBefore);   // v7.0.0: the sync tick, both legs
-        // v6.4: advance the play boundary by the REAL frames just played.
-        // The delay prefill (pushSilence) carries no sequence -- it is
-        // subtracted here exactly once per frame, so the boundary lives in
-        // true capture-sequence space and the drift math stays absolute.
-        {
-            size_t real = n;
-            if (L.prefillRemaining) {
-                const size_t p = real < L.prefillRemaining ? real : L.prefillRemaining;
-                L.prefillRemaining -= p;
-                real -= p;
-            }
-        if (real)
-            L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed) + real);
-        }
-        // v8.4.21 QUIET-WINDOW DRIFT CORRECTION: the armed drop lands HERE,
-        // inside a chunk whose masked content is digital silence -- a skip
-        // inside silence is bit-silent and cannot click. Post-mask,
-        // bitZero8 IS the leg's own quiet test. The valve (biteForced,
-        // past 10 ms of accumulated drift) executes regardless -- 10 ms of
-        // desync is worse than one gentle skip.
-        if (L.biteDue) {
-            const bool chunkQuiet = (L.zeroFast && bitZero8(sc, n));
-            if (chunkQuiet || L.biteForced) {
-                const size_t drop = L.biteDue;
-                L.raw.discardOldest(drop);
-                L.biteDue = 0;
-                L.biteForced = false;
-                L.syncDrops++;
-                L.wardenDrops++;
-                L.depthDrops += drop;
-                const unsigned long long dbn = GetTickCount64();
-                if (dbn - L.lastSyncLogMs >= 10000) {
-                    L.lastSyncLogMs = dbn;
-                    tlog("[twinspeak] drift out%d    : %llu fr of drift dropped inside a silent window\n"
-                         "                            (%llu total; a skip inside digital silence cannot click)\n",
-                         idx + 1, (unsigned long long)drop, (unsigned long long)L.syncDrops);
-                }
-            }
-        }
         done += n;
     }
-    // v8.4.7 THE SYNC PAD, v8.4.9 THE WIDE NUDGE: this switch deliberately
-    // popped padApplied frames less -- the pad region HOLDS the last mixed
-    // frame (a held sample: the DAC receives its full frameCount, the
-    // boundary stalls by padApplied frames, the wobble rides the hold like
-    // any frame; at padApplied = 1 this is byte-for-byte the v8.4.7 pad).
-    // A starved switch abandons its pad (the shortfall already stalled
-    // the boundary).
-    const size_t padApplied = (padFr && done + padFr >= frameCount) ? padFr : 0;
-    if (padApplied) {
-        const float* holdSrc = out + (frameCount - padApplied - 1) * L.outCh;
-        for (size_t i = 0; i < padApplied; ++i)
-            memcpy(out + (frameCount - padApplied + i) * L.outCh, holdSrc,
-                   L.outCh * sizeof(float));
-        L.syncPads++;
-        if (L.padBudget >= padApplied) L.padBudget -= padApplied;   // v8.4.19: the pad budget spends as it lands
-        else                           L.padBudget = 0;
-        const unsigned long long nowMs = GetTickCount64();
-        if (nowMs - L.lastSyncLogMs >= 10000) {
-            L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; the warden\n"
-                 "                            bite, %d fr / %u ms max, a held sample, never a hole)\n",
-                 idx + 1, kDriftCorrectFr, (unsigned long long)L.syncPads, kDriftCorrectFr, kDriftIntervalMs);
+    // v8.6.0 THE HOLD: whatever this switch could not fill -- the trim's
+    // deliberate stall (padFr) or a shortfall -- HOLDS the last played
+    // frame. A held sample cannot click; the v8.1.0 silence-hole is
+    // retired with the rings (the keep-alive still rides on top at the
+    // device layer, so even a long hold keeps the amp fed). A trim hold
+    // counts syncPads; a shortfall counts und.
+    if (done < frameCount) {
+        const size_t hole = frameCount - done;
+        if (done > 0) {
+            const float* holdSrc = out + (done - 1) * L.outCh;
+            for (size_t i = 0; i < hole; ++i)
+                memcpy(out + (done + i) * L.outCh, holdSrc, L.outCh * sizeof(float));
+        } else {
+            memset(out, 0, (size_t)frameCount * L.outCh * sizeof(float));
+        }
+        if (padFr && done + padFr >= frameCount) {
+            L.syncPads++;
+            if (L.padBudget >= hole) L.padBudget -= hole;   // v8.4.19: the budget spends as it lands
+            else                     L.padBudget = 0;
+        } else {
+            L.und.fetch_add(1);
         }
     }
-    // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
-    // restart, never an escalation. (v8.4.7: the sync pad's frame is not a
-    // hole -- it repeated, above; only real holes count.)
-    if (done + padApplied < frameCount)
-        L.und.fetch_add(1);
     // v8.4.23: THE ABSOLUTE LANE GATE and the device-layer lane verdicts
     // are RETIRED with the mask-copy-mask fan-out -- a masked leg can only
     // ever play its own channels, so there is nothing left to gate, and
@@ -4291,10 +4179,10 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     }
 
     // v6.4 lag display: the age of the newest played frame, in cable time.
-    // Pure display -- the drift metric is the seqTail difference and needs
+    // Pure display -- the drift metric is the cursor difference and needs
     // no clock at all.
     if (g_qpf > 0.0) {
-        const unsigned long long st = L.raw.seqTail.load(std::memory_order_relaxed);
+        const unsigned long long st = L.cursor.load(std::memory_order_relaxed);
         if (st) {
             LARGE_INTEGER c;
             QueryPerformanceCounter(&c);
@@ -5666,7 +5554,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6520,41 +6408,10 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     return true;
 }
 
-// v8.4.13/v8.4.14 THE DEFERRED REOPEN LANDING (the v8.4.10 reopen backlog
-// discard, moved to where it can actually stick). Field, v8.4.13: "Just
-// heard a second ding which raised raw2 to 43." The ding is the reopen
-// chime (armChime fires on every leg2 reopen); the 43 was the landing
-// being UNDONE: the old dropReopenBacklog trimmed the ring to its anchor
-// AT REOPEN TIME -- but the new device takes hundreds of ms to actually
-// start consuming, and in that window the capture kept pushing and
-// refilled the ring right back toward its cap. The first pop then saw
-// ~160 ms of backlog: off jumped, and the servo spent the next ~25 s
-// grinding it (the log's "2064 fr late" = the field's 43 ms, mid-grind).
-// THE FIX: a reopen only MARKS the leg (relandPending, set by
-// tryRestartLeg before the new device thread exists); the NEW device
-// thread lands its own ring at its FIRST buffer switch -- the discard and
-// the first pop are the same instant, nothing can refill in between, and
-// the producer races are already covered by the tail's monotonic CAS (the
-// capture callback's evictions share it).
-// The landing target is the servo's own (v8.4.20: the reference is leg1
-// again): r2' = r1' -- leg1's REAL BACKLOG (its depth minus its delay
-// prefill -- v8.4.12: the original full-depth target leaked delay1_ms
-// into the landing, the field's "raw2 sits at 62") plus this leg's own
-// prefill, floored at the leg's device-buffer anchor so the restart's
-// first fill cannot starve on a capture gap. The user's calibration lives
-// in the delay prefills and needs no baseline to survive a reopen.
-static void landReopenedRing(int idx) {
-    Leg& L = g_leg[idx];
-    const long long have = (long long)L.raw.count();
-    const long long rMaster = (long long)g_leg[0].raw.count()
-                            - (long long)g_leg[0].delayFrames;
-    long long want = ((idx != 0) ? (rMaster + (long long)L.delayFrames)
-                                 : ((long long)L.delayFrames + (long long)L.anchorFrames));
-    if (want < (long long)L.delayFrames + (long long)L.anchorFrames)
-        want = (long long)L.delayFrames + (long long)L.anchorFrames;   // the starvation floor
-    if (have > want)
-        L.raw.discardOldest((size_t)(have - want));   // advances tail AND seqTail, ledger-true
-}
+// v8.6.0: THE DEFERRED REOPEN LANDING IS GONE with the rings. A reopened
+// leg's cursor simply sits where it was while the window's head kept
+// advancing; the leg's first switch sees lag beyond the window and the
+// trim's forced resync lands it at the target. Nothing to clean up.
 
 // ------------------------------------------------- v3.8 watchdog restarts --
 // v8.5.2: THE WATCHDOG IS RETIRED -- this function now serves the
@@ -6582,7 +6439,6 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
     // to the WASAPI path below (and stay there for subsequent restarts).
     if (L.backend == 1) {
         ksCloseLeg(idx);
-        L.relandPending = true;   // v8.4.14: the NEW device thread lands the ring at its first switch
         if (ksOpenLeg(idx, needle)) {
             L.name = L.ks.filterName;
             L.ks.thread = CreateThread(nullptr, 0, ksThread, (LPVOID)(INT_PTR)idx, 0, nullptr);
@@ -6603,7 +6459,6 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
 
     if (L.dev.pContext) ma_device_uninit(&L.dev);
     memset(&L.dev, 0, sizeof(L.dev));
-    L.relandPending = true;   // v8.4.14: the NEW device thread lands the ring at its first switch
     ma_device_id id; std::string nm;
     if (!pickDevice(ctx, ma_device_type_playback, needle, &id, &nm)) return false;
     bool ok = initLegDevice(idx, ctx, &id, periodMs, L.isExclusive);
@@ -6659,7 +6514,7 @@ static void printLegDevice(int idx) {
     Leg& L = g_leg[idx];
     if (L.disabled) return;   // v8.4.0: the caller gates the print; belt to that
     const double burst = (double)g_capPeriodFrames * 1000.0 / (double)kSampleRate;
-    const double ring  = (double)L.delayFrames * 1000.0 / (double)kSampleRate;
+    const double ring  = (double)(L.delayFrames + kWindowCushionFr) * 1000.0 / (double)kSampleRate;   // v8.6.0: the window distance (delay + cushion)
     // v7.8.2: a released leg (boot yield / default-device yield) holds no
     // device -- print the release state instead of a zeroed device line.
     if (L.yielded.load(std::memory_order_relaxed)) {
@@ -11349,15 +11204,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                       : (size_t)(capPeriodMs * (kSampleRate / 1000));
     if (g_capPeriodFrames == 0) g_capPeriodFrames = 192;   // v8.1.0: informational only
 
-    // v8.1.0: THE STRIPPED PATH -- there are no out rings and no targets.
-    // Each leg's ONLY buffer is its raw fan-out ring: capacity = the delay +
-    // generous capture-jitter headroom; the delay itself is a silence
-    // PREFILL (bit-exact, sequence-less). Capture excess evicts oldest at
-    // the cap (counted in rawDrop, ledger-true); a device shortfall plays
-    // silence (counted in und). Nothing manages depth.
+    // v8.6.0: THE WINDOW -- one shared broadcast buffer, per-leg read
+    // cursors. The per-leg loop sets the delays/anchors; the window itself
+    // opens below with head at the largest target, so every cursor starts
+    // EXACTLY at its target and the delay prefill is the buffer's own
+    // zero-fill (bit-exact silence -- pushSilence is gone).
     for (int i = 0; i < 4; ++i) {
         Leg& L = g_leg[i];
-        if (L.disabled) continue;   // v8.4.0: an empty rear leg owns no ring
+        if (L.disabled) continue;   // v8.4.0: an empty rear leg owns no cursor
         const float delayMs = (i == 0) ? g_cfg.delay1Ms
                           : (i == 1) ? g_cfg.delay2Ms
                           : g_cfg.offset3Ms;           // v8.4.0: the rears' own knob (v8.4.11: ONE rear leg)
@@ -11369,14 +11223,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.delayMs     = delayMs;
         // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
         // negotiated period) -- the sound card's own pre-load and the floor
-        // the pipeline physically allows. On the field's WASAPI legs
-        // (period 96 fr x2) that is 192 fr = 4.0 ms; on a KS leg the pacer's
-        // own 768-fr lead. The depth guard holds the ring at delay + this;
-        // margin 0 is the DAC reading silence.
+        // the pipeline physically allows. The shared window cushion
+        // (kWindowCushionFr) is sized above every leg's anchor; margin 0 is
+        // the DAC reading silence.
         L.anchorFrames = devPeriodFr * 2;
-        L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 150), kInCh);
-        L.raw.pushSilence(L.delayFrames);   // the delay: bit-exact, seq-less
-        L.prefillRemaining = L.delayFrames; // v6.4 lineage: prefill carries no sequence
         // the KS lapse guard's re-prime source (the replay path is gone).
         L.lastCap = kReplayMaxPeriods * devPeriodFr;
         L.lastBlock.assign(L.lastCap * (size_t)L.outCh, 0.0f);
@@ -11391,16 +11241,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.rawDrop.store(0, std::memory_order_relaxed);
         L.und.store(0, std::memory_order_relaxed);
         L.firstSwitchUs.store(0, std::memory_order_relaxed);   // v7.1.5 start align
-        L.relandPending = false;                                       // v8.4.14: fresh run, nothing pending
         L.syncDrops = 0;                                               // (per run, like the clocks)
         L.syncPads  = 0;
-        L.lastBiteMs   = 0;                                            // v8.4.11/8.4.12: the bite + depth-guard clocks
-        L.wardenDrops  = 0;
-        L.wardenPads   = 0;
-        L.depthDrops   = 0;
+        L.lastBiteMs   = 0;                                            // the trim's correction pacing
         L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
-        L.biteDue      = 0;                                            // v8.4.21: no armed drift bite either
-        L.biteForced   = false;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -11411,6 +11255,35 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             : (i == 1)
             ? (g_ceq.on ? true : g_cfg.gainCenter >= 0.0f)
             : (g_cfg.gainRl >= 0.0f && g_cfg.gainRr >= 0.0f); // v8.4.11: the one rear leg, both sides (g * 0 == 0, always)
+    }
+
+    // v8.6.0 THE WINDOW ITSELF: capacity = the largest delay target + a
+    // working margin, rounded to the power of two the mask arithmetic
+    // wants. The head opens at H0 = the largest target; the region below
+    // it is the buffer's zero-fill -- THE DELAY PREFILL, for free -- and
+    // every cursor starts at H0 - target_i, so every leg's lag is EXACTLY
+    // its target from the very first switch. No start trim, no start
+    // align, no landing: the placement IS the alignment.
+    {
+        unsigned long long maxTarget = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (g_leg[i].disabled) continue;
+            const unsigned long long t = g_leg[i].delayFrames + (unsigned long long)kWindowCushionFr;
+            if (t > maxTarget) maxTarget = t;
+        }
+        const size_t want = (size_t)maxTarget + 4096;   // over-run room: bursts, the trim's grind, the dead-leg drift
+        size_t capc = 256; while (capc < want) capc <<= 1;
+        g_win.init(capc, kInCh, maxTarget);
+        for (int i = 0; i < 4; ++i) {
+            if (g_leg[i].disabled) continue;
+            const unsigned long long tgt = g_leg[i].delayFrames + (unsigned long long)kWindowCushionFr;
+            g_leg[i].cursor.store(maxTarget - tgt, std::memory_order_release);
+        }
+        tlog("[twinspeak] window        : %zu fr (%.1f ms) x %d ch shared, head at %llu -- every cursor opens at its\n"
+             "                            target (lag = delay + %.1f ms cushion from frame one; the delay prefill\n"
+             "                            is the window's own zero-fill)\n",
+             g_win.cap, (double)g_win.cap * 1000.0 / (double)kSampleRate, kInCh,
+             maxTarget, (double)kWindowCushionFr * 1000.0 / (double)kSampleRate);
     }
 
     // ---------------- v3.8 COM volume layer (setup on the main thread) -----
@@ -11513,31 +11386,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog( "[twinspeak] capture start failed\n");
         return 1;
     }
-    // v8.1.0: no pumps to start -- the switches pull from the raw rings.
-    Sleep(30);   // let capture fill both raw rings with real audio
-
-    // v7.1.5 START AT THE ANCHOR (half ONE of two -- half two, the start
-    // STAGGER align, follows the device starts below): the Sleep(30) gap +
-    // the render devices' start latency let the capture side pile REAL
-    // frames on top of the prefill -- playback then opened ~10 ms behind
-    // and the per-callback settle trim spent its first corrections shaving
-    // that backlog (the field: "a ~10ms delay every time I start/restart
-    // that eventually gets readjusted"). The excess is trimmed HERE, before
-    // either leg starts: the first buffer opens at the target latency and
-    // the settle trim stays a safety net. Same discardOldest semantics as
-    // the per-callback trim (front-out bit-exact skip; the discarded
-    // frames' sequence numbers are consumed with them).
-    for (int li = 0; li < 4; ++li) {   // v8.4.0: the rears trim their backlog too
-        Leg& SL = g_leg[li];
-        if (!SL.raw.cap) continue;                     // ring not built
-        const long long level = (long long)SL.raw.count();
-        if (level > (long long)(SL.delayFrames + SL.anchorFrames)) {
-            const size_t dropped =
-                SL.raw.discardOldest((size_t)(level - (long long)SL.delayFrames - (long long)SL.anchorFrames));
-            tlog("[twinspeak] leg%d sync     : start trim: dropped %llu fr of pre-playback backlog -- the first buffer opens at the delay anchor\n",
-                 li + 1, (unsigned long long)dropped);
-        }
-    }
+    // v8.6.0: no pumps, no start trim, no Sleep(30) fill -- the window's
+    // virtual prefix IS the prefill and every cursor opens at its target.
+    // The switches pull from the shared window.
 
     // v8.4.1: no center device = no chime (the signature rides out2 only);
     // arming it with leg2 disabled would just never play.
@@ -11571,90 +11422,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
     }
 
-    // v7.1.5 START AT THE SAME INSTANT (half two of the start-latency fix) --
-    // the start trim above fixed the RING backlog, but the two output devices
-    // also begin EATING their prefills when THEIR start call lands, and the
-    // calls land a few ms apart (ma_device_start vs the KS thread's RUN flip).
-    // A start stagger shifts that leg's WHOLE stream: the early leg stays
-    // early by the gap, the ledger reads a FLAT drift (baseline + gap) from
-    // the first real frame, the 5..9 s baseline calibration absorbs the gap
-    // and the warden never sees it -- the field heard it as "there is still
-    // latency between the legs on every start/apply+restart". So: wait for
-    // both legs' first buffer switch (the moment each DAC began eating --
-    // stamped in bufferSwitchFill), then replay-pad the EARLY leg by exactly
-    // the gap. Both streams then open on the same instant, the ledger starts
-    // ON the calibrated baseline, and no settle correction ever fires. The
-    // pad rides the ring level, so it is clamped under the per-callback trim
-    // line (target + burst + period) -- a larger gap is padded as far as is
-    // safe and the log says so. Everything lands inside the silence prefill
-    // window (guarded), so the filler is literal silence, never a repeat.
-    if (g_cfg.clockSync) {
-        // v8.4.0: the align generalizes to every LIVE leg (a disabled rear
-        // is out of the game by design; a boot-yielded leg aligns itself on
-        // its quiet reopen). Wait for every participant's first buffer
-        // switch, then align them ALL to the earliest one.
-        const unsigned long long alignT0 = GetTickCount64();
-        for (;;) {
-            bool all = true;
-            for (int i = 0; i < 4; ++i) {
-                if (g_leg[i].disabled) continue;
-                if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
-                if (g_leg[i].popped.load(std::memory_order_acquire) == 0) { all = false; break; }
-            }
-            if (all) break;
-            if (GetTickCount64() - alignT0 > 250) break;   // a dead leg: watchdog territory
-            Sleep(1);
-        }
-        unsigned long long fs[4] = { 0, 0, 0, 0 };
-        int nPart = 0;
-        bool missing = false;
-        for (int i = 0; i < 4; ++i) {
-            if (g_leg[i].disabled) continue;
-            if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;   // released legs hand in nothing
-            fs[i] = g_leg[i].firstSwitchUs.load(std::memory_order_acquire);
-            if (fs[i]) ++nPart; else missing = true;
-        }
-        if (missing || nPart < 2) {
-            tlog("[twinspeak] start align  : a leg never handed in its first buffer switch (dead or released) --\n"
-                 "                            alignment skipped (the watchdog owns a dead leg; a released leg\n"
-                 "                            aligns itself on its quiet reopen)\n");
-        } else {
-            int ref = -1;
-            for (int i = 0; i < 4; ++i)
-                if (fs[i] && (ref < 0 || fs[i] < fs[ref])) ref = i;
-            for (int i = 0; i < 4; ++i) {
-                if (i == ref || !fs[i]) continue;
-                const long long gapUs = (long long)fs[i] - (long long)fs[ref];
-                if (gapUs <= 0) continue;               // within one frame of the reference
-                long long gapFr = (gapUs * (long long)kSampleRate + 500000) / 1000000;
-                // v8.1.0: the replay-pad is GONE. A leg that began eating
-                // later holds ~gapFr frames more in its raw ring -- skipping
-                // them oldest-first (bit-exact, ledger-true) puts every
-                // stream at the same depth, so all legs open their stream on
-                // the same instant. The delay/offset differences are left
-                // exactly as configured: the skip is clipped to the excess
-                // and only ever consumes PREFILL SILENCE.
-                Leg& T = g_leg[i];
-                bool clipped = false;
-                const long long excess = (long long)T.raw.count()
-                                       - (long long)g_leg[ref].raw.count();
-                if (gapFr > excess) { gapFr = excess; clipped = true; }
-                if (gapFr > 0) {
-                    T.raw.discardOldest((size_t)gapFr);
-                    tlog("[twinspeak] start align  : leg%d began eating %lld us after leg%d -- skipped %lld fr\n"
-                         "                            (%.2f ms)%s of its deeper backlog so every leg opens its\n"
-                         "                            stream on the same instant (bit-exact, ledger-true)\n",
-                         i + 1, gapUs, ref + 1, gapFr,
-                         (double)gapFr * 1000.0 / (double)kSampleRate,
-                         clipped ? " (clipped to the available excess)" : "");
-                } else {
-                    tlog("[twinspeak] start align  : leg%d stagger %lld us vs leg%d, but it holds no excess to\n"
-                         "                            skip -- leaving it to the baseline calibration\n",
-                         i + 1, gapUs, ref + 1);
-                }
-            }
-        }
-    }
+    // v8.6.0: THE START ALIGN (v7.1.5's both halves) IS GONE with the rings.
+    // Every cursor is PLACED at its target before any device exists, so a
+    // device's start stagger only delays its first READ, never shifts its
+    // stream: the lag at the first switch is the target exactly (plus the
+    // stagger, which the trim's aligned skip absorbs in one seamless
+    // correction). The stream alignment IS the cursor placement.
 
     // v3.8: volume/pin watcher -- 25 ms volume poll, 2 s output pin re-check.
     HANDLE hWatch = (g_cfg.volumeFollow || g_cfg.pinOutputs)
@@ -11977,16 +11750,21 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             aB[i] = Ai; pB[i] = Ci;   // v8.4.0: a disabled leg holds 0/0 -> off stays 0
         }
         // v8.1.0 fields: off = measured clock offset ppm; short ('und') =
-        // switches the raw ring could not fill; evict ('drop') = passive
-        // oldest-evictions at the raw cap. Computed BEFORE the hint so it
-        // can require a quiet window.
+        // switches the window read could not fill (held instead -- v8.6.0);
+        // evict ('drop') = frames the trim/resync skipped. Computed BEFORE
+        // the hint so it can require a quiet window.
         unsigned long long dropN[4], undN[4];
         for (int i = 0; i < 4; ++i) {
             dropN[i] = g_leg[i].rawDrop.load();
             undN[i]  = g_leg[i].und.load();
         }
-        const long long st0 = (long long)g_leg[0].raw.seqTail.load(std::memory_order_relaxed);
-        const long long st1 = (long long)g_leg[1].raw.seqTail.load(std::memory_order_relaxed);
+        // v8.6.0: the drift metric is the CURSOR difference -- each leg's
+        // lag (head - cursor) is its boundary's distance behind the live
+        // edge, and the difference is the measured inter-speaker offset.
+        const long long st0 = (long long)(g_win.head.load(std::memory_order_relaxed)
+                                         - g_leg[0].cursor.load(std::memory_order_relaxed));
+        const long long st1 = (long long)(g_win.head.load(std::memory_order_relaxed)
+                                         - g_leg[1].cursor.load(std::memory_order_relaxed));
         const bool driftOK = (st0 > 0 && st1 > 0);
         const double driftMs = driftOK ? (double)(st0 - st1) / 48.0 : 0.0;
         char driftStr[16];
@@ -12027,6 +11805,32 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // plays the keep-alive into the void until the engine is restarted
         // by hand.
         const unsigned long long nowMs = GetTickCount64();
+        // v8.6.0 THE DEAD-LEG LEDGER: with the rescue machinery retired
+        // (v8.5.2), a stalled device is ANNOUNCED, not chased. A live leg
+        // whose heartbeat went stale while the window's head kept advancing
+        // is DOWN: its KS pin froze (the DAC saws its WaveRT loop -- the
+        // stale-audio crackle) or the device is gone. Down until the engine
+        // is restarted. Measure-only: logged on transition + every 60 s.
+        {
+            static bool deadAnnounced[4] = { false, false, false, false };
+            static unsigned long long lastDeadLog[4] = { 0, 0, 0, 0 };
+            for (int i = 0; i < 4; ++i) {
+                if (g_leg[i].disabled || g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
+                const bool dead = (nowMs - hbOutGet(i) > 5000);
+                if (dead && (!deadAnnounced[i] || nowMs - lastDeadLog[i] >= 60000)) {
+                    deadAnnounced[i] = true;
+                    lastDeadLog[i] = nowMs;
+                    tlog("[twinspeak] leg%d DOWN      : no device heartbeat for 5 s -- the window's head keeps\n"
+                         "                            advancing without it (its DAC may be sawing stale audio -- the\n"
+                         "                            crackle). NOTHING reopens it (v8.5.2): restart the engine to\n"
+                         "                            bring this leg back.\n", i + 1);
+                } else if (!dead && deadAnnounced[i]) {
+                    deadAnnounced[i] = false;
+                    tlog("[twinspeak] leg%d alive     : the heartbeat returned -- the leg is switching again (the\n"
+                         "                            trim's resync lands its cursor back at the target).\n", i + 1);
+                }
+            }
+        }
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
         // Field directive: "if the main audio device is either output_device1
         // or output_device2 that the DAC shuts off immediately to let the
@@ -12257,6 +12061,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 }
             }
         }
+        // v8.6.0: the per-leg window distance (head - cursor), in ms -- the
+        // health/devbuf lines' "raw" columns (the backlog IS the lag now).
+        const auto winLagMs = [&](int i) -> double {
+            return (double)(g_win.head.load(std::memory_order_relaxed)
+                          - g_leg[i].cursor.load(std::memory_order_relaxed))
+                 * 1000.0 / (double)kSampleRate;
+        };
         if ((sec % 10) == 0) {   // same cadence as the log-file health line
             // v8.4.25 THE PROOF METER READOUT: the peak |ch3| the cable
             // actually carried over the last second. 0.0 = ch3 is genuinely
@@ -12271,22 +12082,22 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                  c3pk,
                  c3pk > 0.0f ? "the cable's ch3 is CARRYING content" : "the cable's ch3 is genuinely zero",
                  c3pk > 0.0f ? "phantom evidence" : "clean");
-            const double path1 = padMs[0] + (double)g_leg[0].raw.count() * 1000.0 / kSampleRate;
-            const double path2 = padMs[1] + (double)g_leg[1].raw.count() * 1000.0 / kSampleRate;
-            tlog("\n[twinspeak] devbuf      : leg1 %5.1f ms (%s) + raw %5.1f = %5.1f ms\n"
-                 "                            leg2 %5.1f ms (%s) + raw %5.1f = %5.1f ms\n"
+            const double path1 = padMs[0] + winLagMs(0);
+            const double path2 = padMs[1] + winLagMs(1);
+            tlog("\n[twinspeak] devbuf      : leg1 %5.1f ms (%s) + win %5.1f = %5.1f ms\n"
+                 "                            leg2 %5.1f ms (%s) + win %5.1f = %5.1f ms\n"
                  "                            measured path diff %+.1f ms -- BELOW-packetizer silicon (the\n"
                  "                            S5's own FIFO) is still outside these numbers\n",
-                 padMs[0], padHow[0], g_leg[0].raw.count() * 1000.0 / kSampleRate, path1,
-                 padMs[1], padHow[1], g_leg[1].raw.count() * 1000.0 / kSampleRate, path2,
+                 padMs[0], padHow[0], winLagMs(0), path1,
+                 padMs[1], padHow[1], winLagMs(1), path2,
                  path1 - path2);
             // v8.4.0: the rear legs ride the same 10 s cadence, against leg1.
             for (int i = 2; i < 4; ++i) {
                 if (g_leg[i].disabled) continue;
-                const double pathR = padMs[i] + (double)g_leg[i].raw.count() * 1000.0 / kSampleRate;
-                tlog("                            leg%d %5.1f ms (%s) + raw %5.1f = %5.1f ms (vs leg1: %+.1f ms)\n",
+                const double pathR = padMs[i] + winLagMs(i);
+                tlog("                            leg%d %5.1f ms (%s) + win %5.1f = %5.1f ms (vs leg1: %+.1f ms)\n",
                      i + 1, padMs[i], padHow[i],
-                     g_leg[i].raw.count() * 1000.0 / kSampleRate, pathR, pathR - path1);
+                     winLagMs(i), pathR, pathR - path1);
             }
             unsigned long long laps[4] = { 0, 0, 0, 0 };
             bool anyLapse = false;
@@ -12323,8 +12134,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog(g_logToFile
              ? "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | drift %s | err %s\n"
              : "raw1 %5.1f | raw2 %5.1f | vol %s | off %+6ld/%+6ld | short +%llu/%llu/%llu/%llu | evict +%llu/%llu/%llu/%llu | drift %s | err %s   \r",
-               g_leg[0].raw.count() * 1000.0f / kSampleRate,
-               g_leg[1].raw.count() * 1000.0f / kSampleRate,
+               winLagMs(0),
+               winLagMs(1),
                volStr,   // v3.9 NOTE: this argument WAS missing in v3.8 (the crash);
                          // every conversion here is argument-checked since (v6.5.1 added err).
                offV[0], offV[1],   // v8.4.0: the rear legs' offsets live in the devbuf line
