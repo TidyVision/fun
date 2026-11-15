@@ -62,6 +62,50 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.2 THE PAGE-0 NOTE + THE REOPEN COLD START + THE UNCAPPED LOG
+//            (field-directed, three asks in one release: "make it so
+//            there's a description right below the 'launch at windows
+//            startup' that tells you ..." -- the field's own text,
+//            summarized by request; "account for device disconnects and
+//            reconnects, as I found they can cause some weird low-sounding
+//            crackling within it"; "the console text keeps cutting off. Is
+//            there a console text buffer size? If so, that needs removed.
+//            Also have it auto-follow to the bottom if the scrolling is 2
+//            lines away to the absolute bottom"). THREE changes, nothing
+//            else touched:
+//            1) THE PAGE-0 NOTE: a 4-line small-font note right below the
+//               startup row, the field's text summarized: empty leg2 = the
+//               simulated center (the mains must be a stereo pair, the sub
+//               included; the center plays via HRTF + XTC); empty leg3 =
+//               the simulated surround + rears (the 0.51 ms comb rears,
+//               the frequency-boosted L/R phase-inversion surround, wider
+//               than the L/R pair alone can place). NO controls moved.
+//            2) THE REOPEN COLD START: a disconnect/reconnect left the
+//               fold's filter state holding PRE-GAP samples -- after the
+//               reopen landing, the first mixed chunks smeared the stale
+//               bass through the surround-bass biquad, the 0.51 ms comb
+//               lines and the virtual center's XTC/HRTF lines (the field's
+//               "low-sounding crackling"). landReopenedRing now flushes
+//               the reopened leg's OWN state (leg1: the surround bass +
+//               the rear comb + the virtual center; leg2: the center EQ)
+//               -- the first post-gap mix starts cold: a hard cut at the
+//               gap, never a smear. The keep-alive's per-leg phase index
+//               survives reopens by design (phase-continuous, no click);
+//               yields ride the same watchdog path and are covered.
+//            3) THE UNCAPPED CONSOLE + THE AUTO-FOLLOW: the text history
+//               had TWO caps -- the tlog ring trimmed itself at 64 KB
+//               (text lost while the window is closed/tray-only) and the
+//               pane's v8.4.19 A/B rotation DELETED the oldest half every
+//               64 KB (the visible "cutting off"). BOTH are retired: the
+//               ring grows unbounded, the pane is one append-only history
+//               (g_logA/g_logB are gone whole; every append is the same
+//               WM_SETREDRAW-batched end-insert). Before each append the
+//               pane measures its own scroll (first visible line vs the
+//               wrapped line count and the client height): within TWO
+//               LINES of the absolute bottom, the append scrolls to the
+//               bottom (the old always-follow); scrolled UP, the view is
+//               left exactly where the user parked it. NO engine change,
+//               NO ini key, NO UI row beyond the note's own text.
 //    v9.1.1 THE VIRTUAL CENTER -- THE HRTF + XTC FOLD (field-directed: "Also,
 //            if leg2 is blank, I would want the center channel be folded to
 //            the mains too, just with an HRTF Convolution + Crosstalk
@@ -2695,7 +2739,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.1"
+#define TWS_VERSION "9.1.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5954,6 +5998,22 @@ static void landReopenedRing(int idx) {
         want = (long long)L.delayFrames + (long long)L.anchorFrames;   // the starvation floor
     if (have > want)
         L.raw.discardOldest((size_t)(have - want));   // advances tail AND seqTail, ledger-true
+    // v9.1.2 THE REOPEN COLD START: the gap between the disconnect and this
+    // landing left the leg's own filter state holding PRE-GAP samples -- the
+    // first mixed chunks would smear the stale bass through the surround-bass
+    // biquad, the 0.51 ms comb lines and the virtual center's XTC/HRTF lines
+    // (the field's "low-sounding crackling"). Flush the reopened leg's OWN
+    // state here, on the SAME thread that mixes -- the first post-gap mix
+    // starts cold: a hard cut at the gap, never a smear. (leg3 has no state;
+    // the keep-alive's per-leg phase index survives by design -- continuous,
+    // no click. Yields ride this same watchdog path and are covered.)
+    if (idx == 0) {
+        surroundBassFlushZ();
+        rearCombFlushZ();
+        centerVirtualFlushZ();
+    } else if (idx == 1) {
+        centerEqFlushZ();
+    }
 }
 
 // ------------------------------------------------- v3.8 watchdog restarts --
@@ -6263,17 +6323,13 @@ static bool      g_applyRestart  = false;   // v7.1.20: APPLY+RESTART chains off
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
 static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
-// v8.4.19 THE TWO-BUFFER CONSOLE: the pane's history lives in TWO string
-// buffers -- g_logA (the older half) and g_logB (the newer half). Appends
-// land in B; the moment B passes its cap, A is DELETED and B moves into
-// A's slot (a pointer move -- the first element is set to the second), and
-// B starts empty: the earliest text dies with A, exactly like a command
-// prompt shedding its oldest rows. The edit control's text is rebuilt
-// (A + B) only on that rotation; between rotations an append is the cheap
-// end-insert it always was. GUI-thread only (the ring handoff above is the
-// only cross-thread leg).
-static std::string g_logA;                     // the pane's older history half
-static std::string g_logB;                     // the pane's newer history half (appends land here)
+// v9.1.2 THE UNCAPPED CONSOLE: the pane's history is the edit control's own
+// text, append-only. The v8.4.19 A/B rotation (g_logA/g_logB -- the oldest
+// half deleted every 64 KB) and the ring's own 64 KB trim are RETIRED: no
+// text ever dies now, whether the window is open or tray-only. The
+// auto-follow (in guiAppendLog) keeps the view pinned to the bottom unless
+// the user scrolled up. GUI-thread only (the ring handoff above is the only
+// cross-thread leg).
 static std::string g_lastHealth;               // latest "out1 ..." health line
 static std::atomic<bool> g_logDirty{false};
 // v6.6.1: tray + startup
@@ -7343,8 +7399,7 @@ static void guiLogSink(const char* s) {
     for (size_t i = 0; i < line.size(); ++i)
         if (line[i] == '\r') line[i] = '\n';          // console \r-overwrite -> lines
     EnterCriticalSection(&g_logCS);
-    if (g_logRing.size() > 65536) g_logRing.erase(0, 32768);
-    g_logRing += line;
+    g_logRing += line;                            // v9.1.2: the 64 KB trim is retired -- nothing is lost
     LeaveCriticalSection(&g_logCS);
     g_logDirty.store(true);
 }
@@ -7367,31 +7422,37 @@ static void guiAppendLog(const std::string& s) {
             norm += s[i];
         }
     }
-    // v8.4.19 THE TWO-BUFFER CONSOLE: the append lands in B; the moment B
-    // passes its cap, A is deleted, B moves into A's slot (a pointer move
-    // -- the first element is set to the second) and B starts empty, so
-    // the pane holds exactly two buffers of history and the earliest text
-    // dies with the rotation -- the command-prompt shed. The edit's text
-    // is rebuilt (A + B) only on a rotation; every other append is the
-    // WM_SETREDRAW-batched end-insert (one repaint per chunk, the
-    // subclassed pane lands it as a single blit).
-    g_logB += norm;
-    const bool rotated = g_logB.size() > 65536;
-    if (rotated) {
-        g_logA = std::move(g_logB);                   // the first slot takes the second's buffer...
-        g_logB.clear();                               // ...and the old first half is deleted with the move
+    // v9.1.2 THE UNCAPPED LOG: the v8.4.19 A/B rotation is retired whole --
+    // the pane is ONE append-only history, nothing is ever deleted, and
+    // every append is the WM_SETREDRAW-batched end-insert (one repaint per
+    // chunk, the subclassed pane lands it as a single blit).
+    // v9.1.2 THE AUTO-FOLLOW: measure the view BEFORE the append -- if the
+    // user has scrolled to within TWO LINES of the absolute bottom, the
+    // append follows to the bottom (the old always-scroll behavior); if
+    // they scrolled UP to read history, the view is left exactly where
+    // they parked it (the end-insert adds its lines below the fold; the
+    // caret still lands at the end, the view does not move).
+    const int firstVis = (int)SendMessageA(e, EM_GETFIRSTVISIBLELINE, 0, 0);
+    const int total    = (int)SendMessageA(e, EM_GETLINECOUNT, 0, 0);
+    int lineH = 14;
+    {
+        HDC dc = GetDC(e);
+        if (dc) {
+            TEXTMETRICA tm;
+            if (GetTextMetricsA(dc, &tm))
+                lineH = tm.tmHeight + tm.tmExternalLeading;
+            ReleaseDC(e, dc);
+        }
     }
+    RECT rc;
+    GetClientRect(e, &rc);
+    const int visible = (rc.bottom - rc.top) / (lineH > 0 ? lineH : 14);
+    const bool follow = (total - (firstVis + visible)) <= 2;
     SendMessageA(e, WM_SETREDRAW, FALSE, 0);
-    if (rotated) {
-        const std::string full = g_logA + g_logB;     // the edit always mirrors A + B exactly
-        SendMessageA(e, EM_SETSEL, 0, -1);
-        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)full.c_str());
-    } else {
-        const int len = GetWindowTextLengthA(e);
-        SendMessageA(e, EM_SETSEL, len, len);
-        SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
-    }
-    SendMessageA(e, EM_SCROLLCARET, 0, 0);
+    const int len = GetWindowTextLengthA(e);
+    SendMessageA(e, EM_SETSEL, len, len);
+    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
+    if (follow) SendMessageA(e, EM_SCROLLCARET, 0, 0);
     SendMessageA(e, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(e, nullptr, FALSE);
 }
@@ -7573,6 +7634,14 @@ static void guiBuildPages(HWND w) {
     tglRow(w, COLB_X, 240, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
     row(w, COLB_X, 274, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 308, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+    // v9.1.2 THE PAGE-0 NOTE: right below the startup row, the field's own
+    // text (summarized by request) -- what an empty leg2/leg3 does, and
+    // what the mains must be for each simulation.
+    note(w, COLB_X, 336,
+         "empty leg2 = simulated center: mains must be a stereo pair (2.1 with the\n"
+         "sub if you have one); the center plays via HRTF + XTC.\n"
+         "empty leg3 = simulated surround + rears: the rears fold with a 0.51 ms comb,\n"
+         "the surround with frequency-boosted L/R phase inversion, wider than L/R alone.", 4);
 
     // ============ page 1: TIMING ==============================================
     // v8.4.5: the transport rows are GONE -- the bite is BUILT IN (v9.0.1:
