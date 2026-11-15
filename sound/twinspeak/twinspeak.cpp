@@ -62,6 +62,31 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.5 THE SLOT LEDGER (field-directed: "on the center eq, the 'save
+//            to slot' on the current slot saves to slots after that, which
+//            is a weird thing you should fix"). THE TRACE: every layer of
+//            the slot path, checked index-for-index -- the control ids are
+//            consecutive (IDC_SLOT1..5), the faces are created "SLOT %d"
+//            on IDC_SLOT1+i, a click arms id - IDC_SLOT1, the SAVE TO SLOT
+//            button writes the armed slot, a right-click writes its own
+//            face, the ini load AND splice both parse key[7] - '1', and
+//            the owner-draw accent paints g_eqSel == i on face i -- all
+//            consistent, in the running build's source and this one. THE
+//            MECHANISM THE TRACE FOUND: the boot matcher (controlsFromCfg)
+//            ARMED a slot with NO click whenever the live EQ matched a
+//            saved slot within 1 Hz / 0.26 dB / 0.02 Q -- and since every
+//            save MIRRORS center_eq to the saved slot's values, the match
+//            is common: a slot saved in an earlier session came up
+//            ACCENTED AND ARMED at the next window build and took the
+//            next SAVE TO SLOT nobody aimed at it (the field's own ini:
+//            the 3296 Hz test curve sitting in slot 5 with slot 2's
+//            mirror beside it). THE FIX: the boot match NO LONGER ARMS --
+//            it names itself in the pane; the save target needs a click,
+//            and the accent follows the click only. THE LEDGER: every
+//            slot action now logs -- the boot match names itself, every
+//            click names the armed slot, every save names its target and
+//            the exact curve (the status line was transient; the pane is
+//            the record). NO new ini key, NO UI row.
 //    v8.5.4 THE SIDE ANGLE (field-directed: "Invert the surround pair's
 //            phase effect when leg3's device is present, so that way it
 //            moves the speaker more to the approximate 90 degree angle I
@@ -2605,7 +2630,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.4"
+#define TWS_VERSION "8.5.5"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5598,7 +5623,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.4 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -7568,6 +7593,9 @@ static void guiApplySlot(HWND w, int i) {
     g_eqSel = i;                      // v7.1.10: one var -- the click selects AND
                                       // arms the slot; the accent survives slider
                                       // tweaks so the SAVE target stays visible
+    // v8.5.5 THE SLOT LEDGER: every arm names itself in the pane.
+    tlog("[twinspeak] gui           : EQ arm (click)  : slot %d%s\n",
+         i + 1, g_cfg.eqSlotF[i] > 0.0f ? "" : " (empty -- sliders kept)");
     if (g_cfg.eqSlotF[i] <= 0.0f) {   // empty slot -- arm it, keep the sliders
         char b[128];
         snprintf(b, sizeof(b),
@@ -7602,6 +7630,11 @@ static void guiSaveSlot(HWND w, int i) {
     g_cfg.centerEqQ    = g_cfg.eqSlotQ[i];
     g_eqSel  = i;
     const bool ok = guiSaveIni();
+    // v8.5.5 THE SLOT LEDGER: the save's target + the exact curve, in the
+    // pane -- the status line is transient, this is the record.
+    tlog("[twinspeak] gui           : EQ save        : slot %d -- %.1f Hz / %+.1f dB / Q %.2f%s\n",
+         i + 1, g_cfg.eqSlotF[i], g_cfg.eqSlotG[i], g_cfg.eqSlotQ[i],
+         ok ? "" : " -- INI WRITE FAILED");
     guiUpdateEqLabels(w);
     guiRepaint(w, IDC_TGL_EQ);
     guiRepaintSlots(w);
@@ -7850,13 +7883,26 @@ static void controlsFromCfg(HWND w) {
     sldSetPos(GetDlgItem(w, IDC_SLD_FREQ), freqToPos(g_cfg.centerEqFreq), FALSE);
     sldSetPos(GetDlgItem(w, IDC_SLD_GAIN), (int)(g_cfg.centerEqGain * 2.0f), FALSE);
     sldSetPos(GetDlgItem(w, IDC_SLD_Q),    qToPos(g_cfg.centerEqQ), FALSE);
-    g_eqSel = -1;    // custom unless the values match a saved slot exactly
+    // v7.1.10: g_eqSel starts UNARMED. v8.5.5: the boot match NO LONGER
+    // auto-arms -- the ledger found the field's "saves to slots after
+    // that": the matcher armed a slot with NO click whenever the live EQ
+    // matched a saved slot, and since every save mirrors center_eq to the
+    // saved slot's values, that match is common -- a slot saved in an
+    // earlier session came up ACCENTED AND ARMED at the next window build
+    // and took the next SAVE TO SLOT nobody aimed at it. The match is
+    // still named in the pane; the save target now needs a click.
+    g_eqSel = -1;
     for (int i = 0; i < 5; ++i) {
         if (g_cfg.eqSlotF[i] > 0.0f &&
             g_cfg.centerEq     == g_cfg.eqSlotOn[i] &&
             fabsf(g_cfg.centerEqFreq - g_cfg.eqSlotF[i]) < 1.0f &&
             fabsf(g_cfg.centerEqGain - g_cfg.eqSlotG[i]) < 0.26f &&
-            fabsf(g_cfg.centerEqQ    - g_cfg.eqSlotQ[i]) < 0.02f) { g_eqSel = i; break; }
+            fabsf(g_cfg.centerEqQ    - g_cfg.eqSlotQ[i]) < 0.02f) {
+            tlog("[twinspeak] gui           : EQ boot match : live EQ == slot %d (NOT armed -- the SAVE TO SLOT\n"
+                 "                            target needs a click; the accent follows the click only)\n",
+                 i + 1);
+            break;
+        }
     }
     guiUpdateEqLabels(w);
     InvalidateRect(w, nullptr, TRUE);
