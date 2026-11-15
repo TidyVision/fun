@@ -2953,7 +2953,31 @@
 #include <initguid.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include <ksguid.h>   // v9.0: ks.h's own DEFINE_GUIDEX is storage-less; this
+                      // one re-defines it WITH selectany storage -- without
+                      // it every KS GUID links as an undefined reference.
 #include <setupapi.h>
+
+// v9.0: the KS GUIDs still come out of the mingw-w64 headers as bare
+// extern declarations (ks.h defines its own storage-less DEFINE_GUIDEX
+// BEFORE ksguid.h can override it, and its #ifndef guard wins the second
+// pass). This re-declaration with selectany storage is the documented
+// INITGUID semantics and satisfies the linker -- values come straight from
+// the headers' own STATIC_ macros, nothing is hand-spelled here.
+#define TS_KS_GUID(name) \
+    extern "C" const GUID name; \
+    extern "C" const GUID DECLSPEC_SELECTANY name = { STATIC_##name }
+TS_KS_GUID(KSPROPSETID_RtAudio);
+TS_KS_GUID(KSPROPSETID_Pin);
+TS_KS_GUID(KSPROPSETID_Audio);
+TS_KS_GUID(KSPROPSETID_Connection);
+TS_KS_GUID(KSMEDIUMSETID_Standard);
+TS_KS_GUID(KSINTERFACESETID_Standard);
+TS_KS_GUID(KSCATEGORY_RENDER);
+TS_KS_GUID(KSCATEGORY_CAPTURE);
+TS_KS_GUID(KSDATAFORMAT_TYPE_AUDIO);
+TS_KS_GUID(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX);
+TS_KS_GUID(KSDATAFORMAT_SPECIFIER_DSOUND);
 // v7.8.0: the one-file window header is RETIRED whole -- no include, no
 // external chrome API, no stub file. The window is a plain native
 // WS_OVERLAPPEDWINDOW (the flat default Windows 10 frame) and the one
@@ -3459,6 +3483,21 @@ struct KsOut {
     HANDLE        thread      = nullptr;
     std::vector<unsigned char> conv;   // format-conversion scratch (private)
     std::vector<float>         fill;   // one period of decoded audio (private)
+
+    // v9.0 THE STREAMING LEG (the WaveCyclic transport): a pin whose
+    // KSPROPERTY_RTAUDIO_BUFFER is refused (USB audio class -- the S5)
+    // still streams through the pin FILE with IOCTL_KS_WRITE_STREAM,
+    // PortAudio's PinWrite protocol: N packets in flight, each an
+    // OVERLAPPED DeviceIoControl carrying one KSSTREAM_HEADER. The
+    // write loop keeps `nPk - 1` periods of lead in the driver exactly
+    // the way the looped path keeps leadFrames in the mapped ring.
+    bool          streaming   = false; // 1 = packet transport, not WaveRT looped
+    unsigned      nPk         = 0;     // packet count (>= 2)
+    std::vector<unsigned char> pkData; // nPk * periodFrames * frameBytes
+    std::vector<KSSTREAM_HEADER> pkHdr;// one header per packet
+    std::vector<OVERLAPPED>    pkOv;   // one OVERLAPPED per packet
+    std::vector<HANDLE>        pkEv;   // one event per packet
+    unsigned      pkNext      = 0;     // next packet slot to fill (round-robin)
 };
 
 // ------------------------------------------------------------------ legs ----
@@ -5198,6 +5237,49 @@ static bool ksRangeAccepts(const std::vector<KsRange>& ranges, int outCh, const 
 // WAVEFORMATEXTENSIBLE (FormatSize covers both; Specifier = WAVEFORMATEX).
 // The driver reads the format at Connect + sizeof(KSPIN_CONNECT), so the
 // whole blob must be one contiguous struct.
+static HANDLE ksTryCreatePinRaw(HANDLE filter, KSPIN_CONNECT* c,
+                               int* usedLooped, DWORD* lastErr,
+                               bool capture) {
+    TS_KsCreatePinFn kp = ksCreatePinFn();
+    if (!kp) { *lastErr = (DWORD)-1; return nullptr; }
+    HANDLE pin = nullptr;
+    // v8.6.4 THE ACCESS FALLBACK: the classic WDM-KS gotcha -- many drivers
+    // (USB audio class in particular) refuse GENERIC_READ on a RENDER sink
+    // pin with ERROR_ACCESS_DENIED, and the reference WDM-KS backends
+    // retry WRITE-only for exactly that. The old path tried READ|WRITE
+    // alone: a driver with the gotcha refused EVERY pin/format
+    // unconditionally -- the field's "always refusing" new system.
+    // v8.6.7: the CAPTURE direction mirrors it -- READ|WRITE first, then
+    // READ-only (a capture source pin reads; some drivers refuse WRITE).
+    const DWORD acc1 = capture ? (DWORD)(GENERIC_READ | GENERIC_WRITE)
+                               : (DWORD)(GENERIC_WRITE | GENERIC_READ);
+    const DWORD acc2 = capture ? (DWORD)GENERIC_READ : (DWORD)GENERIC_WRITE;
+    DWORD err = kp(filter, c, acc1, &pin);
+    if (err != ERROR_SUCCESS) {
+        if (pin) CloseHandle(pin);
+        pin = nullptr;
+        *lastErr = err;
+        err = kp(filter, c, acc2, &pin);
+        if (err != ERROR_SUCCESS) {
+            if (pin) CloseHandle(pin);
+            *lastErr = err;
+            return nullptr;
+        }
+    }
+    *lastErr = ERROR_SUCCESS;
+    *usedLooped = (c->Interface.Id == (ULONG)KSINTERFACE_STANDARD_LOOPED_STREAMING) ? 1 : 0;
+    return pin;
+}
+
+// v9.0 THE FORMAT FALLBACK: the second classic WDM-KS gotcha, straight from
+// the reference backends (pa_win_wdmks.c builds the connect blob twice):
+// many drivers -- HDAudio WaveRT pins are the textbook case -- accept a
+// plain WAVE_FORMAT_PCM blob (bare WAVEFORMATEX, cbSize=0, KSDATAFORMAT
+// alone) but refuse WAVE_FORMAT_EXTENSIBLE with ERROR_NO_MATCH. The old
+// code only ever built the EXTENSIBLE variant, so every attempt on such a
+// pin came back "no match" -- rule-3 hits that never convert. We now retry
+// the identical pin/interface with a PCM blob when the EXTENSIBLE create
+// is refused.
 static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt& f,
                              bool looped, int* usedLooped, DWORD* lastErr,
                              bool capture = false) {
@@ -5242,35 +5324,35 @@ static HANDLE ksTryCreatePin(HANDLE filter, ULONG pinId, int outCh, const KsFmt&
                      : (outCh == 6) ? (DWORD)KSAUDIO_SPEAKER_5POINT1
                      : (outCh == 8) ? (DWORD)KSAUDIO_SPEAKER_7POINT1_SURROUND : 0u;
 
-    TS_KsCreatePinFn kp = ksCreatePinFn();
-    if (!kp) { *lastErr = (DWORD)-1; return nullptr; }
-    HANDLE pin = nullptr;
-    // v8.6.4 THE ACCESS FALLBACK: the classic WDM-KS gotcha -- many drivers
-    // (USB audio class in particular) refuse GENERIC_READ on a RENDER sink
-    // pin with ERROR_ACCESS_DENIED, and the reference WDM-KS backends
-    // retry WRITE-only for exactly that. The old path tried READ|WRITE
-    // alone: a driver with the gotcha refused EVERY pin/format
-    // unconditionally -- the field's "always refusing" new system.
-    // v8.6.7: the CAPTURE direction mirrors it -- READ|WRITE first, then
-    // READ-only (a capture source pin reads; some drivers refuse WRITE).
-    const DWORD acc1 = capture ? (DWORD)(GENERIC_READ | GENERIC_WRITE)
-                               : (DWORD)(GENERIC_WRITE | GENERIC_READ);
-    const DWORD acc2 = capture ? (DWORD)GENERIC_READ : (DWORD)GENERIC_WRITE;
-    DWORD err = kp(filter, c, acc1, &pin);
-    if (err != ERROR_SUCCESS) {
-        if (pin) CloseHandle(pin);
-        pin = nullptr;
-        *lastErr = err;
-        err = kp(filter, c, acc2, &pin);
-        if (err != ERROR_SUCCESS) {
-            if (pin) CloseHandle(pin);
-            *lastErr = err;
-            return nullptr;
-        }
+    HANDLE pin = ksTryCreatePinRaw(filter, c, usedLooped, lastErr, capture);
+    if (pin) return pin;
+
+    // v9.0: EXTENSIBLE refused -> retry the same pin/interface with a bare
+    // WAVE_FORMAT_PCM blob (KSDATAFORMAT + WAVEFORMATEX, cbSize=0). Only
+    // meaningful for integer PCM; float only exists as EXTENSIBLE.
+    if (f.container == f.bits) {
+        struct BlobPcm {
+            KSPIN_CONNECT connect;
+            KSDATAFORMAT  df;
+            WAVEFORMATEX  wf;
+        } bp;
+        memcpy(&bp, &blob, sizeof(bp.connect) + sizeof(bp.df));
+        memset((unsigned char*)&bp + sizeof(bp.connect) + sizeof(bp.df), 0,
+               sizeof(bp.wf));
+        bp.df.FormatSize = (ULONG)sizeof(bp.df) + (ULONG)sizeof(bp.wf);
+        bp.df.Specifier  = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+        bp.wf.wFormatTag      = WAVE_FORMAT_PCM;
+        bp.wf.nChannels       = (WORD)outCh;
+        bp.wf.nSamplesPerSec  = kSampleRate;
+        bp.wf.wBitsPerSample  = (WORD)(f.container * 8);
+        bp.wf.nBlockAlign     = blockAlign;
+        bp.wf.nAvgBytesPerSec = kSampleRate * blockAlign;
+        bp.wf.cbSize          = 0;
+        KSPIN_CONNECT* c2 = (KSPIN_CONNECT*)&bp;
+        HANDLE pin2 = ksTryCreatePinRaw(filter, c2, usedLooped, lastErr, capture);
+        if (pin2) return pin2;
     }
-    *lastErr = ERROR_SUCCESS;
-    *usedLooped = looped ? 1 : 0;
-    return pin;
+    return nullptr;
 }
 
 static unsigned long ksGcd(unsigned long a, unsigned long b) { return b ? ksGcd(b, a % b) : a; }
@@ -5344,17 +5426,20 @@ static std::string wideToNarrow(const std::wstring& w) {
     return s;
 }
 
-// Every present KSCATEGORY_RENDER wave filter, with the friendliest name
-// we can dig up (the interface key's FriendlyName first -- that is the
-// wave filter's own name -- then the device's).
-static void ksEnumerateRenderFilters(std::vector<KsFilterInfo>& out) {
+// Every present wave filter of one category (KSCATEGORY_RENDER for output,
+// KSCATEGORY_CAPTURE for capture -- v9.0: the capture source pins are
+// registered under the CAPTURE category; a render filter exposes only sink
+// factories), with the friendliest name we can dig up (the interface key's
+// FriendlyName first -- that is the wave filter's own name -- then the
+// device's).
+static void ksEnumerateCategoryFilters(const GUID* cat, std::vector<KsFilterInfo>& out) {
     out.clear();
-    const HDEVINFO di = SetupDiGetClassDevsW(&KSCATEGORY_RENDER, nullptr, nullptr,
+    const HDEVINFO di = SetupDiGetClassDevsW(cat, nullptr, nullptr,
                                              DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (di == INVALID_HANDLE_VALUE) return;
     SP_DEVICE_INTERFACE_DATA ifd;
     ifd.cbSize = sizeof(ifd);
-    for (ULONG i = 0; SetupDiEnumDeviceInterfaces(di, nullptr, &KSCATEGORY_RENDER, i, &ifd); ++i) {
+    for (ULONG i = 0; SetupDiEnumDeviceInterfaces(di, nullptr, cat, i, &ifd); ++i) {
         DWORD need = 0;
         SetupDiGetDeviceInterfaceDetailW(di, &ifd, nullptr, 0, &need, nullptr);
         if (!need) continue;
@@ -5392,7 +5477,7 @@ static int ksNeedleScore(const std::string& filterName, const std::string& needl
 
 static void ksListKs() {
     std::vector<KsFilterInfo> fl;
-    ksEnumerateRenderFilters(fl);
+    ksEnumerateCategoryFilters(&KSCATEGORY_RENDER, fl);
     // v8.6.6 THE NAME MAP: each KS filter's WASAPI endpoint counterpart --
     // the same layered score, the reverse direction.
     ma_backend be[] = { ma_backend_wasapi };
@@ -5501,7 +5586,7 @@ static int ksNeedleScore(const std::string& filterName, const std::string& needl
 static const std::vector<KsFilterInfo>& ksFilterCache() {
     static std::vector<KsFilterInfo> fl;
     static bool done = false;
-    if (!done) { ksEnumerateRenderFilters(fl); done = true; }
+    if (!done) { ksEnumerateCategoryFilters(&KSCATEGORY_RENDER, fl); done = true; }
     return fl;
 }
 static std::string ksCounterpartFromWasapi(const std::string& name) {
@@ -5623,7 +5708,14 @@ static bool ksCapOpen() {
     const std::string& needle = g_cfg.inputDevice;
     if (!ksCreatePinFn()) return false;
     std::vector<KsFilterInfo> fl;
-    ksEnumerateRenderFilters(fl);
+    // v9.0: enumerate the CAPTURE category, not RENDER. The capture source
+    // pins (DATAFLOW_OUT factories) are registered under KSCATEGORY_CAPTURE
+    // -- the render filter of the same device exposes only sink factories,
+    // so scanning RENDER for a capture pin found nothing ("0 attempts",
+    // every time, by construction).
+    ksEnumerateCategoryFilters(&KSCATEGORY_CAPTURE, fl);
+    tlog("[twinspeak] capture KS   : %zu capture filters present -- matching \"%s\"\n",
+         fl.size(), needle.c_str());
     int chosen = -1, cs = 0;
     for (size_t i = 0; i < fl.size(); ++i) {
         if (fl[i].name.empty()) continue;
@@ -5693,7 +5785,8 @@ static bool ksCapOpen() {
                     continue;
                 }
                 pin = hp; usedFmt = fi; usedPin = p; container = f.container;
-                rtBuf = buf; rtGot = got; rtBarrier = barrier;
+                rtBuf = buf; rtGot = got;
+                (void)rtBarrier;   // capture never touches the write barrier
             }
         }
     }
@@ -5769,7 +5862,7 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     }
 
     std::vector<KsFilterInfo> fl;
-    ksEnumerateRenderFilters(fl);
+    ksEnumerateCategoryFilters(&KSCATEGORY_RENDER, fl);
     if (fl.empty()) {
         tlog("[twinspeak] leg%d KS        : no KSCATEGORY_RENDER wave filters found\n", idx + 1);
         return false;
@@ -5859,15 +5952,32 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
                 unsigned char* buf = nullptr; size_t got = 0; BOOL barrier = FALSE;
                 const size_t wantBytes = (size_t)outCh * (size_t)f.container *
                                          (size_t)loopReqFrames;
+                bool isStream = false;
                 if (!ksAllocRtBuffer(hp, (ULONG)(outCh * f.container), wantBytes,
                                      &buf, &got, &barrier)) {
-                    tlog("[twinspeak] leg%d KS        : pin %lu accepted %s but has no WaveRT looped buffer\n",
-                         idx + 1, (unsigned long)p, f.name);
-                    CloseHandle(hp);
-                    continue;
+                    // v9.0 THE STREAMING LEG: no WaveRT memory does NOT mean
+                    // no audio -- USB audio class (the S5) is WaveCyclic: the
+                    // pin streams through the pin file itself with
+                    // IOCTL_KS_WRITE_STREAM. Keep the pin ONLY if it was
+                    // created with the STREAMING interface (looped-streaming
+                    // requires the RT buffer by construction); the pacing
+                    // thread then runs the packet transport instead of the
+                    // mapped-loop transport.
+                    if (lp == 0) {
+                        isStream = true;
+                        tlog("[twinspeak] leg%d KS        : pin %lu accepted %s -- no WaveRT buffer, taking the STREAMING (WaveCyclic) transport\n",
+                             idx + 1, (unsigned long)p, f.name);
+                    } else {
+                        tlog("[twinspeak] leg%d KS        : pin %lu accepted %s looped but has no WaveRT looped buffer\n",
+                             idx + 1, (unsigned long)p, f.name);
+                        CloseHandle(hp);
+                        continue;
+                    }
                 }
                 pin = hp; usedLooped = ul; usedFmt = fi; usedPin = p;
-                rtBuf = buf; rtGot = got; rtBarrier = barrier;
+                rtBuf = buf; rtGot = got;
+                if (!isStream) rtBarrier = barrier;   // barrier belongs to the mapped loop only
+                K.streaming = isStream;   // picked up below (K is L.ks)
             }
         }
         if (!pin && haveRanges && pinAttempts == 0 && !ranges.empty())
@@ -5893,6 +6003,114 @@ static bool ksOpenLeg(int idx, const std::string& needle) {
     K.loopBuf     = rtBuf;
     K.loopBytes   = rtGot;
     K.barrier     = rtBarrier;
+
+    // ---- v9.0: the STREAMING (WaveCyclic) branch -- packets, not a ring --
+    if (K.streaming) {
+        // The packet ring: nPk packets, each one period, the same total
+        // device cushion as the looped path requests (loopPeriods periods).
+        // PortAudio defaults to 2 for WaveCyclic; we keep the engine's own
+        // 3-period cushion so the pacer's storm budget is unchanged.
+        K.nPk = loopPeriods;
+        const size_t pkBytes = (size_t)periodFrames * K.frameBytes;
+        K.pkData.assign((size_t)K.nPk * pkBytes, 0);
+        K.pkHdr.assign(K.nPk, KSSTREAM_HEADER());
+        K.pkOv.assign(K.nPk, OVERLAPPED());
+        K.pkEv.assign(K.nPk, nullptr);
+        for (unsigned i = 0; i < K.nPk; ++i) {
+            K.pkEv[i] = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!K.pkEv[i]) { K.streaming = false; break; }
+            KSSTREAM_HEADER& h = K.pkHdr[i];
+            h.Data = K.pkData.data() + (size_t)i * pkBytes;
+            h.FrameExtent = (ULONG)pkBytes;
+            h.DataUsed    = (ULONG)pkBytes;
+            h.Size        = sizeof(KSSTREAM_HEADER);
+            h.PresentationTime.Numerator   = 1;
+            h.PresentationTime.Denominator = 1;
+        }
+        if (!K.streaming) {
+            tlog("[twinspeak] leg%d KS        : packet-event creation failed -- the WASAPI path takes this leg\n",
+                 idx + 1);
+            for (unsigned i = 0; i < K.nPk; ++i) if (K.pkEv[i]) { CloseHandle(K.pkEv[i]); K.pkEv[i] = nullptr; }
+            K.pkData.clear(); K.pkData.shrink_to_fit();
+            K.pkHdr.clear();  K.pkHdr.shrink_to_fit();
+            K.pkOv.clear();   K.pkOv.shrink_to_fit();
+            K.pkEv.clear();   K.pkEv.shrink_to_fit();
+            CloseHandle(pin);
+            CloseHandle(fh);
+            return false;
+        }
+        K.pkNext = 0;
+        // The streaming leg's "loop bookkeeping" is fiction kept for the
+        // shared meters and the mod-loop position math: the loop is the
+        // packet ring's worth of frames. loopBytes MUST be set -- the
+        // pacing thread's residue integration computes raw % loopBytes.
+        K.loopFrames  = (size_t)periodFrames * K.nPk;
+        K.loopBytes   = K.loopFrames * K.frameBytes;
+        K.leadFrames  = (K.nPk - 1) * periodFrames;
+        // STOP -> ACQUIRE -> PAUSE, prime every packet with silence, and
+        // SUBMIT them all while paused -- the driver holds them queued; RUN
+        // releases the first. The events start signaled (manual-reset,
+        // created that way) so the thread's first wait on each slot passes
+        // immediately for the priming round.
+        ksSetPinState(pin, KSSTATE_STOP);
+        ksSetPinState(pin, KSSTATE_ACQUIRE);
+        ksSetPinState(pin, KSSTATE_PAUSE);
+        memset(K.pkData.data(), 0, K.pkData.size());
+        for (unsigned i = 0; i < K.nPk; ++i) {
+            OVERLAPPED& ov = K.pkOv[i];
+            memset(&ov, 0, sizeof(ov));
+            ov.hEvent = K.pkEv[i];
+            DWORD cbRet = 0;
+            if (!DeviceIoControl(pin, IOCTL_KS_WRITE_STREAM, nullptr, 0,
+                                 &K.pkHdr[i], K.pkHdr[i].Size, &cbRet, &ov)) {
+                const DWORD e = GetLastError();
+                if (e != ERROR_IO_PENDING) {
+                    tlog("[twinspeak] leg%d KS        : priming write %u failed (err %lu) -- the WASAPI path takes this leg\n",
+                         idx + 1, i, (unsigned long)e);
+                    for (unsigned j = 0; j < K.nPk; ++j)
+                        if (K.pkEv[j]) { CloseHandle(K.pkEv[j]); K.pkEv[j] = nullptr; }
+                    K.pkData.clear(); K.pkData.shrink_to_fit();
+                    K.pkHdr.clear();  K.pkHdr.shrink_to_fit();
+                    K.pkOv.clear();   K.pkOv.shrink_to_fit();
+                    K.pkEv.clear();   K.pkEv.shrink_to_fit();
+                    K.streaming = false;
+                    CloseHandle(pin);
+                    CloseHandle(fh);
+                    return false;
+                }
+            }
+            ++K.pkNext;   // the next fill reuses slot 0 only after it completes
+        }
+
+        // Clock: KSPROPERTY_AUDIO_POSITION through the pin -- the position
+        // register is a WaveRT-only luxury. The byte count wraps at the
+        // packet ring's total (the driver counts bytes since RUN; the
+        // pacing math only ever uses it mod "loop").
+        K.posMapped = false;
+        K.posReg = nullptr;
+        ULONG posBytes = 0;
+        if (!ksReadPosIoctl(pin, &posBytes)) posBytes = 0;
+
+        K.playFrames  = 0;
+        K.writeFrames = K.leadFrames;      // the silence primed ahead
+        K.lastPosBytes = 0;
+        K.havePos     = true;              // streaming position starts at 0
+        K.posGlitch   = 0;
+        K.wrote       = 0;
+        K.conv.assign((size_t)periodFrames * K.frameBytes + 64, 0);
+        K.fill.assign((size_t)periodFrames * (size_t)outCh, 0.0f);
+
+        L.backend    = 1;
+        L.isExclusive = false;
+        K.active     = 1;
+        K.filter     = fh;
+        K.pin        = pin;
+
+        tlog("[twinspeak] leg%d KS        : \"%s\" pin %lu, %s %dch @ %u Hz, STREAMING (WaveCyclic) transport, %u x %u fr packets, lead %u fr | pos IOCTL polled\n",
+             idx + 1, K.filterName.c_str(), (unsigned long)usedPin, K.fmtName.c_str(), outCh,
+             (unsigned)kSampleRate, K.nPk, periodFrames, K.leadFrames);
+        return true;
+    }
 
     K.loopFrames = K.loopBytes / K.frameBytes;
     if (K.loopFrames < 2 * (size_t)periodFrames) {
@@ -5972,6 +6190,17 @@ static void ksCloseLeg(int idx) {
         K.thread = nullptr;
     }
     if (K.pin) {
+        if (K.streaming) {
+            // v9.0: the streaming leg -- wait out the in-flight packets
+            // (the driver owns their buffers until each completes), then
+            // stop. No mapped loop to sweep.
+            for (unsigned i = 0; i < K.nPk; ++i)
+                if (K.pkEv[i]) WaitForSingleObject(K.pkEv[i], 500);
+            ksSetPinState(K.pin, KSSTATE_PAUSE);
+            ksSetPinState(K.pin, KSSTATE_STOP);
+            CloseHandle(K.pin);
+            K.pin = nullptr;
+        } else {
         // v7.0.0: the shutdown silence, KS edition -- the looped WaveRT buffer
         // keeps looping whatever was written last until the pin stops, so
         // zero it WHILE the pin still runs (a PAUSE would freeze the cursor
@@ -5984,6 +6213,7 @@ static void ksCloseLeg(int idx) {
         ksSetPinState(K.pin, KSSTATE_STOP);
         CloseHandle(K.pin);
         K.pin = nullptr;
+        }
     }
     if (K.filter) { CloseHandle(K.filter); K.filter = nullptr; }
     K.loopBuf = nullptr;
@@ -5991,6 +6221,15 @@ static void ksCloseLeg(int idx) {
     K.posReg = nullptr;
     K.posMapped = false;
     K.pinId = -1;
+    // v9.0: tear the packet ring down with the pin
+    for (unsigned i = 0; i < K.nPk; ++i)
+        if (K.pkEv[i]) { CloseHandle(K.pkEv[i]); K.pkEv[i] = nullptr; }
+    K.pkData.clear(); K.pkData.shrink_to_fit();
+    K.pkHdr.clear();  K.pkHdr.shrink_to_fit();
+    K.pkOv.clear();   K.pkOv.shrink_to_fit();
+    K.pkEv.clear();   K.pkEv.shrink_to_fit();
+    K.streaming = false;
+    K.nPk = 0;
     K.conv.clear();
     K.conv.shrink_to_fit();
     K.fill.clear();
@@ -6232,7 +6471,42 @@ static DWORD WINAPI ksThread(LPVOID p) {
         bufferSwitchFill(idx, fill, periodFr);
         sumLegExtras(idx, fill, periodFr);   // v8.4.5: the universal wobble, every KS leg
         ksConvertTo(K, fill, conv, periodFr);
-        ksWriteLoop(K, conv, (size_t)periodFr * K.frameBytes);
+        if (K.streaming) {
+            // v9.0 THE STREAMING TRANSPORT: submit one packet -- wait for
+            // the in-flight packet this slot last carried (round-robin:
+            // nPk-1 periods of lead live inside the driver), copy the
+            // converted period into it, and hand it back with
+            // IOCTL_KS_WRITE_STREAM. Position comes from the AUDIO_POSITION
+            // property, NOT the packet ledger -- the loop math above reads
+            // it the same way for both transports.
+            const unsigned pk = K.pkNext % K.nPk;
+            OVERLAPPED& ov = K.pkOv[pk];
+            HANDLE ev = K.pkEv[pk];
+            if (!ev) break;   // torn-down racing shutdown
+            if (WaitForSingleObject(ev, 2000) != WAIT_OBJECT_0) {
+                // The driver stalled a full packet-slot's worth -- treat as
+                // a lost device: stop writing, let the health loop see it.
+                tlog("[twinspeak] leg%d KS stream: packet %u did not complete in 2 s -- abandoning the leg\n",
+                     idx + 1, pk);
+                break;
+            }
+            ResetEvent(ev);
+            memcpy(K.pkHdr[pk].Data, conv, (size_t)periodFr * K.frameBytes);
+            memset(&ov, 0, sizeof(ov));
+            ov.hEvent = ev;
+            DWORD cbRet = 0;
+            if (!DeviceIoControl(K.pin, IOCTL_KS_WRITE_STREAM, nullptr, 0,
+                                 &K.pkHdr[pk], K.pkHdr[pk].Size, &cbRet, &ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) {
+                    tlog("[twinspeak] leg%d KS stream: write failed (err %lu) -- abandoning the leg\n",
+                         idx + 1, (unsigned long)GetLastError());
+                    break;
+                }
+            }
+            ++K.pkNext;
+        } else {
+            ksWriteLoop(K, conv, (size_t)periodFr * K.frameBytes);
+        }
         K.writeFrames += periodFr;
         K.wrote       += periodFr;
     }
@@ -8310,7 +8584,7 @@ static void guiFillCombos(HWND w) {
     std::vector<std::string> ksNames;
     {
         std::vector<KsFilterInfo> fl;
-        ksEnumerateRenderFilters(fl);
+        ksEnumerateCategoryFilters(&KSCATEGORY_RENDER, fl);
         for (const KsFilterInfo& f : fl)
             if (!f.name.empty()) ksNames.push_back(f.name);
     }
