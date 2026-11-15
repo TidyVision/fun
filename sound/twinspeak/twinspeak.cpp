@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.7 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,26 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.8 THE PRE-ROUND (field-directed, on the conversion map: "So this
+//            means float32 has to be converted during use."). CORRECT --
+//            the pins on the new system are integer-only and (mostly)
+//            non-WaveRT, so the conversions are the price of the transport,
+//            and the conversion map has one weak link: the WASAPI fallback
+//            legs' f32 -> s16 conversion is MINIAUDIO's, and it TRUNCATES
+//            (the v8.4.22 finding) -- the truncation error is
+//            signal-correlated and reads as the paper crinkle at reduced
+//            levels, on the 16-bit center leg especially. THE FIX: every
+//            16-bit WASAPI leg's output gets the sign-aware half-LSB bias
+//            before the conversion (one add per sample) -- truncation
+//            becomes round-to-nearest, the same conversion class the KS
+//            path applies with lrintf. The samples clamp to the int16
+//            grid's top (+/-32767/32768) in the same pass, which also
+//            kills the exact-full-scale wrap (a clamped 1.0 x 32768 does
+//            not fit int16). Silence stays silent (a 0.5-LSB bias
+//            truncates back to 0). The KS paths are untouched -- they
+//            already round. AND the capture-KS refusal names itself when
+//            the filter exposes no DATAFLOW_OUT (capture source) factories
+//            (the field's "0 attempt(s)" line). NO new ini key, NO UI row.
 //    v8.6.7 THE KS CAPTURE (field-directed: "Every input device must also be
 //            WDM-KS"). THE CONTEXT: the v8.6.4 interrogation decoded the
 //            render-side refusals on the field's new system -- err 50
@@ -2889,7 +2909,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.7"
+#define TWS_VERSION "8.6.8"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3423,6 +3443,13 @@ struct Leg {
     // watchdog, no yield -- nothing to do).
     bool                disabled = false;
     bool                zeroFast = false;        // v6.6.9: bit-zero blocks skip the mix (start-frozen gate)
+    // v8.6.8 THE PRE-ROUND: a WASAPI leg whose negotiated format is 16-bit
+    // gets the half-LSB bias on its output -- miniaudio's f32->s16
+    // conversion TRUNCATES, and the truncation error is signal-correlated
+    // (the paper crinkle at reduced levels, the v8.4.22 finding). The bias
+    // turns it into round-to-nearest, the same conversion class the KS
+    // path applies with lrintf.
+    bool                s16Round = false;
     // v8.6.0 THE WINDOW: the leg's read position in the shared broadcast
     // buffer (absolute capture frames). Single owner = this leg's device
     // thread; the drift corrector moves it, nothing else does. The old
@@ -4532,24 +4559,51 @@ static void playCore(int idx, float* out, ma_uint32 frameCount) {
     bufferSwitchFill(idx, out, (size_t)frameCount);
 }
 
+// v8.6.8 THE PRE-ROUND: miniaudio's f32->s16 conversion TRUNCATES -- the
+// truncation error is signal-correlated and reads as the paper crinkle at
+// reduced levels (the v8.4.22 finding, still true on the WASAPI fallback
+// legs). The sign-aware half-LSB bias turns truncation into
+// round-to-nearest -- the same conversion class the KS path applies with
+// lrintf. One add per sample; silence stays silent (a 0.5-LSB bias
+// truncates back to 0). The samples clamp to the int16 grid's top
+// (+/-32767/32768) in the same pass, which also kills the exact-full-scale
+// wrap (a clamped 1.0 x 32768 does not fit int16). The KS paths are
+// untouched -- they already round.
+static void s16PreRound(int idx, float* out, ma_uint32 frameCount) {
+    if (!g_leg[idx].s16Round) return;
+    const float b = 0.5f / 32768.0f;
+    const float lim = 32767.0f / 32768.0f;
+    const size_t n = (size_t)frameCount * (size_t)g_leg[idx].outCh;
+    for (size_t i = 0; i < n; ++i) {
+        float s = out[i] + (out[i] >= 0.0f ? b : -b);
+        if (s >  lim) s =  lim;
+        if (s < -lim) s = -lim;
+        out[i] = s;
+    }
+}
+
 static void playCallback1(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     playCore(0, (float*)pOutput, frameCount);
-    sumLegExtras(0, (float*)pOutput, frameCount);   // v8.4.5: the universal wobble, stop gap included
+    sumLegExtras(0, (float*)pOutput, frameCount);
+    s16PreRound(0, (float*)pOutput, frameCount);   // v8.6.8: the KS-equivalent rounding
 }
 
 static void playCallback2(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     playCore(1, (float*)pOutput, frameCount);
-    sumLegExtras(1, (float*)pOutput, frameCount);   // v8.4.5: the wobble + the chime, through the stop gap
+    sumLegExtras(1, (float*)pOutput, frameCount);
+    s16PreRound(1, (float*)pOutput, frameCount);
 }
 // v8.4.0: the rear legs -- 2ch switches. v8.4.5: they sum the universal
 // keep-alive like every leg (no chime -- that stays out2's own test).
 static void playCallback3(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     playCore(2, (float*)pOutput, frameCount);
     sumLegExtras(2, (float*)pOutput, frameCount);
+    s16PreRound(2, (float*)pOutput, frameCount);
 }
 static void playCallback4(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     playCore(3, (float*)pOutput, frameCount);
     sumLegExtras(3, (float*)pOutput, frameCount);
+    s16PreRound(3, (float*)pOutput, frameCount);
 }
 
 // ------------------------------------------- v6.5.18 center dialogue EQ ----
@@ -5601,6 +5655,13 @@ static bool ksCapOpen() {
         }
     }
     if (!pin) {
+        // v8.6.7: the no-source clarity line -- "0 attempt(s)" means the
+        // filter exposes no DATAFLOW_OUT (capture source) factories at all
+        // (the VAC cable's KS filter exposes only its render sink here).
+        if (attempts == 0)
+            tlog("[twinspeak] capture KS   : the filter exposes no DATAFLOW_OUT (capture source) pin\n"
+                 "                            factories -- the KS capture cannot exist here; the WASAPI\n"
+                 "                            capture takes the input\n");
         tlog("[twinspeak] capture KS   : \"%s\" refused every capture pin/format -- %u attempt(s), last err %lu\n"
              "                            the WASAPI capture takes the input\n",
              fl[chosen].name.c_str(), attempts, (unsigned long)lastErr);
@@ -6163,7 +6224,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.7 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -11927,6 +11988,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_periodFrames[i] = g_leg[i].dev.playback.internalPeriodSizeInFrames
                           ? (size_t)g_leg[i].dev.playback.internalPeriodSizeInFrames
                           : (size_t)(((i == 0) ? periodMs1 : periodMs2) * (kSampleRate / 1000));
+        // v8.6.8 THE PRE-ROUND: armed on the 16-bit WASAPI legs (the
+        // negotiation is known here -- the devices exist above).
+        if (g_leg[i].backend == 0)
+            g_leg[i].s16Round = (g_leg[i].dev.playback.internalFormat == ma_format_s16);
     }
     g_capPeriodFrames = g_capDev.capture.internalPeriodSizeInFrames
                       ? (size_t)g_capDev.capture.internalPeriodSizeInFrames
