@@ -62,6 +62,21 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.0.2 THE THREE-LINE STATUS BAR (field-directed: "I need the status
+//            text (the one saying 'engine started') to show 3 lines instead
+//            of one"). The GUI status band is three 18px rows now: row 1
+//            the engine state ("engine stopped/started/RUNNING/stopping"),
+//            row 2 the health front four (raw1 | raw2 | vol | off), row 3
+//            the health back four (short | evict | drift | err) -- the old
+//            single line appended all of it and clipped past ~106 mono
+//            chars. The band grows 18 -> 54 px (y 458..512), the log pane
+//            moves 480 -> 516 with KLOG_BOTTOM 734 -> 770, the client grows
+//            760 -> 796 (the min==max track and the DPI ledger follow the
+//            same constants). Short one-off texts ("ini saved") land on
+//            row 1 alone; each row ellipsizes at the band edge, never a
+//            hard cut. Drive-by: the console frame rect around the pane
+//            still drew v8.4.19's 114px height -- it hugs the pane's full
+//            254px now, exactly as its own comment always claimed.
 //    v9.0.1 THE WASAPI-ONLY ENGINE + THE CONSTANT BUFFER SIZE AGAIN + THE
 //            3-LINE STATUS + THE FIXED WINDOW (field-directed: "I'd just
 //            remove WDM-KS from c++ and find any issues that could
@@ -2596,7 +2611,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.0.1"
+#define TWS_VERSION "9.0.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -6080,9 +6095,9 @@ static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
 static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
-static int KCLI_W     = 880, KCLI_H      = 760;        // designed client size (v8.4.19: the log pane grew 140 px)
+static int KCLI_W     = 880, KCLI_H      = 796;        // designed client size (v9.0.2: +36 -- the status band grew to 3 rows)
 static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
-static int KLOG_BOTTOM= 734;                            // log pane bottom
+static int KLOG_BOTTOM= 770;                            // log pane bottom (v9.0.2: 734+36 -- the band took 3 rows)
 static int kTabW[3]   = { 283, 283, 283 };   // v8.3.0: three faces fill the strip (3*283+2*4 = 857)
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // v7.8.0: the in-client caption band is RETIRED with the custom chrome --
@@ -6095,10 +6110,10 @@ static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // "system-aware, fixed for the process lifetime" rule is retired.
 static void guiApplyDpi() {
     KCLI_W     = S(880);
-    KCLI_H     = S(760);
+    KCLI_H     = S(796);
     KPANEL_T   = S(66);
     KPANEL_B   = S(402);
-    KLOG_BOTTOM= S(734);
+    KLOG_BOTTOM= S(770);
     kTabW[0] = kTabW[1] = kTabW[2] = S(283);
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
@@ -7097,7 +7112,8 @@ static void guiAppendLog(const std::string& s) {
 static void guiSetStatus(HWND w, const char* s) {
     SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
     // v7.1.20: MUST mirror guiPaintFrame's scaled status band exactly.
-    const RECT sr = { S(14), S(458), S(866), S(476) };
+    // v9.0.2: the band is 3 rows (54px) -- one '\n'-split string.
+    const RECT sr = { S(14), S(458), S(866), S(512) };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
 }
 
@@ -7857,23 +7873,30 @@ static void guiBuildControls(HWND w) {
     // column (same label + pill style as every other row; only its ORDER
     // changed). The bar keeps its five controls; nothing else moved.
     // v7.1.5 FLICKER-FREE STATUS: the STATIC is HIDDEN -- it only stores the
-    // string; guiPaintFrame draws the line inside the frame buffer (one blit,
+    // string; guiPaintFrame draws the band inside the frame buffer (one blit,
     // no erase-then-draw flicker four times a second). Writers go through
     // guiSetStatus, which invalidates the status band of the frame.
     // v7.1.20: the direct creations scale too (the factories do it for the
     // rest).
+    // v9.0.2: THE THREE-LINE STATUS BAR. The band is three 18px rows (54px):
+    // row 1 the engine state ("engine started"), rows 2-3 the health fields
+    // split 4+4 -- the old single line appended all ten and clipped past
+    // ~106 mono chars. A '\n' in the stored string starts the next row
+    // (guiPaintFrame splits on it); the hidden STATIC never shows it.
     HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              S(14), S(458), S(852), S(16),
+                              S(14), S(458), S(852), S(54),
                               w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
     SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(st, 14, 458, 852, 16, &g_fMono);   // the dpi ledger
+    tsTrackChild(st, 14, 458, 852, 54, &g_fMono);   // the dpi ledger
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
+    // v9.0.2: the pane rides 36px lower (under the 3-row band) and keeps
+    // every pixel of its 254px height.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        S(14), S(480), S(852), S(254), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), S(516), S(852), S(254), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(log, 14, 480, 852, 254, &g_fMono);   // the dpi ledger (v8.4.19: the pane grew 140 px)
+    tsTrackChild(log, 14, 516, 852, 254, &g_fMono);   // the dpi ledger (v8.4.19: the pane grew 140 px; v9.0.2: it moved under the 3-row band)
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -8170,7 +8193,8 @@ static bool guiCreateRealWindow() {
     // resize, so they are gone with the edges). The rest of the v7.8.0 plain
     // native frame story stands: the system owns the caption, the icon, the
     // buttons, the shadow and the DPI story. The outer size still comes from
-    // AdjustWindowRectEx around the designed 880x760 client, and
+    // AdjustWindowRectEx around the designed 880x796 client (v9.0.2: the
+    // status band's third row), and
     // WM_GETMINMAXINFO pins min==max track to that size at the CURRENT DPI
     // (see guiWndProc) -- WM_DPICHANGED re-derives the scale first and sizes
     // the window itself, so a monitor change still lands the right frame.
@@ -8660,12 +8684,14 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // S(13)/S(479) derivation rounded the frame and the pane separately,
     // and at 150% the drift showed -- the console frame floated off the
     // pane at odd scales. The pane is the anchor now; the frame cannot
-    // miss it. (v7.8.0: the pane sits at its plain client seat -- S(480),
-    // no band arithmetic.)
+    // miss it. (v7.8.0: the pane sits at its plain client seat; v9.0.2: the
+    // seat moved to S(516) under the 3-row status band, and the rect hugs
+    // the pane's full S(254) height -- the stale v8.4.19 S(114) height is
+    // fixed with it.)
     g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(14) - 0.5f,
-                                        (Gdiplus::REAL)S(480) - 0.5f,
+                                        (Gdiplus::REAL)S(516) - 0.5f,
                                         (Gdiplus::REAL)S(852) + 1.0f,
-                                        (Gdiplus::REAL)S(114) + 1.0f));
+                                        (Gdiplus::REAL)S(254) + 1.0f));
     char vbuf[640];
     // v8.4.3 THE HONEST WATERMARK: this corner still read "v7.8.4 | <ini>"
     // -- a hard literal the v7.9.0 banner fix missed. It prints the real
@@ -8678,10 +8704,25 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
     // inside the frame buffer -- the STATIC child (hidden) only stores the
     // string. One blit, no flicker while the health line updates.
+    // v9.0.2: THE THREE-LINE STATUS BAR. The stored string may carry '\n'
+    // breaks -- each row paints into its own 18px slot of the 54px band
+    // (row 1 the engine state, rows 2-3 the health fields), each row
+    // ellipsizing at the band edge (NoWrap + ellipsis, as before). One-off
+    // texts without breaks ("ini saved") simply paint row 1 and leave rows
+    // 2-3 empty.
     char stb[512] = "";
     if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
-    const RECT stc = { S(14), S(458), S(866), S(476) };
-    guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
+    {
+        const char* p = stb;
+        for (int row = 0; row < 3; ++row) {
+            const char* nl = strchr(p, '\n');
+            std::string r(p, nl ? (size_t)(nl - p) : strlen(p));
+            const RECT stc = { S(14), S(458 + 18 * row), S(866), S(458 + 18 * row + 18) };
+            guiAAString(g, dc, stc, r.c_str(), guic::cAccent, g_fMono, 1);
+            if (!nl) break;
+            p = nl + 1;
+        }
+    }
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
     const RECT kbr = { S(14), KLOG_BOTTOM, S(552), KCLI_H };
@@ -9320,7 +9361,28 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         EnterCriticalSection(&g_logCS);
         const std::string health = g_lastHealth;
         LeaveCriticalSection(&g_logCS);
-        if (!health.empty()) { s += "   |   "; s += health; }
+        // v9.0.2: THE THREE-LINE STATUS BAR. The health line stays ONE line
+        // in storage (the sink's "raw1 " contract is untouched); HERE it
+        // splits on its own " | " separators into rows 2-3, four fields
+        // each (buffers/clocks then faults) -- the old single row appended
+        // all ten fields and clipped past ~106 mono chars.
+        if (!health.empty()) {
+            std::string r2, r3;
+            size_t pos = 0;
+            int fi = 0;
+            while (pos <= health.size() && fi < 8) {
+                size_t sep = health.find(" | ", pos);
+                const size_t end = (sep == std::string::npos) ? health.size() : sep;
+                const std::string fld = health.substr(pos, end - pos);
+                if (fi < 4) { if (fi) r2 += " | "; r2 += fld; }
+                else        { if (fi > 4) r3 += " | "; r3 += fld; }
+                ++fi;
+                if (sep == std::string::npos) break;
+                pos = sep + 3;
+            }
+            s += "\n"; s += r2;
+            s += "\n"; s += r3;
+        }
         // v7.0.7: WM_SETTEXT repaints a STATIC even when the text is
         // identical -- 4 idle repaints a second for nothing. Set only on
         // change; the task-manager CPU line stays at the engine's floor.
