@@ -62,6 +62,29 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.6 THE DOUBLE STATE (field-directed: "do the fastest eq compute
+//            whilst also aiming for highest quality output", with "I don't
+//            want any simd -- simd's already in compilation anyway"). THE
+//            CONSTRAINT: a biquad is a serial FEEDBACK loop -- each
+//            sample's state update depends on the previous OUTPUT -- so no
+//            vectorizer (auto or hand-written) can span samples, and the
+//            transposed DF2 recurrence (5 mul + 4 add per sample) is the
+//            op-minimal form of the filter. THE MOVE: scalar DOUBLE is the
+//            same throughput as scalar float on x64 (both pipelined 1 per
+//            cycle -- no SIMD anywhere, field-directed), so the compute
+//            cost is UNCHANGED while the numerics become transparent: the
+//            coefficients AND the DF2 state now run in double in BOTH
+//            filters (the center EQ and the surround bass restore) -- the
+//            implemented response matches the designed response exactly
+//            (no coefficient quantization shifting the center/Q), the
+//            state carries no rounding accumulation, and the signal
+//            rounds ONCE at the output boundary instead of inside every
+//            state update. double denormals live at ~1e-308 (unreachable
+//            by audio states) and the FTZ/DAZ belt stands; the build's
+//            default /fp:precise guarantees no hidden FMA contraction.
+//            THE OUTPUT IS NOT BYTE-IDENTICAL TO v8.5.5 -- that is the
+//            quality upgrade, deliberate and documented. NO new ini key,
+//            NO UI row.
 //    v8.5.5 THE SLOT LEDGER (field-directed: "on the center eq, the 'save
 //            to slot' on the current slot saves to slots after that, which
 //            is a weird thing you should fix"). THE TRACE: every layer of
@@ -2630,7 +2653,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.5"
+#define TWS_VERSION "8.5.6"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4415,8 +4438,16 @@ struct CenterEq {
     float   f0     = 0.0f;   // clamped values, for the banner
     float   gainDb = 0.0f;
     float   q      = 0.0f;
-    float   b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    float   z1 = 0.0f, z2 = 0.0f;          // transposed DF2 state
+    // v8.5.6: coefficients AND state in double. Scalar double costs the
+    // same as scalar float on x64 (same pipelined 1/cycle ops -- no SIMD
+    // anywhere, field-directed; and an IIR feedback loop cannot vectorize
+    // across samples anyway -- each state update depends on the previous
+    // output). The implemented response now matches the designed response
+    // exactly (no coefficient quantization shifting the center/Q), the
+    // state carries no rounding accumulation, and the signal rounds ONCE
+    // at the output boundary.
+    double  b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+    double  z1 = 0.0, z2 = 0.0;          // transposed DF2 state
 };
 static CenterEq g_ceq;
 
@@ -4424,7 +4455,7 @@ static CenterEq g_ceq;
 // mix -- the center EQ's filter state must not carry across silence.
 static void centerEqFlushZ()
 {
-    if (g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
+    if (g_ceq.on) { g_ceq.z1 = 0.0; g_ceq.z2 = 0.0; }
 }
 
 static void centerEqInit() {
@@ -4447,10 +4478,10 @@ static void centerEqInit() {
     const double b0 = 1.0 + alpha * A, b1 = -2.0 * cos(w0), b2 = 1.0 - alpha * A;
     const double a0 = 1.0 + alpha / A, a1 = -2.0 * cos(w0), a2 = 1.0 - alpha / A;
     g_ceq.f0 = f0; g_ceq.gainDb = gdb; g_ceq.q = qv;
-    g_ceq.b0 = (float)(b0 / a0); g_ceq.b1 = (float)(b1 / a0);
-    g_ceq.b2 = (float)(b2 / a0); g_ceq.a1 = (float)(a1 / a0);
-    g_ceq.a2 = (float)(a2 / a0);
-    g_ceq.z1 = g_ceq.z2 = 0.0f;
+    g_ceq.b0 = b0 / a0; g_ceq.b1 = b1 / a0;
+    g_ceq.b2 = b2 / a0; g_ceq.a1 = a1 / a0;
+    g_ceq.a2 = a2 / a0;
+    g_ceq.z1 = g_ceq.z2 = 0.0;
 }
 
 // ------------------------------ v8.5.1 surround bass restore (the hollow) ----
@@ -4487,9 +4518,12 @@ struct SurroundBassEq {
     float   f0     = 0.0f;   // for the banner
     float   gainDb = 0.0f;
     float   q      = 0.0f;
-    float   b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    float   z1L = 0.0f, z2L = 0.0f;          // transposed DF2 state, ch5 (SL)
-    float   z1R = 0.0f, z2R = 0.0f;          // transposed DF2 state, ch6 (SR)
+    // v8.5.6: coefficients AND state in double -- same rationale as the
+    // center EQ (scalar double = scalar float in throughput on x64, no
+    // SIMD, and the feedback loop cannot vectorize across samples).
+    double  b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+    double  z1L = 0.0, z2L = 0.0;          // transposed DF2 state, ch5 (SL)
+    double  z1R = 0.0, z2R = 0.0;          // transposed DF2 state, ch6 (SR)
 };
 static SurroundBassEq g_sbeq;
 
@@ -4498,18 +4532,21 @@ static SurroundBassEq g_sbeq;
 // starts clean.
 static void surroundBassFlushZ()
 {
-    g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f;
-    g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f;
+    g_sbeq.z1L = 0.0; g_sbeq.z2L = 0.0;
+    g_sbeq.z1R = 0.0; g_sbeq.z2R = 0.0;
 }
 
 // One sample through the peaking section (transposed DF2, the center EQ's
-// exact op structure: multiply + add, never FMA). Inlined into the fold loops.
-static inline float sbPeak(const float x, float& z1, float& z2)
+// exact op structure: multiply + add, never FMA). v8.5.6: the recurrence
+// runs in double -- same scalar throughput, one rounding at the boundary.
+// Inlined into the fold loops.
+static inline float sbPeak(const float x, double& z1, double& z2)
 {
-    const float y = g_sbeq.b0 * x + z1;
-    z1 = g_sbeq.b1 * x - g_sbeq.a1 * y + z2;
-    z2 = g_sbeq.b2 * x - g_sbeq.a2 * y;
-    return y;
+    const double xd = x;
+    const double y = g_sbeq.b0 * xd + z1;
+    z1 = g_sbeq.b1 * xd - g_sbeq.a1 * y + z2;
+    z2 = g_sbeq.b2 * xd - g_sbeq.a2 * y;
+    return (float)y;
 }
 
 static void surroundBassInit() {
@@ -4520,11 +4557,11 @@ static void surroundBassInit() {
     const double b0 = 1.0 + alpha * A, b1 = -2.0 * cos(w0), b2 = 1.0 - alpha * A;
     const double a0 = 1.0 + alpha / A, a1 = -2.0 * cos(w0), a2 = 1.0 - alpha / A;
     g_sbeq.f0 = kSbFreq; g_sbeq.gainDb = kSbGainDb; g_sbeq.q = kSbQ;
-    g_sbeq.b0 = (float)(b0 / a0); g_sbeq.b1 = (float)(b1 / a0);
-    g_sbeq.b2 = (float)(b2 / a0); g_sbeq.a1 = (float)(a1 / a0);
-    g_sbeq.a2 = (float)(a2 / a0);
-    g_sbeq.z1L = g_sbeq.z2L = 0.0f;
-    g_sbeq.z1R = g_sbeq.z2R = 0.0f;
+    g_sbeq.b0 = b0 / a0; g_sbeq.b1 = b1 / a0;
+    g_sbeq.b2 = b2 / a0; g_sbeq.a1 = a1 / a0;
+    g_sbeq.a2 = a2 / a0;
+    g_sbeq.z1L = g_sbeq.z2L = 0.0;
+    g_sbeq.z1R = g_sbeq.z2R = 0.0;
 }
 
 // ----------------------------------------------------------------- mixer ----
@@ -4644,12 +4681,18 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                     chunk[i * 2 + 1] = 0.0f;
                 }
             } else {
+                // v8.5.6: the recurrence runs in double (coefficients and
+                // state) -- scalar double is the same throughput as scalar
+                // float on x64, and the feedback loop cannot vectorize
+                // across samples anyway. The rounding happens ONCE at the
+                // output boundary instead of inside every state update.
+                const double gCd = gC;
                 for (size_t i = 0; i < n; ++i) {
-                    const float x = sc[i * kInCh + 2];
-                    const float y = g_ceq.b0 * x + g_ceq.z1;
+                    const double x = sc[i * kInCh + 2];
+                    const double y = g_ceq.b0 * x + g_ceq.z1;
                     g_ceq.z1 = g_ceq.b1 * x - g_ceq.a1 * y + g_ceq.z2;
                     g_ceq.z2 = g_ceq.b2 * x - g_ceq.a2 * y;
-                    float c = gC * y;
+                    float c = (float)(gCd * y);
                     // the boost can push past full scale; clamp here so the
                     // EQ mode is self-contained (the device layer would clip
                     // the same peak a moment later, after the keep-alive sum)
@@ -5623,7 +5666,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
