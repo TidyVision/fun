@@ -3534,6 +3534,21 @@ struct Leg {
     // the early leg by exactly that gap so both streams open together.
     std::atomic<unsigned long long> firstSwitchUs{0};
     unsigned long long  lastReopenMs = 0;            // warden pauses 10 s after a reopen
+    // v8.6.9 THE DYNABIT (the WASAPI fallback legs): the period request
+    // drifts to the LOWEST size the machine serves cleanly -- the field's
+    // own spec ("dynamic buffer size with a strict 3 buffer rule ...
+    // sees which lowest buffer size wins ... slowly drift to compensate").
+    // The notches: 1/2/3/4/6/8 ms; the device buffer is ALWAYS 3 periods
+    // (the strict rule). dynFloor = the storm-proven notch (once this run
+    // needed a size, the dynabit never re-offers smaller -- no
+    // oscillation). Written by the health tick's controller ONLY.
+    unsigned            dynPeriodMs = 1;
+    unsigned            dynNotch    = 0;
+    unsigned            dynFloor    = 0;
+    unsigned long long  dynLastDriftMs   = 0;
+    unsigned long long  dynCleanSinceMs  = 0;
+    unsigned long long  dynLateBase      = 0;
+    unsigned long long  dynWindowMs      = 0;
     // ---- v7.8.3/v7.8.4 DROP CORRECTION + SHALLOW ESCALATION: REMOVED in
     // v8.1.0 (the whole ring-depth machinery went with them). A short switch
     // plays silence and counts into 'und' -- nothing escalates, nothing
@@ -7076,7 +7091,11 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     ma_device_config pc = ma_device_config_init(ma_device_type_playback);
     pc.sampleRate = kSampleRate;
     pc.periodSizeInMilliseconds = periodMs;
-    pc.periods = 2;
+    // v8.6.9 THE STRICT 3-BUFFER RULE (field-directed: "dynamic buffer size
+    // with a strict 3 buffer rule"): the WASAPI fallback's device buffer is
+    // ALWAYS three periods -- the pacer's storm budget is two full periods
+    // of service before the DAC grazes the edge, at every dynabit notch.
+    pc.periods = 3;
     pc.playback.pDeviceID = id;
     pc.playback.format = ma_format_f32;
     pc.playback.channels = (idx == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
