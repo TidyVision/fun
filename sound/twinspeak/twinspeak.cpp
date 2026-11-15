@@ -62,6 +62,53 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.0 THE REAR COMB FOLD + THE SUPER-WIDE SPLIT (field-directed, after
+//            the first v9.1.0 microphone-calibration line was undone whole:
+//            "I found that you could just add a 0.51ms delay for the whole
+//            comb folder specific to your rear channels only if your leg3
+//            device is blank. So, I'd like that instead. And also, if leg3's
+//            device is not blank, then the surround channel should route to
+//            the mains (with the phase filter, as mentioned) at 60% volume
+//            because the dedicated rear speaker would do most of the work
+//            for you, but also routing the surround to the dedicated rear
+//            speakers at 60% volume as well, to get that full super wide
+//            effect ... on equalizer APO you could in theory make a comb
+//            filter of 0.51ms and get the same rear effect coming from my
+//            mains as the simulation part where leg3's device is blank").
+//            TWO behaviors, nothing else touched:
+//            1) THE REAR COMB FOLD (leg3 EMPTY): the rear fold's term no
+//               longer lands direct -- it runs through a FEEDFORWARD COMB,
+//               y = x + x delayed by 0.51 ms, the exact EQ-APO recipe that
+//               produces the rear effect from the mains alone. 0.51 ms is
+//               24.48 frames at 48 kHz -- a first-order fractional delay
+//               (the 24- and 25-frame taps, lerped 0.52/0.48; no resampler,
+//               no pitch path -- a per-lane two-tap filter with one shared
+//               write cursor). REAR CHANNELS ONLY (ch7 RL / ch8 RR; the
+//               surround's wide fold is untouched) and EMPTY-LEG3 ONLY (a
+//               real rear device carries the rears natively, no comb
+//               anywhere). Feedforward means a lane drains itself in 25
+//               frames -- no ringing -- but the silence contract holds
+//               lane-by-lane anyway: an all-zero rear lane RESETS its line
+//               and contributes exactly zero (g*0 = 0), and a skipped
+//               bit-zero block flushes both lines (the v8.5.1 flush
+//               pattern, rearCombFlushZ). Where the comb is inactive the
+//               terms are 0.0f * 0.0f = +0.0f and x + 0.0f = x: every other
+//               path stays byte-identical to v9.0.2.
+//            2) THE SUPER-WIDE SPLIT (leg3 SET): the surround fold is no
+//               longer leg3-exclusive -- the sides (ch5 SL / ch6 SR) fold
+//               onto the MAINS with the v8.4.27 matrix phase trick at 60%
+//               (kSurroundSplit x gain_sl/gain_sr: the phase filter, since
+//               the dedicated rear speaker does most of the work), AND the
+//               sides still ride the rear device's own outputs at 60%
+//               (kSurroundSplit x gain_rl/gain_rr, the v8.4.6 side fold
+//               scaled) -- surround plays on BOTH at once, the full super-
+//               wide effect. The surround bass restore follows: its lane
+//               scan drops the g_rearFold condition (the filter serves the
+//               surround wherever the surround plays), and leg1's mask
+//               opens ch5/ch6 in BOTH cases (the rear slots ch7/ch8 still
+//               open only on an empty leg3). The rears themselves keep
+//               their full knob on leg3 and NEVER comb there. NO new ini
+//               key, NO UI row.
 //    v9.0.2 THE THREE-LINE STATUS BAR (field-directed: "I need the status
 //            text (the one saying 'engine started') to show 3 lines instead
 //            of one"). The GUI status band is three 18px rows now: row 1
@@ -2611,7 +2658,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.0.2"
+#define TWS_VERSION "9.1.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4029,6 +4076,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n);
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore);
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
+static void rearCombFlushZ();                    // v9.1.0, defined next to g_rcomb
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
@@ -4164,11 +4212,17 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 for (int c = 0; c < kInCh; ++c) {
                     unsigned char keep = mk[c];
                     // v8.4.26 THE FOLD CHANNELS: leg1's mask opens for the
-                    // center fold (ch3, leg2 empty) and the rear fold (ch5
-                    // SL / ch6 SR, leg3 empty) -- the folds fold INTO the
-                    // stereo output, never onto another device's slots.
+                    // center fold (ch3, leg2 empty) and the fold channels
+                    // -- the folds fold INTO the stereo output, never onto
+                    // another device's slots. v9.1.0: the SURROUND slots
+                    // (0-based 4/5 = ch5 SL / ch6 SR) open for leg1 in BOTH
+                    // cases now -- the super-wide split folds them onto the
+                    // mains at 60% even when a real rear device exists. The
+                    // REAR slots (6/7 = ch7 RL / ch8 RR) still open only on
+                    // an empty leg3 (the 0.51 ms comb fold).
                     if (idx == 0 && c == 2 && g_centerFold) keep = 1;
-                    if (idx == 0 && g_rearFold && (c == 4 || c == 5 || c == 6 || c == 7)) keep = 1;
+                    if (idx == 0 && (c == 4 || c == 5)) keep = 1;
+                    if (idx == 0 && g_rearFold && (c == 6 || c == 7)) keep = 1;
                     if (!keep) sc[i * kInCh + c] = 0.0f;
                 }
         }
@@ -4179,7 +4233,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const bool skipMix = (L.zeroFast && bitZero8(sc, n));
         if (skipMix) {
             if (idx == 1) centerEqFlushZ();
-            if (idx == 0) surroundBassFlushZ();   // v8.5.1: the fold's filters start clean after a skipped block
+            if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); }   // v8.5.1/v9.1.0: the fold's filters start clean after a skipped block
             // dst is already silence
         } else {
             mixBlock(idx, sc, dst, n);         // v6.5: the bulk mix, inline now
@@ -4527,6 +4581,54 @@ static void surroundBassInit() {
     g_sbeq.z1R = g_sbeq.z2R = 0.0f;
 }
 
+// ------------------------------ v9.1.0 the rear comb (the 0.51 ms trick) ----
+// On an EMPTY leg3 the rears fold to the mains -- and the field found, on
+// Equalizer APO, that a 0.51 ms comb filter on that fold produces the same
+// rear effect as the plain fold, only further back. The fold's rear term now
+// RUNS THROUGH ONE: y = x + x delayed by 0.51 ms. REAR CHANNELS ONLY (the
+// surround's wide fold is untouched) and EMPTY-LEG3 ONLY (a real rear device
+// carries the rears natively, no comb anywhere). 0.51 ms is 24.48 frames at
+// 48 kHz -- a first-order fractional delay: the 24- and 25-frame taps,
+// lerped at 0.52 / 0.48 (no resampler, no pitch path -- a two-tap filter
+// with one shared write cursor, the sbeq pattern). Feedforward only -- no
+// feedback, no ringing; a fed-zeros lane drains itself in 25 frames, but
+// the silence contract holds lane-by-lane anyway: an all-zero rear lane
+// RESETS its line and contributes exactly zero (g * 0 = 0), and the cursor
+// advances only while at least one lane is live.
+static constexpr float kRearCombMs   = 0.51f;    // the comb's delay (the field's number)
+static constexpr int   kRearCombInt  = 24;       // 0.51 ms * 48 kHz = 24.48 frames
+static constexpr float kRearCombFrac = 0.48f;    // the fractional part (the -25 tap's weight)
+static_assert(kRearCombInt + 2 <= 32, "the comb lines must hold both taps");
+static constexpr float kSurroundSplit = 0.6f;    // v9.1.0: the super-wide split (60% to the mains, 60% to the rears)
+
+struct RearComb {
+    float bufL[32] = {};            // the rear-L line (taps at cursor-24 / cursor-25)
+    float bufR[32] = {};            // the rear-R line
+    int   idx = 0;                  // the shared write cursor (wraps at 32)
+};
+static RearComb g_rcomb;
+
+// The center EQ's silence contract, extended to the comb: a skipped
+// (bit-zero) block must not leave state behind -- the next fold starts cold.
+static void rearCombFlushZ()
+{
+    memset(g_rcomb.bufL, 0, sizeof(g_rcomb.bufL));
+    memset(g_rcomb.bufR, 0, sizeof(g_rcomb.bufR));
+}
+
+// One sample through the comb: y = x + ((1 - frac) * x[-24] + frac * x[-25]),
+// the first-order fractional delay at 24.48 frames (0.51 ms). The lane's
+// buffer is written; the shared cursor is advanced by the caller once per
+// sample, only while at least one lane is live.
+static inline float rearCombRun(const float x, float* buf, const int idx)
+{
+    const int   i24 = (idx + 32 - kRearCombInt) & 31;
+    const int   i25 = (idx + 32 - kRearCombInt - 1) & 31;
+    const float d   = (1.0f - kRearCombFrac) * buf[i24] + kRearCombFrac * buf[i25];
+    buf[idx] = x;
+    return x + d;
+}
+
 // ----------------------------------------------------------------- mixer ----
 // v6.5: whole-BLOCK mix with the ini gains hoisted into locals. Every
 // per-frame FP op is unchanged (multiply + add, never FMA -- -ffp-contract
@@ -4545,7 +4647,11 @@ static void surroundBassInit() {
 // with an EMPTY device never runs -- empty in = empty out (stereo content
 // plays with silent rears; that is the truth), and an empty leg3 takes its
 // side fold down with it. A 5.1 movie (surround on ch5/ch6) plays its
-// surround on the rear speakers natively now.
+// surround on the rear speakers natively now. v9.1.0: BOTH statements lose
+// their absoluteness -- the sides ALSO fold onto the mains (the super-wide
+// split: the phase trick at 60% on leg1, the rear device's side fold at
+// 60%), and on an EMPTY leg3 the rears' own fold runs through a 0.51 ms
+// comb (the EQ-APO rear effect, built in). See the v9.1.0 changelog above.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // v8.4.23 leg1 = THE MASKED STEREO COPY: the chunk arrives with
@@ -4557,15 +4663,22 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // is no upmix risk by construction.
         const float gL = g_cfg.gainL, gR = g_cfg.gainR, gLfe = g_cfg.gainLfe;
         // v8.4.26/27 THE REAR + SURROUND FOLD (leg3 empty): the rears (ch7
-        // RL, ch8 RR) fold DIRECT to their own sides -- their own specific
-        // type. The surrounds (ch5 SL, ch6 SR) fold WIDE -- the
+        // RL, ch8 RR) fold to their own sides -- their own specific type,
+        // now THROUGH THE 0.51 ms REAR COMB below (v9.1.0). The surrounds
+        // (ch5 SL, ch6 SR) fold WIDE -- the
         // matrix-encoding phase trick: each surround feeds its own side
         // in-phase and the opposite side INVERTED at half gain, so the
         // surround pushes outward instead of smearing the front image.
         const float gRL = g_rearFold ? g_cfg.gainRl : 0.0f;
         const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
-        const float gSL = g_rearFold ? g_cfg.gainSl : 0.0f;   // v8.5.0: the surround gains
-        const float gSR = g_rearFold ? g_cfg.gainSr : 0.0f;
+        // v9.1.0 THE SUPER-WIDE SPLIT: the surround fold runs in BOTH cases
+        // now -- FULL gain on an empty leg3 (the pure 2.1 simulation), and
+        // 60% when a real rear device carries most of the work (the same
+        // 60% rides the rear device's own side fold below -- surround plays
+        // on BOTH at once, with the phase trick, the full super-wide
+        // effect).
+        const float gSL = g_rearFold ? g_cfg.gainSl : g_cfg.gainSl * kSurroundSplit;
+        const float gSR = g_rearFold ? g_cfg.gainSr : g_cfg.gainSr * kSurroundSplit;
         // v8.5.1 THE SURROUND BASS RESTORE: the fold's surround lanes run
         // through the peaking biquad FIRST (surround_bass_gain dB @
         // surround_bass_freq, from the ORIGINAL pre-trick samples -- the
@@ -4577,7 +4690,9 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // bit-exactness). Nonzero lanes run every sample, internal zeros
         // included.
         bool slLive = false, srLive = false;
-        if (g_rearFold && g_sbeq.on) {
+        // v9.1.0: the surround lanes feed leg1 in BOTH cases now -- the
+        // bass filter's scan drops the g_rearFold condition.
+        if (g_sbeq.on) {
             for (size_t i = 0; i < n; ++i) {
                 if (sc[i * kInCh + 4] != 0.0f) slLive = true;
                 if (sc[i * kInCh + 5] != 0.0f) srLive = true;
@@ -4586,6 +4701,22 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             if (!slLive) { g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f; }
             if (!srLive) { g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f; }
         }
+        // v9.1.0 THE REAR COMB: the rear lanes gate themselves (the center
+        // EQ's silence contract, lane by lane) -- a dead lane RESETS its
+        // comb line and contributes exactly zero; the live lanes run the
+        // 0.51 ms comb below. REAR CHANNELS ONLY, EMPTY LEG3 ONLY (the
+        // scan is gated on g_rearFold; a real rear device never combs).
+        bool rlLive = false, rrLive = false;
+        if (g_rearFold) {
+            for (size_t i = 0; i < n; ++i) {
+                if (sc[i * kInCh + 6] != 0.0f) rlLive = true;
+                if (sc[i * kInCh + 7] != 0.0f) rrLive = true;
+                if (rlLive && rrLive) break;
+            }
+            if (!rlLive) memset(g_rcomb.bufL, 0, sizeof(g_rcomb.bufL));
+            if (!rrLive) memset(g_rcomb.bufR, 0, sizeof(g_rcomb.bufR));
+        }
+        const bool combAdv = g_rearFold && (rlLive || rrLive);
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             for (size_t i = 0; i < n; ++i) {
@@ -4597,8 +4728,13 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 // biquad; a dead lane passes its samples through untouched)
                 const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];
                 const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];
-                o[0] = gL * f[0] + lfe + cf + gRL * f[6] + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + cf + gRR * f[7] + gSR * s6 - 0.5f * gSL * s5;
+                // v9.1.0 THE REAR COMB: the comb eats the RAW sample; the
+                // gain applies after -- the EQ-APO order.
+                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
+                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
+                if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
+                o[0] = gL * f[0] + lfe + cf + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
+                o[1] = gR * f[1] + lfe + cf + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
@@ -4607,8 +4743,12 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 const float lfe = gLfe * f[3];
                 const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];   // v8.5.1
                 const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];   // v8.5.1
-                o[0] = gL * f[0] + lfe + gRL * f[6] + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + gRR * f[7] + gSR * s6 - 0.5f * gSL * s5;
+                // v9.1.0 THE REAR COMB (the else branch, same ops)
+                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
+                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
+                if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
+                o[0] = gL * f[0] + lfe + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
+                o[1] = gR * f[1] + lfe + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
             }
         }
     } else if (idx == 1) {
@@ -4670,10 +4810,15 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // mix only when ALL FOUR lanes are all-zero (each lane's gate is
         // its own, above).
         const float gRL = g_cfg.gainRl, gRR = g_cfg.gainRr;
+        // v9.1.0 THE SUPER-WIDE SPLIT: the sides ride the rear device at 60%
+        // (the mains carry their own 60% with the phase trick above -- the
+        // full super-wide effect, both at once). The REAR term keeps its
+        // full knob: the dedicated speaker does most of the work. The rears
+        // NEVER comb here -- the 0.51 ms comb is the empty-leg3 fold only.
         for (size_t i = 0; i < n; ++i) {
             const float* f = sc + i * kInCh;
-            chunk[i * 2 + 0] = gRL * f[kRearLCh] + gRL * f[kSideLCh];   // rear L ch7 + side L ch5
-            chunk[i * 2 + 1] = gRR * f[kRearRCh] + gRR * f[kSideRCh];   // rear R ch8 + side R ch6
+            chunk[i * 2 + 0] = gRL * f[kRearLCh] + kSurroundSplit * gRL * f[kSideLCh];   // rear L ch7 + side L ch5 at 60%
+            chunk[i * 2 + 1] = gRR * f[kRearRCh] + kSurroundSplit * gRR * f[kSideRCh];   // rear R ch8 + side R ch6 at 60%
         }
     }
 }
@@ -4810,6 +4955,10 @@ static void writeTemplate(const char* path) {
         "; (an EMPTY rear device keeps the rears silent). v8.4.11: ONE rear\n"
         "; device carries BOTH rears (the old output_device4/offset4_ms are\n"
         "; read-and-ignored -- stale lines load clean).\n"
+        "; v9.1.0: the rears' fold to the mains (empty leg3) runs through a\n"
+        "; 0.51 ms comb -- the EQ-APO rear effect, built in. A REAL leg3\n"
+        "; splits the surround 60/60: the mains carry it with the phase\n"
+        "; trick AND the rears carry it natively, both at 60%.\n"
         "\n"
         "; ALIGNMENT DELAY (v6.1): delay1_ms / delay2_ms push ONE leg's output\n"
         "; later by whole milliseconds -- a BIT-EXACT ring delay: the leg's ring\n"
