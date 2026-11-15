@@ -62,6 +62,43 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.1 THE VIRTUAL CENTER -- THE HRTF + XTC FOLD (field-directed: "Also,
+//            if leg2 is blank, I would want the center channel be folded to
+//            the mains too, just with an HRTF Convolution + Crosstalk
+//            Cancellation (XTC)"). The plain mono center fold (the in-head
+//            phantom: the same cf on both mains) is REPLACED -- leg2 empty
+//            now folds ch3 onto the mains through a virtual 0-degree center
+//            speaker, built from two pieces:
+//            1) THE CROSSTALK CANCELLATION (the shuffler canceller): y = x
+//               - a * hp(x[n - 0.26 ms]), a = 0.70. The speaker pair's own
+//               acoustic comb (D + C*e^-jwt -- the thing that makes a
+//               phantom sound in-head) is pre-notched, so the acoustic sum
+//               at the ears lands flat and only the second-order residual
+//               (1 - a^2*e^-2jwt) remains. 0.26 ms is the crosstalk delay
+//               of a +-30-degree triangle (12.48 frames at 48 kHz -- the
+//               rear comb's first-order fractional-delay pattern, taps 12/
+//               13 at 0.52/0.48). The SUBTRACTED branch is highpassed at
+//               700 Hz (RBJ, Q 0.707) -- band-limited XTC: the cancellation
+//               never touches dialogue bass, where the phantom is harmless
+//               and exact cancellation is physically impossible (C == D).
+//            2) THE HRTF CONVOLUTION: a synthesized 0-degree kernel -- the
+//               direct impulse, the concha wall tap (+0.30 @ 0.125 ms,
+//               which interferes into the ~4 kHz frontal notch), the
+//               pinna's secondary (-0.22 @ 0.354 ms) and a small torso tap
+//               (+0.10 @ 0.625 ms), normalized to unit DC. TRUE FIR
+//               convolution over a 32-frame line, executed across its four
+//               nonzero taps. It is NOT a measured KEMAR IR -- it is the
+//               minimal frontal-spectrum kernel; gain_center still owns the
+//               level. The output lands on BOTH mains (symmetric at 0
+//               degrees: no image shift, the image stays dead center --
+//               only the timbre and the externalization change).
+//            CONTRACT: the ch3 lane gates the chain lane-by-lane (an
+//            all-zero block RESETS the HP state and both lines and
+//            contributes exactly zero, g*0 = 0), and a skipped bit-zero
+//            block flushes it (centerVirtualFlushZ, the v8.5.1 pattern).
+//            With leg2 SET the branch never runs (bit-identical to v9.1.0);
+//            with ch3 silent the terms are exact zeros. NO new ini key, NO
+//            UI row.
 //    v9.1.0 THE REAR COMB FOLD + THE SUPER-WIDE SPLIT (field-directed, after
 //            the first v9.1.0 microphone-calibration line was undone whole:
 //            "I found that you could just add a 0.51ms delay for the whole
@@ -2658,7 +2695,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.0"
+#define TWS_VERSION "9.1.1"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4077,6 +4114,7 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static void rearCombFlushZ();                    // v9.1.0, defined next to g_rcomb
+static void centerVirtualFlushZ();               // v9.1.1, defined next to g_cvc
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
@@ -4233,7 +4271,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const bool skipMix = (L.zeroFast && bitZero8(sc, n));
         if (skipMix) {
             if (idx == 1) centerEqFlushZ();
-            if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); }   // v8.5.1/v9.1.0: the fold's filters start clean after a skipped block
+            if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); centerVirtualFlushZ(); }   // v8.5.1/v9.1.0/v9.1.1: the fold's filters start clean after a skipped block
             // dst is already silence
         } else {
             mixBlock(idx, sc, dst, n);         // v6.5: the bulk mix, inline now
@@ -4629,6 +4667,95 @@ static inline float rearCombRun(const float x, float* buf, const int idx)
     return x + d;
 }
 
+// ---------------- v9.1.1 the virtual center (the HRTF + XTC fold) -----------
+// With leg2 EMPTY the center folds onto the mains -- but no longer as the
+// plain mono phantom (the same sample on both speakers, which the acoustic
+// comb of the speaker pair renders in-head). The fold's center term now runs
+// through a virtual 0-degree center speaker: THE CROSSTALK CANCELLATION
+// first, then THE HRTF CONVOLUTION, and the result lands on BOTH mains
+// (symmetric at 0 degrees: no ILD, no ITD -- the image stays dead center,
+// only the timbre and the externalization change). The center EQ stays
+// out2-only; the fold never ran it and still does not.
+static constexpr float  kCvcXtcMs   = 0.26f;     // the crosstalk delay of a +-30-degree triangle
+static constexpr int    kCvcXtcInt  = 12;        // 0.26 ms * 48 kHz = 12.48 frames
+static constexpr float  kCvcXtcFrac = 0.48f;     // the fractional part (the -13 tap's weight)
+static constexpr float  kCvcXtcA    = 0.70f;     // the XTC regularization (a = 1 leaves 1 - e^-2jwt nulls)
+static constexpr double kCvcHpHz    = 700.0;     // the subtracted branch's highpass (band-limited XTC)
+static constexpr int    kCvcHrTapK[4] = { 0, 6, 17, 30 };        // the synthesized 0-degree kernel's taps (frames)
+static constexpr float  kCvcHrTapG[4] = { 1.0f, 0.30f, -0.22f, 0.10f };   // direct, concha, pinna, torso
+static_assert(kCvcXtcInt + 2 <= 16, "the XTC line must hold both taps");
+static_assert(kCvcHrTapK[3] + 1 <= 32, "the HRTF line must hold the longest tap");
+
+struct CenterVirtual {
+    // the XTC branch's highpass (RBJ, transposed DF2 -- the sbPeak pattern)
+    float hpB0 = 1.0f, hpB1 = 0.0f, hpB2 = 0.0f, hpA1 = 0.0f, hpA2 = 0.0f;
+    float hpZ1 = 0.0f, hpZ2 = 0.0f;
+    float xdl[16] = {};             // the XTC line (taps at cursor-12 / cursor-13)
+    int   xidx = 0;
+    float hline[32] = {};           // the HRTF convolution line
+    float hg[4] = { 1.0f, 0.0f, 0.0f, 0.0f };   // the kernel, normalized to unit DC at init
+    int   hidx = 0;
+};
+static CenterVirtual g_cvc;
+
+static void centerVirtualInit()
+{
+    // the kernel, normalized so the fold's loudness is the phantom's
+    float sum = 0.0f;
+    for (int i = 0; i < 4; ++i) sum += kCvcHrTapG[i];
+    for (int i = 0; i < 4; ++i) g_cvc.hg[i] = kCvcHrTapG[i] / sum;
+    // RBJ audio-EQ-cookbook highpass at kCvcHpHz, Q = 0.707 (Butterworth)
+    const double w0  = kTwoPi * kCvcHpHz / (double)kSampleRate;
+    const double cw  = cos(w0), sw = sin(w0);
+    const double al  = sw / (2.0 * 0.70710678118654752);
+    const double b0  =  (1.0 + cw) / 2.0, b1 = -(1.0 + cw), b2 = (1.0 + cw) / 2.0;
+    const double a0  = 1.0 + al, a1 = -2.0 * cw, a2 = 1.0 - al;
+    g_cvc.hpB0 = (float)(b0 / a0); g_cvc.hpB1 = (float)(b1 / a0);
+    g_cvc.hpB2 = (float)(b2 / a0); g_cvc.hpA1 = (float)(a1 / a0);
+    g_cvc.hpA2 = (float)(a2 / a0);
+}
+
+// The center EQ's silence contract, extended to the virtual chain: a dead
+// center lane (or a skipped bit-zero block) RESETS everything -- the next
+// fold starts cold and silent lanes contribute exactly zero (g * 0 = 0).
+static void centerVirtualFlushZ()
+{
+    g_cvc.hpZ1 = 0.0f; g_cvc.hpZ2 = 0.0f;
+    memset(g_cvc.xdl, 0, sizeof(g_cvc.xdl));
+    memset(g_cvc.hline, 0, sizeof(g_cvc.hline));
+    g_cvc.xidx = 0;
+    g_cvc.hidx = 0;
+}
+
+// One sample through the virtual center: the speaker-pair signal both mains
+// receive. y = x - a * hp(x[n - 12.48 fr]) -- the shuffler canceller, the
+// acoustic comb of the pair pre-notched (the subtraction is HIGH passed, so
+// the LF stays the harmless phantom) -- then the HRTF convolution over the
+// kernel's four nonzero taps.
+static inline float centerVirtualRun(const float x)
+{
+    // 1) THE CROSSTALK CANCELLATION (first-order fractional delay, the rear
+    //    comb's pattern)
+    const int   i12 = (g_cvc.xidx + 16 - kCvcXtcInt) & 15;
+    const int   i13 = (g_cvc.xidx + 16 - kCvcXtcInt - 1) & 15;
+    const float d   = (1.0f - kCvcXtcFrac) * g_cvc.xdl[i12] + kCvcXtcFrac * g_cvc.xdl[i13];
+    g_cvc.xdl[g_cvc.xidx] = x;
+    if (++g_cvc.xidx >= 16) g_cvc.xidx = 0;
+    const float dh  = g_cvc.hpB0 * d + g_cvc.hpZ1;
+    g_cvc.hpZ1 = g_cvc.hpB1 * d - g_cvc.hpA1 * dh + g_cvc.hpZ2;
+    g_cvc.hpZ2 = g_cvc.hpB2 * d - g_cvc.hpA2 * dh;
+    const float y   = x - kCvcXtcA * dh;
+    // 2) THE HRTF CONVOLUTION (the direct tap reads the sample just written)
+    g_cvc.hline[g_cvc.hidx] = y;
+    const int iA = (g_cvc.hidx + 32 - kCvcHrTapK[1]) & 31;
+    const int iB = (g_cvc.hidx + 32 - kCvcHrTapK[2]) & 31;
+    const int iC = (g_cvc.hidx + 32 - kCvcHrTapK[3]) & 31;
+    const float z = g_cvc.hg[0] * y + g_cvc.hg[1] * g_cvc.hline[iA]
+                  + g_cvc.hg[2] * g_cvc.hline[iB] + g_cvc.hg[3] * g_cvc.hline[iC];
+    if (++g_cvc.hidx >= 32) g_cvc.hidx = 0;
+    return z;
+}
+
 // ----------------------------------------------------------------- mixer ----
 // v6.5: whole-BLOCK mix with the ini gains hoisted into locals. Every
 // per-frame FP op is unchanged (multiply + add, never FMA -- -ffp-contract
@@ -4719,11 +4846,22 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         const bool combAdv = g_rearFold && (rlLive || rrLive);
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
+            // v9.1.1: the center lane gates the virtual chain (the silence
+            // contract, lane by lane) -- a dead ch3 RESETS the chain and
+            // contributes exactly zero.
+            bool cLive = false;
+            for (size_t i = 0; i < n; ++i)
+                if (sc[i * kInCh + 2] != 0.0f) { cLive = true; break; }
+            if (!cLive) centerVirtualFlushZ();
             for (size_t i = 0; i < n; ++i) {
                 const float* f = sc + i * kInCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
-                const float cf  = gC * f[2];            // the center fold (leg2 empty)
+                // v9.1.1 THE VIRTUAL CENTER: the HRTF + XTC chain replaces
+                // the plain mono fold -- the SAME shaped signal lands on
+                // BOTH mains (symmetric at 0 degrees), so the sum stays the
+                // phantom's position with the virtual speaker's timbre.
+                const float cf  = cLive ? gC * centerVirtualRun(f[2]) : 0.0f;
                 // v8.5.1: the surround bass restore (the scan above gates the
                 // biquad; a dead lane passes its samples through untouched)
                 const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];
@@ -4959,6 +5097,10 @@ static void writeTemplate(const char* path) {
         "; 0.51 ms comb -- the EQ-APO rear effect, built in. A REAL leg3\n"
         "; splits the surround 60/60: the mains carry it with the phase\n"
         "; trick AND the rears carry it natively, both at 60%.\n"
+        "; v9.1.1: an EMPTY center device folds ch3 onto the mains through a\n"
+        "; virtual 0-degree center -- crosstalk cancellation + an HRTF\n"
+        "; convolution (the phantom's acoustic comb is pre-notched and the\n"
+        "; image externalizes).\n"
         "\n"
         "; ALIGNMENT DELAY (v6.1): delay1_ms / delay2_ms push ONE leg's output\n"
         "; later by whole milliseconds -- a BIT-EXACT ring delay: the leg's ring\n"
@@ -10273,6 +10415,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
 
     // v8.5.1: surround bass restore coefficients (ini: surround_bass*)
     surroundBassInit();
+
+    // v9.1.1: the virtual center's coefficients (the synthesized 0-degree
+    // HRTF kernel + the XTC branch's highpass) -- no ini keys; the chain
+    // arms itself whenever the center fold runs (leg2 empty).
+    centerVirtualInit();
 
     // v6.2 chimes: render the modernized signature ONCE -- C7 42 ms -> G7
     // 72 ms triangle blips, 20 ms gap, exp decay, peak = chime_gain. Plays
