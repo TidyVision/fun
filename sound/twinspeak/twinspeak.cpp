@@ -62,6 +62,90 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.4 LEG4 -- THE LFE FOLD TO AN EXISTING LEG (field-directed: "have a
+//            leg4, specific to LFE folding to an existing leg device only,
+//            where if the selected device is playing on a leg that it
+//            essentially adds the LFE channel of the frame to the L and R
+//            channels of that specific device. I want this, because now I'm
+//            wanting my adesso to be my mains and my 2.1 surround analog
+//            speakers as the rear and surround source, with leg4's device
+//            being the said 2.1 surround analog speakers since all it would
+//            do is basically add bass to it"). output_device4 is UN-RETIRED
+//            with a new meaning: leg4 NEVER opens a device of its own (a
+//            WASAPI EXCLUSIVE stream cannot open twice -- the fold is the
+//            only way a shared device gets bass). At start its needle is
+//            resolved and matched against the legs that are actually
+//            playing, by RESOLVED endpoint id: a match to leg2 turns the
+//            LFE fold on there (gain_lfe * ch4 on BOTH of the leg's
+//            outputs, the center EQ's silence contract intact -- a dead ch3
+//            with live LFE still passes the bass), a match to leg3 adds the
+//            bass to the rears/surround device (the field's exact ask: the
+//            2.1 speakers as the rear+surround source, leg4 adding the
+//            sub's channel to them), and a match to leg1 is reported idle
+//            (the mains already fold the LFE by design). No match -- or an
+//            empty needle, or a needle that resolves to nothing (a soft
+//            note in the log, never an error) -- and leg4 stays IDLE. The
+//            fold target's mask opens ch4 (0-based 3) so the silence
+//            compression sees a live LFE lane; gain_lfe remains the ONE
+//            knob. Also in passing: the v9.1.1 route banner still said the
+//            center fold was "a plain gain_center sum, no filter" -- it
+//            says the virtual center now. NO new gain key, NO new ini key
+//            beyond output_device4's return, the UI gains one combo row
+//            (the left column reflowed: leg4 at 256, volume_endpoint 290,
+//            REFRESH 318, the note 352).
+//    v9.1.3 THE MASK BLEND + THE PARALLEL ROBUSTNESS ESTIMATOR + NO BOTTOM
+//            (field-directed: "I want to combine HRTF and phase-shuffled
+//            comb-correction by a float mask value that's calculated by
+//            their own 'robust to wrong geometry' calculation, done in an
+//            optimized manner (no simd, just make it parallel on all
+//            threads). Also, I still see a bottom on the console. Why is
+//            this though?"). THREE changes:
+//            1) THE MASK BLEND: the virtual center is a blend of TWO
+//               chains now -- chain A, the v9.1.1 HRTF + XTC (feedforward,
+//               no poles, cannot resonate), and chain B, THE PHASE-
+//               SHUFFLED COMB CORRECTION: the recursive shuffler comb that
+//               inverts the phantom's acoustic comb exactly,
+//                 y[n] = g*y[n - 2tau] + x[n] - x[n - tau],   g = 0.85,
+//               the factored inverse 1/(1 + e^-jwt): its numerator kills
+//               DC/LF by itself (no bass damage), and the regularized
+//               pole lifts the acoustic nulls back flat. Both chains
+//               share tau (12.48 fr) and the same two-tap fractional
+//               delay; the mix thread lerps them per sample by the
+//               SMOOTHED mask (one pole toward the estimator's verdict).
+//            2) THE ROBUSTNESS ESTIMATOR: the mask target is computed
+//               every round from the center's own recent window (up to
+//               341 ms) -- THE COMB-EXPOSURE FIGURE: the max normalized
+//               autocorrelation of the center across the fixed combs' own
+//               periods {12, 13, 24, 25}. Content that is itself
+//               comb-like at those periods (synths, metallic resonances)
+//               is exactly where a fixed-geometry comb's wrong-geometry
+//               exposure bites -- the figure measures that exposure
+//               directly from the data path (no microphone, no geometry
+//               assumptions). Exposure below 0.25 = pure chain A (the
+//               sound the field approved stays the default); above 0.65
+//               the shuffler blends in, up to half. THE PARALLELISM: a
+//               persistent pool of one thread per processor
+//               (GetNativeSystemInfo; no std::thread include, no SIMD --
+//               plain partial sums over disjoint slices) computes the
+//               four lag sums each round; the coordinator (which takes
+//               slice 0 itself) merges the parts and publishes the
+//               verdict through an atomic, generation-counted so a slow
+//               worker can never pollute the next round. The center's
+//               samples reach it through an SPSC ring the mix thread
+//               feeds (the writer drops the oldest frame on overrun; a
+//               starved ring keeps the last verdict). The pool and the
+//               coordinator live and die with the engine
+//               (centerVirtualInit / centerVirtualShutdown).
+//            3) NO BOTTOM: the "bottom" was the CARET'S LINE -- every log
+//               line ended with its own newline, so the caret lived on a
+//               trailing EMPTY line, and EM_SCROLLCARET (a minimal-scroll
+//               primitive) parked the view with that empty line at the
+//               edge, thumb shy of the end. The append now strips the
+//               chunk's TRAILING breaks and carries its own LEADING break
+//               (the caret ends ON the last text line), and a follow pins
+//               the view with EM_LINESCROLL clamped into range -- the
+//               absolute bottom, no dead row, thumb seated. NO ini key,
+//               NO UI row.
 //    v9.1.2 THE PAGE-0 NOTE + THE REOPEN COLD START + THE UNCAPPED LOG
 //            (field-directed, three asks in one release: "make it so
 //            there's a description right below the 'launch at windows
@@ -2739,7 +2823,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.2"
+#define TWS_VERSION "9.1.4"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2899,6 +2983,7 @@ struct Config {
     // no device is opened, no ring is built, the needle never matches:
     // empty in = empty out, the truth.
     std::string outputDevice3;
+    std::string outputDevice4;   // v9.1.4: leg4 -- the LFE fold to an EXISTING leg's device (never opens its own)
     std::string volumeEndpoint;      // v3.9: needle for the cable's PLAYBACK endpoint
                                      //       (volume follow); empty = use input_device
     float       gainL          = 1.0f;
@@ -3349,6 +3434,7 @@ static bool g_centerFold = false;
 // rear device is configured. Written once per engine start on the main
 // thread, before any device thread exists.
 static bool g_rearFold = false;
+static int  g_lfeFoldLeg = -1;   // v9.1.4: leg4's LFE fold target (-1 = idle; 1 = leg2, 2 = leg3)
 
 // v8.4.0: one place answers "which ini needle opens leg i" -- every open /
 // reopen / yield path asks here, so a rear leg can never fall back to a
@@ -4305,6 +4391,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                     if (idx == 0 && c == 2 && g_centerFold) keep = 1;
                     if (idx == 0 && (c == 4 || c == 5)) keep = 1;
                     if (idx == 0 && g_rearFold && (c == 6 || c == 7)) keep = 1;
+                    // v9.1.4 LEG4: the fold target's mask opens ch4 (0-based
+                    // 3) -- the LFE lane rides that leg's own mix. leg1
+                    // already keeps it (the built-in LFE fold), so this
+                    // line only ever widens leg2/leg3.
+                    if (idx == g_lfeFoldLeg && c == 3) keep = 1;
                     if (!keep) sc[i * kInCh + c] = 0.0f;
                 }
         }
@@ -4729,6 +4820,13 @@ static constexpr int    kCvcHrTapK[4] = { 0, 6, 17, 30 };        // the synthesi
 static constexpr float  kCvcHrTapG[4] = { 1.0f, 0.30f, -0.22f, 0.10f };   // direct, concha, pinna, torso
 static_assert(kCvcXtcInt + 2 <= 16, "the XTC line must hold both taps");
 static_assert(kCvcHrTapK[3] + 1 <= 32, "the HRTF line must hold the longest tap");
+// v9.1.3: the mask blend + the parallel robustness estimator
+static constexpr float  kCvcShufG  = 0.85f;    // the shuffler comb's regularization (its poles sit on the acoustic nulls)
+static constexpr float  kCvcMaskSm = 0.0005f;  // the per-sample one-pole smoothing (~40 ms at 48 kHz)
+static constexpr double kCvcMaskLo = 0.25;     // comb exposure below: pure chain A (the approved sound)
+static constexpr double kCvcMaskHi = 0.65;     // comb exposure above: half the shuffler in
+static constexpr int    kCvcEstLags[4] = { 12, 13, 24, 25 };   // the fixed combs' own periods (tau and 2*tau, both taps)
+static constexpr size_t kCvcMinFrames = 4096;  // 85 ms: a shorter window keeps the last verdict
 
 struct CenterVirtual {
     // the XTC branch's highpass (RBJ, transposed DF2 -- the sbPeak pattern)
@@ -4739,8 +4837,183 @@ struct CenterVirtual {
     float hline[32] = {};           // the HRTF convolution line
     float hg[4] = { 1.0f, 0.0f, 0.0f, 0.0f };   // the kernel, normalized to unit DC at init
     int   hidx = 0;
+    // v9.1.3: chain B -- the phase-shuffled comb correction (the recursive
+    // shuffler comb). Its feedback taps read PAST OUTPUTS at 2*tau (24/25);
+    // its feedforward taps read past INPUTS at tau (12/13).
+    float brng[32] = {};
+    float xrng[16] = {};
+    int   bidx = 0, xidx2 = 0;
 };
 static CenterVirtual g_cvc;
+
+// The center EQ's silence contract, extended to the virtual chain: a dead
+// center lane (or a skipped bit-zero block) RESETS everything -- the next
+// fold starts cold and silent lanes contribute exactly zero (g * 0 = 0).
+static void centerVirtualFlushZ()
+{
+    g_cvc.hpZ1 = 0.0f; g_cvc.hpZ2 = 0.0f;
+    memset(g_cvc.xdl, 0, sizeof(g_cvc.xdl));
+    memset(g_cvc.hline, 0, sizeof(g_cvc.hline));
+    g_cvc.xidx = 0;
+    g_cvc.hidx = 0;
+    memset(g_cvc.brng, 0, sizeof(g_cvc.brng));   // v9.1.3: chain B starts cold too
+    memset(g_cvc.xrng, 0, sizeof(g_cvc.xrng));
+    g_cvc.bidx = 0;
+    g_cvc.xidx2 = 0;
+}
+
+// ---------------- v9.1.3: the mask + the parallel robustness estimator ------
+// The float mask blends the two chains: 1 = pure HRTF + XTC, 0 = pure
+// phase-shuffled comb correction. Its TARGET is the estimator's verdict;
+// the mix thread smooths toward it so the crossfade is silent.
+static float              g_cvcMask = 1.0f;      // the smoothed mask (the mix thread owns it)
+static std::atomic<float> g_cvcMaskTarget{1.0f}; // the estimator's verdict (chain-A weight)
+
+// the SPSC center ring: the mix thread writes the RAW center samples, the
+// estimator drains them (the writer drops the OLDEST frame on overrun)
+static constexpr size_t kCvcRingFrames = 16384; // 341 ms @ 48 kHz, power of two
+static constexpr size_t kCvcRingMask   = kCvcRingFrames - 1;
+static std::vector<float> g_cvcRing;
+static std::atomic<size_t> g_cvcHead{0};
+static std::atomic<size_t> g_cvcTail{0};
+
+// the pool: one thread per PROCESSOR, plain partial sums (no SIMD -- the
+// window splits into disjoint slices, each worker computes its part, the
+// coordinator merges). Generation-counted: a slow worker publishing an old
+// round can never pollute the current one.
+static constexpr int kCvcMaxWorkers = 64;
+static std::vector<float> g_cvcWin;             // the window copy (the coordinator fills it)
+static int                g_cvcWinN = 0;
+static HANDLE             g_cvcPool[kCvcMaxWorkers] = {};
+static int                g_cvcWorkers = 0;     // participants (the coordinator is slot 0)
+static CRITICAL_SECTION   g_cvcPoolCS;
+static CONDITION_VARIABLE g_cvcWorkCv;
+static CONDITION_VARIABLE g_cvcDoneCv;
+static int                g_cvcGen = 0;
+static int                g_cvcSeen[kCvcMaxWorkers] = {};
+static HANDLE             g_cvcThread = nullptr;
+static std::atomic<bool>  g_cvcRun{false};
+struct CvcPart {
+    double dot[4] = {};             // sum x[i] * x[i+L]
+    double e0[4]  = {};             // sum x[i]^2
+    double eL[4]  = {};             // sum x[i+L]^2
+};
+static CvcPart g_cvcParts[kCvcMaxWorkers] = {};
+
+// One slice's partial sums for all four lags. The slices partition the
+// window's indices; a tail index whose lag partner falls past the window is
+// simply not counted (every worker applies the same rule -- the union is
+// exact).
+static void cvcPartial(const float* w, const int n, const int a, const int b, CvcPart& part)
+{
+    for (int k = 0; k < 4; ++k) {
+        const int L = kCvcEstLags[k];
+        double dot = 0.0, e0 = 0.0, eL = 0.0;
+        const int lim = (b < n ? b : n);
+        for (int i = a; i < lim; ++i) {
+            if (i + L >= n) break;
+            const double xi = (double)w[i], xj = (double)w[i + L];
+            dot += xi * xj;
+            e0  += xi * xi;
+            eL  += xj * xj;
+        }
+        part.dot[k] = dot;
+        part.e0[k]  = e0;
+        part.eL[k]  = eL;
+    }
+}
+
+static DWORD WINAPI cvcWorkerThread(LPVOID p)
+{
+    const int me = (int)(INT_PTR)p;
+    while (g_cvcRun.load(std::memory_order_acquire)) {
+        EnterCriticalSection(&g_cvcPoolCS);
+        while (g_cvcRun.load(std::memory_order_acquire) && g_cvcSeen[me] == g_cvcGen)
+            SleepConditionVariableCS(&g_cvcWorkCv, &g_cvcPoolCS, 250);
+        const int gen = g_cvcGen;
+        LeaveCriticalSection(&g_cvcPoolCS);
+        if (!g_cvcRun.load(std::memory_order_acquire) || gen == g_cvcSeen[me]) continue;
+        const int n = g_cvcWinN;
+        const int chunk = (n + g_cvcWorkers - 1) / g_cvcWorkers;
+        int b = (me + 1) * chunk;
+        if (b > n) b = n;
+        CvcPart part;
+        cvcPartial(g_cvcWin.data(), n, me * chunk, b, part);
+        EnterCriticalSection(&g_cvcPoolCS);
+        g_cvcParts[me] = part;
+        g_cvcSeen[me] = gen;
+        LeaveCriticalSection(&g_cvcPoolCS);
+        WakeConditionVariable(&g_cvcDoneCv);
+    }
+    return 0;
+}
+
+// The coordinator: drains the ring, dispatches a round, takes slice 0
+// itself, merges the parts and publishes the mask target. The verdict is
+// THE COMB-EXPOSURE FIGURE -- the max normalized autocorrelation across the
+// fixed combs' own periods. Content that is comb-like at those periods is
+// exactly where a fixed-geometry comb's wrong-geometry exposure bites;
+// smooth content (dialogue, most music) reads low and keeps chain A pure.
+static DWORD WINAPI cvcEstimatorThread(LPVOID)
+{
+    while (g_cvcRun.load(std::memory_order_acquire)) {
+        Sleep(100);
+        if (!g_cvcRun.load(std::memory_order_acquire)) break;
+        const size_t head = g_cvcHead.load(std::memory_order_acquire);
+        const size_t tail = g_cvcTail.load(std::memory_order_acquire);
+        const size_t avail = (head + kCvcRingFrames - tail) & kCvcRingMask;
+        if (avail < kCvcMinFrames) continue;          // too short a window: keep the last verdict
+        const size_t n = avail;
+        for (size_t i = 0; i < n; ++i)
+            g_cvcWin[i] = g_cvcRing[(tail + i) & kCvcRingMask];
+        g_cvcTail.store(head, std::memory_order_release);
+        g_cvcWinN = (int)n;
+        // dispatch the round (the coordinator's own slice runs after the
+        // wake, on this thread)
+        EnterCriticalSection(&g_cvcPoolCS);
+        ++g_cvcGen;
+        WakeAllConditionVariable(&g_cvcWorkCv);
+        LeaveCriticalSection(&g_cvcPoolCS);
+        {
+            const int chunk = (g_cvcWinN + g_cvcWorkers - 1) / g_cvcWorkers;
+            int b = chunk; if (b > g_cvcWinN) b = g_cvcWinN;
+            cvcPartial(g_cvcWin.data(), g_cvcWinN, 0, b, g_cvcParts[0]);
+            EnterCriticalSection(&g_cvcPoolCS);
+            g_cvcSeen[0] = g_cvcGen;
+            LeaveCriticalSection(&g_cvcPoolCS);
+            WakeConditionVariable(&g_cvcDoneCv);
+        }
+        // wait for THIS generation's workers (a generation-aware test -- a
+        // stale round's publish never counts)
+        EnterCriticalSection(&g_cvcPoolCS);
+        while (g_cvcRun.load(std::memory_order_acquire)) {
+            bool all = true;
+            for (int i = 0; i < g_cvcWorkers; ++i)
+                if (g_cvcSeen[i] != g_cvcGen) { all = false; break; }
+            if (all) break;
+            SleepConditionVariableCS(&g_cvcDoneCv, &g_cvcPoolCS, 250);
+        }
+        if (g_cvcRun.load(std::memory_order_acquire)) {
+            double combVis = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                double dot = 0.0, e0 = 0.0, eL = 0.0;
+                for (int m = 0; m < g_cvcWorkers; ++m) {
+                    dot += g_cvcParts[m].dot[k];
+                    e0  += g_cvcParts[m].e0[k];
+                    eL  += g_cvcParts[m].eL[k];
+                }
+                const double r = fabs(dot) / sqrt(e0 * eL + 1e-30);
+                if (r > combVis) combVis = r;
+            }
+            double blend = (combVis - kCvcMaskLo) / (kCvcMaskHi - kCvcMaskLo);
+            if (blend < 0.0) blend = 0.0;
+            if (blend > 1.0) blend = 1.0;
+            g_cvcMaskTarget.store((float)(1.0 - 0.5 * blend), std::memory_order_release);
+        }
+        LeaveCriticalSection(&g_cvcPoolCS);
+    }
+    return 0;
+}
 
 static void centerVirtualInit()
 {
@@ -4757,18 +5030,55 @@ static void centerVirtualInit()
     g_cvc.hpB0 = (float)(b0 / a0); g_cvc.hpB1 = (float)(b1 / a0);
     g_cvc.hpB2 = (float)(b2 / a0); g_cvc.hpA1 = (float)(a1 / a0);
     g_cvc.hpA2 = (float)(a2 / a0);
+    // v9.1.3: the estimator's pool -- ONE thread per processor (the
+    // coordinator is slot 0 of the participant set), started once and
+    // living until centerVirtualShutdown. A restart only ever arrives here
+    // after a shutdown, so the exchange guard catches a true double start.
+    if (g_cvcRun.exchange(true)) return;
+    InitializeCriticalSection(&g_cvcPoolCS);
+    InitializeConditionVariable(&g_cvcWorkCv);
+    InitializeConditionVariable(&g_cvcDoneCv);
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    int cores = (int)si.dwNumberOfProcessors;
+    if (cores < 1) cores = 1;
+    if (cores > kCvcMaxWorkers) cores = kCvcMaxWorkers;
+    g_cvcWorkers = cores;
+    g_cvcRing.assign(kCvcRingFrames, 0.0f);
+    g_cvcWin.assign(kCvcRingFrames, 0.0f);
+    g_cvcHead.store(0, std::memory_order_relaxed);
+    g_cvcTail.store(0, std::memory_order_relaxed);
+    g_cvcGen = 0;
+    g_cvcWinN = 0;
+    for (int i = 0; i < kCvcMaxWorkers; ++i) g_cvcSeen[i] = 0;
+    for (int i = 1; i < g_cvcWorkers; ++i)
+        g_cvcPool[i] = CreateThread(nullptr, 0, cvcWorkerThread, (LPVOID)(INT_PTR)i, 0, nullptr);
+    g_cvcThread = CreateThread(nullptr, 0, cvcEstimatorThread, nullptr, 0, nullptr);
+    tlog("[twinspeak] center        : the mask estimator is up (%d threads, one per processor)\n", g_cvcWorkers);
 }
 
-// The center EQ's silence contract, extended to the virtual chain: a dead
-// center lane (or a skipped bit-zero block) RESETS everything -- the next
-// fold starts cold and silent lanes contribute exactly zero (g * 0 = 0).
-static void centerVirtualFlushZ()
+static void centerVirtualShutdown()
 {
-    g_cvc.hpZ1 = 0.0f; g_cvc.hpZ2 = 0.0f;
-    memset(g_cvc.xdl, 0, sizeof(g_cvc.xdl));
-    memset(g_cvc.hline, 0, sizeof(g_cvc.hline));
-    g_cvc.xidx = 0;
-    g_cvc.hidx = 0;
+    if (!g_cvcRun.exchange(false)) return;
+    if (g_cvcThread) {
+        WaitForSingleObject(g_cvcThread, 2000);
+        CloseHandle(g_cvcThread);
+        g_cvcThread = nullptr;
+    }
+    WakeAllConditionVariable(&g_cvcWorkCv);      // the workers see run=false within their 250 ms wait
+    for (int i = 1; i < kCvcMaxWorkers; ++i) {
+        if (g_cvcPool[i]) {
+            WaitForSingleObject(g_cvcPool[i], 2000);
+            CloseHandle(g_cvcPool[i]);
+            g_cvcPool[i] = nullptr;
+        }
+    }
+    DeleteCriticalSection(&g_cvcPoolCS);
+    g_cvcRing.clear();
+    g_cvcRing.shrink_to_fit();
+    g_cvcWin.clear();
+    g_cvcWin.shrink_to_fit();
+    g_cvcWinN = 0;
 }
 
 // One sample through the virtual center: the speaker-pair signal both mains
@@ -4778,8 +5088,19 @@ static void centerVirtualFlushZ()
 // kernel's four nonzero taps.
 static inline float centerVirtualRun(const float x)
 {
-    // 1) THE CROSSTALK CANCELLATION (first-order fractional delay, the rear
-    //    comb's pattern)
+    // 0) THE ROBUSTNESS ESTIMATOR'S RING (SPSC -- the mix thread is the only
+    //    writer; on overrun the OLDEST frame is dropped, the estimator keeps
+    //    the freshest window)
+    {
+        const size_t h = g_cvcHead.load(std::memory_order_relaxed);
+        g_cvcRing[h] = x;
+        const size_t nh = (h + 1) & kCvcRingMask;
+        const size_t t = g_cvcTail.load(std::memory_order_acquire);
+        if (nh == t) g_cvcTail.store((t + 1) & kCvcRingMask, std::memory_order_release);
+        g_cvcHead.store(nh, std::memory_order_release);
+    }
+    // 1) CHAIN A -- THE CROSSTALK CANCELLATION (first-order fractional
+    //    delay, the rear comb's pattern)
     const int   i12 = (g_cvc.xidx + 16 - kCvcXtcInt) & 15;
     const int   i13 = (g_cvc.xidx + 16 - kCvcXtcInt - 1) & 15;
     const float d   = (1.0f - kCvcXtcFrac) * g_cvc.xdl[i12] + kCvcXtcFrac * g_cvc.xdl[i13];
@@ -4794,10 +5115,29 @@ static inline float centerVirtualRun(const float x)
     const int iA = (g_cvc.hidx + 32 - kCvcHrTapK[1]) & 31;
     const int iB = (g_cvc.hidx + 32 - kCvcHrTapK[2]) & 31;
     const int iC = (g_cvc.hidx + 32 - kCvcHrTapK[3]) & 31;
-    const float z = g_cvc.hg[0] * y + g_cvc.hg[1] * g_cvc.hline[iA]
-                  + g_cvc.hg[2] * g_cvc.hline[iB] + g_cvc.hg[3] * g_cvc.hline[iC];
+    const float zA = g_cvc.hg[0] * y + g_cvc.hg[1] * g_cvc.hline[iA]
+                   + g_cvc.hg[2] * g_cvc.hline[iB] + g_cvc.hg[3] * g_cvc.hline[iC];
     if (++g_cvc.hidx >= 32) g_cvc.hidx = 0;
-    return z;
+    // 3) CHAIN B -- THE PHASE-SHUFFLED COMB CORRECTION: the recursive
+    //    shuffler comb, the phantom's acoustic comb inverted exactly --
+    //      y[n] = g*y[n - 2tau] + x[n] - x[n - tau]
+    //    (1/(1 + e^-jwt) factored: the numerator kills DC/LF by itself, the
+    //    regularized pole lifts the acoustic nulls back flat)
+    const int   xi12 = (g_cvc.xidx2 + 16 - kCvcXtcInt) & 15;
+    const int   xi13 = (g_cvc.xidx2 + 16 - kCvcXtcInt - 1) & 15;
+    const float xd   = (1.0f - kCvcXtcFrac) * g_cvc.xrng[xi12] + kCvcXtcFrac * g_cvc.xrng[xi13];
+    g_cvc.xrng[g_cvc.xidx2] = x;
+    if (++g_cvc.xidx2 >= 16) g_cvc.xidx2 = 0;
+    const int   yi24 = (g_cvc.bidx + 32 - kCvcXtcInt * 2) & 31;
+    const int   yi25 = (g_cvc.bidx + 32 - kCvcXtcInt * 2 - 1) & 31;
+    const float yd   = (1.0f - kCvcXtcFrac) * g_cvc.brng[yi24] + kCvcXtcFrac * g_cvc.brng[yi25];
+    const float zB   = kCvcShufG * yd + x - xd;
+    g_cvc.brng[g_cvc.bidx] = zB;
+    if (++g_cvc.bidx >= 32) g_cvc.bidx = 0;
+    // 4) THE MASK BLEND (the smoothed one-pole toward the estimator's
+    //    verdict: 1 = pure chain A, 0 = pure chain B)
+    g_cvcMask += kCvcMaskSm * (g_cvcMaskTarget.load(std::memory_order_relaxed) - g_cvcMask);
+    return g_cvcMask * zA + (1.0f - g_cvcMask) * zB;
 }
 
 // ----------------------------------------------------------------- mixer ----
@@ -4938,6 +5278,11 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // ONLY ch3 -- every other channel is muted by never being touched,
         // so out2 can never be a clone of the program audio.
         const float gC = g_cfg.gainCenter;
+        // v9.1.4 LEG4: the LFE fold -- gain_lfe * ch4 rides BOTH of this
+        // leg's outputs when leg4 targets leg2. The silence contract holds
+        // for the CENTER lane: a dead ch3 resets the EQ and still passes
+        // the bass. Idle (no leg4) the ops are untouched -- bit-exact.
+        const float lfe4g = (g_lfeFoldLeg == 1) ? g_cfg.gainLfe : 0.0f;
         if (g_ceq.on) {
             // v6.5.18: peaking EQ on the center sample, BEFORE the gain. A
             // bit-zero ch3 block RESETS the filter instead of feeding it (a
@@ -4951,8 +5296,10 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 g_ceq.z1 = 0.0f;
                 g_ceq.z2 = 0.0f;
                 for (size_t i = 0; i < n; ++i) {
-                    chunk[i * 2 + 0] = 0.0f;
-                    chunk[i * 2 + 1] = 0.0f;
+                    float c = 0.0f;
+                    if (lfe4g != 0.0f) c = lfe4g * sc[i * kInCh + 3];   // v9.1.4: the LFE rides a dead center
+                    chunk[i * 2 + 0] = c;
+                    chunk[i * 2 + 1] = c;
                 }
             } else {
                 for (size_t i = 0; i < n; ++i) {
@@ -4961,6 +5308,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                     g_ceq.z1 = g_ceq.b1 * x - g_ceq.a1 * y + g_ceq.z2;
                     g_ceq.z2 = g_ceq.b2 * x - g_ceq.a2 * y;
                     float c = gC * y;
+                    if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4: the fold rides the same sum
                     // the boost can push past full scale; clamp here so the
                     // EQ mode is self-contained (the device layer would clip
                     // the same peak a moment later, after the keep-alive sum)
@@ -4971,7 +5319,8 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
-                const float c = gC * sc[i * kInCh + 2];
+                float c = gC * sc[i * kInCh + 2];
+                if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4
                 chunk[i * 2 + 0] = c;
                 chunk[i * 2 + 1] = c;
             }
@@ -4997,10 +5346,18 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // full super-wide effect, both at once). The REAR term keeps its
         // full knob: the dedicated speaker does most of the work. The rears
         // NEVER comb here -- the 0.51 ms comb is the empty-leg3 fold only.
+        // v9.1.4 LEG4: the LFE fold -- gain_lfe * ch4 (0-based 3) adds to
+        // both outputs, the sub's channel riding the same device as the
+        // rears/surround. Idle the ops are untouched -- bit-exact.
+        const float gLfe4 = (g_lfeFoldLeg == 2) ? g_cfg.gainLfe : 0.0f;
         for (size_t i = 0; i < n; ++i) {
             const float* f = sc + i * kInCh;
             chunk[i * 2 + 0] = gRL * f[kRearLCh] + kSurroundSplit * gRL * f[kSideLCh];   // rear L ch7 + side L ch5 at 60%
             chunk[i * 2 + 1] = gRR * f[kRearRCh] + kSurroundSplit * gRR * f[kSideRCh];   // rear R ch8 + side R ch6 at 60%
+            if (gLfe4 != 0.0f) {
+                chunk[i * 2 + 0] += gLfe4 * f[3];
+                chunk[i * 2 + 1] += gLfe4 * f[3];
+            }
         }
     }
 }
@@ -5135,8 +5492,11 @@ static void writeTemplate(const char* path) {
         "; routing, built in; gain_lfe below still scales it. v8.4.0 also\n"
         "; adds THE REAR LEGS: output_device3, offset3_ms and gain_rl/gain_rr\n"
         "; (an EMPTY rear device keeps the rears silent). v8.4.11: ONE rear\n"
-        "; device carries BOTH rears (the old output_device4/offset4_ms are\n"
-        "; read-and-ignored -- stale lines load clean).\n"
+        "; device carries BOTH rears (the old output_device4/offset4_ms were\n"
+        "; read-and-ignored through v9.1.3). v9.1.4: output_device4 is BACK --\n"
+        "; leg4 NEVER opens a device: its needle must match a leg that is\n"
+        "; already playing, and THAT leg's outputs gain gain_lfe*ch4 (LFE).\n"
+        "; offset4_ms stays retired.\n"
         "; v9.1.0: the rears' fold to the mains (empty leg3) runs through a\n"
         "; 0.51 ms comb -- the EQ-APO rear effect, built in. A REAL leg3\n"
         "; splits the surround 60/60: the mains carry it with the phase\n"
@@ -5633,6 +5993,7 @@ static bool loadIni(const char* path) {
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
         else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs (v8.4.11: ONE device, both rears)
+        else if (key == "output_device4") g_cfg.outputDevice4 = val;   // v9.1.4: the LFE fold target (was retired v8.4.11-9.1.3)
         // v8.4.11: output_device4 is RETIRED -- the key is read-and-ignored
         // (an unknown key falls through the loader untouched).
         else if (key == "gain_l")         g_cfg.gainL = (float)atof(val.c_str());
@@ -6279,6 +6640,7 @@ enum {
     // v8.4.0: the four-leg controls -- the rear device combos, the gain
     // quad's two new edits, the timing quad's two offset edits.
     IDC_OUT3, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3,   // v8.4.11: IDC_OUT4/IDC_OFF4 retired with leg4
+    IDC_OUT4,                                       // v9.1.4: leg4 is BACK -- the LFE fold target combo
     IDC_GAIN_SL, IDC_GAIN_SR,                       // v8.5.0: the surround gains (the second quad)
 };
 
@@ -7144,12 +7506,12 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
 static void guiFillCombos(HWND w) {
     std::vector<std::string> pb, cp;
     guiEnumNames(pb, cp);
-    const int ids[4] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_INDEV };  // 0..2 playback (v8.4.11: ONE rear combo); 3 capture
-    for (int k = 0; k < 4; ++k) {
+    const int ids[5] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_OUT4, IDC_INDEV };  // 0..3 playback (v9.1.4: leg4's fold target); 4 capture
+    for (int k = 0; k < 5; ++k) {
         HWND h = GetDlgItem(w, ids[k]);
         char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
         SendMessageA(h, CB_RESETCONTENT, 0, 0);
-        const std::vector<std::string>& v = (k < 3) ? pb : cp;   // v8.4.11: three playback combos
+        const std::vector<std::string>& v = (k < 4) ? pb : cp;   // v9.1.4: four playback combos
         for (size_t i = 0; i < v.size(); ++i)
             SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
         if (cur[0]) SetWindowTextA(h, cur);
@@ -7197,6 +7559,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
+    else if (key == "output_device4")    return g_cfg.outputDevice4;   // v9.1.4: leg4's fold target
     else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
     else if (key == "gui_theme")        { snprintf(b, 64, "%u", (unsigned)g_theme); return b; }
     else if (key == "startup_engine")   return boolText(g_cfg.startupEngine);   // v7.1.2
@@ -7218,7 +7581,8 @@ static std::string cfgValueText(const std::string& key) {
 static const char* kIniKeys[] = {
     "delay1_ms", "delay2_ms", "offset3_ms",                    // v8.4.0 rears (v8.4.11: offset4_ms retired)
     "input_device", "output_device1", "output_device2",
-    "output_device3",                                          // v8.4.0 rears (v8.4.11: output_device4 retired)
+    "output_device3",                                          // v8.4.0 rears
+    "output_device4",                                          // v9.1.4: leg4 -- the LFE fold to an existing leg
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "surround_bass", "surround_bass_freq", "surround_bass_gain", "surround_bass_q",   // v8.5.1
@@ -7307,6 +7671,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
     g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent (v8.4.11: ONE rear device)
+    g_cfg.outputDevice4  = editStr(w, IDC_OUT4);   // v9.1.4: leg4's LFE fold target (empty = idle)
     g_cfg.volumeEndpoint = editStr(w, IDC_VOLEP);
     g_cfg.gainL     = editFloat(w, IDC_GAIN_L,  1.0f);
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
@@ -7345,6 +7710,7 @@ static void controlsFromCfg(HWND w) {
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
+    SetDlgItemTextA(w, IDC_OUT4,  g_cfg.outputDevice4.c_str());   // v9.1.4
     SetDlgItemTextA(w, IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
     snprintf(b, 64, "%g", g_cfg.gainL);      SetDlgItemTextA(w, IDC_GAIN_L, b);
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
@@ -7432,6 +7798,15 @@ static void guiAppendLog(const std::string& s) {
     // they scrolled UP to read history, the view is left exactly where
     // they parked it (the end-insert adds its lines below the fold; the
     // caret still lands at the end, the view does not move).
+    // v9.1.3 NO BOTTOM: the chunk's TRAILING breaks are stripped and the
+    // NEXT append carries its own LEADING break, so the caret ends ON the
+    // last text line -- no trailing empty line for the view to park on.
+    {
+        size_t e2 = norm.size();
+        while (e2 >= 2 && norm[e2 - 2] == '\r' && norm[e2 - 1] == '\n') e2 -= 2;
+        if (e2 != norm.size()) norm.resize(e2);
+        if (norm.empty()) return;
+    }
     const int firstVis = (int)SendMessageA(e, EM_GETFIRSTVISIBLELINE, 0, 0);
     const int total    = (int)SendMessageA(e, EM_GETLINECOUNT, 0, 0);
     int lineH = 14;
@@ -7448,11 +7823,19 @@ static void guiAppendLog(const std::string& s) {
     GetClientRect(e, &rc);
     const int visible = (rc.bottom - rc.top) / (lineH > 0 ? lineH : 14);
     const bool follow = (total - (firstVis + visible)) <= 2;
+    // the leading break: the pane's very first append starts the text, every
+    // later append opens its own row (self-resets when the pane is rebuilt)
+    std::string out;
+    if (GetWindowTextLengthA(e) != 0) out += "\r\n";
+    out += norm;
     SendMessageA(e, WM_SETREDRAW, FALSE, 0);
     const int len = GetWindowTextLengthA(e);
     SendMessageA(e, EM_SETSEL, len, len);
-    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)norm.c_str());
-    if (follow) SendMessageA(e, EM_SCROLLCARET, 0, 0);
+    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)out.c_str());
+    if (follow) {
+        SendMessageA(e, EM_SCROLLCARET, 0, 0);
+        SendMessageA(e, EM_LINESCROLL, 0, 0x20000000);   // clamped: pins the view to the ABSOLUTE bottom
+    }
     SendMessageA(e, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(e, nullptr, FALSE);
 }
@@ -7587,10 +7970,14 @@ static void guiBuildPages(HWND w) {
     comboRow(w, COLA_X, 154, "output leg1 (mains)", IDC_OUT1, false, g_cfg.outputDevice1.c_str());
     comboRow(w, COLA_X, 188, "output leg2 (center)", IDC_OUT2, false, g_cfg.outputDevice2.c_str());
     comboRow(w, COLA_X, 222, "output leg3 (rears)", IDC_OUT3, false, g_cfg.outputDevice3.c_str());
-    row(w, COLA_X, 256, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 290, 150, 26, "REFRESH DEVICES");
+    // v9.1.4 LEG4: the LFE fold target -- pick a device ALREADY playing on
+    // another leg and that leg's outputs gain the LFE channel. The left
+    // column reflows: leg4 256, volume_endpoint 290, REFRESH 318, note 352.
+    comboRow(w, COLA_X, 256, "output leg4 (LFE fold)", IDC_OUT4, false, g_cfg.outputDevice4.c_str());
+    row(w, COLA_X, 290, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 318, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
-    note(w, COLA_X, 318,
+    note(w, COLA_X, 352,
          "We recommend you wait 10 seconds before doing the tick test to prepare the audio buffer preload for accurate latency compensation measurements between each audio device.", 3);
     header(w, COLB_X, KHDR_Y, "GAIN");
     // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
@@ -10559,6 +10946,35 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (g_leg[2].disabled)
         tlog("[twinspeak] leg3 (rears)    : output_device3 is EMPTY -- the leg stays SILENT (no device, no error)\n");
 
+    // v9.1.4 LEG4 -- THE LFE FOLD: leg4 NEVER opens a device of its own (a
+    // WASAPI exclusive stream cannot open twice). Its needle is resolved
+    // and matched against the legs that are actually playing, by RESOLVED
+    // endpoint id: a match turns the LFE fold on for THAT leg (gain_lfe *
+    // ch4 on both of its outputs); a match to leg1 is reported idle (the
+    // mains already fold the LFE); no match -- or an empty needle, or a
+    // needle that resolves to nothing (a soft note, never an error) -- and
+    // leg4 stays idle.
+    g_lfeFoldLeg = -1;
+    if (!g_cfg.outputDevice4.empty()) {
+        ma_device_id id4; std::string n4;
+        if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice4, &id4, &n4)) {
+            tlog("[twinspeak] leg4 (LFE fold) : output_device4 matching \"%s\" not found -- leg4 stays idle\n"
+                 "                            (a soft note, never an error; --list to see names)\n",
+                 g_cfg.outputDevice4.c_str());
+        } else if (memcmp(&id4, &id1, sizeof(ma_device_id)) == 0) {
+            tlog("[twinspeak] leg4 (LFE fold) : the device is leg1 (the mains) -- the LFE already folds there; idle\n");
+        } else if (!g_leg[1].disabled && memcmp(&id4, &id2, sizeof(ma_device_id)) == 0) {
+            g_lfeFoldLeg = 1;
+            tlog("[twinspeak] leg4 (LFE fold) : folding the LFE (ch4) onto leg2's L/R at gain_lfe -- \"%s\"\n", n4.c_str());
+        } else if (!g_leg[2].disabled && memcmp(&id4, &id3, sizeof(ma_device_id)) == 0) {
+            g_lfeFoldLeg = 2;
+            tlog("[twinspeak] leg4 (LFE fold) : folding the LFE (ch4) onto leg3's L/R at gain_lfe -- \"%s\"\n", n4.c_str());
+        } else {
+            tlog("[twinspeak] leg4 (LFE fold) : \"%s\" is not playing on any leg -- idle (the fold targets\n"
+                 "                            EXISTING legs only; no second stream is opened for it)\n", n4.c_str());
+        }
+    }
+
     // per-leg periods -- one engine constant for both now. v8.1.0: the
     // capture burst system is GONE -- the capture opens with a fixed 4 ms
     // request (the field's engine period) and nothing consumes burst math
@@ -11171,8 +11587,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] route out2     : EMPTY -- no center device; ch3 (center) FOLDS onto out1's FL/FR at\n"
              "                            gain_center %.2f, the LFE fold's pattern (the output is stereo L+R).\n",
              g_cfg.gainCenter);
-        tlog("[twinspeak] route out2     : center EQ idle -- it is out2-only and out2 is EMPTY; the fold is a plain\n"
-             "                            gain_center sum, no filter (a fold must never color the mains)\n");
+        tlog("[twinspeak] route out2     : center EQ idle -- it is out2-only and out2 is EMPTY; the fold is the\n"
+             "                            virtual center (v9.1.1: crosstalk cancellation + the HRTF convolution,\n"
+             "                            the same shaped sum on both mains)\n");
     } else {
         tlog("[twinspeak] route out2     : L = R = %.2f*ch3(center) ONLY -- the mask isolates ch3 for this device alone\n"
                "[twinspeak] route out2     : (out2 is NOT a clone of the program audio) + %.0f Hz @ %.2f%% keep-alive\n",
@@ -11184,6 +11601,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         else
             tlog("[twinspeak] route out2     : center EQ off -- out2 is bit-exact\n");
     }
+    // v9.1.4: the leg4 fold says its routing in the same banner voice
+    if (g_lfeFoldLeg >= 0)
+        tlog("[twinspeak] route leg%d    : + %.2f*ch4 (LFE) on BOTH outputs -- leg4's fold to this existing leg\n",
+             g_lfeFoldLeg + 1, g_cfg.gainLfe);
+    else if (!g_cfg.outputDevice4.empty())
+        tlog("[twinspeak] route leg4     : idle -- output_device4 matches no playing leg (the fold targets\n"
+             "                            existing legs only; leg1 is already covered by the built-in LFE fold)\n");
     // v6.3.1: the align line does the arithmetic -- both est paths and their
     // difference, with the trim direction spelled out. Same formula as
     // printLegDevice (ring + device lead + capture burst, delay included),
@@ -11796,6 +12220,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     for (int i = 0; i < 4; ++i) {   // v8.4.0: the rear legs close the same way
         if (g_leg[i].dev.pContext) ma_device_uninit(&g_leg[i].dev);
     }
+    centerVirtualShutdown();   // v9.1.3: the mask estimator's pool dies with the engine
     if (g_srcVol) { g_srcVol->Release(); g_srcVol = nullptr; }
     for (int i = 0; i < 4; ++i)
         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
