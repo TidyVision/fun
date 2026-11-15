@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.5 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.6 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,28 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.6 THE NAME MAP (field-directed: "I want it so the device list has
+//            a map of a string where it translates the wasapi device name
+//            to the wdm-ks names. I'm serious. Actually, I want wdm-ks
+//            names on everything, including the output devices from the
+//            ini"). THE MAP: the layered needle score (v8.6.5) is now the
+//            UNIVERSAL device match -- (1) pickDevice (the WASAPI path)
+//            scores every endpoint against the needle with the same
+//            three-layer rules, best score wins, the default endpoint
+//            breaks ties: an ini value in EITHER scheme drives EITHER
+//            backend. (2) THE DAC YIELD bridges too: the needle
+//            containment, the leg's RESOLVED device name contained in the
+//            default's name (containment only -- a wrong release
+//            silences), or the default endpoint's KS counterpart equal to
+//            a KS leg's own filter name (the filter enumeration caches per
+//            boot -- one setupapi walk). (3) --list prints each playback
+//            endpoint's KS counterpart; --list-ks prints each filter's
+//            WASAPI counterpart. (4) THE OUTPUT COMBOS list the WDM-KS
+//            filter names (the capture combo stays WASAPI -- the cable has
+//            no render filter); the edit keeps whatever the ini carries,
+//            either scheme, and the boot-yield bridge compares the
+//            default's counterpart to the needle. NO new ini key, NO UI
+//            row.
 //    v8.6.5 THE NEEDLE BRIDGE (field-directed, with the --list-ks output:
 //            "I ran --list-ks"). THE CAUSE OF EVERY KS REFUSAL, BOTH
 //            SYSTEMS, ALL ALONG: the ini's output_deviceN values are the
@@ -2832,7 +2854,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.5"
+#define TWS_VERSION "8.6.6"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5198,9 +5220,19 @@ static void ksEnumerateRenderFilters(std::vector<KsFilterInfo>& out) {
     SetupDiDestroyDeviceInfoList(di);
 }
 
+static int ksNeedleScore(const std::string& filterName, const std::string& needle);   // v8.6.5: defined with ksOpenLeg
+
 static void ksListKs() {
     std::vector<KsFilterInfo> fl;
     ksEnumerateRenderFilters(fl);
+    // v8.6.6 THE NAME MAP: each KS filter's WASAPI endpoint counterpart --
+    // the same layered score, the reverse direction.
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context wctx;
+    ma_device_info* wpb = nullptr; ma_uint32 wnpb = 0;
+    ma_device_info* wcp = nullptr; ma_uint32 wncp = 0;
+    const bool haveWasapi = ma_context_init(be, 1, nullptr, &wctx) == MA_SUCCESS
+                         && ma_context_get_devices(&wctx, &wpb, &wnpb, &wcp, &wncp) == MA_SUCCESS;
     tlog("[twinspeak] WDM-KS render filters on this system (%zu):\n", fl.size());
     for (size_t i = 0; i < fl.size(); ++i) {
         HANDLE fh = CreateFileW(fl[i].path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -5208,6 +5240,14 @@ static void ksListKs() {
                                 OPEN_EXISTING, 0, nullptr);
         tlog("  [%zu] \"%s\"%s\n", i, fl[i].name.c_str(),
              (fh == INVALID_HANDLE_VALUE) ? "  (cannot open -- busy or access denied)" : "");
+        if (haveWasapi) {
+            std::string best; int bs = 0;
+            for (ma_uint32 j = 0; j < wnpb; ++j) {
+                const int sc = ksNeedleScore(wpb[j].name, fl[i].name);
+                if (sc > bs) { bs = sc; best = wpb[j].name; }
+            }
+            tlog("        WASAPI: %s\n", bs ? best.c_str() : "(no counterpart endpoint)");
+        }
         if (fh == INVALID_HANDLE_VALUE) continue;
         ULONG ctypes = 0;
         if (ksPinPropGet(fh, KSPROPSETID_Pin, KSPROPERTY_PIN_CTYPES, 0,
@@ -5231,8 +5271,10 @@ static void ksListKs() {
         }
         CloseHandle(fh);
     }
-    tlog("  use a substring of a filter name as output_deviceN, then set\n"
-         "  backendN = ks to route that leg through WDM-KS.\n");
+    if (haveWasapi) ma_context_uninit(&wctx);
+    tlog("  the ini's output_deviceN takes either scheme -- the WASAPI endpoint\n"
+         "  name or the KS filter name above (the v8.6.5 needle bridge scores\n"
+         "  both); set backendN = ks to route that leg through WDM-KS.\n");
 }
 
 // Open one leg's output on WDM-KS. Returns true with K.active = 1 and the
@@ -5282,6 +5324,26 @@ static int ksNeedleScore(const std::string& filterName, const std::string& needl
         for (const auto& b : ft)
             if (a == b) { ++shared; break; }
     return shared >= 2 ? 1 : 0;
+}
+
+// v8.6.6 THE NAME MAP: the KS-side counterpart of a WASAPI endpoint name --
+// the best-scoring KS filter (the layered needle score, any rule). The
+// filter enumeration caches: the KS topology is static per boot, so the
+// per-tick callers (the yield bridge) pay one setupapi walk total.
+static const std::vector<KsFilterInfo>& ksFilterCache() {
+    static std::vector<KsFilterInfo> fl;
+    static bool done = false;
+    if (!done) { ksEnumerateRenderFilters(fl); done = true; }
+    return fl;
+}
+static std::string ksCounterpartFromWasapi(const std::string& name) {
+    std::string best; int bestScore = 0;
+    for (const KsFilterInfo& f : ksFilterCache()) {
+        if (f.name.empty()) continue;
+        const int sc = ksNeedleScore(f.name, name);
+        if (sc > bestScore) { bestScore = sc; best = f.name; }
+    }
+    return best;
 }
 
 static bool ksOpenLeg(int idx, const std::string& needle) {
@@ -5801,7 +5863,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.5 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.6 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6406,9 +6468,13 @@ static void listDevices() {
         return;
     }
     tlog("[twinspeak] backend: %s\n\n", ma_get_backend_name(ctx.backend));
-    tlog("PLAYBACK devices (%u):\n", npb);
+    tlog("PLAYBACK devices (%u) -- each with its WDM-KS filter counterpart (v8.6.6):\n", npb);
     for (ma_uint32 i = 0; i < npb; ++i) {
         tlog("  [%u] %s%s\n", i, pb[i].name, pb[i].isDefault ? "   (default)" : "");
+        // v8.6.6 THE NAME MAP: the WASAPI endpoint's KS filter counterpart
+        // (the layered needle score) -- either scheme works in the ini.
+        const std::string ksn = ksCounterpartFromWasapi(pb[i].name);
+        tlog("        KS: %s\n", ksn.empty() ? "(no counterpart filter)" : ksn.c_str());
         for (ma_uint32 k = 0; k < pb[i].nativeDataFormatCount && k < 4; ++k)
             tlog("        native: %uch @ %u Hz, %s\n", pb[i].nativeDataFormats[k].channels,
                    pb[i].nativeDataFormats[k].sampleRate,
@@ -6432,11 +6498,19 @@ static bool pickDevice(ma_context* ctx, ma_device_type type, const std::string& 
     if (ma_context_get_devices(ctx, &pb, &npb, &cp, &ncp) != MA_SUCCESS) return false;
     ma_device_info* arr = (type == ma_device_type_playback) ? pb : cp;
     ma_uint32      cnt  = (type == ma_device_type_playback) ? npb : ncp;
-    int best = -1;
+    // v8.6.6 THE NAME MAP ON EVERYTHING: the needle match is the layered
+    // score now (endpoint contains needle > needle contains endpoint >
+    // 2+ shared tokens) -- an ini value in EITHER naming scheme (the WASAPI
+    // endpoint name or the WDM-KS filter name) matches its device on both
+    // backends. The best score wins; the default endpoint breaks ties.
+    int best = -1, bestScore = 0;
     for (ma_uint32 i = 0; i < cnt; ++i) {
-        if (!containsCI(arr[i].name, needle)) continue;
-        if (best < 0) best = (int)i;
-        else if (arr[i].isDefault && !arr[best].isDefault) best = (int)i;
+        const int sc = ksNeedleScore(arr[i].name, needle);
+        if (sc <= 0) continue;
+        if (best < 0 || sc > bestScore ||
+            (sc == bestScore && arr[i].isDefault && !arr[best].isDefault)) {
+            best = (int)i; bestScore = sc;
+        }
     }
     if (best < 0) return false;
     *outId = arr[best].id;
@@ -7815,12 +7889,24 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
 static void guiFillCombos(HWND w) {
     std::vector<std::string> pb, cp;
     guiEnumNames(pb, cp);
+    // v8.6.6 THE NAME MAP ON EVERYTHING: the output combos list the WDM-KS
+    // filter names (the field: "I want wdm-ks names on everything,
+    // including the output devices from the ini") -- pickDevice and
+    // ksOpenLeg both score the layered bridge, so a KS name drives either
+    // backend, and the edit keeps whatever the ini carries (either scheme).
+    std::vector<std::string> ksNames;
+    {
+        std::vector<KsFilterInfo> fl;
+        ksEnumerateRenderFilters(fl);
+        for (const KsFilterInfo& f : fl)
+            if (!f.name.empty()) ksNames.push_back(f.name);
+    }
     const int ids[4] = { IDC_OUT1, IDC_OUT2, IDC_OUT3, IDC_INDEV };  // 0..2 playback (v8.4.11: ONE rear combo); 3 capture
     for (int k = 0; k < 4; ++k) {
         HWND h = GetDlgItem(w, ids[k]);
         char cur[512]; GetWindowTextA(h, cur, sizeof(cur));
         SendMessageA(h, CB_RESETCONTENT, 0, 0);
-        const std::vector<std::string>& v = (k < 3) ? pb : cp;   // v8.4.11: three playback combos
+        const std::vector<std::string>& v = (k < 3) ? ksNames : cp;   // v8.6.6: KS names on the outputs
         for (size_t i = 0; i < v.size(); ++i)
             SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)v[i].c_str());
         if (cur[0]) SetWindowTextA(h, cur);
@@ -11382,7 +11468,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             if (g_leg[i].disabled) continue;      // v8.4.0: an empty rear leg holds nothing
             const char* yn = legNeedle(i);
             if (!yn[0]) continue;
-            if (haveDef && containsCI(defNm, yn)) {
+            // v8.6.6: the yield match bridges the naming schemes -- the
+            // default endpoint's KS counterpart compared to the needle, so
+            // a KS-name ini yields too.
+            if (haveDef && (containsCI(defNm, yn)
+                            || ksCounterpartFromWasapi(defNm) == yn)) {
                 bootYield[i] = true;
                 g_leg[i].yielded.store(true, std::memory_order_relaxed);
                 g_leg[i].isExclusive = g_cfg.exclusive;   // the quiet re-grab opens exclusive first
@@ -12172,7 +12262,17 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     const char* yneedle = legNeedle(i);
                     if (!yneedle[0]) continue;
                     Leg& Y = g_leg[i];
-                    const bool mine = containsCI(defName, yneedle);
+                    // v8.6.6: the yield match bridges the naming schemes --
+                    // the needle containment, the leg's RESOLVED device
+                    // name contained in the default's (containment only --
+                    // no token rule here: a wrong release silences a leg),
+                    // or the default endpoint's KS counterpart equal to a
+                    // KS leg's own filter name (cached enum, one setupapi
+                    // walk per boot).
+                    const bool mine = containsCI(defName, yneedle)
+                                   || ksNeedleScore(defName, Y.name) >= 2
+                                   || (Y.backend == 1
+                                       && ksCounterpartFromWasapi(defName) == Y.name);
                     if (mine && !Y.yielded.load(std::memory_order_relaxed)) {
                         Y.yielded.store(true, std::memory_order_relaxed);
                         tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
