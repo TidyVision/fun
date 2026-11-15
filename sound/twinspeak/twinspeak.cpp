@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.8 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.9 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,34 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.9 THE DYNABIT (field-directed: "dynamic buffer size with a strict
+//            3 buffer rule ... sees which lowest buffer size wins, and
+//            should also slowly drift to compensate for it ... a low middle
+//            average starting from 64 samples all the way to 256 samples"
+//            -- the v8.6.7-turn plan, now landing where it bites: the
+//            WASAPI fallback legs, whose 1 ms exclusive period this
+//            machine's scheduling cannot serve -- the device lines show
+//            2.8-8.9 ms service gaps against a 2 ms buffer, the DAC
+//            crossing into stale audio on every storm). (1) THE STRICT
+//            3-BUFFER RULE: every WASAPI leg's device buffer is ALWAYS 3
+//            periods (initLegDevice's periods = 3; was 2). (2) THE
+//            NOTCHES: 1/2/3/4/6/8 ms -- the 64..256-sample span at 48 kHz
+//            (1.33..5.33 ms) plus the machine's reality above it, because
+//            the S5's observed service gaps (8.9 ms) need the headroom.
+//            (3) THE CONTROLLER (the health tick): the leg's own
+//            late-switch count over the window is the signal (the meter's
+//            gap threshold scales with the period, so a storm that
+//            starves a small buffer reads loudly). UP: > 15 late
+//            switch(es) in the last 30 s -- the period drifts up one
+//            notch and the leg reopens (tryRestartLeg; the trim's forced
+//            resync lands it seamlessly). DOWN: <= 2 late switch(es) in
+//            the last 120 s. THE FLOOR: the storm-proven notch -- once
+//            this run needed a size, the dynabit never re-offers smaller
+//            (no oscillation; "which lowest buffer size WINS"). One drift
+//            per 10 s ("slowly"). The KS legs keep their tuned static
+//            bite (128 x 3) -- the dynabit is the fallback's rescue, and
+//            the KS legs don't exist on the box that needs it. NO new ini
+//            key, NO UI row.
 //    v8.6.8 THE PRE-ROUND (field-directed, on the conversion map: "So this
 //            means float32 has to be converted during use."). CORRECT --
 //            the pins on the new system are integer-only and (mostly)
@@ -2909,7 +2937,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.8"
+#define TWS_VERSION "8.6.9"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -6239,7 +6267,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.8 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.9 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -12058,6 +12086,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.syncPads  = 0;
         L.lastBiteMs   = 0;                                            // the trim's correction pacing
         L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
+        L.dynPeriodMs  = 1;                                            // v8.6.9: the dynabit opens at the 1 ms notch
+        L.dynNotch     = 0;
+        L.dynFloor     = 0;
+        L.dynLastDriftMs   = 0;
+        L.dynCleanSinceMs  = 0;
+        L.dynLateBase      = 0;
+        L.dynWindowMs      = 0;
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -12684,6 +12719,75 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                      "                            delivering). The legs hold their last frames; measure-only.\n");
             }
         }
+        // ---------------- v8.6.9 THE DYNABIT -------------------------------
+        // Field-directed: "dynamic buffer size with a strict 3 buffer rule
+        // ... sees which lowest buffer size wins, and should also slowly
+        // drift to compensate for it ... a low middle average starting from
+        // 64 samples all the way to 256 samples" -- applied to the WASAPI
+        // fallback legs (the render-side KS pins are refused on this box;
+        // the interrogation proved it in one line). The notches span the
+        // 64..256-sample span at 48 kHz (1.33..5.33 ms) plus the machine's
+        // reality above it: 1/2/3/4/6/8 ms. THE DEVICE BUFFER IS ALWAYS 3
+        // PERIODS (the strict rule -- cc.periods = 3 at every notch). THE
+        // SIGNAL: the leg's own late-switch count (the meter's threshold
+        // scales with the period, so a storm that starves a small buffer
+        // reads loudly at it). UP: > 15 late switch(es) in the last 30 s.
+        // DOWN: <= 2 in the last 120 s -- and never below the storm-proven
+        // floor (once this run needed a notch, the dynabit never re-offers
+        // smaller: no oscillation). One drift per 10 s; every drift reopens
+        // the leg and the trim's forced resync lands it seamlessly.
+        {
+            static const unsigned kDynNotches[6] = { 1, 2, 3, 4, 6, 8 };
+            for (int i = 0; i < 4; ++i) {
+                Leg& D = g_leg[i];
+                if (D.disabled || D.backend == 1 || D.yielded.load(std::memory_order_relaxed)) continue;
+                const unsigned long long late = D.lateSwitches.load(std::memory_order_relaxed);
+                if (D.dynWindowMs == 0) { D.dynWindowMs = nowMs; D.dynLateBase = late; continue; }
+                const unsigned long long win = nowMs - D.dynWindowMs;
+                const unsigned long long lateDelta = late >= D.dynLateBase
+                                                   ? late - D.dynLateBase : 0;
+                if (lateDelta > 2) D.dynCleanSinceMs = 0;          // the clean run broke
+                else if (D.dynCleanSinceMs == 0) D.dynCleanSinceMs = nowMs;
+                const bool storm = (win >= 30000 && lateDelta > 15);
+                const bool clean = (D.dynCleanSinceMs != 0
+                                 && nowMs - D.dynCleanSinceMs >= 120000
+                                 && lateDelta <= 2);
+                if (nowMs - D.dynLastDriftMs < 10000) continue;    // "slowly": one drift per 10 s
+                if (storm && D.dynNotch < 5) {
+                    const unsigned oldMs = D.dynPeriodMs;
+                    ++D.dynNotch;
+                    if (D.dynFloor < D.dynNotch) D.dynFloor = D.dynNotch;   // the storm-proven floor
+                    D.dynPeriodMs = kDynNotches[D.dynNotch];
+                    D.dynLastDriftMs = nowMs;
+                    D.dynWindowMs = nowMs;
+                    D.dynLateBase = late;
+                    D.dynCleanSinceMs = 0;
+                    tlog("[twinspeak] dynabit out%d  : %llu late switch(es) in %.0f s at a %u ms period -- the\n"
+                         "                            period drifts UP to %u ms (buffer %u ms, the strict 3-buffer\n"
+                         "                            rule; the floor is notch %u -- never re-offered smaller)\n",
+                         i + 1, lateDelta, (double)win / 1000.0, oldMs,
+                         D.dynPeriodMs, D.dynPeriodMs * 3, D.dynFloor + 1);
+                    tryRestartLeg(i, &ctx, D.dynPeriodMs,
+                                  "the dynabit up-drift (the late-switch storm)");
+                } else if (clean && D.dynNotch > D.dynFloor) {
+                    const unsigned oldMs = D.dynPeriodMs;
+                    const double cleanS = (double)(nowMs - D.dynCleanSinceMs) / 1000.0;
+                    --D.dynNotch;
+                    D.dynPeriodMs = kDynNotches[D.dynNotch];
+                    D.dynLastDriftMs = nowMs;
+                    D.dynWindowMs = nowMs;
+                    D.dynLateBase = late;
+                    D.dynCleanSinceMs = 0;
+                    tlog("[twinspeak] dynabit out%d  : %.0f s clean at a %u ms period -- the period drifts DOWN\n"
+                         "                            to %u ms (buffer %u ms; the floor is notch %u -- the machine\n"
+                         "                            proved it needs at least that once this run)\n",
+                         i + 1, cleanS, oldMs,
+                         D.dynPeriodMs, D.dynPeriodMs * 3, D.dynFloor + 1);
+                    tryRestartLeg(i, &ctx, D.dynPeriodMs,
+                                  "the dynabit down-drift (the machine earned it)");
+                }
+            }
+        }
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
         // Field directive: "if the main audio device is either output_device1
         // or output_device2 that the DAC shuts off immediately to let the
@@ -12764,7 +12868,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                      "                            -- reopening (\"%s\")\n",
                                      i + 1, Y.name.c_str());
                                 Y.lastReopenMs = nowMs;
-                                tryRestartLeg(i, &ctx, i == 0 ? periodMs1 : periodMs2,
+                                tryRestartLeg(i, &ctx, Y.dynPeriodMs,
                                               "yield release (default device moved away)");
                             }
                         }
