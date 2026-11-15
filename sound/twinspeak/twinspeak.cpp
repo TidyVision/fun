@@ -62,6 +62,74 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.0 THE MICROPHONE CALIBRATION -- THE 12-ANGLE SURROUND/REAR SYSTEM
+//            (field-directed: "an entirely new system where you use a
+//            microphone to measure and test 12 different angles of your
+//            main speakers to ensure that you get the best sounding
+//            emulated surround and rear channels, given you have 2.1
+//            analog speakers ... 1. Your microphone must be pointed
+//            straight to a 90 degree angle 2. Record the sound coming out
+//            of your 2.1 analog speakers with your volume at least -6db
+//            3. Make sure the distance between them are least 36 inches
+//            or above 4. Finally, your calibration must be at least 20
+//            seconds to complete for an accurate surround channel audio
+//            phase effect, simulating the sound going to literally more
+//            left and more right than what you can possibly hear on left
+//            and right channels alone 5. Repeat the step for accurate
+//            rear measurements, then it immediately plays surround and
+//            rear channel" -- then, same session: "have a step right
+//            after you start recording that the software immediately
+//            starts trying to figure out the phase patterns with the
+//            recording filtered with 0.5ms of comb filtering, and that
+//            after everything, you do it all over again by placing your
+//            microphone at the opposite direction. I'd have a single
+//            440hz sine wave play, then 220hz afterward"). THE MEASURE-
+//            MENT RIDES THE REAL FOLD: calSum8 injects a 2 s log sweep
+//            (200 Hz - 8 kHz) per virtual angle into leg1's MASKED
+//            scratch ahead of the silence test -- the 12 surround angles
+//            (60..135 deg) carry the matrix trick's own outward push
+//            (the inverted cross term grows with depth: literally more
+//            left / more right than the L/R pair alone), the 12 rear
+//            angles (120..180 deg) ride the direct rear fold, the front
+//            reference rides plain FL/FR -- the ini gains, the trick and
+//            the v8.5.1 bass filter apply exactly as they do to a movie.
+//            waveIn (48 kHz mono 16-bit, winmm) records the room while
+//            every arrival is cross-correlated against its template for
+//            level (dB), delay (ms, stage-relative) and polarity; the
+//            recording is comb-filtered at 0.5 ms (24 frames) and each
+//            angle's comb figure is the seat's interference pattern --
+//            THE PHASE-PATTERN STEP runs the moment recording starts
+//            (a rolling pass over whatever has already arrived) and
+//            again on the full capture. TWO PASSES (field-directed):
+//            pass 1 = probe + 6x front reference + 12 surround + 12
+//            rear + a single 440 Hz sine then 220 Hz afterward; the
+//            window then demands the microphone TURNED TO THE OPPOSITE
+//            DIRECTION and pass 2 repeats everything; the two tables
+//            average (polarity follows pass 1, a disagreement logs).
+//            THE RESULTS: the stage medians derive a surround trim and
+//            a rear trim (clamped +-6 dB) riding the fold gains, and
+//            the surround stage's measured bass deficit (the hollow,
+//            re-measured under the 0.5 ms comb) rides the surround
+//            bass filter's gain (clamped +4 dB) -- with NO stored memo
+//            every multiplier is exactly 1.0f and the fold is
+//            byte-identical to v9.0.2 (x * 1.0f changes no float).
+//            The run closes with the surround + rear tour playing at
+//            once through the fold (rule 5). STRICT GATES: the engine
+//            RUNNING with output leg3 EMPTY, the mains endpoint scalar
+//            >= 0.5 (-6.02 dB) read live at START, two acknowledged
+//            checkboxes (the 90-degree aim, the 36-inch spacing), the
+//            20 s stage minimum re-verified from the MEASURED onsets,
+//            every arrival validated (normalized correlation >= 0.30),
+//            a hearing probe on the mic itself, and the window refuses
+//            to close mid-run. THE SECRET MEMO: the results append to
+//            the ini as raw IEEE-754 hex bits under short memo keys
+//            (cv / cvf / cvs / cds / cps / cvw / cvr / cdr / cpr / cvx /
+//            cst / crt / csb / ct4 / ct2) no GUI ever shows and the
+//            writer passes verbatim; deleting the block un-calibrates
+//            cleanly. THE CALIBRATE BUTTON sits right below "launch at
+//            Windows startup" (page 0) and opens the strict window --
+//            its microphone picker is TEMPORARY: session only, never
+//            the ini. NO engine-key changes.
 //    v9.0.2 THE THREE-LINE STATUS BAR (field-directed: "I need the status
 //            text (the one saying 'engine started') to show 3 lines instead
 //            of one"). The GUI status band is three 18px rows now: row 1
@@ -2611,7 +2679,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.0.2"
+#define TWS_VERSION "9.1.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -4027,11 +4095,18 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 // were; only their names are promised here.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n);
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore);
+static void calSum8(int idx, float* sc, size_t n, unsigned long long seqBefore);   // v9.1.0: the calibration sweep injector (defined below the tick)
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
+// v9.1.0: three globals the calibration needs before their old homes -- the
+// switch loop tests the injection gate inline, and the run worker reads the
+// engine state and posts to the control window (the same move-up pattern).
+static std::atomic<bool> g_calOn{false};         // the calibration's injection gate
+static std::atomic<int>  g_engState{0};          // 0 stopped, 1 starting, 2 running, 3 stopping
+static HWND              g_hwnd = nullptr;       // the control window
 
 // v8.1.0 playback core -- THE STRIPPED SWITCH, bit-exact, ONE code path
 // (every device callback lands here): pop the leg's raw fan-out ring
@@ -4175,6 +4250,13 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // v6.6.9: silence compression -- a bit-zero masked chunk needs no
         // mix: same bytes out, none of the work. Post-mask, a bit-zero
         // chunk means the leg's OWN channels are silent.
+        // v9.1.0: the calibration sweep injects HERE -- into the MASKED
+        // scratch, ahead of the silence test, so a cal chunk never reads as
+        // bit-zero and the sweep rides the REAL fold (the ini gains, the
+        // v8.4.27 matrix trick and the v8.5.1 bass filter all apply exactly
+        // as they do to a movie's surround lanes). The mic hears the truth.
+        if (g_calOn.load(std::memory_order_acquire))
+            calSum8(idx, sc, n, seqBefore);
         float* dst = out + done * L.outCh;
         const bool skipMix = (L.zeroFast && bitZero8(sc, n));
         if (skipMix) {
@@ -4468,6 +4550,14 @@ static void centerEqInit() {
 // leg1's switch thread (the fold and leg3's native mix are mutually
 // exclusive -- g_rearFold == g_leg[2].disabled -- so a block is never
 // double-processed).
+// v9.1.0: the microphone calibration's LIVE corrections -- read by the fold
+// mixes and the surround bass init. Exactly 1.0 / 0.0 until a stored memo
+// parses, and x * 1.0f changes no float, so the no-calibration fold stays
+// byte-identical to v9.0.2. (The calibration section below owns the writes.)
+static float g_calMulSl = 1.0f, g_calMulSr = 1.0f;   // the surround gains
+static float g_calMulRl = 1.0f, g_calMulRr = 1.0f;   // the rear gains
+static float g_calSbDb = 0.0f;                       // the measured hollow, dB (>= 0)
+
 struct SurroundBassEq {
     bool    on     = false;
     float   f0     = 0.0f;   // clamped values, for the banner
@@ -4507,9 +4597,12 @@ static void surroundBassInit() {
     const float f0  = g_cfg.surroundBassFreq < 20.0f    ? 20.0f
                     : g_cfg.surroundBassFreq > 20000.0f ? 20000.0f
                     : g_cfg.surroundBassFreq;
-    const float gdb = g_cfg.surroundBassGain < -12.0f   ? -12.0f
-                    : g_cfg.surroundBassGain > 12.0f    ? 12.0f
-                    : g_cfg.surroundBassGain;
+    // v9.1.0: the calibration's measured hollow rides ON the ini gain -- the
+    // clamp below still owns the ceiling, so a memo cannot exceed it.
+    const float cfgGain = g_cfg.surroundBassGain + g_calSbDb;
+    const float gdb = cfgGain < -12.0f   ? -12.0f
+                    : cfgGain > 12.0f    ? 12.0f
+                    : cfgGain;
     const float qv  = g_cfg.surroundBassQ < 0.1f        ? 0.1f
                     : g_cfg.surroundBassQ > 10.0f       ? 10.0f
                     : g_cfg.surroundBassQ;
@@ -4562,10 +4655,12 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // matrix-encoding phase trick: each surround feeds its own side
         // in-phase and the opposite side INVERTED at half gain, so the
         // surround pushes outward instead of smearing the front image.
-        const float gRL = g_rearFold ? g_cfg.gainRl : 0.0f;
-        const float gRR = g_rearFold ? g_cfg.gainRr : 0.0f;
-        const float gSL = g_rearFold ? g_cfg.gainSl : 0.0f;   // v8.5.0: the surround gains
-        const float gSR = g_rearFold ? g_cfg.gainSr : 0.0f;
+        // v9.1.0: the microphone calibration's live multipliers ride the four
+        // fold gains (exactly 1.0f with no stored memo -- the bit-exact fold).
+        const float gRL = (g_rearFold ? g_cfg.gainRl : 0.0f) * g_calMulRl;
+        const float gRR = (g_rearFold ? g_cfg.gainRr : 0.0f) * g_calMulRr;
+        const float gSL = (g_rearFold ? g_cfg.gainSl : 0.0f) * g_calMulSl;   // v8.5.0: the surround gains
+        const float gSR = (g_rearFold ? g_cfg.gainSr : 0.0f) * g_calMulSr;
         // v8.5.1 THE SURROUND BASS RESTORE: the fold's surround lanes run
         // through the peaking biquad FIRST (surround_bass_gain dB @
         // surround_bass_freq, from the ORIGINAL pre-trick samples -- the
@@ -4669,7 +4764,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // leaves the bytes bit-identical; the switch layer skips the whole
         // mix only when ALL FOUR lanes are all-zero (each lane's gate is
         // its own, above).
-        const float gRL = g_cfg.gainRl, gRR = g_cfg.gainRr;
+        const float gRL = g_cfg.gainRl * g_calMulRl, gRR = g_cfg.gainRr * g_calMulRr;   // v9.1.0: the cal multipliers
         for (size_t i = 0; i < n; ++i) {
             const float* f = sc + i * kInCh;
             chunk[i * 2 + 0] = gRL * f[kRearLCh] + gRL * f[kSideLCh];   // rear L ch7 + side L ch5
@@ -4753,6 +4848,854 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
     }
 }
 
+// ===========================================================================
+// v9.1.0 THE MICROPHONE CALIBRATION -- THE 12-ANGLE SURROUND/REAR SYSTEM
+// ===========================================================================
+// The field's strict rules, verbatim:
+//   1. the microphone is pointed straight at a 90 degree angle;
+//   2. the sound coming out of the 2.1 analog speakers is recorded with the
+//      volume at least -6 dB (endpoint scalar >= 0.5, read live at START);
+//   3. the mains are at least 36 inches apart (acknowledged under the
+//      user's own checkbox -- only the ear can truly confirm it);
+//   4. the calibration is at least 20 s per 12-angle stage, for an accurate
+//      surround channel audio phase effect -- the sound going to literally
+//      more left and more right than the L/R channels alone can do;
+//   5. the step repeats for the rear measurements, then surround + rear
+//      play together through the fold.
+// And the additions: a phase-pattern step that runs the moment recording
+// starts, over the recording filtered with 0.5 ms of comb filtering; after
+// everything the whole pass repeats with the microphone AT THE OPPOSITE
+// DIRECTION; a single 440 Hz sine plays, then 220 Hz afterward.
+// THE MEASUREMENT: calSum8 writes a 2 s log sweep into leg1's masked
+// scratch per virtual angle, ahead of the silence test -- the surround
+// angles ride the v8.4.27 wide fold (the injected cross term grows with
+// depth), the rear angles ride the direct rear fold, the front reference
+// rides plain FL/FR. The ini gains, the matrix trick and the bass filter
+// all apply exactly as they do to a movie. waveIn records the room at
+// 48 kHz mono 16-bit; every arrival is cross-correlated against its
+// template for level, delay and polarity, and the 0.5 ms comb (24 frames)
+// yields each angle's interference figure. The derived trims ride the fold
+// gains and the hollow rides the surround bass filter. The results store
+// SECRETLY to the ini (hex IEEE-754 bits, short memo keys, no GUI) and the
+// microphone picker is TEMPORARY -- session only, never the ini.
+// ===========================================================================
+
+static constexpr int      kCalAngles     = 12;      // 12 angles per stage, always
+static constexpr int      kCalSweepMs    = 2000;    // one angle = one 2 s sweep
+static constexpr int      kCalGapMs      = 500;     // the hush between angles
+static constexpr int      kCalRefCount   = 6;       // stage 0: the front reference, x6
+static constexpr int      kCalDemoCount  = 8;       // the closing surround+rear tour
+static constexpr float    kCalSweepAmp   = 0.35f;   // headroom for the fold sums
+static constexpr float    kCalToneAmp    = 0.30f;   // the 440/220 verification tones
+static constexpr float    kCalProbeAmp   = 0.30f;   // the 700 Hz mic-hearing probe
+static constexpr double   kCalF0         = 200.0;   // the sweep band's floor
+static constexpr double   kCalF1         = 8000.0;  // the sweep band's ceiling
+static constexpr int      kCalMinStageMs = 20000;   // RULE 4: a stage spans >= 20 s
+static constexpr unsigned kCalStamp      = 0x39313000u;   // the memo's cv stamp ("910")
+static constexpr float    kCalVolMinLin  = 0.5f;    // RULE 2: 0.5 scalar = -6.02 dB
+static constexpr float    kCalMicFloor   = 0.0015f; // ~-56 dBFS: the probe's hearing floor
+
+// The 12 surround angles (virtual azimuths, + = right): 60..135 in 15 deg
+// steps. The 12 rear angles: 120..180 in 12 deg steps.
+static const int kCalAngSur[kCalAngles]  = { -135,-120,-105,-90,-75,-60, 60, 75, 90, 105, 120, 135 };
+static const int kCalAngRear[kCalAngles] = { -180,-168,-156,-144,-132,-120, 120, 132, 144, 156, 168, 180 };
+
+// One timeline event: the shared sweep template (or a pure tone) written
+// into the masked scratch's channel slots at the angle's weights. slotA/B
+// are VAC slots (0 L, 1 R, 4 SL, 5 SR, 6 RL, 7 RR); -1 = unused.
+struct CalEvt {
+    unsigned long long at;      // frames from the pass's seq0
+    int   slotA, slotB;
+    float wa, wb;
+    int   stage;                // 0 front ref, 1 surround, 2 rear, 3 probe, 4 tour, 5 tones
+    int   angle;
+    unsigned long long len;
+    bool  tone;
+    float fq;                   // tone events: the frequency (probe 700, 440, 220)
+};
+
+// The analyzer's per-angle result (one row of the 12-angle tables).
+struct CalAngle { float lvl = 0.0f, dly = 0.0f, pol = 1.0f, comb = 0.0f; };
+
+// The combined data -- also the ini memo's exact payload.
+struct CalData {
+    bool      ok = false;
+    float     ref[kCalRefCount] = {};
+    CalAngle  sur[kCalAngles];
+    CalAngle  rear[kCalAngles];
+    float     surTrim = 0.0f, rearTrim = 0.0f, sbAdj = 0.0f;
+    float     t440 = 0.0f, t220 = 0.0f;
+};
+static CalData g_calData;
+
+// run state (the worker owns the writes; the popup and the drive loop read)
+// (g_calOn, g_engState and g_hwnd moved up next to g_tickOn -- the switch
+// loop and the worker need them before this block.)
+static std::atomic<bool>               g_calDemoGate{false}; // the tour rides pass 2 only
+static std::atomic<long long>          g_calSeq0{-1};        // capture-seq of the pass's frame zero
+static std::atomic<unsigned long long> g_calPos{0};          // absolute frames played (popup progress)
+static std::atomic<unsigned long long> g_calProbeEnd{0};     // plan landmarks (frames)
+static std::atomic<unsigned long long> g_calSurAt{0};
+static std::atomic<unsigned long long> g_calRearAt{0};
+static std::atomic<unsigned long long> g_calToneAt{0};
+static std::atomic<unsigned long long> g_calPassFrames{0};   // the measured part of one pass
+static std::atomic<unsigned long long> g_calDemoEnd{0};      // one pass INCLUDING the tour
+static std::atomic<unsigned long long> g_calPassBase{0};     // absolute offset of the current pass
+static std::atomic<int>                g_calRunFlag{0};      // 0 idle, 1 running, 2 mic-turn, 3 done-ok, 4 done-fail
+static std::atomic<bool>               g_calContinue{false}; // the mic-turn gate
+static std::vector<CalEvt>             g_calPlan;            // built once per run (both passes share it)
+static std::vector<float>              g_calSweep;           // the ONE 2 s log sweep template
+static int                             g_calMicDev = -1;     // TEMPORARY: the popup's combo, session only
+static HANDLE                          g_calThread = nullptr;
+static HWND                            g_calWnd = nullptr;   // the strict window (result posts)
+static std::string                     g_calLastError;       // the popup shows it on a fail
+
+// v9.1.0: the ini path moves up here -- the secret memo writer lives in this
+// section and needs the path before the GUI block exists.
+static std::string g_guiIniPath;
+
+static unsigned long long calMs(int ms) {
+    return (unsigned long long)kSampleRate * (unsigned long long)ms / 1000ULL;
+}
+
+// The per-angle encoding of the surround stage: the own side carries the
+// full sweep, the OPPOSITE slot carries the trick's inverted half-gain
+// cross term growing with depth -- literally more left / more right than
+// the speaker pair alone can place. The REAL fold applies its own ratios
+// on top; the mic then reports where each virtual angle actually landed.
+static void calSurWeights(int ang, float& wa, float& wb) {
+    const float m     = (float)(abs(ang) - 60) / 75.0f;
+    const float cross = -0.5f * m;
+    if (ang < 0) { wa = 1.0f; wb = cross; }
+    else         { wa = cross; wb = 1.0f; }
+}
+
+// The ONE sweep template: 2 s, 200 Hz -> 8 kHz, log rate, 15 ms fades.
+static void calRenderSweep() {
+    if (!g_calSweep.empty()) return;
+    const size_t n = (size_t)kSampleRate * (size_t)kCalSweepMs / 1000;
+    g_calSweep.resize(n);
+    const double dur = (double)n / (double)kSampleRate;
+    const double lam = log(kCalF1 / kCalF0);
+    const double fade = 0.015;
+    double ph = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double t = (double)i / (double)kSampleRate;
+        const double f = kCalF0 * exp(lam * t / dur);
+        ph += kTwoPi * f / (double)kSampleRate;
+        double a = (double)kCalSweepAmp;
+        if (t < fade)            a *= t / fade;
+        else if (t > dur - fade) a *= (dur - t) / fade;
+        g_calSweep[i] = (float)(a * sin(ph));
+    }
+}
+
+// A pure tone template with the same fades (the analyzer's reference for
+// the probe and the 440/220 verification tones).
+static void calToneMake(float fq, float amp, std::vector<float>& v) {
+    v.assign((size_t)kSampleRate * (size_t)kCalSweepMs / 1000, 0.0f);
+    const int fade = 720;                                     // 15 ms at 48 kHz
+    const size_t n = v.size();
+    for (size_t i = 0; i < n; ++i) {
+        float env = 1.0f;
+        if ((int)i < fade)                    env = (float)i / (float)fade;
+        else if ((int)i >= (int)n - fade)     env = (float)(n - i) / (float)fade;
+        v[i] = (float)(amp * sin(kTwoPi * (double)fq * (double)i / (double)kSampleRate)) * env;
+    }
+}
+
+// THE PASS PLAN (built once, ridden twice -- pass 2 is the full repeat at
+// the opposite mic direction): probe, 6x front reference, 12 surround
+// angles, 12 rear angles, then a single 440 Hz sine and 220 Hz afterward.
+// The closing tour (stage 4) rides pass 2 only and is heard, not measured.
+static void calBuildPlan() {
+    g_calPlan.clear();
+    unsigned long long t = 0;
+    // THE PROBE: two 600 ms bursts at 700 Hz -- rule 2's mic side, verdict
+    // delivered the moment recording can prove it.
+    g_calPlan.push_back({ t, 0, 1, kCalProbeAmp, kCalProbeAmp, 3, 0, calMs(600), true, 700.0f }); t += calMs(600);
+    t += calMs(400);
+    g_calPlan.push_back({ t, 0, 1, kCalProbeAmp, kCalProbeAmp, 3, 1, calMs(600), true, 700.0f }); t += calMs(600);
+    g_calProbeEnd.store(t);
+    t += calMs(500);
+    // STAGE 0: the plain stereo front reference -- the loudness yardstick.
+    for (int i = 0; i < kCalRefCount; ++i) {
+        g_calPlan.push_back({ t, 0, 1, 1.0f, 1.0f, 0, i, calMs(kCalSweepMs), false, 0.0f });
+        t += calMs(kCalSweepMs + kCalGapMs);
+    }
+    t += calMs(500);
+    // STAGE 1: the 12 surround angles through the REAL wide fold (rule 4).
+    const unsigned long long s1 = t;
+    for (int i = 0; i < kCalAngles; ++i) {
+        float wa, wb; calSurWeights(kCalAngSur[i], wa, wb);
+        g_calPlan.push_back({ t, 4, 5, wa, wb, 1, i, calMs(kCalSweepMs), false, 0.0f });
+        t += calMs(kCalSweepMs + kCalGapMs);
+    }
+    t += calMs(500);
+    // STAGE 2: the 12 rear angles through the REAL direct rear fold.
+    const unsigned long long s2 = t;
+    for (int i = 0; i < kCalAngles; ++i) {
+        const bool left = kCalAngRear[i] < 0;
+        g_calPlan.push_back({ t, left ? 6 : 7, -1, 1.0f, 0.0f, 2, i, calMs(kCalSweepMs), false, 0.0f });
+        t += calMs(kCalSweepMs + kCalGapMs);
+    }
+    t += calMs(500);
+    // THE VERIFICATION TONES: a single 440 Hz sine, then 220 Hz afterward.
+    const unsigned long long s3 = t;
+    g_calPlan.push_back({ t, 0, 1, kCalToneAmp, kCalToneAmp, 5, 0, calMs(kCalSweepMs), true, 440.0f }); t += calMs(kCalSweepMs);
+    t += calMs(kCalGapMs);
+    g_calPlan.push_back({ t, 0, 1, kCalToneAmp, kCalToneAmp, 5, 1, calMs(kCalSweepMs), true, 220.0f }); t += calMs(kCalSweepMs);
+    g_calSurAt.store(s1); g_calRearAt.store(s2); g_calToneAt.store(s3);
+    g_calPassFrames.store(t);
+    // THE CLOSING TOUR: surround + rear play TOGETHER, sweeping outward
+    // (rule 5's "immediately plays surround and rear channel").
+    for (int i = 0; i < kCalDemoCount; ++i) {
+        const int s = (i & 1) ? (60 + i * 15) : -(60 + i * 15);
+        float wa, wb; calSurWeights(s, wa, wb);
+        const bool left = s < 0;
+        g_calPlan.push_back({ t, 4, 5, wa, wb, 4, i, calMs(1500), false, 0.0f });
+        g_calPlan.push_back({ t, left ? 6 : 7, -1, 0.6f, 0.0f, 4, i, calMs(1500), false, 0.0f });
+        t += calMs(1500 + 400);
+    }
+    g_calDemoEnd.store(t);
+}
+
+// THE INJECTOR: the sweeps are written into the masked scratch of LEG 1
+// ONLY, ahead of the silence test -- a cal chunk never reads as bit-zero,
+// so the mix always runs and the fold applies exactly as it does to a
+// movie's surround lanes. The keep-alive, the gates and the timing paths
+// are untouched; this is the tick test's raw dispatch, aimed at the fold.
+static void calSum8(int idx, float* sc, size_t n, unsigned long long seqBefore) {
+    if (idx != 0) return;                                    // the mains only
+    const long long s0 = g_calSeq0.load(std::memory_order_acquire);
+    if (s0 < 0) return;
+    const long long a = (long long)seqBefore, b = a + (long long)n;
+    for (const CalEvt& e : g_calPlan) {
+        if (e.stage == 4 && !g_calDemoGate.load(std::memory_order_acquire)) continue;
+        const long long eEnd = (long long)(e.at + e.len);
+        if (eEnd <= a) continue;
+        if ((long long)e.at >= b) break;
+        for (size_t i = 0; i < n; ++i) {
+            const long long p = a + (long long)i - (long long)e.at;
+            if (p < 0 || p >= (long long)e.len) continue;
+            float s;
+            if (e.tone) {
+                const int fade = 720;                        // 15 ms at 48 kHz
+                float env = 1.0f;
+                if (p < fade)                        env = (float)p / (float)fade;
+                else if (p >= (long long)e.len - fade) env = (float)(e.len - p) / (float)fade;
+                s = e.wa * (float)(sin(kTwoPi * (double)e.fq * (double)p / (double)kSampleRate)) * env;
+            } else {
+                s = g_calSweep[(size_t)p];                   // the shared sweep
+            }
+            float* f = sc + i * (size_t)kInCh;
+            if (e.slotA >= 0) f[e.slotA] += e.wa * s;
+            if (e.slotB >= 0) f[e.slotB] += e.wb * s;
+        }
+    }
+}
+
+// ---- the microphone (waveIn, 48 kHz mono, 16-bit) --------------------------
+// TEMPORARY by design: the device lives only for this session (the popup's
+// combo is the mic key the field asked for); nothing about the mic ever
+// touches the ini.
+static constexpr int kCalMicBufs      = 8;
+static constexpr int kCalMicBufFrames = 24000;               // 0.5 s each = 4 s cushion
+
+struct CalMic {
+    HWAVEIN  h = nullptr;
+    WAVEHDR  hdr[kCalMicBufs] = {};
+    std::vector<short> buf[kCalMicBufs];
+    std::vector<float> data;                                 // the whole session, -1..1
+    CRITICAL_SECTION cs;
+    bool opened = false;
+};
+static CalMic g_calMic;
+
+static void CALLBACK calMicCb(HWAVEIN, UINT msg, DWORD_PTR, DWORD_PTR p1, DWORD_PTR) {
+    if (msg != WIM_DATA) return;
+    WAVEHDR* h = (WAVEHDR*)p1;
+    EnterCriticalSection(&g_calMic.cs);
+    const short* s = (const short*)h->lpData;
+    const size_t n = h->dwBytesRecorded / 2;
+    for (size_t i = 0; i < n; ++i) g_calMic.data.push_back((float)s[i] / 32768.0f);
+    LeaveCriticalSection(&g_calMic.cs);
+    if (g_calMic.h) waveInAddBuffer(g_calMic.h, h, sizeof(WAVEHDR));   // keep the ring full
+}
+
+static void calMicClose() {
+    if (!g_calMic.opened) return;
+    waveInReset(g_calMic.h);
+    for (int i = 0; i < kCalMicBufs; ++i)
+        waveInUnprepareHeader(g_calMic.h, &g_calMic.hdr[i], sizeof(WAVEHDR));
+    waveInClose(g_calMic.h);
+    g_calMic.h = nullptr;
+    g_calMic.opened = false;
+    DeleteCriticalSection(&g_calMic.cs);
+}
+
+static bool calMicOpen(int dev) {
+    calMicClose();
+    WAVEFORMATEX f;
+    f.wFormatTag = WAVE_FORMAT_PCM; f.nChannels = 1;
+    f.nSamplesPerSec = 48000; f.wBitsPerSample = 16;
+    f.nAvgBytesPerSec = 48000 * 2; f.nBlockAlign = 2; f.cbSize = 0;
+    InitializeCriticalSection(&g_calMic.cs);
+    if (waveInOpen(&g_calMic.h, (UINT_PTR)dev, &f, (DWORD_PTR)calMicCb, 0,
+                   CALLBACK_FUNCTION) != MMSYSERR_NOERROR) {
+        DeleteCriticalSection(&g_calMic.cs);
+        return false;
+    }
+    g_calMic.data.clear();
+    for (int i = 0; i < kCalMicBufs; ++i) {
+        g_calMic.buf[i].assign(kCalMicBufFrames, 0);
+        WAVEHDR& hd = g_calMic.hdr[i];
+        memset(&hd, 0, sizeof(hd));
+        hd.lpData = (LPSTR)g_calMic.buf[i].data();
+        hd.dwBufferLength = kCalMicBufFrames * 2;
+        waveInPrepareHeader(g_calMic.h, &hd, sizeof(WAVEHDR));
+        waveInAddBuffer(g_calMic.h, &hd, sizeof(WAVEHDR));
+    }
+    g_calMic.opened = true;
+    if (waveInStart(g_calMic.h) != MMSYSERR_NOERROR) {
+        calMicClose();
+        return false;
+    }
+    return true;
+}
+
+// ---- the math helpers ------------------------------------------------------
+static float calRms(const std::vector<float>& v, size_t a, size_t b) {
+    if (b > v.size()) b = v.size();
+    if (a >= b) return 0.0f;
+    double s = 0.0;
+    for (size_t i = a; i < b; ++i) s += (double)v[i] * (double)v[i];
+    return (float)sqrt(s / (double)(b - a));
+}
+
+static float calMed(std::vector<float>& v) {
+    if (v.empty()) return 0.0f;
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+static void calDecim(const std::vector<float>& v, int D, std::vector<float>& out) {
+    out.clear();
+    const size_t n = v.size() / (size_t)D;
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        float s = 0.0f;
+        for (int k = 0; k < D; ++k) s += v[i * (size_t)D + k];
+        out[i] = s / (float)D;
+    }
+}
+
+// THE 0.5 ms COMB (the field's own filter): y[n] = x[n] + x[n-24] -- 24
+// frames at 48 kHz. The two mains' arrivals sum at the seat exactly like
+// this comb does, so each angle's comb figure IS the seat's interference
+// pattern for that virtual direction.
+static void calComb(const std::vector<float>& in, std::vector<float>& out) {
+    out.assign(in.size(), 0.0f);
+    for (size_t i = 24; i < in.size(); ++i) out[i] = in[i] + in[i - 24];
+}
+
+static float calCombFig(const std::vector<float>& comb, const std::vector<float>& raw,
+                        size_t a, size_t b) {
+    // dB of (comb rms / raw rms): negative = the destructive phase pattern,
+    // positive = constructive. The surround angles SHOULD read negative.
+    return 20.0f * log10f((calRms(comb, a, b) + 1e-9f) / (calRms(raw, a, b) + 1e-9f));
+}
+
+// The hollow's raw ingredient: one-pole lowpass at 300 Hz, the ratio of the
+// low band's energy to the broadband energy over one arrival window. The
+// trick's bass cancellation shows as the surround stage's lower ratio.
+static float calBassRatio(const std::vector<float>& rec, size_t onset) {
+    const size_t a = onset + 2400, b2 = onset + 93600;
+    if (b2 > rec.size() || a >= b2) return -120.0f;
+    const float al = 1.0f - expf(-(float)kTwoPi * 300.0f / (float)kSampleRate);
+    double lo = 0.0, all = 0.0;
+    float y = 0.0f;
+    for (size_t i = a; i < b2; ++i) {
+        const float x = rec[i];
+        y += al * (x - y);
+        lo += (double)y * y;
+        all += (double)x * x;
+    }
+    if (all <= 0.0) return -120.0f;
+    return 10.0f * log10f((float)(lo / all));
+}
+
+// ---- the analyzer ----------------------------------------------------------
+struct CalTpl {
+    std::vector<float>  f, f16;
+    std::vector<double> e16;                                 // prefix energies (16x)
+    double rms = 0.0;
+};
+static void calTplBuild(CalTpl& t, const std::vector<float>& src) {
+    t.f = src;
+    calDecim(src, 16, t.f16);
+    t.e16.assign(t.f16.size(), 0.0);
+    double s = 0.0;
+    for (size_t i = 0; i < t.f16.size(); ++i) {
+        s += (double)t.f16[i] * t.f16[i];
+        t.e16[i] = s;
+    }
+    const size_t n = src.size();
+    t.rms = n > 4800 ? calRms(src, 2400, n - 2400) : calRms(src, 0, n);
+}
+
+struct CalPassRes {
+    CalAngle a[kCalAngles];                                  // the surround stage
+    CalAngle rear[kCalAngles];                               // the rear stage
+    float    refLvl[kCalRefCount] = {};
+    float    t440 = 0.0f, t220 = 0.0f;
+    float    bassDef = 0.0f;                                 // ref - surround, the hollow
+    bool     ok = false;
+};
+struct CalRunOut {
+    bool        ok = false;
+    std::string err;
+    CalData     data;
+};
+
+// One arrival: coarse search on a 16x decimation (0.33 ms steps, +-250 ms
+// around the nominal), refine +-48 frames at full rate over the template's
+// middle second, then level, polarity and the 0.5 ms comb figure in the
+// same window. Returns false when the arrival did not correlate.
+static bool calMeasureArrival(const std::vector<float>& rec,
+                              const std::vector<float>& rec16, const std::vector<double>& re16,
+                              const std::vector<float>& comb,
+                              const CalTpl& t, double nominal,
+                              float& lvl, float& pol, float& combF, double& onset) {
+    const size_t tN = t.f.size(), tN16 = t.f16.size();
+    const double lo = nominal - (double)calMs(250), hi = nominal + (double)calMs(250);
+    if (lo < 0.0 || hi + (double)tN16 >= (double)rec16.size()) return false;
+    double best = 0.0;
+    long long bo = -1;
+    for (long long o = (long long)lo; o <= (long long)hi; ++o) {
+        double dot = 0.0;
+        const float* r = &rec16[(size_t)o];
+        for (size_t i = 0; i < tN16; ++i) dot += (double)r[i] * (double)t.f16[i];
+        const double en  = re16[(size_t)o + tN16 - 1] - (o > 0 ? re16[(size_t)o - 1] : 0.0);
+        const double nrm = dot / sqrt(en * t.e16[tN16 - 1] + 1e-24);
+        if (fabs(nrm) > fabs(best)) { best = nrm; bo = o; }
+    }
+    if (bo < 0 || fabs(best) < 0.30) return false;           // the strict validity gate
+    const size_t mid0 = tN / 2 - (size_t)kSampleRate / 2;
+    double bdot = 0.0;
+    long long bon = -1;
+    for (int d = -48; d <= 48; ++d) {
+        const long long O = (long long)bo * 16 + d;
+        if (O < 0 || (size_t)(O + (long long)tN) >= rec.size()) continue;
+        double dot = 0.0;
+        for (size_t i = mid0; i < mid0 + (size_t)kSampleRate; ++i)
+            dot += (double)rec[(size_t)O + i] * (double)t.f[i];
+        if (fabs(dot) > fabs(bdot)) { bdot = dot; bon = O; }
+    }
+    if (bon < 0) return false;
+    onset = (double)bon;
+    pol = bdot >= 0.0 ? 1.0f : -1.0f;
+    const size_t a = (size_t)bon + 2400, b2 = (size_t)bon + tN - 2400;
+    if (b2 > rec.size()) return false;
+    lvl   = 20.0f * log10f((calRms(rec, a, b2) + 1e-9f) / (float)(t.rms + 1e-9));
+    combF = calCombFig(comb, rec, a, b2);
+    return true;
+}
+
+// THE PHASE-PATTERN STEP, run the moment recording is underway: the recorded
+// audio is filtered with the 0.5 ms comb and the figures for whatever has
+// already arrived go to the log; the full analysis repeats it on the whole
+// capture and stores the figures.
+static void calPhaseRoll(const std::vector<float>& rec, double lead) {
+    if (rec.size() < (size_t)calMs(5000)) return;
+    std::vector<float> comb;
+    calComb(rec, comb);
+    char line[640];
+    int n = snprintf(line, sizeof(line),
+                     "[twinspeak] cal          : phase-pattern pass -- 0.5 ms comb figures:");
+    for (const CalEvt& e : g_calPlan) {
+        if (e.stage != 1) continue;
+        const double nom = lead + (double)e.at + (double)calMs(10);
+        const size_t a = (size_t)(nom + 2400.0);
+        const size_t b2 = (size_t)(nom + (double)calMs(kCalSweepMs) - 2400.0);
+        if (b2 >= rec.size()) break;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %+0.1f", calCombFig(comb, rec, a, b2));
+        if (n >= 600) break;
+    }
+    tlog("%s dB\n", line);
+}
+
+// THE FULL ANALYSIS: both passes, every measured event, then the combine
+// (averages; polarity follows pass 1) and the derived trims.
+static void calAnalyze(const std::vector<float>& rec, double lead0, double lead1, CalRunOut& out) {
+    std::vector<float> rec16;
+    calDecim(rec, 16, rec16);
+    std::vector<double> re16(rec16.size(), 0.0);
+    { double s = 0.0; for (size_t i = 0; i < rec16.size(); ++i) { s += (double)rec16[i] * rec16[i]; re16[i] = s; } }
+    std::vector<float> comb;
+    calComb(rec, comb);
+    // the templates: the ONE sweep + the three pure tones
+    calRenderSweep();
+    CalTpl tSw, t700, t440, t220;
+    calTplBuild(tSw, g_calSweep);
+    { std::vector<float> v; calToneMake(700.0f, kCalProbeAmp, v); calTplBuild(t700, v); }
+    { std::vector<float> v; calToneMake(440.0f, kCalToneAmp, v); calTplBuild(t440, v); }
+    { std::vector<float> v; calToneMake(220.0f, kCalToneAmp, v); calTplBuild(t220, v); }
+
+    CalPassRes pr[2];
+    const double leads[2] = { lead0, lead1 };
+    for (int pass = 0; pass < 2; ++pass) {
+        double ons1[kCalAngles] = {}, ons2[kCalAngles] = {};
+        float bassRef[kCalRefCount] = {}, bass1[kCalAngles] = {}, bass2[kCalAngles] = {};
+        int bad = 0;
+        char why[192] = "";
+        for (const CalEvt& e : g_calPlan) {
+            if (e.stage == 4) continue;                      // the tour is heard, not measured
+            const CalTpl* t = e.tone ? (e.fq > 600.0f ? &t700 : (e.fq > 300.0f ? &t440 : &t220)) : &tSw;
+            const double nominal = leads[pass] + (double)e.at + (double)calMs(10);
+            float lvl, pol, cf;
+            double on;
+            if (!calMeasureArrival(rec, rec16, re16, comb, *t, nominal, lvl, pol, cf, on)) {
+                ++bad;
+                if (!why[0]) {
+                    const char* st = e.stage == 0 ? "front ref"
+                                   : e.stage == 1 ? "surround"
+                                   : e.stage == 2 ? "rear" : "tone";
+                    snprintf(why, sizeof(why),
+                             "pass %d %s angle %d: the arrival did not correlate -- is the microphone in place?",
+                             pass + 1, st, e.angle + 1);
+                }
+                continue;
+            }
+            switch (e.stage) {
+            case 0:
+                pr[pass].refLvl[e.angle] = lvl;
+                bassRef[e.angle] = calBassRatio(rec, (size_t)on);
+                break;
+            case 1:
+                pr[pass].a[e.angle] = { lvl, 0.0f, pol, cf };
+                ons1[e.angle] = on;
+                bass1[e.angle] = calBassRatio(rec, (size_t)on);
+                break;
+            case 2:
+                pr[pass].rear[e.angle] = { lvl, 0.0f, pol, cf };
+                ons2[e.angle] = on;
+                bass2[e.angle] = calBassRatio(rec, (size_t)on);
+                break;
+            case 5:
+                if (e.angle == 0) pr[pass].t440 = lvl; else pr[pass].t220 = lvl;
+                break;
+            }
+        }
+        if (bad) { out.err = why; return; }
+        // RULE 4, re-verified from the MEASURED onsets: each 12-angle stage
+        // must span its strict 20 s minimum (the plan builds 30 s).
+        const double span1 = ons1[kCalAngles - 1] - ons1[0] + (double)kSampleRate;
+        const double span2 = ons2[kCalAngles - 1] - ons2[0] + (double)kSampleRate;
+        if (span1 < (double)calMs(kCalMinStageMs) || span2 < (double)calMs(kCalMinStageMs)) {
+            char b[160];
+            snprintf(b, sizeof(b),
+                     "the 20 s stage rule failed on the measured onsets (surround %.1f s, rear %.1f s)",
+                     span1 / 48000.0, span2 / 48000.0);
+            out.err = b;
+            return;
+        }
+        // the stage-relative delays (the median removes the shared path)
+        {
+            std::vector<float> v;
+            for (int i = 0; i < kCalAngles; ++i) v.push_back((float)ons1[i]);
+            const float m1 = calMed(v);
+            for (int i = 0; i < kCalAngles; ++i) pr[pass].a[i].dly = (float)((ons1[i] - (double)m1) / 48.0);
+            v.clear();
+            for (int i = 0; i < kCalAngles; ++i) v.push_back((float)ons2[i]);
+            const float m2 = calMed(v);
+            for (int i = 0; i < kCalAngles; ++i) pr[pass].rear[i].dly = (float)((ons2[i] - (double)m2) / 48.0);
+        }
+        // the hollow's raw ingredient, per pass
+        {
+            std::vector<float> v;
+            for (int i = 0; i < kCalRefCount; ++i) v.push_back(bassRef[i]);
+            const float mr = calMed(v);
+            v.clear();
+            for (int i = 0; i < kCalAngles; ++i) v.push_back(bass1[i]);
+            pr[pass].bassDef = mr - calMed(v);
+        }
+        pr[pass].ok = true;
+    }
+    // THE COMBINE: averages; polarity follows pass 1 (a disagreement logs).
+    CalData& d = out.data;
+    for (int i = 0; i < kCalRefCount; ++i)
+        d.ref[i] = 0.5f * (pr[0].refLvl[i] + pr[1].refLvl[i]);
+    for (int i = 0; i < kCalAngles; ++i) {
+        d.sur[i].lvl  = 0.5f * (pr[0].a[i].lvl  + pr[1].a[i].lvl);
+        d.sur[i].dly  = 0.5f * (pr[0].a[i].dly  + pr[1].a[i].dly);
+        d.sur[i].comb = 0.5f * (pr[0].a[i].comb + pr[1].a[i].comb);
+        d.sur[i].pol  = pr[0].a[i].pol;
+        if (pr[0].a[i].pol != pr[1].a[i].pol)
+            tlog("[twinspeak] cal          : pass 2 polarity disagrees at surround angle %d -- pass 1 is kept\n", i + 1);
+        d.rear[i].lvl  = 0.5f * (pr[0].rear[i].lvl  + pr[1].rear[i].lvl);
+        d.rear[i].dly  = 0.5f * (pr[0].rear[i].dly  + pr[1].rear[i].dly);
+        d.rear[i].comb = 0.5f * (pr[0].rear[i].comb + pr[1].rear[i].comb);
+        d.rear[i].pol  = pr[0].rear[i].pol;
+        if (pr[0].rear[i].pol != pr[1].rear[i].pol)
+            tlog("[twinspeak] cal          : pass 2 polarity disagrees at rear angle %d -- pass 1 is kept\n", i + 1);
+    }
+    d.t440 = 0.5f * (pr[0].t440 + pr[1].t440);
+    d.t220 = 0.5f * (pr[0].t220 + pr[1].t220);
+    // THE DERIVED TRIMS + THE HOLLOW (measured under the 0.5 ms comb too).
+    {
+        std::vector<float> v;
+        for (int i = 0; i < kCalRefCount; ++i) v.push_back(d.ref[i]);
+        const float refMed = calMed(v);
+        v.clear(); for (int i = 0; i < kCalAngles; ++i) v.push_back(d.sur[i].lvl);
+        const float surMed = calMed(v);
+        v.clear(); for (int i = 0; i < kCalAngles; ++i) v.push_back(d.rear[i].lvl);
+        const float rearMed = calMed(v);
+        float st = refMed - surMed;
+        float rt = refMed - rearMed;
+        if (st < -6.0f) st = -6.0f; if (st > 6.0f) st = 6.0f;
+        if (rt < -6.0f) rt = -6.0f; if (rt > 6.0f) rt = 6.0f;
+        d.surTrim = st;
+        d.rearTrim = rt;
+        const float def = 0.5f * (pr[0].bassDef + pr[1].bassDef);
+        d.sbAdj = def < 0.0f ? 0.0f : def > 4.0f ? 4.0f : def;
+        std::vector<float> cv;
+        for (int i = 0; i < kCalAngles; ++i) cv.push_back(d.sur[i].comb);
+        tlog("[twinspeak] cal          : ref %0.1f dB, surround median %0.1f dB, rear median %0.1f dB, comb median %+0.1f dB\n",
+             refMed, surMed, rearMed, calMed(cv));
+    }
+    d.ok = true;
+    out.ok = true;
+}
+
+// ---- the application + the secret memo -------------------------------------
+static void calApplyData(const CalData& d) {
+    auto lin = [](float db) {
+        float v = powf(10.0f, db / 20.0f);
+        if (v < 0.5f) v = 0.5f;
+        if (v > 2.0f) v = 2.0f;
+        return v;
+    };
+    g_calMulSl = g_calMulSr = lin(d.surTrim);
+    g_calMulRl = g_calMulRr = lin(d.rearTrim);
+    g_calSbDb  = d.sbAdj < 0.0f ? 0.0f : d.sbAdj > 4.0f ? 4.0f : d.sbAdj;
+    surroundBassInit();          // rebuild the peaking section with the measured hollow
+    tlog("[twinspeak] cal          : applied -- surround %+0.2f dB, rear %+0.2f dB, hollow %+0.2f dB\n",
+         d.surTrim, d.rearTrim, g_calSbDb);
+}
+
+// The hex codec: every float stores as its raw IEEE-754 bits -- the memo is
+// deliberately not human-readable (the field asked for SECRET).
+static std::string calHex(float v) {
+    unsigned u;
+    memcpy(&u, &v, 4);
+    char b[16];
+    snprintf(b, sizeof(b), "%08X", u);
+    return b;
+}
+static float calUnhex(const std::string& s) {
+    unsigned u = (unsigned)strtoul(s.c_str(), nullptr, 16);
+    float v;
+    memcpy(&v, &u, 4);
+    return v;
+}
+
+// THE SECRET MEMO: appended to the ini after a completed calibration. The
+// keys are short and neutral, the values are hex bits, no GUI ever shows
+// them, and kIniKeys does not know them -- the ini writer passes every line
+// verbatim, so the memo survives every save. Deleting the block
+// un-calibrates cleanly (the loader simply finds no stamp).
+static bool calSaveSecretIni(const CalData& d) {
+    FILE* f = fopen(g_guiIniPath.c_str(), "a");
+    if (!f) return false;
+    fprintf(f, "\n; twinspeak engine memo (do not edit)\n");
+    fprintf(f, "cv = %08X\n", kCalStamp);
+    char key[16];
+    for (int i = 0; i < kCalRefCount; ++i) {
+        snprintf(key, sizeof(key), "cvf%d", i);
+        fprintf(f, "%s = %s\n", key, calHex(d.ref[i]).c_str());
+    }
+    for (int i = 0; i < kCalAngles; ++i) {
+        snprintf(key, sizeof(key), "cvs%d", i); fprintf(f, "%s = %s\n", key, calHex(d.sur[i].lvl).c_str());
+        snprintf(key, sizeof(key), "cds%d", i); fprintf(f, "%s = %s\n", key, calHex(d.sur[i].dly).c_str());
+        snprintf(key, sizeof(key), "cps%d", i); fprintf(f, "%s = %s\n", key, calHex(d.sur[i].pol).c_str());
+        snprintf(key, sizeof(key), "cvw%d", i); fprintf(f, "%s = %s\n", key, calHex(d.sur[i].comb).c_str());
+        snprintf(key, sizeof(key), "cvr%d", i); fprintf(f, "%s = %s\n", key, calHex(d.rear[i].lvl).c_str());
+        snprintf(key, sizeof(key), "cdr%d", i); fprintf(f, "%s = %s\n", key, calHex(d.rear[i].dly).c_str());
+        snprintf(key, sizeof(key), "cpr%d", i); fprintf(f, "%s = %s\n", key, calHex(d.rear[i].pol).c_str());
+        snprintf(key, sizeof(key), "cvx%d", i); fprintf(f, "%s = %s\n", key, calHex(d.rear[i].comb).c_str());
+    }
+    fprintf(f, "cst = %s\n", calHex(d.surTrim).c_str());
+    fprintf(f, "crt = %s\n", calHex(d.rearTrim).c_str());
+    fprintf(f, "csb = %s\n", calHex(d.sbAdj).c_str());
+    fprintf(f, "ct4 = %s\n", calHex(d.t440).c_str());
+    fprintf(f, "ct2 = %s\n", calHex(d.t220).c_str());
+    fclose(f);
+    return true;
+}
+
+// RULE 2, verified live: the mains endpoint's scalar must be >= 0.5
+// (-6.02 dB). The engine's own pinning holds a non-default leg at 100% --
+// the check is honest either way; a leg the user slides down fails here.
+static bool calVolumeOk(float& outLin) {
+    outLin = -1.0f;
+    IAudioEndpointVolume* v = findRenderEndpointVolume(g_cfg.outputDevice1, nullptr);
+    if (!v) return false;
+    BOOL mute = FALSE;
+    v->GetMute(&mute);
+    float lin = 0.0f;
+    const bool ok = SUCCEEDED(v->GetMasterVolumeLevelScalar(&lin)) && !mute && lin >= kCalVolMinLin;
+    v->Release();
+    outLin = lin;
+    return ok;
+}
+
+// ---- the run thread --------------------------------------------------------
+static DWORD WINAPI calRunThread(LPVOID) {
+    CalRunOut out;
+    bool micOk = false;
+    ULONGLONG armTick[2] = { 0, 0 };
+    double lead[2] = { 0.0, 0.0 };
+    const ULONGLONG micT0 = GetTickCount64();
+    do {
+        // ---- preflight, again, strictly (the popup checked; the worker insists)
+        if (g_engState.load() != 2) { out.err = "the engine is not RUNNING -- start it first"; break; }
+        if (!g_rearFold)            { out.err = "the 2.1 fold is not active -- set output leg3 (rears) EMPTY first"; break; }
+        if (g_calMicDev < 0)        { out.err = "no microphone picked"; break; }
+        {
+            float vl = 0.0f;
+            if (!calVolumeOk(vl)) {
+                char b[192];
+                const float db = vl > 0.0f ? 20.0f * log10f(vl) : -120.0f;
+                snprintf(b, sizeof(b), "the volume gate failed: the mains endpoint reads %.1f dB -- the strict rule is at least -6.0 dB", db);
+                out.err = b;
+                break;
+            }
+        }
+        if (!calMicOpen(g_calMicDev)) { out.err = "the microphone would not open (48 kHz mono, 16-bit)"; break; }
+        micOk = true;
+        calRenderSweep();
+        calBuildPlan();
+        const unsigned long long passTotal = g_calPassFrames.load();
+        for (int pass = 0; pass < 2 && out.err.empty(); ++pass) {
+            g_calDemoGate.store(pass == 1);
+            Sleep(400);                                      // a short hush before each pass
+            armTick[pass] = GetTickCount64();
+            g_calSeq0.store((long long)g_leg[0].captured.load(std::memory_order_relaxed) + 24000,
+                            std::memory_order_release);
+            g_calOn.store(true, std::memory_order_release);
+            // ---- the drive loop
+            ULONGLONG lastAdv = GetTickCount64();
+            long long lastPos = 0;
+            bool probeChecked = false, rolled = false;
+            const unsigned long long target = (pass == 1) ? g_calDemoEnd.load() : passTotal;
+            while (true) {
+                Sleep(100);
+                if (g_engState.load() != 2) { out.err = "the engine stopped mid-run"; break; }
+                const long long pos = (long long)g_leg[0].captured.load(std::memory_order_relaxed)
+                                    - g_calSeq0.load(std::memory_order_acquire);
+                if (pos > lastPos) { lastPos = pos; lastAdv = GetTickCount64(); }
+                else if (pos <= lastPos && GetTickCount64() - lastAdv > 5000 && pos >= 0) {
+                    out.err = "the engine stopped mixing -- the sweep stalled";
+                    break;
+                }
+                if (pos >= 0)
+                    g_calPos.store(g_calPassBase.load() + (unsigned long long)pos);
+                // THE PROBE VERDICT, the moment recording can prove it (strict).
+                if (!probeChecked && pos >= (long long)g_calProbeEnd.load() + 1800) {
+                    probeChecked = true;
+                    std::vector<float> snap;
+                    EnterCriticalSection(&g_calMic.cs);
+                    snap = g_calMic.data;
+                    LeaveCriticalSection(&g_calMic.cs);
+                    const double ld = (double)(armTick[pass] - micT0) * 48.0;
+                    const size_t a = (size_t)(ld > (double)calMs(250) ? ld - (double)calMs(250) : 0.0);
+                    double bD = ld + (double)g_calProbeEnd.load() + (double)calMs(250);
+                    if (bD > (double)snap.size()) bD = (double)snap.size();
+                    const size_t b2 = (size_t)bD;
+                    float peak = 0.0f;
+                    for (size_t i = a; i < b2 && i < snap.size(); ++i) {
+                        const float q = fabsf(snap[i]);
+                        if (q > peak) peak = q;
+                    }
+                    if (peak < kCalMicFloor) {
+                        char b[192];
+                        snprintf(b, sizeof(b), "the microphone hears nothing (pass %d peak %.0f dBFS) -- check the mic device and its input level",
+                                 pass + 1, 20.0f * log10f(peak + 1e-9f));
+                        out.err = b;
+                        break;
+                    }
+                    tlog("[twinspeak] cal          : probe pass %d -- the mic hears the sweep (peak %.1f dBFS)\n",
+                         pass + 1, 20.0f * log10f(peak));
+                }
+                // THE PHASE-PATTERN STEP: the moment recording is underway,
+                // the 0.5 ms comb starts figuring whatever has arrived.
+                if (!rolled && pos >= (long long)g_calSurAt.load() + (long long)calMs(2 * (kCalSweepMs + kCalGapMs))) {
+                    rolled = true;
+                    std::vector<float> snap;             // a private copy -- the waveIn
+                    EnterCriticalSection(&g_calMic.cs);  // callback keeps pushing
+                    snap = g_calMic.data;
+                    LeaveCriticalSection(&g_calMic.cs);
+                    calPhaseRoll(snap, (double)(armTick[pass] - micT0) * 48.0);
+                }
+                if (pos >= (long long)target) break;
+            }
+            if (!out.err.empty()) break;
+            g_calOn.store(false, std::memory_order_release);
+            g_calSeq0.store(-1, std::memory_order_release);
+            lead[pass] = (double)(armTick[pass] - micT0) * 48.0;
+            if (pass == 0) {
+                g_calPassBase.store(passTotal);
+                // THE TURN: the window demands the microphone at the OPPOSITE
+                // direction; the run cannot proceed without the user.
+                g_calRunFlag.store(2);
+                if (g_calWnd) PostMessageA(g_calWnd, WM_APP + 11, 0, 0);
+                while (g_calRunFlag.load() == 2 && !g_calContinue.load()) {
+                    Sleep(100);
+                    if (g_engState.load() != 2) { out.err = "the engine stopped while waiting for the mic turn"; break; }
+                }
+                if (!out.err.empty()) break;
+                g_calRunFlag.store(1);
+            } else {
+                g_calPassBase.store(passTotal + (g_calDemoEnd.load() - passTotal));
+            }
+        }
+        if (!out.err.empty()) break;
+        Sleep(600);                                          // the tour's tail lands
+        // ---- stop the mic, snapshot, analyze BOTH passes
+        std::vector<float> rec;
+        {
+            EnterCriticalSection(&g_calMic.cs);
+            rec.swap(g_calMic.data);
+            LeaveCriticalSection(&g_calMic.cs);
+        }
+        calMicClose();
+        micOk = false;
+        calAnalyze(rec, lead[0], lead[1], out);
+        if (!out.ok) break;
+        // ---- store secretly + apply live
+        g_calData = out.data;
+        calApplyData(out.data);
+        if (!calSaveSecretIni(out.data)) {
+            out.ok = false;
+            out.err = "the ini would not take the memo (file locked?)";
+            break;
+        }
+        tlog("[twinspeak] cal          : complete -- both passes measured, the memo is in the ini\n");
+    } while (0);
+    // ---- teardown
+    g_calOn.store(false, std::memory_order_release);
+    g_calSeq0.store(-1, std::memory_order_release);
+    if (micOk) calMicClose();
+    g_calContinue.store(false);
+    g_calLastError = out.err;
+    g_calRunFlag.store(out.ok ? 3 : 4);
+    if (g_calWnd) PostMessageA(g_calWnd, WM_APP + 9, out.ok ? 1 : 0, 0);
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP + 10, out.ok ? 1 : 0, 0);
+    if (!out.ok) tlog("[twinspeak] cal          : FAILED -- %s\n", out.err.c_str());
+    return 0;
+}
+
 // ----------------------------------------------------------------- pacing --
 // (v6.5.7's kTick500us / v8.1.0's kTick100ns one-shot timer constants are
 // REMOVED in v9.0.1 with the WDM-KS pacer -- their only consumer was the KS
@@ -4787,7 +5730,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v9.0.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v9.1.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -4797,6 +5740,9 @@ static void writeTemplate(const char* path) {
         "; paces every switch; WDM-KS is gone).\n"
         "; cap_ms / ring1_ms / ring2_ms are read-and-ignored.\n"
         "\n"
+        "; v9.1.0: the CALIBRATE button (below launch-at-startup) opens the strict\n"
+        "; microphone calibration; a completed run appends a secret engine memo to\n"
+        "; this file's tail (hex bits under short keys) -- deleting it un-calibrates.\n"
         "; v8.2.0: out1ms / out2ms (and the legacy buffer_size alias) are\n"
         "; read-and-ignored too -- the WASAPI device period is an engine\n"
         "; constant now (v9.0.1: 128 fr x 3, the constant frame request).\n"
@@ -5317,6 +6263,25 @@ static bool loadIni(const char* path) {
         else if (key == "surround_bass_freq") g_cfg.surroundBassFreq = (float)atof(val.c_str());
         else if (key == "surround_bass_gain") g_cfg.surroundBassGain = (float)atof(val.c_str());
         else if (key == "surround_bass_q")    g_cfg.surroundBassQ    = (float)atof(val.c_str());
+        // v9.1.0: THE SECRET CALIBRATION MEMO -- raw IEEE-754 bits as hex,
+        // written only by a completed calibration (see the engine's
+        // calibration section). Unknown to kIniKeys, so the ini writer
+        // passes every line verbatim; the loader alone reads them.
+        else if (key == "cv")   g_calData.ok = ((unsigned)strtoul(val.c_str(), nullptr, 16) == kCalStamp);
+        else if (key == "cst")  g_calData.surTrim  = calUnhex(val);
+        else if (key == "crt")  g_calData.rearTrim = calUnhex(val);
+        else if (key == "csb")  g_calData.sbAdj    = calUnhex(val);
+        else if (key == "ct4")  g_calData.t440     = calUnhex(val);
+        else if (key == "ct2")  g_calData.t220     = calUnhex(val);
+        else if (key.rfind("cvf", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalRefCount) g_calData.ref[i]     = calUnhex(val); }
+        else if (key.rfind("cvs", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.sur[i].lvl  = calUnhex(val); }
+        else if (key.rfind("cds", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.sur[i].dly  = calUnhex(val); }
+        else if (key.rfind("cps", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.sur[i].pol  = calUnhex(val); }
+        else if (key.rfind("cvw", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.sur[i].comb = calUnhex(val); }
+        else if (key.rfind("cvr", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.rear[i].lvl  = calUnhex(val); }
+        else if (key.rfind("cdr", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.rear[i].dly  = calUnhex(val); }
+        else if (key.rfind("cpr", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.rear[i].pol  = calUnhex(val); }
+        else if (key.rfind("cvx", 0) == 0) { const int i = atoi(key.c_str() + 3); if (i >= 0 && i < kCalAngles)  g_calData.rear[i].comb = calUnhex(val); }
         // v7.1.8: the five EQ save slots (eq_slotN_on / _freq / _gain / _q)
         else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
                  key[7] >= '1' && key[7] <= '5') {
@@ -5345,6 +6310,10 @@ static bool loadIni(const char* path) {
     }
     fclose(f);
     cfgSanitize();
+    // v9.1.0: a stored calibration memo rides the loaded config -- the fold
+    // multipliers and the measured hollow land before anything computes
+    // coefficients. With no memo (or a stale stamp) everything stays 1.0 / 0.
+    if (g_calData.ok) calApplyData(g_calData);
     return true;
 }
 
@@ -5929,10 +6898,12 @@ enum {
     // quad's two new edits, the timing quad's two offset edits.
     IDC_OUT3, IDC_GAIN_RL, IDC_GAIN_RR, IDC_OFF3,   // v8.4.11: IDC_OUT4/IDC_OFF4 retired with leg4
     IDC_GAIN_SL, IDC_GAIN_SR,                       // v8.5.0: the surround gains (the second quad)
+    IDC_CALIBRATE,                                  // v9.1.0: opens the strict microphone calibration window
 };
 
 // ---- gui state -------------------------------------------------------------
-static HWND      g_hwnd          = nullptr;
+// (g_hwnd moved UP next to g_tickOn -- v9.1.0: the calibration worker posts
+// its result to the control window and needs the name before this block.)
 static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
                  g_fSml = nullptr, g_fMono = nullptr;
 // v7.8.0: g_fTitle is RETIRED with the custom caption -- the native title
@@ -5940,7 +6911,8 @@ static HFONT     g_fUI = nullptr, g_fUIb = nullptr,
 // caption font API exists on any Windows.
 static HBRUSH    g_brBg = nullptr, g_brPanel = nullptr, g_brPanel2 = nullptr,
                  g_brLog = nullptr;
-static std::string g_guiIniPath;
+// (v9.1.0: g_guiIniPath moved UP, next to the calibration engine -- the
+// secret memo writer lives there and needs the path before the GUI block.)
 static int       g_tab           = 0;
 // v7.0.3: the tab fade-in. guiShowPage anchors the clock and arms the 16 ms
 // WM_TIMER id 2; the frame's halo and the selected tab's face/border/label
@@ -5969,7 +6941,8 @@ static int       g_eqSel         = -1;         // v7.1.10: THE selected slot -- 
 static std::vector<HWND> g_pageHw[3];          // children per page (show/hide; v8.3.0: THREE pages)
 static HANDLE    g_engThread     = nullptr;
 static bool      g_applyRestart  = false;   // v7.1.20: APPLY+RESTART chains off WM_APP+2
-static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
+// (g_engState moved UP next to g_tickOn -- v9.1.0: the calibration worker
+// preflights against it before this block exists.)
 static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
 // v8.4.19 THE TWO-BUFFER CONSOLE: the pane's history lives in TWO string
@@ -6939,6 +7912,368 @@ static bool guiSaveIni() {
     return true;
 }
 
+// ===========================================================================
+// v9.1.0: THE STRICT CALIBRATION WINDOW -- the rules live here, not in a tab
+// ===========================================================================
+// The field's five rules print as STRICT RULES and are ENFORCED, not
+// suggested: the 90-degree aim and the 36-inch spacing are acknowledged
+// checkboxes, the -6 dB volume gate reads the mains endpoint live at START,
+// the 20 s per-stage minimum is built into the sweep plan AND re-verified
+// from the measured onsets, the engine must be RUNNING on the 2.1 fold,
+// and the window refuses to close while a run is in flight. The microphone
+// picker is TEMPORARY by design -- session only, never the ini (the memo's
+// keys are the only thing a calibration ever writes).
+// ===========================================================================
+
+static const char* kCalRuleTxt[10] = {
+    "1. Point the microphone straight at a 90 deg angle (capsule up, seat height).",
+    "2. Playback volume at least -6 dB -- read live from the mains endpoint at START.",
+    "3. The mains are at least 36 inches (91 cm) apart.",
+    "4. Each surround/rear pass runs 30 s minimum -- 12 angles x 2 s sweeps; stay",
+    "    seated and silent, close the players (the sweeps ride the live cable).",
+    "5. After pass 1 the window asks for the microphone TURNED to the OPPOSITE",
+    "    direction and repeats everything; a single 440 Hz sine then 220 Hz closes",
+    "    each pass out, and surround + rear play together right after.",
+    "The engine must be RUNNING with output leg3 (rears) EMPTY. The mic picker is",
+    "temporary -- session only, never the ini.",
+};
+
+// this window's own control namespace
+static constexpr int kCalIdStart = 101, kCalIdClose = 102, kCalIdCont = 103,
+                     kCalIdMic  = 104, kCalIdCk1   = 105, kCalIdCk2  = 106;
+static constexpr int kCalW = 520, kCalH = 560;           // client design px
+
+static std::string g_calStatus, g_calStatus2;            // the popup's status lines
+
+static void calStageText(char* b, size_t bn) {
+    const unsigned long long pf = g_calPassFrames.load();
+    const unsigned long long p  = g_calPos.load();
+    const int flag = g_calRunFlag.load();
+    if (flag == 0 || pf == 0) { snprintf(b, bn, "idle"); return; }
+    if (flag == 3) { snprintf(b, bn, "done -- both passes measured"); return; }
+    if (flag == 4) { snprintf(b, bn, "failed"); return; }
+    const int pass = p >= pf ? 2 : 1;
+    const unsigned long long q = (pass == 2 && p >= pf) ? p - pf : p;
+    const char* nm = "probe";
+    int ang = -1, deg = 0;
+    const unsigned long long sw = (unsigned long long)kSampleRate * (kCalSweepMs + kCalGapMs) / 1000ULL;
+    if (q >= g_calToneAt.load()) {
+        nm = "440 Hz + 220 Hz tones";
+    } else if (q >= g_calRearAt.load()) {
+        nm = "REAR (direct fold)";
+        ang = (int)((q - g_calRearAt.load()) / sw);
+        if (ang > 11) ang = 11;
+        deg = kCalAngRear[ang];
+    } else if (q >= g_calSurAt.load()) {
+        nm = "SURROUND (wide fold)";
+        ang = (int)((q - g_calSurAt.load()) / sw);
+        if (ang > 11) ang = 11;
+        deg = kCalAngSur[ang];
+    } else if (q >= g_calProbeEnd.load()) {
+        nm = "front reference x6";
+    }
+    if (ang >= 0) snprintf(b, bn, "pass %d/2 -- %s -- angle %d/12 (%+d deg)", pass, nm, ang + 1, deg);
+    else          snprintf(b, bn, "pass %d/2 -- %s", pass, nm);
+}
+
+static void calStartPressed(HWND w) {
+    char b[320];
+    if (g_calRunFlag.load() == 1 || g_calRunFlag.load() == 2) {
+        g_calStatus = "a calibration is already in flight -- let it finish";
+    } else if (IsDlgButtonChecked(w, kCalIdCk1) != BST_CHECKED ||
+               IsDlgButtonChecked(w, kCalIdCk2) != BST_CHECKED) {
+        g_calStatus = "STRICT: acknowledge the 90-degree aim and the 36-inch spacing first";
+    } else if (g_engState.load() != 2) {
+        g_calStatus = "STRICT: the engine is not RUNNING -- start the engine first";
+    } else if (!g_rearFold) {
+        g_calStatus = "STRICT: the 2.1 fold is inactive -- set output leg3 (rears) EMPTY in the configuration";
+    } else if (g_calMicDev < 0) {
+        g_calStatus = "STRICT: pick a microphone (the list is the temporary session key)";
+    } else {
+        float vl = 0.0f;
+        if (!calVolumeOk(vl)) {
+            const float db = vl > 0.0f ? 20.0f * log10f(vl) : -120.0f;
+            snprintf(b, sizeof(b), "STRICT rule 2 failed: the mains endpoint reads %.1f dB -- the rule is at least -6.0 dB", db);
+            g_calStatus = b;
+        } else {
+            g_calRunFlag.store(1);
+            g_calPassBase.store(0);
+            g_calContinue.store(false);
+            g_calPos.store(0);
+            g_calLastError.clear();
+            g_calStatus  = "calibration running -- stay silent and seated";
+            g_calStatus2 = "pass 1 of 2 -- the phase-pattern step is already watching the 0.5 ms comb";
+            EnableWindow(GetDlgItem(w, kCalIdStart), FALSE);
+            g_calThread = CreateThread(nullptr, 0, calRunThread, nullptr, 0, nullptr);
+        }
+    }
+    InvalidateRect(w, nullptr, TRUE);
+}
+
+// the popup's own small builders (never regPage()d -- this window is not a page)
+static HWND calMkBtn(HWND w, int id, int x, int y, int cw, int ch, const char* txt) {
+    x = S(x); y = S(y); cw = S(cw); ch = S(ch);
+    HWND h = CreateWindowExA(0, "BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        x, y, cw, ch, w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUIb, TRUE);
+    return h;
+}
+static HWND calMkCombo(HWND w, int id, int x, int y, int cw) {
+    x = S(x); y = S(y); cw = S(cw);
+    HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        x, y, cw, S(240), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+    SendMessageA(h, CB_SETITEMHEIGHT, (WPARAM)-1, S(16));
+    guiDarkCtl(h);
+    return h;
+}
+static HWND calMkCheck(HWND w, int id, int x, int y, const char* txt) {
+    x = S(x); y = S(y);
+    HWND h = CreateWindowExA(0, "BUTTON", txt,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        x, y, S(480), S(22), w, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+    guiDarkCtl(h);
+    return h;
+}
+
+static LRESULT CALLBACK calWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_CREATE: {
+        HWND cb = calMkCombo(w, kCalIdMic, 16, 236, 360);
+        calMkCheck(w, kCalIdCk1, 16, 276, "the microphone is pointed straight at 90 degrees");
+        calMkCheck(w, kCalIdCk2, 16, 302, "the mains are at least 36 inches (91 cm) apart");
+        calMkBtn(w, kCalIdStart, 16, 336, 200, 30, "START CALIBRATION");
+        calMkBtn(w, kCalIdCont, 226, 336, 170, 30, "CONTINUE (mic turned)");
+        calMkBtn(w, kCalIdClose, 406, 336, 90, 30, "CLOSE");
+        // THE MIC KEY: enumerated from waveIn, TEMPORARY -- session only.
+        char dn[160];
+        const UINT nd = waveInGetNumDevs();
+        for (UINT i = 0; i < nd && i < 24; ++i) {
+            WAVEINCAPSA c = {};
+            if (waveInGetDevCapsA((UINT_PTR)i, &c, sizeof(c)) == MMSYSERR_NOERROR) {
+                snprintf(dn, sizeof(dn), "[%u] %.120s", i, c.szPname);
+                SendMessageA(cb, CB_ADDSTRING, 0, (LPARAM)dn);
+            }
+        }
+        if (nd > 0) {
+            SendMessageA(cb, CB_SETCURSEL, 0, 0);
+            g_calMicDev = 0;
+        }
+        return 0; }
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        const int ev = HIWORD(wp);
+        if (id == kCalIdMic && ev == CBN_SELCHANGE) {
+            const int s = (int)SendMessageA((HWND)lp, CB_GETCURSEL, 0, 0);
+            if (s >= 0) g_calMicDev = s;
+            return 0;
+        }
+        if (id == kCalIdClose) { SendMessageA(w, WM_CLOSE, 0, 0); return 0; }
+        if (id == kCalIdCont) {
+            if (g_calRunFlag.load() == 2) {
+                g_calContinue.store(true);
+                g_calStatus  = "continuing -- pass 2 of 2 (microphone at the opposite direction)";
+                g_calStatus2 = "";
+                EnableWindow(GetDlgItem(w, kCalIdCont), FALSE);
+                InvalidateRect(w, nullptr, TRUE);
+            }
+            return 0;
+        }
+        if (id == kCalIdStart) calStartPressed(w);
+        return 0; }
+    case WM_APP + 9: {                     // the run finished (ok in wParam)
+        const bool ok = wp != 0;
+        if (ok) {
+            char b[220];
+            snprintf(b, sizeof(b), "complete -- surround %+0.1f dB, rear %+0.1f dB, hollow +0.1f dB -- stored to the ini",
+                     g_calData.surTrim, g_calData.rearTrim, g_calData.sbAdj);
+            g_calStatus = b;
+            g_calStatus2 = "the tour played surround + rear together; the memo keys are this ini's tail";
+        } else {
+            g_calStatus  = "CALIBRATION FAILED";
+            g_calStatus2 = g_calLastError;
+        }
+        EnableWindow(GetDlgItem(w, kCalIdStart), TRUE);
+        EnableWindow(GetDlgItem(w, kCalIdCont), FALSE);
+        InvalidateRect(w, nullptr, TRUE);
+        return 0; }
+    case WM_APP + 11: {                    // pass 1 done -- the microphone turn
+        g_calStatus  = "TURN THE MICROPHONE to the OPPOSITE direction (180 deg)";
+        g_calStatus2 = "keep the 90-degree aim, then press CONTINUE";
+        EnableWindow(GetDlgItem(w, kCalIdCont), TRUE);
+        InvalidateRect(w, nullptr, TRUE);
+        return 0; }
+    case WM_TIMER:
+        InvalidateRect(w, nullptr, FALSE);
+        return 0;
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
+        const RECT rc = d->rcItem;
+        FillRect(d->hDC, &rc, g_brPanel);          // plain GDI erase first (the v6.6.7 rule)
+        char txt[96];
+        GetWindowTextA(d->hwndItem, txt, sizeof(txt));
+        const bool dis = (d->itemState & ODS_DISABLED) != 0;
+        const bool prs = (d->itemState & ODS_SELECTED) != 0;
+        const bool acc = (d->CtlID == kCalIdStart && !dis)
+                      || (d->CtlID == kCalIdCont && g_calRunFlag.load() == 2);
+        Gdiplus::Graphics g(d->hDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::GraphicsPath* p = guiRoundPath(
+            Gdiplus::Rect(rc.left + 1, rc.top + 1, rc.right - rc.left - 2, rc.bottom - rc.top - 2), 8);
+        Gdiplus::SolidBrush face(GCol(prs ? guic::cAccentDk
+                                        : acc ? guic::cAccentDk : guic::cPanel2));
+        g.FillPath(&face, p);
+        Gdiplus::Pen pen(GCol(dis ? guic::cLine : (acc ? guic::cAccent : guic::cLine)), 1.2f);
+        g.DrawPath(&pen, p);
+        delete p;
+        SetBkMode(d->hDC, TRANSPARENT);
+        SetTextColor(d->hDC, dis ? guic::cLine : (acc ? guic::cAccent : guic::cText));
+        SelectObject(d->hDC, g_fUIb);
+        DrawTextA(d->hDC, txt, -1, (LPRECT)&rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return 0; }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, guic::cPanel);
+        SetTextColor(dc, guic::cText);
+        return (LRESULT)g_brPanel; }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        RECT rc;
+        GetClientRect(w, &rc);
+        FillRect(dc, &rc, g_brPanel);
+        SetBkMode(dc, TRANSPARENT);
+        int y = S(14);
+        SelectObject(dc, g_fUIb);
+        SetTextColor(dc, guic::cAccent);
+        TextOutA(dc, S(16), y, "SURROUND / REAR MICROPHONE CALIBRATION", 38);
+        y = S(48);
+        SelectObject(dc, g_fSml);
+        SetTextColor(dc, guic::cText);
+        for (int i = 0; i < 10; ++i) {
+            TextOutA(dc, S(16), y, kCalRuleTxt[i], (int)strlen(kCalRuleTxt[i]));
+            y += S(16);
+        }
+        y = S(212);
+        {
+            const char* ml = "microphone (TEMPORARY -- session only, never the ini):";
+            TextOutA(dc, S(16), y, ml, (int)strlen(ml));
+        }
+        // the preflight line: the two gates the user can see without pressing
+        y = S(376);
+        SelectObject(dc, g_fSml);
+        SetTextColor(dc, guic::cText);
+        {
+            char b[200];
+            snprintf(b, sizeof(b), "engine: %s -- 2.1 fold: %s",
+                     g_engState.load() == 2 ? "RUNNING" : "STOPPED (start it first)",
+                     g_rearFold ? "active" : "inactive (set output leg3 empty)");
+            TextOutA(dc, S(16), y, b, (int)strlen(b));
+        }
+        y += S(20);
+        {
+            char b[200];
+            if (g_calData.ok)
+                snprintf(b, sizeof(b), "stored calibration: ACTIVE -- surround %+0.1f dB, rear %+0.1f dB, hollow +0.1f dB",
+                         g_calData.surTrim, g_calData.rearTrim, g_calData.sbAdj);
+            else
+                snprintf(b, sizeof(b), "stored calibration: none (the engine fold is at its ini gains)");
+            TextOutA(dc, S(16), y, b, (int)strlen(b));
+        }
+        y += S(26);
+        SelectObject(dc, g_fUI);
+        SetTextColor(dc, guic::cText);
+        TextOutA(dc, S(16), y, g_calStatus.c_str(), (int)g_calStatus.size());
+        y += S(22);
+        SelectObject(dc, g_fSml);
+        TextOutA(dc, S(16), y, g_calStatus2.c_str(), (int)g_calStatus2.size());
+        // THE PROGRESS BAR (plain GDI -- the track then the traveled accent)
+        {
+            const RECT pb = { S(16), S(472), S(504), S(482) };
+            FillRect(dc, &pb, g_brPanel2);
+            const unsigned long long pf  = g_calPassFrames.load();
+            const unsigned long long de  = g_calDemoEnd.load();
+            const unsigned long long tot = pf + de;
+            const unsigned long long pp  = g_calPos.load();
+            if (tot > 0 && pp > 0) {
+                const double frac = (double)(pp < tot ? pp : tot) / (double)tot;
+                RECT fill = pb;
+                fill.right = fill.left + (LONG)((pb.right - pb.left) * frac);
+                if (fill.right > fill.left) {
+                    HBRUSH ab = CreateSolidBrush(guic::cAccent);
+                    FillRect(dc, &fill, ab);
+                    DeleteObject(ab);
+                }
+            }
+        }
+        y = S(490);
+        SelectObject(dc, g_fSml);
+        SetTextColor(dc, guic::cText);
+        {
+            char b[160];
+            calStageText(b, sizeof(b));
+            TextOutA(dc, S(16), y, b, (int)strlen(b));
+        }
+        y += S(20);
+        // THE TURN PROMPT, loud, only while the run waits for the mic
+        if (g_calRunFlag.load() == 2) {
+            SelectObject(dc, g_fUIb);
+            SetTextColor(dc, guic::cAccent);
+            TextOutA(dc, S(16), y, "TURN THE MICROPHONE to the OPPOSITE direction, then press CONTINUE", 66);
+        }
+        EndPaint(w, &ps);
+        return 0; }
+    case WM_CLOSE:
+        if (g_calRunFlag.load() == 1 || g_calRunFlag.load() == 2) {
+            MessageBoxA(w,
+                "A calibration is in flight -- the window stays open until it finishes or fails.\n"
+                "Strict rule: no closing mid-run.",
+                "twinspeak calibration", MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        DestroyWindow(w);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(w, 1);
+        if (g_calWnd == w) g_calWnd = nullptr;
+        return 0;
+    }
+    return DefWindowProcA(w, m, wp, lp);
+}
+
+static void calOpenWindow() {
+    if (g_calWnd) { SetForegroundWindow(g_calWnd); return; }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc   = calWndProc;
+        wc.hInstance     = GetModuleHandleA(nullptr);
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = "twinspeak.calib";
+        if (!RegisterClassA(&wc)) return;
+        reg = true;
+    }
+    RECT r = { 0, 0, S(kCalW), S(kCalH) };
+    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    g_calWnd = CreateWindowExA(0, "twinspeak.calib",
+        "TwinSpeak -- microphone calibration (strict)",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+        g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    if (!g_calWnd) return;
+    g_calStatus  = g_calData.ok
+        ? "a stored calibration is ACTIVE -- START to re-measure"
+        : "pick the microphone, check both strict boxes, then START";
+    g_calStatus2.clear();
+    ShowWindow(g_calWnd, SW_SHOW);
+    UpdateWindow(g_calWnd);
+    SetTimer(g_calWnd, 1, 100, nullptr);
+}
+
 // ---- controls -> g_cfg ------------------------------------------------------
 static float editFloat(HWND w, int id, float def) {
     char b[64]; GetDlgItemTextA(w, id, b, sizeof(b));
@@ -7282,6 +8617,14 @@ static void guiBuildPages(HWND w) {
     tglRow(w, COLB_X, 240, "enable_chime", IDC_TGL_CHIMES, g_cfg.chimes);
     row(w, COLB_X, 274, "chime_gain", IDC_CHIMGAIN, []{ char b[32]; snprintf(b,32,"%g",g_cfg.chimeGain); return std::string(b); }().c_str());
     tglRow(w, COLB_X, 308, "launch at Windows startup", IDC_TGL_STARTUP, startupEnabled());
+    // v9.1.0 THE CALIBRATE BUTTON: right below the startup check (the
+    // field's ask) -- opens the strict microphone calibration window. The
+    // mic key on that window is TEMPORARY (session only, never the ini) and
+    // a completed run stores the 12-angle results secretly to this ini.
+    {
+        HWND cb = mkBtn(w, IDC_CALIBRATE, COLB_X, 340, 150, 28, "CALIBRATE");
+        regPage(cb);                       // page 0 only
+    }
 
     // ============ page 1: TIMING ==============================================
     // v8.4.5: the transport rows are GONE -- the bite is BUILT IN (v9.0.1:
@@ -9158,6 +10501,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             case IDC_START:
                 if (g_engState.load() == 0) guiStartEngine(w); else guiStopEngine();
                 return 0;
+            case IDC_CALIBRATE:                // v9.1.0: the strict microphone calibration window
+                calOpenWindow();
+                return 0;
             case IDC_SAVE: {
                 cfgFromControls(w); cfgSanitize();
                 guiSetStatus(w, guiSaveIni() ? "ini saved" : "ini save FAILED");
@@ -9409,6 +10755,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_applyRestart = false;
             if (g_hwnd && IsWindow(g_hwnd)) guiStartEngine(g_hwnd);
         }
+        return 0; }
+    case WM_APP + 10: {                                // v9.1.0: the calibration finished
+        guiSetStatus(w, g_calRunFlag.load() == 3
+            ? "calibration complete -- the 12-angle results are stored (secretly) in the ini"
+            : "calibration FAILED -- the calibration window holds the reason");
         return 0; }
     case WM_APP + 3: {                                 // v6.6.1: tray icon events
         // v7.1.20: version-0 notifications deliver WM_RBUTTONUP (never
