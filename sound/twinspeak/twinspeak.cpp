@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,34 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.1 THE THREE-LINE BAND (field-directed: "make the cyan announcement
+//            log three lines instead of just one, above the console line.
+//            Also, have the console instead grow on its own and have text
+//            that's in it be rendered without ever rendering anything
+//            outside bounds"). (1) THE BAND: the cyan status band above the
+//            console is 52 px -- three lines. TWO LANES: lines 1-2 are the
+//            TICKER lane (the engine state + the health line, word-wrapped
+//            to the band -- the full health line finally fits, no ellipsis
+//            amputation), line 3 is the ANNOUNCEMENT lane -- the last
+//            explicit message now PERSISTS until replaced (the 250 ms
+//            ticker used to stomp an announcement within one tick; "saved
+//            to slot N" stays readable). The ticker writes through
+//            guiSetTicker, announcements through guiSetStatus; the hidden
+//            IDC_STATUS STATIC is gone (the band paints from
+//            g_tickerLine/g_announce inside the frame buffer). The band's
+//            draw is mono word-wrapped (one text metric, space-preferred
+//            breaks) and clipped twice: per-line ellipsis trimming + a
+//            GDI+ Save/SetClip/Restore belt -- NOTHING renders outside the
+//            band's box, ever. (2) THE CONSOLE GROWS ON ITS OWN: the
+//            client grew 36 px (760 -> 796) so the console keeps its full
+//            254 px below the taller band, and the console's seat, frame
+//            and DPI-ledger seat all read the SAME constants
+//            (KLOG_T/KLOG_H). The v8.4.19 pane growth (114 -> 254 px)
+//            never reached guiPaintFrame's hard S(114), so the console
+//            frame hugged only the top 114 px of the 254 px pane and the
+//            console rendered outside its own frame -- one source of truth
+//            now, and that cannot happen again at any DPI. NO new ini key,
+//            NO UI row.
 //    v8.6.0 THE WINDOW (field-directed: "I found it tells you the slot is
 //            empty. Btw, identify as many issues within the audio flow as
 //            possible ... I also don't want a ring system anymore. I want
@@ -2710,7 +2738,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.0"
+#define TWS_VERSION "8.6.1"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5554,7 +5582,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.0 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -6648,7 +6676,7 @@ enum {
     IDC_TABSTRIP = 96,          // v7.0.4: the whole strip is ONE custom control
     IDC_TAB0 = 100,             // v7.0.4: retired (the strip owns the tabs) --
                                 // the ids stay reserved; nothing creates them
-    IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
+    IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,   // v8.6.0: IDC_STATUS retired (the band paints from g_tickerLine/g_announce)
     IDC_LOG = 204, IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
     // page: configuration (v8.3.0: was devices -- the chime pills from the
     // late SETTINGS page live here; v8.4.2: the startup row is this page's
@@ -6851,9 +6879,12 @@ static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
 static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
-static int KCLI_W     = 880, KCLI_H      = 760;        // designed client size (v8.4.19: the log pane grew 140 px)
-static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
-static int KLOG_BOTTOM= 734;                            // log pane bottom
+static int KCLI_W     = 880, KCLI_H      = 796;   // v8.6.0: the 3-line band grew the client 36 px
+static int KPANEL_T   = 66,  KPANEL_B    = 402;  // page panel band
+static int KSTATUS_H  = 52;                     // v8.6.0: the 3-line cyan announcement band (y 458)
+static int KLOG_T     = 516;                    // the console top (band bottom + 4)
+static int KLOG_H     = 254;                    // the console height -- kept full; the window grew
+static int KLOG_BOTTOM= 770;                    // log pane bottom
 static int kTabW[3]   = { 283, 283, 283 };   // v8.3.0: three faces fill the strip (3*283+2*4 = 857)
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // v7.8.0: the in-client caption band is RETIRED with the custom chrome --
@@ -6866,10 +6897,13 @@ static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // "system-aware, fixed for the process lifetime" rule is retired.
 static void guiApplyDpi() {
     KCLI_W     = S(880);
-    KCLI_H     = S(760);
+    KCLI_H     = S(796);
     KPANEL_T   = S(66);
     KPANEL_B   = S(402);
-    KLOG_BOTTOM= S(734);
+    KSTATUS_H  = S(52);
+    KLOG_T     = S(516);
+    KLOG_H     = S(254);
+    KLOG_BOTTOM= KLOG_T + KLOG_H;
     kTabW[0] = kTabW[1] = kTabW[2] = S(283);
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
@@ -7471,6 +7505,7 @@ static float posToQ(int p) { return (float)(0.1 * pow(100.0, (double)p / 1000.0)
 static bool guiSaveIni();                 // fwd: defined below the ini section
 static void guiRepaintSlots(HWND w);      // fwd: defined with the repaint helpers
 static void guiSetStatus(HWND w, const char* s);   // fwd: defined in the frame section
+static void guiSetTicker(HWND w, const char* s);   // v8.6.0: the ticker lane
 
 static void guiUpdateEqLabels(HWND w) {
     char b[96];
@@ -7879,15 +7914,29 @@ static void guiAppendLog(const std::string& s) {
     InvalidateRect(e, nullptr, FALSE);
 }
 
-// v7.1.5 FLICKER-FREE STATUS: the engine/health line paints INSIDE the frame
-// buffer (guiPaintFrame) -- the STATIC child is hidden and only STORES the
-// string. Every writer goes through here so the frame's status band is
-// invalidated in the same breath; the next WM_PAINT lands it as one blit.
-static void guiSetStatus(HWND w, const char* s) {
-    SetDlgItemTextA(g_hwnd ? g_hwnd : w, IDC_STATUS, s);
-    // v7.1.20: MUST mirror guiPaintFrame's scaled status band exactly.
-    const RECT sr = { S(14), S(458), S(866), S(476) };
+// v8.6.0 THE ANNOUNCEMENT LOG, THREE LINES: the cyan band above the console
+// is three lines tall now. Line 1-2 = the TICKER lane (the engine state +
+// the health line, word-wrapped to the band -- the full health line finally
+// fits, no ellipsis amputation); line 3 = the ANNOUNCEMENT lane -- the last
+// explicit message, which PERSISTS until replaced (the 250 ms ticker can no
+// longer stomp it: a "saved to slot N" stays readable). The band draws with
+// a GDI+ clip belt: nothing can render outside the band's box, ever.
+static std::string g_tickerLine;                 // lane 1: the engine state + health line
+static std::string g_announce;                   // lane 2: the last announcement (persists)
+static void guiInvalidateBand(HWND w) {
+    // v7.1.20 rule: MUST mirror guiPaintFrame's scaled status band exactly.
+    const RECT sr = { S(14), S(458), S(866), S(458) + KSTATUS_H };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
+}
+static void guiSetStatus(HWND w, const char* s) {
+    // the ANNOUNCEMENT lane (every explicit message lands here).
+    g_announce = s;
+    guiInvalidateBand(w);
+}
+static void guiSetTicker(HWND w, const char* s) {
+    // the TICKER lane (the 250 ms engine-state + health-line writer).
+    g_tickerLine = s;
+    guiInvalidateBand(w);
 }
 
 // v7.1.6 TRAY-FIRST: the one-and-only ring drain, used by the 250 ms tick
@@ -8645,24 +8694,20 @@ static void guiBuildControls(HWND w) {
     // startup" is a plain tglRow again, the LAST row of page 0's right
     // column (same label + pill style as every other row; only its ORDER
     // changed). The bar keeps its five controls; nothing else moved.
-    // v7.1.5 FLICKER-FREE STATUS: the STATIC is HIDDEN -- it only stores the
-    // string; guiPaintFrame draws the line inside the frame buffer (one blit,
-    // no erase-then-draw flicker four times a second). Writers go through
-    // guiSetStatus, which invalidates the status band of the frame.
-    // v7.1.20: the direct creations scale too (the factories do it for the
-    // rest).
-    HWND st = CreateWindowExA(0, "STATIC", "engine stopped", WS_CHILD,
-                              S(14), S(458), S(852), S(16),
-                              w, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
-    SendMessageA(st, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(st, 14, 458, 852, 16, &g_fMono);   // the dpi ledger
+    // v8.6.0: the hidden IDC_STATUS STATIC is GONE -- the band's text lives
+    // in g_tickerLine (the ticker lane) and g_announce (the announcement
+    // lane) and guiPaintFrame draws it inside the frame buffer with a clip
+    // belt. No control, no storage race, nothing to erase-then-draw.
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
+    // v8.6.0: the console's seat derives from the band's 3-line height
+    // (KLOG_T/KLOG_H) -- the same constants guiPaintFrame's frame reads, so
+    // the frame can never drift off the pane again, at any DPI.
     HWND log = CreateWindowExA(0, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        S(14), S(480), S(852), S(254), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
+        S(14), KLOG_T, S(852), KLOG_H, w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
     SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(log, 14, 480, 852, 254, &g_fMono);   // the dpi ledger (v8.4.19: the pane grew 140 px)
+    tsTrackChild(log, 14, 516, 852, 254, &g_fMono);   // the dpi ledger (design px)
     guiDarkCtl(log);
     SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
@@ -9461,6 +9506,47 @@ static void guiApplyDwmMode() {
 // The paint fills the whole client in plain design space (y = 0 is the
 // first row under the native titlebar) and hands the DC back unshifted --
 // no viewport trick, no byte-direct pass, nothing to restore at the tail.
+// v8.6.0: the status band's mono word-wrap. ONE text metric (the band font
+// is monospace), greedy space-preferred breaks against the band's character
+// budget, each line drawn with guiAAString into its own sub-rect -- the
+// ellipsis trim clips at the band edge, so a line can never overflow. The
+// GDI+ clip belt in guiPaintFrame (Save/SetClip/Restore) is the outer
+// guarantee: nothing renders outside the band's box, ever.
+static void guiBandLines(Gdiplus::Graphics& g, HDC dc, const RECT& rc,
+                         const char* txt, COLORREF col, HFONT f,
+                         int firstLine, int maxLines) {
+    if (!txt || !*txt) return;
+    HFONT of = (HFONT)SelectObject(dc, f);
+    TEXTMETRICA tm;
+    if (!GetTextMetricsA(dc, &tm)) { SelectObject(dc, of); return; }
+    const int charW = tm.tmAveCharWidth > 4 ? tm.tmAveCharWidth : 8;
+    SelectObject(dc, of);
+    int maxChars = (rc.right - rc.left) / charW - 1;
+    if (maxChars < 8) maxChars = 8;
+    const float lineH = (float)(rc.bottom - rc.top) / 3.0f;   // the 3-line band
+    const char* p = txt;
+    for (int ln = 0; ln < maxLines && *p; ++ln) {
+        const int len = (int)strlen(p);
+        int take = len < maxChars ? len : maxChars;
+        if (take < len && take > 0) {            // more text remains: break at a space
+            int brk = take;
+            while (brk > maxChars / 4 && p[brk] != ' ') --brk;
+            if (p[brk] == ' ') take = brk;
+        }
+        RECT lr = { rc.left,
+                    rc.top + (int)((firstLine + ln) * lineH),
+                    rc.right,
+                    rc.top + (int)((firstLine + ln + 1) * lineH) };
+        char frag[512];
+        const int cch = take < (int)sizeof(frag) - 1 ? take : (int)sizeof(frag) - 1;
+        memcpy(frag, p, (size_t)cch);
+        frag[cch] = 0;
+        guiAAString(g, dc, lr, frag, col, f, 1);
+        p += take;
+        while (*p == ' ') ++p;
+    }
+}
+
 static void guiPaintFrame(HDC dc, int cw, int ch) {
     const RECT full = { 0, 0, cw, ch };
     FillRect(dc, &full, g_brBg);          // v7.0.9: the erase used to do this
@@ -9479,9 +9565,15 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     // miss it. (v7.8.0: the pane sits at its plain client seat -- S(480),
     // no band arithmetic.)
     g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(14) - 0.5f,
-                                        (Gdiplus::REAL)S(480) - 0.5f,
+                                        (Gdiplus::REAL)KLOG_T - 0.5f,
                                         (Gdiplus::REAL)S(852) + 1.0f,
-                                        (Gdiplus::REAL)S(114) + 1.0f));
+                                        (Gdiplus::REAL)KLOG_H + 1.0f));
+    // v8.6.0: the frame derives from the console's own geometry constants
+    // (KLOG_T/KLOG_H) -- the v8.4.19 pane growth (114 -> 254 px) never
+    // reached this hard literal, so the frame hugged only the top 114 px of
+    // the 254 px pane and the console rendered outside its own frame. One
+    // source of truth: the pane, its frame and its ledger seat all read the
+    // same constants, and they move together on every DPI change.
     char vbuf[640];
     // v8.4.3 THE HONEST WATERMARK: this corner still read "v7.8.4 | <ini>"
     // -- a hard literal the v7.9.0 banner fix missed. It prints the real
@@ -9491,13 +9583,24 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
              TWS_VERSION, tsMidTrunc(g_guiIniPath, (size_t)S(89)).c_str());
     const RECT ver = { S(300), S(8), S(866), S(30) };
     guiAAString(g, dc, ver, vbuf, guic::cDim, g_fSml, 2);
-    // v7.1.5 FLICKER-FREE STATUS: the engine/health line is painted HERE,
-    // inside the frame buffer -- the STATIC child (hidden) only stores the
-    // string. One blit, no flicker while the health line updates.
-    char stb[512] = "";
-    if (g_hwnd) GetDlgItemTextA(g_hwnd, IDC_STATUS, stb, (int)sizeof(stb));
-    const RECT stc = { S(14), S(458), S(866), S(476) };
-    guiAAString(g, dc, stc, stb, guic::cAccent, g_fMono, 1);
+    // v8.6.0 THE ANNOUNCEMENT LOG, THREE LINES: lines 1-2 = the ticker lane
+    // (the engine state + the health line, word-wrapped to the band -- the
+    // full health line finally fits, no ellipsis amputation); line 3 = the
+    // announcement lane (the last explicit message, persisting until
+    // replaced -- the 250 ms ticker can no longer stomp it). The GDI+ clip
+    // belt makes rendering outside the band's box impossible.
+    const RECT stc = { S(14), S(458), S(866), S(458) + KSTATUS_H };
+    const int bandSave = g.Save();
+    g.SetClip(Gdiplus::RectF((Gdiplus::REAL)stc.left, (Gdiplus::REAL)stc.top,
+                             (Gdiplus::REAL)(stc.right - stc.left),
+                             (Gdiplus::REAL)(stc.bottom - stc.top)));
+    guiBandLines(g, dc, stc, g_tickerLine.c_str(), guic::cAccent, g_fMono, 0, 2);
+    {
+        RECT ar = { stc.left, stc.top + (stc.bottom - stc.top) * 2 / 3,
+                    stc.right, stc.bottom };
+        guiAAString(g, dc, ar, g_announce.c_str(), guic::cAccent, g_fMono, 1);
+    }
+    g.Restore(bandSave);
     // v7.1.5: the keyboard map, tiny, in the free bottom-left half of the
     // watermark strip (the watermark owns the right half).
     const RECT kbr = { S(14), KLOG_BOTTOM, S(552), KCLI_H };
@@ -9727,7 +9830,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return (LRESULT)g_brLog;
         }
         SetBkMode(dc, TRANSPARENT);
-        if (id == IDC_STATUS) { SetTextColor(dc, guic::cAccent); return (LRESULT)g_brBg; }
+        // v8.6.0: the IDC_STATUS branch is gone with the hidden STATIC.
         if (id == IDC_LBL_FREQ || id == IDC_LBL_GAIN || id == IDC_LBL_Q) {
             SetTextColor(dc, guic::cAccent);
             return (LRESULT)g_brPanel;
@@ -10118,11 +10221,11 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // v7.0.7: WM_SETTEXT repaints a STATIC even when the text is
         // identical -- 4 idle repaints a second for nothing. Set only on
         // change; the task-manager CPU line stays at the engine's floor.
-        static std::string s_lastStatus;
-        if (s != s_lastStatus && !anySliderDragging()) {   // v7.1.5: no paint storm mid-drag
-            s_lastStatus = s;
-            guiSetStatus(w, s.c_str());
-        }
+            static std::string s_lastStatus;
+            if (s != s_lastStatus && !anySliderDragging()) {   // v7.1.5: no paint storm mid-drag
+                s_lastStatus = s;
+                guiSetTicker(w, s.c_str());   // v8.6.0: the ticker lane -- band lines 1-2
+            }
         return 0; }
     case WM_APP + 2: {                                 // engine thread ended
         // v7.1.20: reap the thread NOW -- the poster is microseconds from
