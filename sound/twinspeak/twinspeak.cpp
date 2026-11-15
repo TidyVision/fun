@@ -16,7 +16,7 @@
 #pragma comment(lib, "propsys.lib")
 
 // ============================================================================
-//  twinspeak v8.6.1 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.6.2 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
@@ -62,6 +62,33 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.6.2 THE TIGHT POLL (field-directed: "Now, I want to reduce the
+//            amount of late switches"). THE INVENTORY, first: the pacer
+//            already runs at the REALTIME process class, THREAD_PRIORITY_
+//            TIME_CRITICAL, MMCSS Pro Audio at AvrtPriorityCritical, on a
+//            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer, with 100 ns
+//            danger-zone polls and the DAC's own position register deciding
+//            every write -- the remaining late switches are thread
+//            migrations / cold-core wakes, far-sleep overshoot, and
+//            kernel-side DPC storms (the one thing user mode cannot
+//            cancel). THE TWO LEVERS LEFT: (1) THE SOFT PIN -- every
+//            device thread (both KS pacers, the capture, the WASAPI
+//            callbacks) takes its own IDEAL CPU (rotating, skipping CPU 0,
+//            the timer/DPC-bias core; skipped under 4 CPUs). A HINT, not a
+//            mask: the steady state keeps one thread on one warm core --
+//            fewer migrations and cold-cache wakes, which are exactly the
+//            >1 ms service gaps the late-switch meter counts. (2) THE
+//            TIGHT POLL -- the far-sleep cadence drops 500 us -> 200 us:
+//            many drivers batch their position-register reports, and a
+//            report can cross the deadline INSIDE one far sleep (the pacer
+//            then notices a full sleep late -- straight into the
+//            switch-to-switch gap the meter measures). 200 us halves the
+//            worst case; the poll cost is one syscall pair, trivial. The
+//            danger-zone polls were already 100 ns and stay so. What this
+//            CANNOT fix: a kernel DPC/ISR storm longer than the 1 ms
+//            budget preempts even a TIME_CRITICAL thread (user mode
+//            yields) -- the meter will still count those; the write lead
+//            (8 ms on a KS leg) is what keeps them inaudible.
 //    v8.6.1 THE THREE-LINE BAND (field-directed: "make the cyan announcement
 //            log three lines instead of just one, above the console line.
 //            Also, have the console instead grow on its own and have text
@@ -2738,7 +2765,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.6.1"
+#define TWS_VERSION "8.6.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3514,6 +3541,23 @@ static void boostAudioThreadEx(int mmcssSubPrio) {
         }
     }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    // v8.6.2 THE SOFT PIN: every device thread takes its own IDEAL CPU
+    // (rotating, skipping CPU 0 -- the timer/DPC-bias core) so the
+    // scheduler stops migrating the pacers across caches and parked cores.
+    // A cold-core wake or a migration is exactly the kind of >1 ms service
+    // gap the late-switch meter counts; a HINT (not a mask) keeps the OS
+    // load-balancing free while the steady state stays one-warm-core.
+    // Skipped on small machines (< 4 CPUs): too few cores to spread over.
+    {
+        static std::atomic<int> s_coreHint{0};
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const DWORD nCpu = si.dwNumberOfProcessors;
+        if (nCpu >= 4) {
+            const int core = 1 + (s_coreHint.fetch_add(1) % (int)(nCpu - 1));
+            SetThreadIdealProcessor(GetCurrentThread(), (DWORD)core);
+        }
+    }
 }
 static void boostAudioThread() { boostAudioThreadEx(-1); }   // no sub-priority hint
 
@@ -4724,14 +4768,20 @@ static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefor
 }
 
 // ----------------------------------------------------------------- pacing --
-// v6.5.7: the pacing tick is 500 us -- ONE-SHOT high-resolution timer
-// re-armed per cycle (a PERIODIC timer cannot go below 1 ms). v8.1.0 adds
-// kTick100ns -- the finest expressible due time, ONE 100 ns tick, as fast
-// as a Windows wait can be armed: the KS deadline poll waits on it between
-// register reads (polling ALONE -- the register still decides when to
-// write). No busy wait anywhere in the engine. The PUMP THREADS are GONE
-// in v8.1.0 (the buffer switch mixes inline, straight off the raw ring).
-static constexpr long long kTick500us = -5000;   // 0.5 ms, negative = relative (100-ns units)
+// v6.5.7: the pacing tick is a ONE-SHOT high-resolution timer re-armed per
+// cycle (a PERIODIC timer cannot go below 1 ms). v8.1.0 adds kTick100ns --
+// the finest expressible due time, ONE 100 ns tick, as fast as a Windows
+// wait can be armed: the KS deadline poll waits on it between register
+// reads (polling ALONE -- the register still decides when to write). No
+// busy wait anywhere in the engine.
+// v8.6.2 THE TIGHT POLL: the FAR-sleep cadence drops 500 us -> 200 us. The
+// far sleep only runs while the write cursor is comfortably ahead of the
+// lead line, but a lazy position-register update (many drivers batch their
+// reports) can cross the deadline INSIDE one far sleep -- the pacer then
+// notices up to one full sleep late, and that overshoot lands straight in
+// the switch-to-switch gap the late-switch meter measures. 200 us halves
+// the worst case (the poll cost is a syscall pair, still trivial).
+static constexpr long long kTickPollUs = -2000;  // 0.2 ms far-sleep (was 500 us; negative = relative)
 static constexpr long long kTick100ns = -1;      // one 100-ns tick -- the poll-only wait
 
 // (v8.4.3's sub-128 loop floor -- kKsLoopFloorFrames 768 / lead 512 --
@@ -5392,7 +5442,7 @@ static DWORD WINAPI ksThread(LPVOID p) {
     HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!hTimer) hTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-    LARGE_INTEGER due; due.QuadPart = kTick500us;   // v6.5.7: one-shot 500 us, re-armed per sleep
+    LARGE_INTEGER due; due.QuadPart = kTickPollUs;   // v8.6.2: one-shot 200 us, re-armed per sleep
     const bool timerOK = hTimer && SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
 
     ksSetPinState(K.pin, KSSTATE_RUN);   // go live: the DAC starts eating the prefill
@@ -5528,7 +5578,7 @@ static DWORD WINAPI ksThread(LPVOID p) {
             // spin.)
             if (slackFr > (long long)periodFr + (long long)(kSampleRate / 2000)) {
                 if (timerOK) {
-                    due.QuadPart = kTick500us;                    // v6.5.7: re-arm one-shot 500 us
+                    due.QuadPart = kTickPollUs;                   // v8.6.2: re-arm one-shot 200 us
                     SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
                     WaitForSingleObject(hTimer, 2);
                 } else
@@ -5582,7 +5632,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.6.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.6.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
