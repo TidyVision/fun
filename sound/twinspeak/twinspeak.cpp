@@ -62,6 +62,27 @@
 //    due) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v8.5.2 THE RESCUE IS RETIRED (field-directed: "I want to remove the
+//            watchdog, power guard, and deep resync. The audio clock is
+//            tuned to a hardware clock anyway."). ALL THREE auto-reopen
+//            mechanisms are GONE -- nothing reopens a device anymore:
+//            (1) THE v3.8 WATCHDOG: the 5 s heartbeat-stale reopen (every
+//            leg + the capture pin) is removed; a device thread that stops
+//            switching stays dead and the leg plays the keep-alive into
+//            the void until the engine is restarted by hand. (2) THE POWER
+//            GUARD: the WM_POWERBROADCAST listener, the park flag, the
+//            resume rebuild and the +-10% consumption-collapse sentinel are
+//            removed whole (powerWndProc/powerThread/g_powerPark/
+//            g_powerWoken/g_hbCap/tryRestartCap/kCollapsePpm die with it;
+//            a post-sleep broken stream stays down like any other). (3)
+//            THE DEEP RESYNC: the scheduled 30-min center-leg reopen is
+//            removed (deep_resync_min stays a read-and-ignored key, so
+//            stale inis load clean). WHAT REMAINS: the default-device
+//            yield is now the ONLY path that can open a device after boot
+//            (its re-grab still chimes), and the chime fires only at
+//            engine start. The per-leg heartbeats stay -- the drift
+//            warden's settled gate still reads them -- but they guard
+//            nothing. NO new ini key, NO UI row.
 //    v8.5.1 THE SURROUND BASS RESTORE (field-directed: "add a sort of 200hz
 //            bass boost taking from the original audio with a 2db boost to
 //            the audio phase specific to the two surround channels ... the
@@ -2533,7 +2554,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "8.5.1"
+#define TWS_VERSION "8.5.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2846,22 +2867,22 @@ struct Config {
     // kWardenMinIntervalMs = 30000. v8.3.0: HARDCODED (was drift_interval_ms)
     // -- 5000 ms, the fielded ini's value; no key, no row.
     unsigned    driftIntervalMs = 5000;
-    // v6.5.12: scheduled fresh reopen of the CENTER leg (minutes; 0 = off).
-    // The S5's below-packetizer FIFO can deepen silently over hours -- no
-    // host meter sees that layer; a scheduled reopen is the one reset that
-    // re-primes it (brief gap, warden re-arms ~9 s). v8.3.0: HARDCODED (was
-    // deep_resync_min) -- 30 min, the field's long-movie setting.
-    unsigned    deepResyncMin   = 30;
+    // v8.5.2: THE DEEP RESYNC IS RETIRED (field-directed, with the watchdog
+    // and the power guard) -- the scheduled 30-min center-leg reopen is
+    // GONE; deep_resync_min stays a read-and-ignored key so stale inis
+    // load clean. Nothing re-primes the S5's below-packetizer layer
+    // anymore; restart the engine if the center audibly lags after hours.
     // v6.5.14 DAC YIELD: if the Windows default render endpoint IS a leg
     // device, that leg's DAC is released so the default-playing app owns the
-    // hardware; the leg reopens via the watchdog when the default moves.
+    // hardware; when the default moves away the leg re-grabs through the
+    // yield path -- v8.5.2: the ONLY open-after-boot path left.
     // v6.6.8: INTEGRATED -- always on.
     bool        yieldDefault    = true;   // v6.6.8: INTEGRATED -- always on (v6.5.17 default was off)
-    // v6.5.2 power guard: suspend parks the pumps, resume rebuilds capture
-    // + legs; a sentinel reopens any leg consuming beyond +-10% for 2 s (a
-    // half-alive post-sleep stream ticks at a bogus rate with a FRESH
-    // heartbeat the silence watchdog cannot see). v6.6.8: INTEGRATED.
-    bool        powerGuard     = true;
+    // v8.5.2: THE POWER GUARD IS RETIRED (field-directed, with the watchdog
+    // and the deep resync) -- no suspend park, no resume rebuild, no +-10%
+    // collapse sentinel; a stream broken by sleep stays down until the
+    // engine is restarted by hand. The v6.5.2 field log (an S5 back from
+    // sleep at ~42% consumption with a fresh heartbeat) stays in history.
     // v7.8.3 DROP CORRECTION: a buffer switch the out ring cannot fill used
     // to tile-replay the last played buffer (the ASIO convention) -- under
     // CPU pressure that repeats every switch and reads as crackle. With
@@ -2882,7 +2903,8 @@ static Config g_cfg;
 // blips with fast decay (C7 42 ms -> G7 72 ms, 20 ms gap) instead of square
 // horns. Rendered ONCE at startup; leg2's device thread sums it onto both
 // out2 channels at the DEVICE layer (not volume-followed: a UI cue, not
-// program audio). out1 never carries it; re-armed on watchdog reopen (3 s).
+// program audio). out1 never carries it; re-armed on a reopen (3 s) --
+// v8.5.2: engine start and a yield re-grab are the only reopens left.
 static std::vector<float> g_chimeBuf;                 // rendered once, read-only after
 static std::atomic<int>      g_chimeSel{-1};          // -1 idle, 0 = playing
 static std::atomic<unsigned> g_chimeIdx{0};           // leg2's device thread owns it
@@ -3203,9 +3225,10 @@ struct Leg {
     int                 backend = 0;
     KsOut               ks;
     // v6.5.14: this leg's DAC is released to the Windows default render
-    // device (yield_default): device closed, pump parked; the watchdog,
-    // collapse sentinel, stall resync, deep resync and warden all skip it.
-    // Cleared + reopened through the watchdog path when the default moves.
+    // device (yield_default): device closed, pump parked; the warden and
+    // the health meters all skip it. v8.5.2: the watchdog/collapse/
+    // deep-resync machinery is retired -- the yield re-grab is the ONLY
+    // path that can open a device after boot.
     std::atomic<bool>   yielded{false};
     // ---- v6.4 DRIFT WARDEN: frame-interval ledger (v8.1.0: MEASUREMENT ONLY) --
     // The RAW ring's seqTail IS this leg's stream position (the capture
@@ -3309,9 +3332,12 @@ struct OutPin {
 };
 static OutPin g_pin[4];                               // v8.4.0: per-leg endpoint pins (watcher-owned)
 
-// v3.8 watchdog heartbeats: each device callback refreshes its timestamp;
-// the health loop reopens any thread that goes silent >5 s.
-static std::atomic<unsigned long long> g_hbCap{0};
+// v3.8 watchdog heartbeats -- v8.5.2: the WATCHDOG IS RETIRED (field-
+// directed: "the audio clock is tuned to a hardware clock anyway"). The
+// per-leg timestamps stay because the drift warden's settled gate reads
+// them (a leg mid-reopen must not calibrate the baseline); nothing
+// reopens a stale heartbeat anymore. The capture-side slot is gone with
+// the watchdog.
 // v8.4.25 THE PROOF METER: the peak |ch3| level of the CAPTURED data,
 // measured pre-volume pre-mask on leg1's popped chunks and read+reset by
 // the 10 s health tick. This splits the center-leak question into two
@@ -3716,56 +3742,19 @@ static DWORD WINAPI volumeWatchThread(LPVOID) {
 }
 
 // --------------------------------------------------- v6.5.2 POWER GUARD ----
-// The adaptive-power layer. g_powerPark is read by the pumps and the
-// health loop; the window thread only logs and flips flags -- every
-// reopen stays on the health-loop thread that owns the devices.
-static std::atomic<bool> g_powerPark{false};    // PBT_APMSUSPEND: pumps idle
-static std::atomic<bool> g_powerWoken{false};   // resume: health loop rebuilds
-static constexpr long kCollapsePpm = 100000;    // +-10%: 25x the worst healthy
-                                                // wobble seen in the field log
-
-static LRESULT CALLBACK powerWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
-    (void)w; (void)lp;
-    if (m == WM_POWERBROADCAST) {
-        if (wp == PBT_APMSUSPEND) {
-            if (!g_powerPark.exchange(true))
-                tlog("[twinspeak] power guard : system suspend -- parking the pumps (audio resumes on wake)\n");
-        } else if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
-            // RESUMESUSPEND trails RESUMEAUTOMATIC on user-initiated
-            // wakes; the health loop consumes the flag once, so raising
-            // it twice is harmless.
-            g_powerPark.store(false, std::memory_order_relaxed);
-            g_powerWoken.store(true, std::memory_order_relaxed);
-        }
-        return TRUE;
-    }
-    return DefWindowProcW(w, m, wp, lp);
-}
-
-static DWORD WINAPI powerThread(LPVOID) {
-    WNDCLASSEXW wc;
-    memset(&wc, 0, sizeof(wc));
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = powerWndProc;
-    wc.lpszClassName = L"twinspeak_power_guard";
-    wc.hInstance     = GetModuleHandleW(nullptr);
-    if (!RegisterClassExW(&wc)) return 0;
-    // style 0 = never visible; a NORMAL top-level window so broadcast
-    // WM_POWERBROADCAST reaches it (message-only windows get nothing).
-    HWND w = CreateWindowExW(0, wc.lpszClassName, L"", 0,
-                             0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
-    if (!w) return 0;
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
-    return 0;
-}
+// RETIRED v8.5.2 (field-directed, with the watchdog and the deep resync):
+// the WM_POWERBROADCAST listener, the park flag, the resume rebuild and
+// the +-10% consumption-collapse sentinel are removed whole --
+// powerWndProc/powerThread/g_powerPark/g_powerWoken/g_hbCap/tryRestartCap/
+// kCollapsePpm die with them. Nothing parks, nothing rebuilds, nothing
+// reopens; a stream broken by sleep stays down until the engine is
+// restarted by hand.
 
 // ------------------------------------------------------------- callbacks ----
 // capture callback: dumb fan-out. The less work happens here, the better --
 // each pump thread does its own leg's mixing, on its own thread, in parallel.
 static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCount) {
     boostDeviceThread();                                          // v4.0 MMCSS
-    g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);   // v3.8 watchdog
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
     for (int i = 0; i < 4; ++i) {
@@ -4308,7 +4297,7 @@ static void playCore(int idx, float* out, ma_uint32 frameCount) {
         L.lastSwQpc = qn;
         L.haveSwQpc = true;
     }
-    hbOut(idx);   // v3.8 watchdog heartbeat
+    hbOut(idx);   // v3.8 heartbeat -- v8.5.2: measure-only (the warden's settled gate reads it)
     bufferSwitchFill(idx, out, (size_t)frameCount);
 }
 
@@ -5538,7 +5527,7 @@ static void writeTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
-        "; twinspeak v8.5.1 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
+        "; twinspeak v8.5.2 config -- BIT-EXACT ASIO-strict engine: out1 = L/R + LFE fold,\n"
         "; out2 = center ONLY, out3 = the rear pair ON ONE DEVICE + the v8.4.6 side\n"
         "; folds (ch5 onto the left output, ch6 onto the right; optional; an EMPTY\n"
         "; device keeps the rears silent), no resampler anywhere.\n"
@@ -5555,6 +5544,9 @@ static void writeTemplate(const char* path) {
         "; deep_resync_min joined them -- hardcoded from the fielded ini\n"
         "; (on / 5 / 5000 / 30). The knobs that are left: the delays + the\n"
         "; rear offsets below, the KS bite, the gains, the EQ and the chime.\n"
+        "; v8.5.2: the watchdog, the power guard and the deep resync are\n"
+        "; RETIRED -- nothing reopens a device anymore; a dropped leg stays\n"
+        "; down until the engine is restarted by hand.\n"
         "; v8.4.0: lfe_fold joined them too -- the fold is the confirmed\n"
         "; routing, built in; gain_lfe below still scales it. v8.4.0 also\n"
         "; adds THE REAR LEGS: output_device3, offset3_ms and gain_rl/gain_rr\n"
@@ -5735,9 +5727,9 @@ static void writeTemplate(const char* path) {
         "; @ 0.5%% since v7.1.24): far below hearing, and a wobble every\n"
         "; amp's sleep timer treats as signal. A gated block (any lane:\n"
         "; ch3/ch7/ch8 all-zero, or the v8.4.6 side lanes ch5/ch6) is\n"
-        "; PROGRAM silence -- the wobble rides on, the amp stays fed. The\n"
-        "; watchdog reopens a failed leg automatically\n"
-        "; whenever it comes back.\n"
+        "; PROGRAM silence -- the wobble rides on, the amp stays fed.\n"
+        "; v8.5.2: the watchdog is retired -- a failed leg is NOT reopened\n"
+        "; automatically anymore; restart the engine to bring it back.\n"
         "; POST-MIX: the tone (and out2's chime) are summed in the OUTPUT\n"
         "; callbacks, after the mix -- they never enter the capture stream\n"
         "; an OBS capture records.\n"
@@ -5748,7 +5740,8 @@ static void writeTemplate(const char* path) {
         "; TRIANGLE BLIPS in the low treble instead: C7 2093 Hz (42 ms) -> G7\n"
         "; 3136 Hz (72 ms), fast decay -- a blip, not a horn. It plays on the\n"
         "; CENTER speaker the moment the engine goes live, and again whenever\n"
-        "; the watchdog brings out2 back (3 s cooldown). It is a UI cue, not\n"
+        "; a reopen brings out2 back (3 s cooldown) -- v8.5.2: engine start\n"
+        "; and a yield re-grab are the only reopens left. It is a UI cue, not\n"
         "; program audio: summed at the out2 device layer exactly like the\n"
         "; keep-alive, so volume_follow does NOT scale it -- and the chime is\n"
         "; out2-ONLY (out1 carries just the universal wobble, never the\n"
@@ -5919,31 +5912,19 @@ static void writeTemplate(const char* path) {
         "; size that is the whole inter-switch window) -- one core per KS leg\n"
         "; is the price of a deadline the scheduler cannot move.\n"
         "\n"
-        "; DEEP RESYNC (v6.5.12, optional): the S5's below-packetizer layer\n"
-        "; (endpoint FIFO + amp silicon) can deepen silently over a long\n"
-        "; session -- the drift ledger stays pinned while the center audibly\n"
-        "; lags again. No host meter can see that layer; a scheduled fresh\n"
-        "; reopen of the center leg re-primes it. Each resync is a brief\n"
-        "; center gap and the warden re-arms ~9 s later; your delay1_ms\n"
-        "; calibration holds across it. v8.3.0: hardcoded -- 30 min, the\n"
-        "; long-movie setting (was deep_resync_min). v8.4.10: every reopen\n"
-        "; first discards the raw ring's backlog -- while the leg was down\n"
-        "; the ring filled to cap and eviction pinned its read position\n"
-        "; ~170 ms behind the freshest capture, and a leg resumed from\n"
-        "; there played a permanent delayed copy of the stream (the\n"
-        "; loopback-sounding echo only a reset cleared). The leg now\n"
-        "; resumes at the freshest capture, its delay calibration intact.\n"
+        "; DEEP RESYNC (v6.5.12) -- RETIRED v8.5.2: the scheduled center-leg\n"
+        "; reopen is GONE (field-directed, with the watchdog and the power\n"
+        "; guard: the audio clock is tuned to a hardware clock). Nothing\n"
+        "; re-primes the S5's below-packetizer layer anymore -- if the center\n"
+        "; audibly lags after hours, restart the engine. The health line\n"
+        "; still measures; nothing acts on it.\n"
         "\n"
-        "; POWER GUARD (v6.5.2) -- sleep / Modern-Standby survival. Field log\n"
-        "; (Lenovo M720Q): after sleep the S5's stream consumed ~42%% of the\n"
-        "; cable's rate with a FRESH heartbeat -- the silence watchdog is blind\n"
-        "; to that, and the path glitched forever in a drop/re-pin limit cycle.\n"
-        "; With the guard ON: suspend parks the legs; resume rebuilds the\n"
-        "; capture pin + both legs (and replays the startup chime); any leg\n"
-        "; whose measured clock offset ('off') leaves +-10%% for 2 s is reopened\n"
-        "; fresh -- that catches the degraded sleep-ENTRY window too, which\n"
-        "; fires before the suspend broadcast. Every action is logged.\n"
-        "; v6.6.8: power_guard is part of the engine now -- ALWAYS ON.\n"
+        "; POWER GUARD (v6.5.2) -- RETIRED v8.5.2: suspend parks nothing and\n"
+        "; resume rebuilds nothing; the +-10%% consumption-collapse sentinel\n"
+        "; is gone with it (field-directed, with the watchdog and the deep\n"
+        "; resync). A stream broken by sleep stays down until the engine is\n"
+        "; restarted by hand. The v6.5.2 field log (an S5 back from sleep at\n"
+        "; ~42%% consumption with a fresh heartbeat) stays in history.\n"
         "\n"
         "; CENTER PRESENCE (v6.1) -- RETIRED v8.4.23: the mask-copy-mask fan-out\n"
         ";     isolates ch3 for out2 alone (the first mask), the output is stereo\n"
@@ -6077,7 +6058,7 @@ static bool loadIni(const char* path) {
                  key == "volume_follow"    ||    // v8.3.0: hardcoded on
                  key == "drift_correct_ms" ||    // v8.3.0: hardcoded 5
                  key == "drift_interval_ms"||    // v8.3.0: hardcoded 5000
-                 key == "deep_resync_min"  ||    // v8.3.0: hardcoded 30
+                 key == "deep_resync_min"  ||    // v8.5.2: retired with the resync
                  key == "ks_period_frames" ||    // v8.4.5: the calm bite is BUILT IN (192 fr)
                  key == "ks_periods"       ||    // v8.4.5: BUILT IN (3 periods)
                  key == "background"        || key == "pin_outputs" ||
@@ -6311,6 +6292,7 @@ static bool logCableStreams(const std::string& nameNeedle) {
         col->Release();
     }
     en->Release();
+    return logged;   // v8.5.2: the missing return (the v8.4.26 contract -- found-and-logged)
 }
 
 static int foreignActiveSessions(const std::string& nameNeedle) {
@@ -6435,10 +6417,12 @@ static void landReopenedRing(int idx) {
 }
 
 // ------------------------------------------------- v3.8 watchdog restarts --
-// The "output shut off by itself" class: a device thread silently stops
-// (endpoint invalidated, USB replug, driver reset). The health loop reopens
-// the leg BY NAME (fresh endpoint id), previous share mode first, then
-// shared; silent retries until the state changes or it succeeds.
+// v8.5.2: THE WATCHDOG IS RETIRED -- this function now serves the
+// default-device yield's re-grab ONLY (the one open-after-boot path
+// left). The 5 s heartbeat-stale reopen, the collapse sentinel, the
+// resume rebuild and the deep resync are all gone; nothing reopens a
+// dead device anymore. The mechanics are unchanged: open BY NAME
+// (fresh endpoint id), previous share mode first, then shared.
 static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
                           const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
@@ -6526,42 +6510,9 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodMs,
     return true;
 }
 
-static bool tryRestartCap(ma_context* ctx) {
-    static unsigned long long lastLog = 0;
-    const unsigned long long now = GetTickCount64();
-    if (now - lastLog >= 10000) {
-        tlog( "[twinspeak] capture WATCHDOG: device thread silent >5 s -- reopening \"%s\"\n",
-                g_capNeedle.c_str());
-        lastLog = now;
-    }
-    if (g_capDev.pContext) ma_device_uninit(&g_capDev);
-    memset(&g_capDev, 0, sizeof(g_capDev));
-    ma_device_id id; std::string nm;
-    if (!pickDevice(ctx, ma_device_type_capture, g_capNeedle, &id, &nm)) return false;
-    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
-    cc.sampleRate = kSampleRate;
-    cc.periodSizeInMilliseconds = (ma_uint32)(g_capPeriodMsF + 0.5f);
-    cc.periods = 2;
-    cc.dataCallback = capCallback;
-    cc.capture.pDeviceID = &id;
-    cc.capture.format = ma_format_f32;
-    cc.capture.channels = kInCh;
-    cc.capture.shareMode = g_capWantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
-    cc.wasapi.usage = ma_wasapi_usage_pro_audio;
-    ma_result r = ma_device_init(ctx, &cc, &g_capDev);
-    if (r != MA_SUCCESS && g_capWantExcl) {
-        cc.capture.shareMode = ma_share_mode_shared;
-        r = ma_device_init(ctx, &cc, &g_capDev);
-    }
-    if (r != MA_SUCCESS) return false;
-    g_capIsExcl = (cc.capture.shareMode == ma_share_mode_exclusive);
-    if (ma_device_start(&g_capDev) != MA_SUCCESS) return false;
-    g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);
-    g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
-    tlog( "[twinspeak] capture WATCHDOG: reopened \"%s\" (%s)\n",
-            nm.c_str(), g_capIsExcl ? "exclusive" : "shared");
-    return true;
-}
+// v8.5.2: tryRestartCap is RETIRED with the watchdog -- nothing reopens
+// the capture pin anymore; a dead capture stays dead until the engine
+// is restarted by hand.
 
 // ------------------------------------------------------- diagnostics --------
 static void printLegDevice(int idx) {
@@ -11491,14 +11442,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     HANDLE hWatch = (g_cfg.volumeFollow || g_cfg.pinOutputs)
                   ? CreateThread(nullptr, 0, volumeWatchThread, nullptr, 0, nullptr)
                   : nullptr;
-    // v6.5.2 power guard: the WM_POWERBROADCAST listener must exist before
-    // the health loop starts -- a sleep landing right after start is still
-    // caught. The thread only flips flags; every reopen stays on the
-    // health-loop thread that owns the devices.
-    HANDLE hPower = g_cfg.powerGuard
-                  ? CreateThread(nullptr, 0, powerThread, nullptr, 0, nullptr)
-                  : nullptr;
-    (void)hPower;
+    // v8.5.2: the power guard's WM_POWERBROADCAST listener is RETIRED with
+    // the guard -- no suspend park, no resume rebuild, nothing reopens.
 
     // v6.2 BACKGROUND: detach BEFORE the banner -- a failure above already
     // returned with the console intact; from here the run is good and the
@@ -11578,11 +11523,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            sync above; v8.4.11: the warden bite corrects creep, never accepts it);\n"
            "                            the cable clock itself stays measurement-only.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
-    tlog("[twinspeak] power guard   : %s -- suspend parks the legs, resume rebuilds capture + both\n"
-           "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
-           "                            fresh. The v6.5.1 field log: an S5 came back from sleep at ~42%%\n"
-           "                            consumption with a fresh heartbeat and glitched forever.\n",
-           g_cfg.powerGuard ? "ON" : "OFF (power_guard = off -- v6.5.1 behavior)");
+    tlog("[twinspeak] power guard   : RETIRED (v8.5.2) -- nothing parks, nothing rebuilds, nothing\n"
+           "                            reopens: the watchdog, the collapse sentinel and the scheduled\n"
+           "                            deep resync are gone (field-directed: the audio clock is tuned to\n"
+           "                            a hardware clock). A dropped leg stays down until the engine is\n"
+           "                            restarted by hand; the yield re-grab is the only open after boot.\n");
     tlog("[twinspeak] leg1 (mains)   : \"%s\" | %s | period %u ms x2\n",
            n1.c_str(),
            g_leg[0].backend == 1 ? "WDM-KS (kernel streaming)" :
@@ -11773,8 +11718,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     unsigned long long aB[4] = { 0, 0, 0, 0 };           // off-meter captured baselines
     unsigned long long pB[4] = { 0, 0, 0, 0 };           // off-meter popped baselines
     long offV[4] = { 0, 0, 0, 0 };                       // measured clock offset ppm per leg
-    int colStreak[4] = { 0, 0, 0, 0 };                   // v6.5.2 collapse sentinel
-    unsigned long long colLastMs[4] = { 0, 0, 0, 0 };    // per-leg reopen cooldown
+    // v8.5.2: colStreak/colLastMs are retired with the collapse sentinel.
     bool ccHintDone = false;
     // v6.4 drift warden state (health-loop owned)
     double driftBase = 0.0;                              // calibrated inter-speaker offset
@@ -11794,7 +11738,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     long prevDom = 0;
     // v8.4.15: stallSec is RETIRED with the stall resync (starvation never
     // reopens; see the STALL RESYNC note below).
-    unsigned long long deepLastMs = 0; // v6.5.12: scheduled deep-resync clock
+    // v8.5.2: deepLastMs is retired with the deep resync -- no scheduled
+    // reopen exists anymore.
     // v8.1.0: the first-second fast tier is GONE (it existed only to fire
     // the warden's re-pin early; the re-pin is gone with the ring system).
     while (g_run.load()) {
@@ -11853,22 +11798,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                      offV[0], offV[1]);
             }
         }
-        // v3.8 WATCHDOG: a device thread whose callback has not ticked for
-        // 5 s is dead (endpoint invalidated, USB re-enumeration, driver
-        // reset). Reopen it by name; retry every tick until it returns.
-        // Out2 is checked first (start-order symmetry).
+        // ---------------- v3.8 WATCHDOG -- RETIRED (v8.5.2) -----------------
+        // Field-directed: "I want to remove the watchdog, power guard, and
+        // deep resync. The audio clock is tuned to a hardware clock anyway."
+        // The 5 s heartbeat-stale reopen (every leg + the capture pin) is
+        // GONE: a device thread that stops switching stays dead -- the leg
+        // plays the keep-alive into the void until the engine is restarted
+        // by hand.
         const unsigned long long nowMs = GetTickCount64();
-        // v6.5.2: while parked (suspend in flight) the heartbeats go stale
-        // by definition -- do NOT storm reopen attempts at a device the OS
-        // is putting to sleep; the resume path rebuilds everything.
-        if (nowMs - g_bootMs > 3000 && !g_powerPark.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < 4; ++i) {   // v8.4.0: every live leg gets the 5 s check
-                if (g_leg[i].disabled) continue;
-                if (nowMs - hbOutGet(i) > 5000 && !g_leg[i].yielded.load(std::memory_order_relaxed))
-                    tryRestartLeg(i, &ctx, kOutPeriodMs);
-            }
-            if (nowMs - g_hbCap.load(std::memory_order_relaxed) > 5000) tryRestartCap(&ctx);
-        }
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
         // Field directive: "if the main audio device is either output_device1
         // or output_device2 that the DAC shuts off immediately to let the
@@ -11880,7 +11817,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // overflows harmlessly, like the suspend park), watchdog/sentinel/
         // resyncs/warden all hold off, devbuf prints '----'. Reaction: one
         // health tick (<= 1 s).
-        if (g_cfg.yieldDefault && !g_powerPark.load(std::memory_order_relaxed)) {
+        if (g_cfg.yieldDefault) {
             std::string defName;
             if (defaultRenderName(&defName)) {
                 for (int i = 0; i < 4; ++i) {
@@ -11947,70 +11884,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 }
             }
         }
-        // ---- v6.5.2 power guard: resume rebuild + collapse sentinel ----
-        if (g_cfg.powerGuard && g_powerWoken.exchange(false)) {
-            g_powerPark.store(false, std::memory_order_relaxed);
-            tlog("[twinspeak] power guard : system resume -- rebuilding capture + both legs\n"
-                 "                            (a post-sleep stream is never trusted: the field log\n"
-                 "                            shows an S5 consuming at ~42%% with a fresh heartbeat)\n");
-            tryRestartCap(&ctx);
-            // v6.5.14: a yielded leg STAYS released (its device is ours by
-            // choice, not broken); the yield check above re-evaluates the
-            // default every tick and reopens it when the default moves.
-            // v8.4.0: one pass over the legs, out2_first symmetry kept.
-            for (int oi = 0; oi < 4; ++oi) {
-                const int i = g_cfg.out2First ? (oi == 0 ? 1 : oi == 1 ? 0 : oi) : oi;
-                if (g_leg[i].disabled) continue;
-                if (!g_leg[i].yielded.load(std::memory_order_relaxed))
-                    tryRestartLeg(i, &ctx, kOutPeriodMs);
-            }
-            wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
-            for (int k = 0; k < 4; ++k) colStreak[k] = 0;   // v8.4.0: all four legs
-        }
-        // CONSUMPTION-COLLAPSE SENTINEL: |off| beyond +-10% for 2 consecutive
-        // seconds is impossible for a healthy 48 kHz link. A half-alive
-        // post-sleep stream ticks at a bogus rate with a FRESH heartbeat --
-        // only this meter sees it (also catches degraded sleep ENTRY and
-        // any driver reset leaving a bogus-rate thread running).
-        if (g_cfg.powerGuard && !g_powerPark.load(std::memory_order_relaxed)
-            && nowMs - g_bootMs > 30000) {
-            // v6.5.14: a yielded leg's off meter reads garbage by design
-            // (captured grows, popped is frozen) -- it must not fire this.
-            // v8.4.0: a disabled leg's off reads a flat 0 (nothing moves)
-            // -- it must not fire this either.
-            int li = -1;
-            for (int i = 0; i < 4; ++i) {
-                const bool bad = !g_leg[i].disabled
-                                 && !g_leg[i].yielded.load(std::memory_order_relaxed)
-                                 && (offV[i] > kCollapsePpm || offV[i] < -kCollapsePpm);
-                colStreak[i] = bad ? colStreak[i] + 1 : 0;
-                if (colStreak[i] >= 2 && li < 0) li = i;
-            }
-            if (li >= 0) {
-                const long bad = offV[li];
-                Leg& SL = g_leg[li];
-                if (nowMs - SL.lastReopenMs > 5000 && nowMs - colLastMs[li] >= 10000) {
-                    colLastMs[li] = nowMs;
-                    for (int k = 0; k < 4; ++k) colStreak[k] = 0;
-                    if (bad > 0) {
-                        // positive = the DEVICE under-consumed (captured more
-                        // than it popped) -- the field log's half-alive S5.
-                        tlog("[twinspeak] power guard : leg%d consuming at %+ld ppm -- stream broken\n"
-                             "                            (sleep resume, driver reset?) -- reopening fresh\n",
-                             li + 1, bad);
-                        tryRestartLeg(li, &ctx, kOutPeriodMs);
-                    } else {
-                        // negative = the leg asked for frames the CAPTURE side
-                        // never delivered -- rebuilding the leg cannot fix a
-                        // starved ring; the capture pin gets rebuilt instead.
-                        tlog("[twinspeak] power guard : leg%d starved (%+ld ppm) -- the capture side\n"
-                             "                            stopped feeding it -- rebuilding the capture pin\n",
-                             li + 1, bad);
-                        tryRestartCap(&ctx);
-                    }
-                }
-            }
-        }
+        // ---------------- v6.5.2 POWER GUARD -- RETIRED (v8.5.2) ------------
+        // The suspend/resume listener, the park flag and the resume rebuild
+        // (capture + every leg) are GONE -- a post-sleep stream is not
+        // rebuilt; a leg broken by sleep stays down until the engine is
+        // restarted by hand.
+        // CONSUMPTION-COLLAPSE SENTINEL -- RETIRED with it: the +-10%
+        // consumption meter that reopened a half-alive stream (the field
+        // log's S5 at ~42% with a fresh heartbeat) is gone. The health
+        // line's 'off' column still measures and names such a stream;
+        // nothing acts on it anymore.
         // ---------------- v6.5.11 STALL RESYNC -- RETIRED (v8.4.15) ----------
         // Field-directed: "I don't want a device being silent to reopen (if
         // at all). The device being silent doesn't 'put the usb to sleep'
@@ -12018,35 +11901,18 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // (silence, counted in 'und') and plays the keep-alive through the
         // hole -- the amp stays fed and a SILENT stream loses nothing, so
         // the 3 s starvation reopen was pure churn (the ding, the restart
-        // window, the landing). The heartbeat WATCHDOG above still reopens
-        // a thread that stopped SWITCHING entirely (a dead device never
-        // returns on its own); a leg that merely starves -- switches alive,
-        // ring dry -- is left alone to ride the next capture burst.
-        // ---------------- v6.5.12 DEEP RESYNC (optional, deep_resync_min) --
-        // The S5's below-packetizer layer (endpoint FIFO + amp DSP) can
-        // deepen silently over hours: the ledger stays pinned while the
-        // center audibly lags again -- no host meter sees that layer. The
-        // only reset that re-primes it is a scheduled fresh reopen (the
-        // stall resync's deep path, on a schedule instead of evidence).
-        // Gated on the baseline + suspend park; the reopen invalidates the
-        // baseline, so the warden re-arms ~9 s later, delay intact.
-        if (g_cfg.deepResyncMin && driftBaseOK
-            && !g_powerPark.load(std::memory_order_relaxed)
-            && !g_leg[1].yielded.load(std::memory_order_relaxed)) {
-            if (deepLastMs == 0)
-                deepLastMs = nowMs;
-            else if (nowMs - deepLastMs >= (unsigned long long)g_cfg.deepResyncMin * 60000ULL) {
-                deepLastMs = nowMs;
-                if (nowMs - g_leg[1].lastReopenMs > 10000
-                    && nowMs - g_leg[0].lastReopenMs > 10000) {
-                    tlog("[twinspeak] deep resync  : scheduled center-leg reopen (%u min) -- re-priming the\n"
-                         "                            device's below-packetizer FIFO; a brief center gap is\n"
-                         "                            expected, the warden re-arms ~9 s later\n",
-                         g_cfg.deepResyncMin);
-                    tryRestartLeg(1, &ctx, periodMs2);
-                }
-            }
-        }
+        // window, the landing). (v8.5.2: the heartbeat watchdog this note
+        // once deferred to is retired too -- a leg that merely starves and
+        // a leg that dies BOTH stay down; only a restart by hand brings a
+        // device back.)
+        // ---------------- v6.5.12 DEEP RESYNC -- RETIRED (v8.5.2) -----------
+        // Field-directed (with the watchdog and the power guard): "The audio
+        // clock is tuned to a hardware clock anyway." The scheduled 30-min
+        // center-leg reopen is GONE -- nothing re-primes the S5's
+        // below-packetizer FIFO + amp DSP layer anymore; if the center
+        // audibly lags after hours, restart the engine.
+        // deep_resync_min stays a read-and-ignored key so stale inis load
+        // clean.
         // ---------------- v6.4 DRIFT WARDEN ----------------
         // Baseline: the settled path's average drift (seconds 5..9, heartbeats
         // fresh, no reopen within 5 s -- includes the user's own delay
