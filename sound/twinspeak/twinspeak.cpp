@@ -11814,14 +11814,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // v6.5.2: while parked (suspend in flight) the heartbeats go stale
         // by definition -- do NOT storm reopen attempts at a device the OS
         // is putting to sleep; the resume path rebuilds everything.
-        if (nowMs - g_bootMs > 3000 && !g_powerPark.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < 4; ++i) {   // v8.4.0: every live leg gets the 5 s check
-                if (g_leg[i].disabled) continue;
-                if (nowMs - hbOutGet(i) > 5000 && !g_leg[i].yielded.load(std::memory_order_relaxed))
-                    tryRestartLeg(i, &ctx, kOutPeriodFrames);
-            }
-            if (nowMs - g_hbCap.load(std::memory_order_relaxed) > 5000) tryRestartCap(&ctx);
-        }
         // ---------------- v6.5.14 DEFAULT-DEVICE DAC YIELD ----------------
         // Field directive: "if the main audio device is either output_device1
         // or output_device2 that the DAC shuts off immediately to let the
@@ -11937,66 +11929,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                  && (offV[i] > kCollapsePpm || offV[i] < -kCollapsePpm);
                 colStreak[i] = bad ? colStreak[i] + 1 : 0;
                 if (colStreak[i] >= 2 && li < 0) li = i;
-            }
-            if (li >= 0) {
-                const long bad = offV[li];
-                Leg& SL = g_leg[li];
-                if (nowMs - SL.lastReopenMs > 5000 && nowMs - colLastMs[li] >= 10000) {
-                    colLastMs[li] = nowMs;
-                    for (int k = 0; k < 4; ++k) colStreak[k] = 0;
-                    if (bad > 0) {
-                        // positive = the DEVICE under-consumed (captured more
-                        // than it popped) -- the field log's half-alive S5.
-                        tlog("[twinspeak] power guard : leg%d consuming at %+ld ppm -- stream broken\n"
-                             "                            (sleep resume, driver reset?) -- reopening fresh\n",
-                             li + 1, bad);
-                        tryRestartLeg(li, &ctx, kOutPeriodFrames);
-                    } else {
-                        // negative = the leg asked for frames the CAPTURE side
-                        // never delivered -- rebuilding the leg cannot fix a
-                        // starved ring; the capture pin gets rebuilt instead.
-                        tlog("[twinspeak] power guard : leg%d starved (%+ld ppm) -- the capture side\n"
-                             "                            stopped feeding it -- rebuilding the capture pin\n",
-                             li + 1, bad);
-                        tryRestartCap(&ctx);
-                    }
-                }
-            }
-        }
-        // ---------------- v6.5.11 STALL RESYNC -- RETIRED (v8.4.15) ----------
-        // Field-directed: "I don't want a device being silent to reopen (if
-        // at all). The device being silent doesn't 'put the usb to sleep'
-        // and cause a drift." A starved leg trips the shortfall rule
-        // (silence, counted in 'und') and plays the keep-alive through the
-        // hole -- the amp stays fed and a SILENT stream loses nothing, so
-        // the 3 s starvation reopen was pure churn (the ding, the restart
-        // window, the landing). The heartbeat WATCHDOG above still reopens
-        // a thread that stopped SWITCHING entirely (a dead device never
-        // returns on its own); a leg that merely starves -- switches alive,
-        // ring dry -- is left alone to ride the next capture burst.
-        // ---------------- v6.5.12 DEEP RESYNC (optional, deep_resync_min) --
-        // The S5's below-packetizer layer (endpoint FIFO + amp DSP) can
-        // deepen silently over hours: the ledger stays pinned while the
-        // center audibly lags again -- no host meter sees that layer. The
-        // only reset that re-primes it is a scheduled fresh reopen (the
-        // stall resync's deep path, on a schedule instead of evidence).
-        // Gated on the baseline + suspend park; the reopen invalidates the
-        // baseline, so the warden re-arms ~9 s later, delay intact.
-        if (g_cfg.deepResyncMin && driftBaseOK
-            && !g_powerPark.load(std::memory_order_relaxed)
-            && !g_leg[1].yielded.load(std::memory_order_relaxed)) {
-            if (deepLastMs == 0)
-                deepLastMs = nowMs;
-            else if (nowMs - deepLastMs >= (unsigned long long)g_cfg.deepResyncMin * 60000ULL) {
-                deepLastMs = nowMs;
-                if (nowMs - g_leg[1].lastReopenMs > 10000
-                    && nowMs - g_leg[0].lastReopenMs > 10000) {
-                    tlog("[twinspeak] deep resync  : scheduled center-leg reopen (%u min) -- re-priming the\n"
-                         "                            device's below-packetizer FIFO; a brief center gap is\n"
-                         "                            expected, the warden re-arms ~9 s later\n",
-                         g_cfg.deepResyncMin);
-                    tryRestartLeg(1, &ctx, kOutPeriodFrames);
-                }
             }
         }
         // ---------------- v6.4 DRIFT WARDEN ----------------
