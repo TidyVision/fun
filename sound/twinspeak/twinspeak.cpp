@@ -15,6 +15,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "comdlg32.lib")   // v9.1.5: GetSaveFileNameA -- the diagnosis log's save dialog
+#pragma comment(lib, "Avrt.lib")
 
 // ============================================================================
 //  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
@@ -63,6 +64,7 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.9 (THIS WAS WRITTEN BY THE REAL TIDYVISION THIS TIME) MCCSS Pro Audio Priority Support
 //    v9.1.8 THE BOOT CHIME WAITS FOR A WORKING DEVICE (field-directed:
 //            "But I still don't hear the chime, even with enable_chime.
 //            Alright, have it play just 400ms later to ensure thee device
@@ -2901,11 +2903,12 @@
 #include <cwctype>
 #include <cstdarg>
 #include <objbase.h>
+#include <avrt.h>
 
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.8"
+#define TWS_VERSION "9.1.9"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3019,11 +3022,11 @@ static unsigned           g_kaIdxLeg[4] = {0, 0, 0, 0};
 // v8.1.0 THE STRIPPED PATH: clock discipline is OBSERVATION ONLY -- a
 // shortfall plays silence and is counted, capture excess evicts oldest at
 // the raw cap (ledger-true), nothing ever repeats or drops on a schedule.
-static size_t             g_capPeriodFrames   = 192;    // real negotiated capture period (informational)
+static size_t             g_capPeriodFrames   = 256;    // real negotiated capture period (informational)
 static size_t             g_periodFrames[4]   = {480, 480, 480, 480}; // real device period per leg (v8.4.0: four)
 // v9.0.1 THE CONSTANT BUFFER SIZE AGAIN: the engine asks for FRAMES, not a
-// millisecond hint -- kOutPeriodFrames 128 x kOutPeriods 3 on EVERY WASAPI
-// leg (the v8.4.24 field-validated geometry: a 2.67 ms switch, ~375
+// millisecond hint -- kOutPeriodFrames 256 x kOutPeriods 3 on EVERY WASAPI
+// leg (the v8.4.24 field-validated geometry: a 5.33 ms switch, ~375
 // switches/s, a 384-fr / 8.0 ms exclusive buffer). A 1 ms HINT let each
 // driver round its own way (the field's Realteks negotiated 96, the S5 48
 // -- two different bites on one engine); the frame request lands both legs
@@ -3035,7 +3038,7 @@ static size_t             g_periodFrames[4]   = {480, 480, 480, 480}; // real de
 // re-init) still has the final word on the exact frame count; the REQUEST
 // is constant, the anchor/ring math (2 x the negotiated period) follows
 // the real number as before.
-static constexpr unsigned kOutPeriodFrames   = 128;  // the CONSTANT bite: 2.67 ms of service @ 48 kHz (v8.4.24 geometry)
+static constexpr unsigned kOutPeriodFrames   = 256;  // the CONSTANT bite: 5.33 ms of service @ 48 kHz (v8.4.24 geometry)
 static constexpr unsigned kOutPeriods        = 3;    // the exclusive buffer: 384 fr (8.0 ms), cushion 256 fr (5.3 ms)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
@@ -4351,6 +4354,19 @@ static std::atomic<bool> g_tickOn{false};        // moved up from the tick block
 // (capCallback's pushOverwrite, ledger-true). frameCount = the REAL device
 // bite (the negotiated period; v9.0.1: one constant request everywhere).
 static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
+    static thread_local HANDLE s_mmcss = NULL;
+    static thread_local bool   s_mmcssDone = false;
+    if (!s_mmcssDone) {
+        DWORD taskIndex = 0;
+        s_mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+        if (s_mmcss) {
+            AvSetMmThreadPriority(s_mmcss, AVRT_PRIORITY_CRITICAL);
+        } else {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+        s_mmcssDone = true;
+    }
+
     Leg& L = g_leg[idx];
     // v7.0.0: the STOP GAP. APPLY + RESTART (and STOP) silences the legs
     // BEFORE the devices close: from the moment the engine begins its
