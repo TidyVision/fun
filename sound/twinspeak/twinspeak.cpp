@@ -63,6 +63,25 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.6 THE CHIME RIDES THE INPUT'S CENTER CHANNEL (field-directed:
+//            "have the chime play directly on the input's center channel,
+//            not on leg2"). The signature blip used to be summed at leg2's
+//            DEVICE layer (sumLegExtras, out2's L+R only, not
+//            volume-followed) -- which meant an EMPTY leg2 never heard it
+//            at all. Now the CAPTURE callback sums the armed chime onto
+//            the cable's ch3 (0-based 2) in one scratch copy of the block
+//            (idle = the block is pushed untouched, bit-exact), so the
+//            chime is genuinely center content: it rides leg2's device --
+//            the center EQ and gain_center and the volume follower with
+//            everything else -- when one exists, and the v9.1.1 virtual-
+//            center fold onto the mains when leg2 is EMPTY. Ownership
+//            moves with it: the capture thread owns g_chimeIdx now, and
+//            sumLegExtras shrinks to the keep-alive alone (its run-based
+//            path, harness-proven bit-exact, is the only path). The proof
+//            meter will show the chime in 'center in' -- it IS center
+//            content now. The arm points are unchanged (engine start +
+//            every leg2 reopen, the 3 s flapping guard). NO ini key, NO
+//            UI row.
 //    v9.1.5 THE PANE IS GONE -- THE STATUS BAND + THE DIAGNOSIS DOWNLOAD
 //            (field-directed: "I would like to just not have the console
 //            show on the GUI at all and just have the status text on there,
@@ -2851,7 +2870,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.5"
+#define TWS_VERSION "9.1.6"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3134,12 +3153,14 @@ static Config g_cfg;
 // --------------------------------------------------- v6.2 chimes -----------
 // The CenterFold signature, modernized: a rising fifth as two short triangle
 // blips with fast decay (C7 42 ms -> G7 72 ms, 20 ms gap) instead of square
-// horns. Rendered ONCE at startup; leg2's device thread sums it onto both
-// out2 channels at the DEVICE layer (not volume-followed: a UI cue, not
-// program audio). out1 never carries it; re-armed on watchdog reopen (3 s).
+// horns. Rendered ONCE at startup. v9.1.6: the CAPTURE thread sums it onto
+// the INPUT's center channel (ch3) -- it rides the REAL center routing
+// (leg2's device, or the v9.1.1 virtual-center fold onto the mains when
+// leg2 is EMPTY), volume-followed and center-EQ'd like any center content.
+// Re-armed on watchdog reopen (3 s); the capture thread owns the index.
 static std::vector<float> g_chimeBuf;                 // rendered once, read-only after
 static std::atomic<int>      g_chimeSel{-1};          // -1 idle, 0 = playing
-static std::atomic<unsigned> g_chimeIdx{0};           // leg2's device thread owns it
+static std::atomic<unsigned> g_chimeIdx{0};           // the capture thread owns it (v9.1.6)
 static unsigned long long    g_chimeLastArmMs = 0;    // reopen cooldown (main thread)
 
 static std::vector<float> renderChime(double f1, double ms1, double f2, double ms2,
@@ -4084,16 +4105,41 @@ static DWORD WINAPI powerThread(LPVOID) {
 // ------------------------------------------------------------- callbacks ----
 // capture callback: dumb fan-out. The less work happens here, the better --
 // each pump thread does its own leg's mixing, on its own thread, in parallel.
+// v9.1.6: EXCEPT the chime -- it is armed center content now, summed onto
+// the block's ch3 (0-based 2) here in one scratch copy, so it rides the
+// REAL center routing (leg2's device, or the v9.1.1 virtual-center fold
+// onto the mains when leg2 is EMPTY). Idle = the block is pushed untouched,
+// bit-exact. The capture thread owns g_chimeIdx (single owner).
+static std::vector<float> g_capScratch;               // the chime's block copy (grown on demand, capture thread only)
 static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCount) {
     boostDeviceThread();                                          // v4.0 MMCSS
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);   // v3.8 watchdog
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
+    const float* src = in;
+    if (g_chimeSel.load(std::memory_order_acquire) >= 0) {
+        if (g_capScratch.size() < (size_t)kInCh * frameCount)
+            g_capScratch.resize((size_t)kInCh * frameCount);
+        float* s = g_capScratch.data();
+        memcpy(s, in, (size_t)kInCh * frameCount * sizeof(float));
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            const unsigned ci = g_chimeIdx.fetch_add(1, std::memory_order_relaxed);
+            if (ci < g_chimeBuf.size()) {
+                float v = s[i * (size_t)kInCh + 2] + g_chimeBuf[ci];
+                if (v >  1.0f) v =  1.0f; else if (v < -1.0f) v = -1.0f;
+                s[i * (size_t)kInCh + 2] = v;
+            } else {
+                g_chimeSel.store(-1, std::memory_order_release);   // the blip is done
+                break;
+            }
+        }
+        src = s;
+    }
     for (int i = 0; i < 4; ++i) {
         // v8.4.0: a disabled rear leg owns no ring (pushOverwrite on an
         // uninit ring would be UB) -- empty device = nothing to feed.
         if (g_leg[i].disabled) continue;
-        size_t dropped = g_leg[i].raw.pushOverwrite(in, frameCount);
+        size_t dropped = g_leg[i].raw.pushOverwrite(src, frameCount);
         if (dropped) {
             g_leg[i].rawDrop.fetch_add(dropped);
             // v6.4: an overwrite silently consumed the oldest frames -- their
@@ -4545,59 +4591,33 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
     // wobble's whole job). Phase is PER LEG: each device thread owns its
     // own index into the shared read-only table, no atomics. leg1 (the 6ch
     // stream) carries it on FL/FR only -- the FC/LFE/rear slots stay
-    // driven silence, the upmixer-exclusion contract. The chime stays
-    // out2's alone (the user's own test, not ambient content): only idx==1
-    // loads g_chimeSel, so g_chimeIdx keeps its single owner.
-    int chSel = (idx == 1) ? g_chimeSel.load(std::memory_order_acquire) : -1;
+    // driven silence, the upmixer-exclusion contract.
+    // v9.1.6: THE CHIME NO LONGER LIVES HERE -- it rides the INPUT's center
+    // channel (the capture callback sums it onto ch3), so it sounds on
+    // whatever the center actually plays through: leg2's device when one
+    // exists, the v9.1.1 virtual-center fold onto the mains when leg2 is
+    // EMPTY. The keep-alive is the only extra, and the wrap-free RUN path
+    // (bit-exact, harness-proven) is the only path.
     const int och = 2;                          // v8.4.23: every leg is stereo L+R (the second mask)
-    // v6.5: with no chime armed the tone is summed in wrap-free RUNS over
-    // the table -- same sample sequence and clamps, bit-exact
-    // (harness-proven).
-    if (chSel < 0) {
-        const unsigned len = g_kaLen;
-        unsigned ka = g_kaIdxLeg[idx];
-        ma_uint32 done = 0;
-        while (done < frameCount) {
-            const ma_uint32 run = (frameCount - done) < (ma_uint32)(len - ka)
-                                ? (frameCount - done) : (ma_uint32)(len - ka);
-            for (ma_uint32 i = 0; i < run; ++i, ++ka) {
-                const float s = g_kaTable[ka];
-                float l = out[(done + i) * och + 0] + s;
-                float r = out[(done + i) * och + 1] + s;
-                if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
-                if (r >  1.0f) r =  1.0f; else if (r < -1.0f) r = -1.0f;
-                out[(done + i) * och + 0] = l;
-                out[(done + i) * och + 1] = r;
-            }
-            done += run;
-            if (ka >= len) ka -= len;
+    const unsigned len = g_kaLen;
+    unsigned ka = g_kaIdxLeg[idx];
+    ma_uint32 done = 0;
+    while (done < frameCount) {
+        const ma_uint32 run = (frameCount - done) < (ma_uint32)(len - ka)
+                            ? (frameCount - done) : (ma_uint32)(len - ka);
+        for (ma_uint32 i = 0; i < run; ++i, ++ka) {
+            const float s = g_kaTable[ka];
+            float l = out[(done + i) * och + 0] + s;
+            float r = out[(done + i) * och + 1] + s;
+            if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
+            if (r >  1.0f) r =  1.0f; else if (r < -1.0f) r = -1.0f;
+            out[(done + i) * och + 0] = l;
+            out[(done + i) * och + 1] = r;
         }
-        g_kaIdxLeg[idx] = ka;
-        return;
+        done += run;
+        if (ka >= len) ka -= len;
     }
-    for (ma_uint32 i = 0; i < frameCount; ++i) {
-        float l = out[i * och + 0];
-        float r = out[i * och + 1];
-        const float s = g_kaTable[g_kaIdxLeg[idx]];   // the wobble rides every leg, chime or not
-        if (++g_kaIdxLeg[idx] >= g_kaLen) g_kaIdxLeg[idx] = 0;
-        l += s;
-        r += s;
-        if (chSel >= 0) {
-            const unsigned ci = g_chimeIdx.fetch_add(1, std::memory_order_relaxed);
-            if (ci < g_chimeBuf.size()) {
-                const float c = g_chimeBuf[ci];
-                l += c;
-                r += c;
-            } else {
-                g_chimeSel.store(-1, std::memory_order_release);
-                chSel = -1;
-            }
-        }
-        if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
-        if (r >  1.0f) r =  1.0f; else if (r < -1.0f) r = -1.0f;
-        out[i * och + 0] = l;
-        out[i * och + 1] = r;
-    }
+    g_kaIdxLeg[idx] = ka;
 }
 
 static void playCore(int idx, float* out, ma_uint32 frameCount) {
