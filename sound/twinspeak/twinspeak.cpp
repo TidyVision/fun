@@ -63,6 +63,23 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.8 THE BOOT CHIME WAITS FOR A WORKING DEVICE (field-directed:
+//            "But I still don't hear the chime, even with enable_chime.
+//            Alright, have it play just 400ms later to ensure thee device
+//            even works."). THE DIAGNOSIS: the boot chime was consumed by
+//            leg1's FIRST ~134 ms of device callbacks -- callbacks that
+//            fire inside the device-open window (the exclusive
+//            negotiation, the boot yield, the USB amp still waking) BEFORE
+//            the DAC is actually producing sound; by the time real audio
+//            flowed, the blip was long gone into the open black hole. THE
+//            FIX: the boot arm no longer fires at engine start -- leg1's
+//            own device thread arms it after it has SERVED 400 ms of real
+//            callbacks (kChimeBootFr 19200 frames: the device open, the
+//            DAC clocked, the amp fed), so the chime plays exactly 400 ms
+//            into the working stream and is heard. A BOOT-YIELDED leg
+//            counts nothing while released -- the wait starts when the
+//            stream actually runs. The leg2-reopen arm is unchanged (leg1
+//            is long past 400 ms by then). NO ini key, NO UI row.
 //    v9.1.7 THE CHIME PLAYS ON THE MAINS (field-directed: "But I don't
 //            hear the chime playing directly from the center channel
 //            output when leg2's device is blank. You know what, I'm just
@@ -2888,7 +2905,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.7"
+#define TWS_VERSION "9.1.8"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3178,6 +3195,13 @@ static Config g_cfg;
 static std::vector<float> g_chimeBuf;                 // rendered once, read-only after
 static std::atomic<int>      g_chimeSel{-1};          // -1 idle, 0 = playing
 static std::atomic<unsigned> g_chimeIdx{0};           // leg1's device thread owns it (v9.1.7)
+// v9.1.8: THE BOOT CHIME WAITS FOR A WORKING DEVICE -- the boot arm fires
+// from leg1's own thread after kChimeBootFr of SERVED callbacks (400 ms:
+// the device open, the DAC clocked, the amp fed), never into the open
+// black hole of the first callbacks. g_chimeBootServed is leg1-thread-only.
+static constexpr unsigned kChimeBootFr = (unsigned)kSampleRate * 400u / 1000u;   // 19200 fr = 400 ms
+static std::atomic<bool>  g_chimeBootWait{false};     // boot chime pending (set at engine start)
+static unsigned           g_chimeBootServed = 0;      // frames leg1 has served since boot (leg1's thread)
 static unsigned long long    g_chimeLastArmMs = 0;    // reopen cooldown (main thread)
 
 static std::vector<float> renderChime(double f1, double ms1, double f2, double ms2,
@@ -4592,6 +4616,20 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
     // center's shaping ate the 134 ms blip on an empty leg2 -- a UI cue
     // must always sound, and the mains always do. Only idx==0 loads
     // g_chimeSel, so g_chimeIdx keeps its single owner (leg1's thread).
+    // v9.1.8 THE BOOT CHIME WAITS 400 MS OF SERVICE: the boot arm fires
+    // HERE, from leg1's own thread, once it has served kChimeBootFr frames
+    // of real callbacks -- the first ~134 ms after open vanish into the
+    // device-open window (exclusive negotiation, yield, the USB amp
+    // waking) before the DAC produces sound, and a boot-time arm was
+    // consumed by exactly that void. A yielded leg serves nothing: the
+    // wait starts when the stream actually runs.
+    if (idx == 0 && g_chimeBootWait.load(std::memory_order_acquire)) {
+        g_chimeBootServed += frameCount;
+        if (g_chimeBootServed >= kChimeBootFr) {
+            g_chimeBootWait.store(false, std::memory_order_release);
+            armChime(true);   // the device has WORKED for 400 ms -- now the cue
+        }
+    }
     int chSel = (idx == 0) ? g_chimeSel.load(std::memory_order_acquire) : -1;
     const int och = 2;                          // v8.4.23: every leg is stereo L+R (the second mask)
     // v6.5: with no chime armed the tone is summed in wrap-free RUNS over
@@ -11293,7 +11331,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v8.4.1: no center device = no chime (the signature rides out2 only);
     // arming it with leg2 disabled would just never play.
     if (!g_leg[1].disabled)
-        armChime(true);   // v6.2: the first thing the center speaker plays is the signature
+        // v9.1.8: the boot chime no longer arms here -- leg1's device
+        // thread arms it after 400 ms of SERVED callbacks (the device open,
+        // the DAC clocked, the amp fed; the old boot-time arm was consumed
+        // by the device-open black hole before sound ever came out).
+        g_chimeBootWait.store(true, std::memory_order_release);
+        g_chimeBootServed = 0;
 
     // (v9.0.1: the v6.3 KS pacing-thread start note is gone with the backend
     // -- ma_device_start applies to every leg.)
