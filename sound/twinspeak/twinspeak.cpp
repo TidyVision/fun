@@ -14,6 +14,7 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "comdlg32.lib")   // v9.1.5: GetSaveFileNameA -- the diagnosis log's save dialog
 
 // ============================================================================
 //  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
@@ -62,6 +63,32 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.1.5 THE PANE IS GONE -- THE STATUS BAND + THE DIAGNOSIS DOWNLOAD
+//            (field-directed: "I would like to just not have the console
+//            show on the GUI at all and just have the status text on there,
+//            and there'd be a 'download log for diagnosis' button that pops
+//            up a generic 'save file' window showing you where to save it
+//            at"). THREE pieces:
+//            1) THE LOG PANE IS RETIRED WHOLE: the EDIT control, its
+//               subclass painter, its buffer blit, its two CTLCOLOR
+//               branches, the v9.1.2 auto-follow (its whole purpose was the
+//               pane) and both drain paths are gone; the window shrinks
+//               880x796 -> 880x542 (KLOG_BOTTOM 770 -> 516: the hint band
+//               now sits directly under the status band). The theme's
+//               cLogBg/cLog/g_brLog stay defined (applyTheme untouched) --
+//               they are simply unused by any control now.
+//            2) THE LOG LIVES IN THE RING: with no pane to drain into, the
+//               uncapped g_logRing (v9.1.2's promise stands) is the WHOLE
+//               engine history -- nothing is ever lost, health lines keep
+//               their own g_lastHealth slot for the status band, and the
+//               ring grows only as fast as the engine talks.
+//            3) DOWNLOAD LOG FOR DIAGNOSIS: a bottom-bar-style button in
+//               the freed band (560..866, opposite the keyboard hints)
+//               opens the GENERIC save-file dialog (GetSaveFileNameA,
+//               comdlg32 -- default name twinspeak-diagnosis.log in the
+//               ini's folder), then writes the ring snapshot CRLF-normalized
+//               under a small header (version, timestamp, the last health
+//               line). NO ini key, NO engine change.
 //    v9.1.4 LEG4 -- THE LFE FOLD TO AN EXISTING LEG (field-directed: "have a
 //            leg4, specific to LFE folding to an existing leg device only,
 //            where if the selected device is playing on a leg that it
@@ -2805,6 +2832,7 @@
 #include <dxgi1_2.h>
 #include <dwrite.h>         // v7.0.6: GPU glyphs for the strip labels
 #include <mmsystem.h>
+#include <commdlg.h>         // v9.1.5: GetSaveFileNameA -- the diagnosis log's save dialog
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -2823,7 +2851,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.4"
+#define TWS_VERSION "9.1.5"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -6605,7 +6633,9 @@ enum {
     IDC_TAB0 = 100,             // v7.0.4: retired (the strip owns the tabs) --
                                 // the ids stay reserved; nothing creates them
     IDC_START = 200, IDC_APPLY = 201, IDC_SAVE = 202, IDC_STATUS = 203,
-    IDC_LOG = 204, IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
+    IDC_LOG = 204,              // v9.1.5: RETIRED -- the pane is gone; the id stays reserved
+    IDC_REFRESH = 205, IDC_THEME = 206, IDC_TICK = 207,
+    IDC_SAVLOG = 208,           // v9.1.5: DOWNLOAD LOG FOR DIAGNOSIS (the save-file dialog)
     // page: configuration (v8.3.0: was devices -- the chime pills from the
     // late SETTINGS page live here; v8.4.2: the startup row is this page's
     // LAST row)
@@ -6685,15 +6715,12 @@ static bool      g_applyRestart  = false;   // v7.1.20: APPLY+RESTART chains off
 static std::atomic<int>  g_engState{0};        // 0 stopped, 1 starting, 2 running, 3 stopping
 static std::atomic<int>  g_engRC{0};
 static std::string g_logRing;                  // pending log lines (g_logCS-locked)
-// v9.1.2 THE UNCAPPED CONSOLE: the pane's history is the edit control's own
-// text, append-only. The v8.4.19 A/B rotation (g_logA/g_logB -- the oldest
-// half deleted every 64 KB) and the ring's own 64 KB trim are RETIRED: no
-// text ever dies now, whether the window is open or tray-only. The
-// auto-follow (in guiAppendLog) keeps the view pinned to the bottom unless
-// the user scrolled up. GUI-thread only (the ring handoff above is the only
-// cross-thread leg).
+// v9.1.5 THE PANE IS GONE: the log has no GUI surface -- the uncapped
+// g_logRing above (v9.1.2's promise stands) is the WHOLE engine history,
+// and the DOWNLOAD LOG FOR DIAGNOSIS button writes it wherever the user
+// points. The health line keeps its own g_lastHealth slot (it feeds the
+// status band, never the log).
 static std::string g_lastHealth;               // latest "out1 ..." health line
-static std::atomic<bool> g_logDirty{false};
 // v6.6.1: tray + startup
 static NOTIFYICONDATAA g_nid = {};
 static ULONG_PTR g_gdipToken = 0;             // v6.6.5: GDI+ session token
@@ -6804,9 +6831,9 @@ static int  S(int v)          { return MulDiv(v, (int)g_dpi96, 96); }
 static float Sf(float v)      { return v * (float)g_dpi96 / 96.0f; }
 // v7.1.20: the scaled geometry lives HERE (single definitions -- the old
 // const definitions farther down the file are gone).
-static int KCLI_W     = 880, KCLI_H      = 796;        // designed client size (v9.0.2: +36 -- the status band grew to 3 rows)
+static int KCLI_W     = 880, KCLI_H      = 542;        // designed client size (v9.1.5: the pane is gone -- the hint band sits under the status band)
 static int KPANEL_T   = 66,  KPANEL_B    = 402;        // page panel band
-static int KLOG_BOTTOM= 770;                            // log pane bottom (v9.0.2: 734+36 -- the band took 3 rows)
+static int KLOG_BOTTOM= 516;                            // v9.1.5: the hint band's top (was the pane's bottom; v9.0.2: 770)
 static int kTabW[3]   = { 283, 283, 283 };   // v8.3.0: three faces fill the strip (3*283+2*4 = 857)
 static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // v7.8.0: the in-client caption band is RETIRED with the custom chrome --
@@ -6819,10 +6846,10 @@ static int kTabGap    = 4, KSTRIP_PAD = 5, KSTRIP_FACE_Y = 6;
 // "system-aware, fixed for the process lifetime" rule is retired.
 static void guiApplyDpi() {
     KCLI_W     = S(880);
-    KCLI_H     = S(796);
+    KCLI_H     = S(542);
     KPANEL_T   = S(66);
     KPANEL_B   = S(402);
-    KLOG_BOTTOM= S(770);
+    KLOG_BOTTOM= S(516);
     kTabW[0] = kTabW[1] = kTabW[2] = S(283);
     kTabGap     = S(4);
     KSTRIP_PAD  = S(5);
@@ -7086,52 +7113,9 @@ static void guiDarkCtl(HWND h) {
     if (f) f(h, L"DarkMode_Explorer", nullptr);
 }
 
-// ---- v7.1.5: the log pane paints through a memory buffer (THE PANE FLICKER)
-// Every log append scrolled the read-only EDIT and its direct WM_PAINT
-// erased-then-drew ON SCREEN -- visible flicker under steady engine logging
-// (the field: "the console text ... still flickers"). The pane is
-// subclassed: WM_ERASEBKGND -> nothing, WM_PAINT renders the control into a
-// memory surface via WM_PRINTCLIENT and lands as ONE opaque blit. The
-// scroll logic, the colors (WM_CTLCOLORSTATIC) and the font stay stock.
-static HDC     g_logDc = nullptr;
-static HBITMAP g_logBm = nullptr, g_logBmOld = nullptr;
-static int     g_logW = 0, g_logH = 0;
-static void guiLogBufRelease() {
-    if (g_logBmOld) { SelectObject(g_logDc, g_logBmOld); g_logBmOld = nullptr; }
-    if (g_logBm)    { DeleteObject(g_logBm);             g_logBm    = nullptr; }
-    if (g_logDc)    { DeleteDC(g_logDc);                 g_logDc    = nullptr; }
-    g_logW = 0; g_logH = 0;
-}
-static bool guiLogBufEnsure(int w, int h) {
-    if (g_logDc && w == g_logW && h == g_logH) return true;
-    guiLogBufRelease();
-    HDC sdc = GetDC(nullptr);
-    g_logDc = CreateCompatibleDC(sdc);
-    g_logBm = CreateCompatibleBitmap(sdc, w, h);
-    ReleaseDC(nullptr, sdc);
-    if (!g_logDc || !g_logBm) { guiLogBufRelease(); return false; }
-    g_logBmOld = (HBITMAP)SelectObject(g_logDc, g_logBm);
-    g_logW = w; g_logH = h;
-    return true;
-}
-static LRESULT CALLBACK logSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp,
-                                   UINT_PTR, DWORD_PTR) {
-    switch (m) {
-    case WM_ERASEBKGND:
-        return 1;                       // the blit below is fully opaque
-    case WM_PAINT: {
-        RECT rc; GetClientRect(h, &rc);
-        if (!guiLogBufEnsure(rc.right, rc.bottom)) break;   // no buffer -> stock paint
-        SendMessageA(h, WM_PRINTCLIENT, (WPARAM)g_logDc, PRF_CLIENT | PRF_ERASEBKGND);
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, g_logDc, 0, 0, SRCCOPY);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    }
-    return DefSubclassProc(h, m, wp, lp);
-}
+// ---- v9.1.5: the log pane's flicker buffer is RETIRED with the pane -------
+// (v7.1.5's subclassed memory-blit painter lived and died with the EDIT
+// control; the log is the ring now, saved on demand.)
 
 // ---- v7.8.0: the DPI child ledger (local) ------------------------------------
 // Children register here in DESIGN px; on WM_DPICHANGED tsRelayoutChildren()
@@ -7759,7 +7743,6 @@ static void guiLogSink(const char* s) {
         EnterCriticalSection(&g_logCS);
         g_lastHealth = line;                          // status bar, not the pane
         LeaveCriticalSection(&g_logCS);
-        g_logDirty.store(true);
         return;
     }
     for (size_t i = 0; i < line.size(); ++i)
@@ -7767,77 +7750,6 @@ static void guiLogSink(const char* s) {
     EnterCriticalSection(&g_logCS);
     g_logRing += line;                            // v9.1.2: the 64 KB trim is retired -- nothing is lost
     LeaveCriticalSection(&g_logCS);
-    g_logDirty.store(true);
-}
-
-static void guiAppendLog(const std::string& s) {
-    HWND e = GetDlgItem(g_hwnd, IDC_LOG);
-    if (!e) return;
-    // v6.6.2: the multiline EDIT honors only \r\n; a bare \n makes rows
-    // merge and the wrap layout COLLAPSE into overlapping lines. Normalize
-    // every break (CR / LF / CRLF / a ring-trim cut mid-pair) to one CRLF.
-    std::string norm;
-    norm.reserve(s.size() + 16);
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\r') {
-            norm += "\r\n";
-            if (i + 1 < s.size() && s[i + 1] == '\n') ++i;   // swallow the pair's LF
-        } else if (s[i] == '\n') {
-            norm += "\r\n";
-        } else {
-            norm += s[i];
-        }
-    }
-    // v9.1.2 THE UNCAPPED LOG: the v8.4.19 A/B rotation is retired whole --
-    // the pane is ONE append-only history, nothing is ever deleted, and
-    // every append is the WM_SETREDRAW-batched end-insert (one repaint per
-    // chunk, the subclassed pane lands it as a single blit).
-    // v9.1.2 THE AUTO-FOLLOW: measure the view BEFORE the append -- if the
-    // user has scrolled to within TWO LINES of the absolute bottom, the
-    // append follows to the bottom (the old always-scroll behavior); if
-    // they scrolled UP to read history, the view is left exactly where
-    // they parked it (the end-insert adds its lines below the fold; the
-    // caret still lands at the end, the view does not move).
-    // v9.1.3 NO BOTTOM: the chunk's TRAILING breaks are stripped and the
-    // NEXT append carries its own LEADING break, so the caret ends ON the
-    // last text line -- no trailing empty line for the view to park on.
-    {
-        size_t e2 = norm.size();
-        while (e2 >= 2 && norm[e2 - 2] == '\r' && norm[e2 - 1] == '\n') e2 -= 2;
-        if (e2 != norm.size()) norm.resize(e2);
-        if (norm.empty()) return;
-    }
-    const int firstVis = (int)SendMessageA(e, EM_GETFIRSTVISIBLELINE, 0, 0);
-    const int total    = (int)SendMessageA(e, EM_GETLINECOUNT, 0, 0);
-    int lineH = 14;
-    {
-        HDC dc = GetDC(e);
-        if (dc) {
-            TEXTMETRICA tm;
-            if (GetTextMetricsA(dc, &tm))
-                lineH = tm.tmHeight + tm.tmExternalLeading;
-            ReleaseDC(e, dc);
-        }
-    }
-    RECT rc;
-    GetClientRect(e, &rc);
-    const int visible = (rc.bottom - rc.top) / (lineH > 0 ? lineH : 14);
-    const bool follow = (total - (firstVis + visible)) <= 2;
-    // the leading break: the pane's very first append starts the text, every
-    // later append opens its own row (self-resets when the pane is rebuilt)
-    std::string out;
-    if (GetWindowTextLengthA(e) != 0) out += "\r\n";
-    out += norm;
-    SendMessageA(e, WM_SETREDRAW, FALSE, 0);
-    const int len = GetWindowTextLengthA(e);
-    SendMessageA(e, EM_SETSEL, len, len);
-    SendMessageA(e, EM_REPLACESEL, FALSE, (LPARAM)out.c_str());
-    if (follow) {
-        SendMessageA(e, EM_SCROLLCARET, 0, 0);
-        SendMessageA(e, EM_LINESCROLL, 0, 0x20000000);   // clamped: pins the view to the ABSOLUTE bottom
-    }
-    SendMessageA(e, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(e, nullptr, FALSE);
 }
 
 // v7.1.5 FLICKER-FREE STATUS: the engine/health line paints INSIDE the frame
@@ -7850,20 +7762,6 @@ static void guiSetStatus(HWND w, const char* s) {
     // v9.0.2: the band is 3 rows (54px) -- one '\n'-split string.
     const RECT sr = { S(14), S(458), S(866), S(512) };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
-}
-
-// v7.1.6 TRAY-FIRST: the one-and-only ring drain, used by the 250 ms tick
-// AND by guiCreateRealWindow. While the window does not exist (tray-only)
-// NOBODY drains: the ring buffers the whole boot log (capped at 64 KB like
-// always); the first drain after the window opens lands it in the pane at
-// once -- nothing the engine said before the first click is lost.
-static void guiFlushLogRing() {
-    if (!g_logDirty.exchange(false)) return;
-    EnterCriticalSection(&g_logCS);
-    const std::string chunk = g_logRing;
-    g_logRing.clear();
-    LeaveCriticalSection(&g_logCS);
-    if (!chunk.empty()) guiAppendLog(chunk);
 }
 
 static DWORD WINAPI guiEngineThread(LPVOID) {
@@ -8615,6 +8513,10 @@ static void guiBuildControls(HWND w) {
     // theme cycler (label = the ACTIVE theme, kThemes[g_theme].name).
     mkBtn(w, IDC_TICK, 448, 414, 150, 36, "120 BPM TICK TEST");
     mkBtn(w, IDC_THEME, 606, 414, 150, 36, kThemes[g_theme].name);
+    // v9.1.5: the diagnosis log's save dialog -- the ring IS the log now,
+    // and this button writes it wherever the user points (it sits in the
+    // freed band under the status text, opposite the keyboard hints)
+    mkBtn(w, IDC_SAVLOG, 560, 516, 306, 26, "DOWNLOAD LOG FOR DIAGNOSIS");
     // v8.4.2: the bottom-bar startup pill is GONE -- "launch at Windows
     // startup" is a plain tglRow again, the LAST row of page 0's right
     // column (same label + pill style as every other row; only its ORDER
@@ -8637,15 +8539,10 @@ static void guiBuildControls(HWND w) {
     tsTrackChild(st, 14, 458, 852, 54, &g_fMono);   // the dpi ledger
     // v6.6.6: no WS_EX_CLIENTEDGE -- the etched 3D edge rendered in light
     // classic colors was the "ghost bordered box"; WM_PAINT draws the frame.
-    // v9.0.2: the pane rides 36px lower (under the 3-row band) and keeps
-    // every pixel of its 254px height.
-    HWND log = CreateWindowExA(0, "EDIT", "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        S(14), S(516), S(852), S(254), w, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
-    SendMessageA(log, WM_SETFONT, (WPARAM)g_fMono, TRUE);
-    tsTrackChild(log, 14, 516, 852, 254, &g_fMono);   // the dpi ledger (v8.4.19: the pane grew 140 px; v9.0.2: it moved under the 3-row band)
-    guiDarkCtl(log);
-    SetWindowSubclass(log, logSubProc, 1, 0);   // v7.1.5: the pane paints buffered
+    // v9.1.5: THE PANE IS GONE -- the EDIT control, its font ledger, its
+    // dark subclass and its flicker buffer are retired whole. The status
+    // band above is the only text surface; the log is the ring, one button
+    // away (IDC_SAVLOG in the hint band below).
     // tab strip -- v7.0.4: ONE custom control (see tabStripProc above). The
     // six BUTTONs, their regions and the frame-painted halo are all retired.
     guiMakeTabStrip(w);
@@ -8940,7 +8837,7 @@ static bool guiCreateRealWindow() {
     // resize, so they are gone with the edges). The rest of the v7.8.0 plain
     // native frame story stands: the system owns the caption, the icon, the
     // buttons, the shadow and the DPI story. The outer size still comes from
-    // AdjustWindowRectEx around the designed 880x796 client (v9.0.2: the
+    // AdjustWindowRectEx around the designed 880x542 client (v9.1.5: the
     // status band's third row), and
     // WM_GETMINMAXINFO pins min==max track to that size at the CURRENT DPI
     // (see guiWndProc) -- WM_DPICHANGED re-derives the scale first and sizes
@@ -9001,9 +8898,9 @@ static bool guiCreateRealWindow() {
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     SetTimer(g_hwnd, 1, 250, nullptr);
 
-    // the whole boot log -- everything the engine said while tray-only --
-    // lands in the pane in one flush, oldest first, nothing lost.
-    guiFlushLogRing();
+    // v9.1.5: no drain -- the ring IS the log now, saved on demand
+    // (IDC_SAVLOG); the health line feeds the status band through
+    // g_lastHealth on its own.
     tlog("[twinspeak] gui           : control window up -- ini at %s\n", g_guiIniPath.c_str());
     return true;
 }
@@ -9425,20 +9322,10 @@ static void guiPaintFrame(HDC dc, int cw, int ch) {
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    Gdiplus::Pen fp(GCol(guic::cLine), 1.0f);   // the log pane's 1px frame (no CLIENTEDGE)
-    // v7.7.1 THE CONSOLE FRAME HUGS THE PANE: the rect is the pane's OWN
-    // device rect expanded 1px on every side. The old independent
-    // S(13)/S(479) derivation rounded the frame and the pane separately,
-    // and at 150% the drift showed -- the console frame floated off the
-    // pane at odd scales. The pane is the anchor now; the frame cannot
-    // miss it. (v7.8.0: the pane sits at its plain client seat; v9.0.2: the
-    // seat moved to S(516) under the 3-row status band, and the rect hugs
-    // the pane's full S(254) height -- the stale v8.4.19 S(114) height is
-    // fixed with it.)
-    g.DrawRectangle(&fp, Gdiplus::RectF((Gdiplus::REAL)S(14) - 0.5f,
-                                        (Gdiplus::REAL)S(516) - 0.5f,
-                                        (Gdiplus::REAL)S(852) + 1.0f,
-                                        (Gdiplus::REAL)S(254) + 1.0f));
+    // v9.1.5: the pane's 1px frame and the pane itself are RETIRED -- the
+    // status band above is the only text surface; the hint band below keeps
+    // the keyboard map, and the diagnosis log is one button away.
+
     char vbuf[640];
     // v8.4.3 THE HONEST WATERMARK: this corner still read "v7.8.4 | <ini>"
     // -- a hard literal the v7.9.0 banner fix missed. It prints the real
@@ -9695,16 +9582,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         const int id = GetDlgCtrlID((HWND)lp);
-        // v6.6.4 THE REAL SCROLL-GHOST FIX: the log pane is ES_READONLY -- it
-        // sends WM_CTLCOLORSTATIC, never WM_CTLCOLOREDIT, so the v6.6.3 fix
-        // sat in a message the pane does not send. Its colors are answered
-        // HERE instead.
-        SetBkMode(dc, OPAQUE);
-        if (id == IDC_LOG) {
-            SetBkColor(dc, guic::cLogBg);
-            SetTextColor(dc, guic::cLog);
-            return (LRESULT)g_brLog;
-        }
+        // v9.1.5: the pane's ES_READONLY branch is retired with the pane.
         SetBkMode(dc, TRANSPARENT);
         if (id == IDC_STATUS) { SetTextColor(dc, guic::cAccent); return (LRESULT)g_brBg; }
         if (id == IDC_LBL_FREQ || id == IDC_LBL_GAIN || id == IDC_LBL_Q) {
@@ -9724,11 +9602,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         // through. OPAQUE + a matching bk color erases beneath every row.
         HDC dc = (HDC)wp;
         SetBkMode(dc, OPAQUE);
-        if (GetDlgCtrlID((HWND)lp) == IDC_LOG) {   // the pane: soft cyan on near-black
-            SetBkColor(dc, guic::cLogBg);
-            SetTextColor(dc, guic::cLog);
-            return (LRESULT)g_brLog;
-        }
+        // v9.1.5: the pane's branch is retired with the pane.
         SetBkColor(dc, guic::cPanel2);
         SetTextColor(dc, guic::cText);
         return (LRESULT)g_brPanel2; }
@@ -9763,7 +9637,7 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const bool onPage = !((id >= IDC_TAB0 && id <= IDC_TAB0 + 2) ||
                               id == IDC_START  || id == IDC_APPLY ||
                               id == IDC_SAVE   || id == IDC_TICK  ||
-                              id == IDC_THEME);
+                              id == IDC_THEME  || id == IDC_SAVLOG);
         // v6.6.7: erase FIRST in PLAIN GDI -- a GDI+ fill let the square
         // corners blend against the white WM_CTLCOLORBTN pass underneath,
         // leaving bright ghost arcs on every rounded corner.
@@ -9908,6 +9782,52 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             case IDC_SAVE: {
                 cfgFromControls(w); cfgSanitize();
                 guiSetStatus(w, guiSaveIni() ? "ini saved" : "ini save FAILED");
+                return 0; }
+            case IDC_SAVLOG: {                 // v9.1.5: the diagnosis log -> a generic save-file dialog
+                char path[MAX_PATH];
+                {
+                    const size_t ds = g_guiIniPath.find_last_of("\\/");
+                    snprintf(path, MAX_PATH, "%s\\twinspeak-diagnosis.log",
+                             ds == std::string::npos ? "." : g_guiIniPath.substr(0, ds).c_str());
+                }
+                OPENFILENAMEA of;
+                memset(&of, 0, sizeof(of));
+                of.lStructSize = sizeof(of);
+                of.hwndOwner   = w;
+                of.lpstrFilter = "Log files (*.log)\0*.log\0All files (*.*)\0*.*\0";
+                of.lpstrFile   = path;
+                of.nMaxFile    = MAX_PATH;
+                of.lpstrDefExt = "log";
+                of.lpstrTitle  = "Download log for diagnosis";
+                of.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+                if (GetSaveFileNameA(&of)) {
+                    // the ring IS the log -- snapshot it under its lock and
+                    // write CRLF-normalized under a small header
+                    EnterCriticalSection(&g_logCS);
+                    const std::string snap = g_logRing;
+                    std::string hl = g_lastHealth;
+                    LeaveCriticalSection(&g_logCS);
+                    for (size_t i = 0; i < hl.size(); ++i)
+                        if (hl[i] == '\n') hl[i] = ' ';
+                    SYSTEMTIME st;
+                    GetLocalTime(&st);
+                    bool ok = false;
+                    FILE* f = fopen(path, "w");
+                    if (f) {
+                        fprintf(f, "; twinspeak %s diagnosis log -- %04u-%02u-%02u %02u:%02u:%02u\r\n",
+                                TWS_VERSION, (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+                                (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+                        fprintf(f, "; last health line: %s\r\n", hl.c_str());
+                        for (size_t i = 0; i < snap.size(); ++i) {
+                            if (snap[i] == '\r') continue;
+                            if (snap[i] == '\n') fputs("\r\n", f);
+                            else fputc(snap[i], f);
+                        }
+                        fclose(f);
+                        ok = true;
+                    }
+                    guiSetStatus(w, ok ? "diagnosis log saved" : "diagnosis log save FAILED");
+                }
                 return 0; }
             case IDC_TICK: {                   // v7.0.0: the 120 bpm sync tick -- PLAY/STOP toggle
                 if (g_engState.load() == 0) {
@@ -10092,7 +10012,6 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_engThread = nullptr;
             guiRepaint(w, IDC_START);
         }
-        guiFlushLogRing();                               // v7.1.6: one shared drain
         static const char* stName[4] = { "engine stopped", "engine started",
                                          "engine RUNNING", "engine stopping..." };
         // v7.0.0: "engine starting..." renamed "engine started" -- the label
