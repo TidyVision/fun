@@ -3022,12 +3022,12 @@ static unsigned           g_kaIdxLeg[4] = {0, 0, 0, 0};
 // v8.1.0 THE STRIPPED PATH: clock discipline is OBSERVATION ONLY -- a
 // shortfall plays silence and is counted, capture excess evicts oldest at
 // the raw cap (ledger-true), nothing ever repeats or drops on a schedule.
-static size_t             g_capPeriodFrames   = 384;    // real negotiated capture period (informational)
-static size_t             g_periodFrames[4]   = {480, 480, 480, 480}; // real device period per leg (v8.4.0: four)
+static size_t             g_capPeriodFrames   = 256;    // real negotiated capture period (informational)
+static size_t             g_periodFrames[4]   = {960, 960, 960, 960}; // real device period per leg (v8.4.0: four)
 // v9.0.1 THE CONSTANT BUFFER SIZE AGAIN: the engine asks for FRAMES, not a
-// millisecond hint -- kOutPeriodFrames 384 x kOutPeriods 3 on EVERY WASAPI
+// millisecond hint -- kOutPeriodFrames 512 x kOutPeriods 3 on EVERY WASAPI
 // leg (the v8.4.24 field-validated geometry: a 5.33 ms switch, ~375
-// switches/s, a 384-fr / 8.0 ms exclusive buffer). A 1 ms HINT let each
+// switches/s, a 512-fr / 8.0 ms exclusive buffer). A 1 ms HINT let each
 // driver round its own way (the field's Realteks negotiated 96, the S5 48
 // -- two different bites on one engine); the frame request lands both legs
 // on the SAME constant switch, and the exclusive event-mode cushion (the
@@ -3038,8 +3038,8 @@ static size_t             g_periodFrames[4]   = {480, 480, 480, 480}; // real de
 // re-init) still has the final word on the exact frame count; the REQUEST
 // is constant, the anchor/ring math (2 x the negotiated period) follows
 // the real number as before.
-static constexpr unsigned kOutPeriodFrames   = 384;  // the CONSTANT bite: ~7 ms of service @ 48 kHz (v8.4.24 geometry)
-static constexpr unsigned kOutPeriods        = 4;    // the exclusive buffer: 384 fr (~8.0 ms)
+static constexpr unsigned kOutPeriodFrames   = 256;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
+static constexpr unsigned kOutPeriods        = 3;    // the exclusive buffer: 256 fr (~8.0 ms)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
