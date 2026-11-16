@@ -19,7 +19,9 @@
 // ============================================================================
 //  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
-//  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
+//  MISSION: one shared capture of a VAC cable -- 8ch, or 16ch (v10.0.0: the
+//  width the cable itself negotiates; an 8ch cable stays byte-identical) --
+//  fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
 //  leg2 = Adesso Xtream S5 (center-only), leg3 = THE REARS ON ONE DEVICE
 //  (stereo: L = ch7+ch5 at gain_rl, R = ch8+ch6 at gain_rr; optional: an
@@ -34,7 +36,8 @@
 //  accepted; the cable clock itself stays measure-only.
 //
 //  ARCHITECTURE (v8.1.0 -- THE STRIPPED PATH):
-//    VAC cable (8ch shared capture, exclusive)
+//    VAC cable (8ch shared capture, exclusive; v10.0.0: a 16ch cable arms
+//             the height lanes ch9-16, the top of the head's own fold)
 //      +--> leg1.raw ring (the fan-out) --> the switch mixes INLINE --> Realtek
 //      |      mix: FL=L+gain_lfe*LFE, FR=R+gain_lfe*LFE, FC/LFE/rear slots
 //      |      = driven silence (the rears AND the sides live on leg3/leg4;
@@ -63,6 +66,110 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v10.0.0 THE SIXTEEN-CHANNEL CABLE -- THE REAL HRTF LAYER + THE ROOM
+//            CORRECTION (field-directed: "I want to simulate audio being
+//            heard on top of your head. I have set the max channels of
+//            muzychenko's virtual audio cable to 16 (allowing for height
+//            channels). So I want to utilize real HRTF for the surround
+//            channel effect and utilize effects similar to hearing sound
+//            come out to the top of your head with this real HRTF. And I
+//            want something as real as possible here. However, just real
+//            quick, would it be backward compatible with the 8-channel
+//            capture in some way? Like, only have the top channel
+//            processing if your capture is 16 channels" -- and: the note
+//            under the tick-test description, and "have a button that
+//            starts room correction by having a three full blips within 2
+//            seconds which lets your microphone (calibrate_dv key) hear
+//            the acoustic reverb and correct the HRTF this way, providing
+//            the best possible surround experience yet"). FIVE pieces:
+//            1) THE NEGOTIATED CAPTURE WIDTH: the cable's own channel
+//               count is the engine's now -- the capture opens EXCLUSIVE at
+//               16ch first, then 8ch (VAC's exclusive pin carries exactly
+//               the cable's configured count, so one of the two lands
+//               bit-direct), and the shared fallback PROBES the endpoint's
+//               mix format (GetMixFormat) and requests exactly that count
+//               -- no converter can exist anywhere in the capture again.
+//               g_inCh owns the width; EVERY stride (the rings, the
+//               scratch, the mask loop, bitZero8, the volume walk) reads it.
+//               AN 8-CHANNEL CAPTURE IS BYTE-IDENTICAL TO v9.1.8: with
+//               g_inCh == 8 the entire height layer is DORMANT -- the same
+//               mask rows, the same folds, the same bytes. Only a 16ch
+//               capture arms it (the field's own compat rule). The
+//               watchdog reopen holds the negotiated width; a mid-run
+//               cable-width change wants APPLY + RESTART.
+//            2) THE REAL HRTF KERNELS: the fold effect stops being a
+//               phase/comb trick and becomes actual binaural FIR
+//               convolution -- a synthesized kernel PAIR per source
+//               position (the v9.1.1 virtual center's pattern, widened):
+//               the Woodworth spherical-head ITD (0.2551 ms/rad, ~0.66 ms
+//               at the sides, zero at the midline), the 12 dB head shadow
+//               (the far ear's direct + its pinna cues attenuated, halved
+//               over the top), and the pinna's three cues -- the concha
+//               wall tap (+0.30, whose delay sets the spectral NOTCH:
+//               0.125 ms at the front, 0.056 ms over the head -- the
+//               documented elevation-to-notch rise, ~4 kHz to ~8.9 kHz),
+//               the pinna secondary (-0.22), and the torso tap (+0.10,
+//               fading with elevation -- sound from above has less body
+//               bounce). SPARSE taps over a 64-frame line per ear (the
+//               codebase's convolution style, no FFT, no resampler), every
+//               ear normalized to unit DC so a fold's loudness is the
+//               plain fold's. THE SURROUND CHANNEL EFFECT, 16ch ONLY: the
+//               mains fold of the sides (ch5/ch6) runs through real +-90
+//               degree kernels INSTEAD of the v8.4.27 matrix phase trick
+//               (the trick's inverted half-gain cross is superseded by the
+//               kernel's own ITD + shadow), and the rear comb fold
+//               (ch7/ch8, empty leg3) keeps the field's 0.51 ms comb but
+//               rides it ON TOP of real +-135 degree kernels. 8ch keeps
+//               both tricks byte-for-byte.
+//            3) THE HEIGHT FOLD (16ch ONLY): cable ch9-16, the 8ch VAC
+//               order at elevation -- ch9 TFL, ch10 TFR, ch11 TFC, ch12
+//               TSL, ch13 TSR, ch14 TRL, ch15 TRR, ch16 TBC. No height
+//               speaker exists, so every lane passes through its position's
+//               elevation kernel (all +35 degrees: the top of the head's
+//               own high notch, the near-zero ITD, the reduced torso) and
+//               lands on the EXISTING legs: TFL/TFR/TBC on the mains,
+//               TFC on the mains at gain_center, TSL/TSR on the mains AND
+//               the rear device wherever the sides play (the super-wide
+//               split, kSurroundSplit), TRL/TRR on the rear device when it
+//               exists and on the mains at gain_rl/gain_rr when the rear
+//               fold is active. The source knobs stay the calibrated ones:
+//               TSL/TSR ride gain_sl/gain_sr, TRL/TRR gain_rl/gain_rr,
+//               TFC/TBC gain_center, TFL/TFR full. Lane-gated BY THEMSELVES
+//               (an all-zero lane resets its lines and contributes exactly
+//               zero, the g*0 = 0 contract), and a skipped bit-zero block
+//               flushes the layer whole (the v8.5.1 flush pattern,
+//               hrtfFlushMains / hrtfFlushRears). NO new ini key, NO UI row.
+//            4) THE NOTE (field-directed, verbatim): right below the
+//               "We recommend you wait 10 seconds" description on
+//               CONFIGURATION, "Note: 16 channel capture is supported, but
+//               comes with more processing power. Make sure your processing
+//               unit has the necessary GHz to do top-height audio
+//               simulation in real time." -- the left column reflows 4 px a
+//               row to carry it inside the panel.
+//            5) ROOM CORRECTION: a ROOM CORRECTION button on the bottom
+//               bar (the row reflows to six). One click arms THREE
+//               FULL-SCALE blips (200 ms of 1 kHz, raised-cosine edges) at
+//               0.10 / 0.80 / 1.50 s -- all three inside 2 s -- summed at
+//               LEG1's DEVICE layer (the chime's contract: a cue, never
+//               program audio, not volume-followed), while a worker opens
+//               the calibrate_dv MIC (new ini key, shared, 2ch, 10 ms) and
+//               records ~3.4 s. The analysis finds each blip's onset from
+//               the raw envelope (no schedule assumption -- the mic's own
+//               latency is measured, not assumed), runs the decay tail
+//               through three RBJ bandpasses (150 Hz / 1 kHz / 5 kHz),
+//               least-squares the dB slope of each tail and reads THE
+//               ROOM'S RT60 PER BAND (median across the three blips).
+//               THE CORRECTION: the kernels' synthetic reflection cues are
+//               re-weighted against a 0.35 s furnished-room reference --
+//               torso x sLow, concha x sMid, pinna x sHi, s = 1 - 0.45 x
+//               ((RT60 - 0.35) / 0.9) clamped to [0.55, 1.25]: a live room
+//               (its own reverb already in the air) damps the synthetic
+//               cues, a dead room lifts them; the virtual center's v9.1.1
+//               kernel is re-weighted the same way (idempotent -- a re-run
+//               rebuilds from raw geometry, never compounds). Memory-only:
+//               the fix lives until APPLY + RESTART, re-run the button.
+//               Fails honest and changes nothing if calibrate_dv matches
+//               nothing or the mic hears no blips.
 //    v9.1.8 THE BOOT CHIME WAITS FOR A WORKING DEVICE (field-directed:
 //            "But I still don't hear the chime, even with enable_chime.
 //            Alright, have it play just 400ms later to ensure thee device
@@ -2905,7 +3012,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.8"
+#define TWS_VERSION "10.0.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2932,6 +3039,19 @@
 
 // ------------------------------------------------------------------ config --
 static constexpr int      kInCh          = 8;      // VAC order: L R C LFE SL SR RL RR
+// v10.0.0 THE SIXTEEN-CHANNEL CABLE: kInCh stays the BASE map's width -- an
+// 8ch capture is byte-identical to v9.1.8 by construction. A 16ch cable
+// carries the SAME order at elevation on ch9-16 (0-based 8..15), the height
+// lanes the fold below consumes:
+static constexpr int      kInChMax       = 16;
+static constexpr int      kTflCh         = 8;      // ch9  TFL -- top front left
+static constexpr int      kTfrCh         = 9;      // ch10 TFR -- top front right
+static constexpr int      kTfcCh         = 10;     // ch11 TFC -- top front center
+static constexpr int      kTslCh         = 11;     // ch12 TSL -- top side left
+static constexpr int      kTsrCh         = 12;     // ch13 TSR -- top side right
+static constexpr int      kTrlCh         = 13;     // ch14 TRL -- top rear left
+static constexpr int      kTrrCh         = 14;     // ch15 TRR -- top rear right
+static constexpr int      kTbcCh         = 15;     // ch16 TBC -- top back center
 // v8.4.23 THE SECOND MASK: every leg's device stream is STEREO L+R -- the
 // mask-copy-mask fan-out ends with the output masked to channels 1 and 2,
 // so no channel conversion can exist anywhere downstream (no upmix risk).
@@ -3249,6 +3369,41 @@ static void armChime(bool force) {
     g_chimeSel.store(0, std::memory_order_release);
 }
 
+// ---------------- v10.0.0 ROOM CORRECTION: the three blips ------------------
+// The measurement's EXCITATION, rendered once at engine start: three
+// FULL-SCALE blips (200 ms of 1 kHz, 10 ms raised-cosine edges) at
+// 0.10 / 0.80 / 1.50 s -- the last ends at 1.70 s, all three inside the
+// 2 s the field asked for. Summed at LEG1's DEVICE layer (the chime's
+// contract: a cue, never program audio, not volume-followed), while the
+// room-correction worker records the calibrate_dv mic and reads the room's
+// reverb off the decays.
+static std::vector<float>    g_roomBlipBuf;            // rendered once, read-only after
+static std::atomic<bool>     g_roomBlipOn{false};      // leg1's device layer sums while true
+static std::atomic<unsigned> g_roomBlipIdx{0};         // leg1's device thread owns it
+
+static std::vector<float> renderRoomBlips() {
+    const size_t edgeLen = (size_t)((double)kSampleRate * 0.010);
+    const size_t blipLen = (size_t)((double)kSampleRate * 0.200);
+    const size_t gapLen  = (size_t)((double)kSampleRate * 0.500);
+    const size_t leadLen = (size_t)((double)kSampleRate * 0.100);
+    const size_t tailLen = (size_t)((double)kSampleRate * 0.200);
+    std::vector<float> v;
+    v.assign(leadLen + 3 * blipLen + 2 * gapLen + tailLen, 0.0f);
+    const double dph = kTwoPi * 1000.0 / (double)kSampleRate;
+    for (int b = 0; b < 3; ++b) {
+        const size_t at = leadLen + (size_t)b * (blipLen + gapLen);
+        double ph = 0.0;
+        for (size_t i = 0; i < blipLen; ++i) {
+            ph += dph;
+            double g = 1.0;
+            if (i < edgeLen)                g = (double)i / (double)edgeLen;
+            else if (i + edgeLen > blipLen) g = (double)(blipLen - i) / (double)edgeLen;
+            v[at + i] = (float)(sin(ph) * g);
+        }
+    }
+    return v;
+}
+
 // ------------------------------------------------------------- SPSC ring ----
 struct Ring {
     std::vector<float>     buf;
@@ -3354,7 +3509,7 @@ struct Ring {
     // pushOverwrite clamps n > cap by dropping from src, which would
     // silently lose the overshoot (the harness caught exactly that).
     void pushSilence(size_t n) {
-        static const float z[kInCh * 512] = { 0 };
+        static const float z[kInChMax * 512] = { 0 };   // v10.0.0: 16ch-capacity zero pad
         const size_t chunkMax = cap < 512 ? cap : 512;
         while (n) {
             const size_t chunk = n < chunkMax ? n : chunkMax;
@@ -3526,6 +3681,17 @@ static bool g_centerFold = false;
 static bool g_rearFold = false;
 static int  g_lfeFoldLeg = -1;   // v9.1.4: leg4's LFE fold target (-1 = idle; 1 = leg2, 2 = leg3)
 
+// v10.0.0 THE NEGOTIATED CAPTURE WIDTH: written once at capture open (the
+// main thread, before any device thread exists); the watchdog reopen HOLDS
+// it (a mid-run cable-width change wants APPLY + RESTART). 8 = the v9.1.8
+// engine byte-for-byte; 16 = the height layer arms. g_legMask is the
+// v8.4.23 mask-copy-mask fan-out's first mask, prebuilt once per engine
+// start (the v9.1.8 per-lane open conditions folded in -- the same values,
+// one read per lane per frame instead of four branches).
+static int           g_inCh     = kInCh;
+static bool          g_heightOn = false;
+static unsigned char g_legMask[4][kInChMax] = {};
+
 // v8.4.0: one place answers "which ini needle opens leg i" -- every open /
 // reopen / yield path asks here, so a rear leg can never fall back to a
 // wrong device's needle.
@@ -3567,6 +3733,40 @@ static const IID kIID_IAudioSessionManager2 =
 // ghost in ch3 can be traced to the exact streams that produced it.
 static const IID kIID_IAudioSessionControl2 =
     { 0x26E49CDA, 0x24B9, 0x4B03, { 0x8F, 0x60, 0x6C, 0x10, 0xA8, 0x18, 0xED, 0xA9 } };
+// v10.0.0: IAudioClient -- the capture width probe reads the endpoint's
+// shared-mode mix format so the shared fallback requests EXACTLY the cable's
+// channel count (no converter anywhere in the capture, the strict rule).
+static const IID kIID_IAudioClient =
+    { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+
+// The capture endpoint's shared-mix channel count (0 = the probe failed --
+// the caller keeps 8, the v9.1.8 request). The engine's capture open calls
+// this on the shared fallback only; exclusive never needs it (VAC's
+// exclusive pin carries exactly the cable's configured count).
+static int probeCaptureMixChans(const wchar_t* idStr) {
+    if (!idStr || !idStr[0]) return 0;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // ma_context_init already did; S_FALSE is fine
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return 0;
+    IMMDevice* dev = nullptr;
+    int chans = 0;
+    if (SUCCEEDED(en->GetDevice(idStr, &dev)) && dev) {
+        IAudioClient* cl = nullptr;
+        if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl)) && cl) {
+            WAVEFORMATEX* fmt = nullptr;
+            if (SUCCEEDED(cl->GetMixFormat(&fmt)) && fmt) {
+                chans = (int)fmt->nChannels;
+                CoTaskMemFree(fmt);
+            }
+            cl->Release();
+        }
+        dev->Release();
+    }
+    en->Release();
+    return chans;
+}
 
 static std::atomic<float>    g_vol{1.0f};             // Line 1 endpoint scalar (0..1)
 static std::atomic<bool>     g_volMuted{false};
@@ -4337,6 +4537,8 @@ static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static void rearCombFlushZ();                    // v9.1.0, defined next to g_rcomb
 static void centerVirtualFlushZ();               // v9.1.1, defined next to g_cvc
+static void hrtfFlushMains();                    // v10.0.0, defined in the real HRTF layer
+static void hrtfFlushRears();                    // v10.0.0, defined in the real HRTF layer
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
@@ -4428,11 +4630,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // makes them moot -- a masked leg can only ever play its own
     // channels). Dithering is retired too (v8.4.22's TPDF): the masked
     // pipeline has no truncation-structure problem to hide.
-    static const unsigned char kLegMask[3][kInCh] = {
-        { 1, 1, 0, 1, 0, 0, 0, 0 },   // leg1: ch1 ch2 (+ ch4 LFE, + ch3 fold)
-        { 0, 0, 1, 0, 0, 0, 0, 0 },   // leg2: ch3
-        { 0, 0, 0, 0, 1, 1, 1, 1 },   // leg3: ch5 ch6 ch7 ch8
-    };
+    // v10.0.0: the mask is PREBUILT once per engine start (g_legMask) -- the
+    // per-lane open conditions that used to run inside the loop below folded
+    // into the build (same values, one read per lane per frame), and the
+    // height rows carry opens only on a 16ch cable. An 8ch cable gets the
+    // exact v9.1.8 rows.
     while (done + padFr < frameCount) {
         const size_t want = frameCount - padFr - done;
         const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
@@ -4447,7 +4649,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         if (idx == 0) {
             float pk = g_ch3InPeak.load(std::memory_order_relaxed);
             for (size_t i = 0; i < n; ++i) {
-                const float a = fabsf(sc[i * kInCh + 2]);
+                const float a = fabsf(sc[i * g_inCh + 2]);
                 if (a > pk) pk = a;
             }
             g_ch3InPeak.store(pk, std::memory_order_relaxed);
@@ -4459,7 +4661,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
                            : g_vol.load(std::memory_order_relaxed);
             if (vg != 1.0f) {
-                const size_t tot = n * (size_t)kInCh;
+                const size_t tot = n * (size_t)g_inCh;
                 for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
             }
         }
@@ -4467,29 +4669,10 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // in place. After this the chunk carries ONLY the channels this
         // device may ever hear.
         {
-            const unsigned char* mk = kLegMask[idx];
+            const unsigned char* mk = g_legMask[idx];   // v10.0.0: prebuilt at start
             for (size_t i = 0; i < n; ++i)
-                for (int c = 0; c < kInCh; ++c) {
-                    unsigned char keep = mk[c];
-                    // v8.4.26 THE FOLD CHANNELS: leg1's mask opens for the
-                    // center fold (ch3, leg2 empty) and the fold channels
-                    // -- the folds fold INTO the stereo output, never onto
-                    // another device's slots. v9.1.0: the SURROUND slots
-                    // (0-based 4/5 = ch5 SL / ch6 SR) open for leg1 in BOTH
-                    // cases now -- the super-wide split folds them onto the
-                    // mains at 60% even when a real rear device exists. The
-                    // REAR slots (6/7 = ch7 RL / ch8 RR) still open only on
-                    // an empty leg3 (the 0.51 ms comb fold).
-                    if (idx == 0 && c == 2 && g_centerFold) keep = 1;
-                    if (idx == 0 && (c == 4 || c == 5)) keep = 1;
-                    if (idx == 0 && g_rearFold && (c == 6 || c == 7)) keep = 1;
-                    // v9.1.4 LEG4: the fold target's mask opens ch4 (0-based
-                    // 3) -- the LFE lane rides that leg's own mix. leg1
-                    // already keeps it (the built-in LFE fold), so this
-                    // line only ever widens leg2/leg3.
-                    if (idx == g_lfeFoldLeg && c == 3) keep = 1;
-                    if (!keep) sc[i * kInCh + c] = 0.0f;
-                }
+                for (int c = 0; c < g_inCh; ++c)
+                    if (!mk[c]) sc[i * g_inCh + c] = 0.0f;
         }
         // v6.6.9: silence compression -- a bit-zero masked chunk needs no
         // mix: same bytes out, none of the work. Post-mask, a bit-zero
@@ -4498,7 +4681,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const bool skipMix = (L.zeroFast && bitZero8(sc, n));
         if (skipMix) {
             if (idx == 1) centerEqFlushZ();
-            if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); centerVirtualFlushZ(); }   // v8.5.1/v9.1.0/v9.1.1: the fold's filters start clean after a skipped block
+            if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); centerVirtualFlushZ(); hrtfFlushMains(); }   // v8.5.1/v9.1.0/v9.1.1/v10.0.0: the fold's filters start clean after a skipped block
+            if (idx == 2) hrtfFlushRears();   // v10.0.0: leg3's height lanes start clean too
             // dst is already silence
         } else {
             mixBlock(idx, sc, dst, n);         // v6.5: the bulk mix, inline now
@@ -4673,6 +4857,19 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
             } else {
                 g_chimeSel.store(-1, std::memory_order_release);
                 chSel = -1;
+            }
+        }
+        // v10.0.0 ROOM CORRECTION'S THREE BLIPS: the measurement's own
+        // excitation, the chime's contract exactly (a cue, never program
+        // audio, not volume-followed) -- leg1's device thread owns the index.
+        if (g_roomBlipOn.load(std::memory_order_acquire)) {
+            const unsigned bi = g_roomBlipIdx.fetch_add(1, std::memory_order_relaxed);
+            if (bi < g_roomBlipBuf.size()) {
+                const float s = g_roomBlipBuf[bi];
+                l += s;
+                r += s;
+            } else {
+                g_roomBlipOn.store(false, std::memory_order_release);
             }
         }
         if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
@@ -5250,6 +5447,201 @@ static inline float centerVirtualRun(const float x)
     return g_cvcMask * zA + (1.0f - g_cvcMask) * zB;
 }
 
+// ============ v10.0.0 THE REAL HRTF LAYER (the surround + the height folds) ==
+// The fold effect stops being a phase/comb trick and becomes actual binaural
+// FIR convolution. One synthesized kernel PAIR per source position (the
+// v9.1.1 virtual center's pattern, widened to the whole sphere):
+//   - THE ITD: the Woodworth spherical-head formula, (a/c)*(theta + sin theta)
+//     with a = 8.75 cm, c = 343 m/s -- 0.2551 ms/rad, ~0.66 ms at the sides,
+//     zero at the midline (the rear arc decays linearly to 0 at 180 degrees,
+//     midline-correct), rounded to whole frames. The ipsilateral ear is not
+//     delayed; the far ear carries the whole ITD.
+//   - THE HEAD SHADOW: the far ear's direct tap drops 12 dB * |sin az| (halved
+//     over the top, where the path clears the head), and the far ear's pinna
+//     cues ride it -- a shadowed ear hears the direct wave and the body, not
+//     the pinna's detail.
+//   - THE PINNA'S THREE CUES: the concha wall tap (+0.30; its delay IS the
+//     spectral notch -- 0.125 ms frontal, 0.056 ms over the head, the
+//     documented elevation-to-notch rise, ~4 kHz to ~8.9 kHz -- "sound come
+//     out to the top of your head" is exactly this cue), the pinna secondary
+//     (-0.22 @ 0.354 ms), and the torso tap (+0.10 @ 0.625 ms, fading with
+//     elevation -- sound from above has less body bounce).
+// SPARSE taps over a 64-frame line per ear (the codebase's convolution style,
+// no FFT, no resampler), each ear normalized to unit DC so a fold's loudness
+// is the plain fold's. THE ROOM CORRECTION (the button) re-weights the
+// synthetic reflection cues from the mic's measured RT60 and REBUILDS the
+// weights from the raw geometry -- idempotent, never cumulative.
+static constexpr int kHrLine    = 64;    // the convolution line (frames, power of two)
+static constexpr int kHrLineMsk = kHrLine - 1;
+static constexpr int kHrMaxTaps = 5;     // per ear after the merge
+static constexpr double kHrHeadRadMs = (0.0875 / 343.0) * 1000.0;   // 0.2551 ms/rad
+
+struct HrtfEar {
+    int   nTaps = 0;
+    int   fr[kHrMaxTaps] = {};           // tap positions (frames)
+    float g [kHrMaxTaps] = {};           // weights (unit-DC, room-scaled)
+};
+struct HrtfPair { HrtfEar l, r; };
+
+// the geometry of every fold position, kept RAW so a room correction rebuilds
+// the weights without re-deriving anything. Azimuth: + = right of the
+// listener, 0 = front, 180 = behind. Elevation: + = above the head.
+struct HrtfGeom { double azDeg, elevDeg; };
+enum {
+    HP_TFL, HP_TFR, HP_TFC, HP_TBC,        // the height fronts (ch9 ch10 ch11 ch16)
+    HP_TSL, HP_TSR, HP_TRL, HP_TRR,        // the height sides/rears (ch12-15)
+    HP_SL,  HP_SR,  HP_RL,  HP_RR,         // the base surround's real-HRTF upgrade
+    HP_COUNT
+};
+static HrtfPair g_hkPos[HP_COUNT];
+static const HrtfGeom kHkGeom[HP_COUNT] = {
+    { -30.0, 35.0 }, { 30.0, 35.0 }, {  0.0, 35.0 }, { 180.0, 35.0 },   // the tops
+    { -90.0, 35.0 }, { 90.0, 35.0 }, { -135.0, 35.0 }, { 135.0, 35.0 },
+    { -90.0,  0.0 }, { 90.0,  0.0 }, { -135.0,  0.0 }, { 135.0,  0.0 }, // the surrounds, ear level
+};
+
+static inline double hrtfItdMs(double azDeg) {
+    const double a = fabs(azDeg);
+    if (a <= 90.0) {
+        const double r = a * kTwoPi / 360.0;
+        return kHrHeadRadMs * (r + sin(r));
+    }
+    return 0.6558 * (1.0 - (a - 90.0) / 90.0);   // the rear arc: sides' max -> 0 at the midline
+}
+static inline double hrtfShadow(double azDeg, double elevFrac) {
+    const double s = fabs(sin(azDeg * kTwoPi / 360.0));
+    return pow(10.0, -(12.0 * s * (1.0 - 0.5 * elevFrac)) / 20.0);
+}
+
+// one tap slot accumulator: same frame index -> weights merge
+static void hrtfAccTap(HrtfEar& e, int fr, float g) {
+    for (int t = 0; t < e.nTaps; ++t) {
+        if (e.fr[t] == fr) { e.g[t] += g; return; }
+    }
+    if (e.nTaps < kHrMaxTaps) { e.fr[e.nTaps] = fr; e.g[e.nTaps] = g; e.nTaps++; }
+}
+
+static void hrtfBuildPair(int pos, double sLow, double sMid, double sHi) {
+    const HrtfGeom& G = kHkGeom[pos];
+    const double elevFrac = G.elevDeg / 90.0;
+    const double azRad    = G.azDeg * kTwoPi / 360.0;
+    const double sh       = hrtfShadow(G.azDeg, elevFrac);
+    const int    itdFr    = (int)(hrtfItdMs(G.azDeg) * (double)kSampleRate / 1000.0 + 0.5);
+    // the pinna taps, delays in frames -- the concha delay sets the spectral
+    // notch (0.125 ms frontal -> 0.056 ms over the head)
+    const int dC = (int)(0.125 * (1.0 - 0.55 * elevFrac) * (double)kSampleRate / 1000.0 + 0.5);
+    const int dP = (int)(0.354 * (1.0 - 0.30 * elevFrac) * (double)kSampleRate / 1000.0 + 0.5);
+    const int dT = (int)(0.625 * (1.0 - 0.40 * elevFrac) * (double)kSampleRate / 1000.0 + 0.5);
+    HrtfEar ipsi, far;
+    ipsi.nTaps = 0; far.nTaps = 0;
+    // the ipsilateral ear: the v9.1.1 kernel's four taps, the room scales on
+    // the synthetic reflection cues (the direct tap is never scaled)
+    hrtfAccTap(ipsi, 0,  1.0f);
+    hrtfAccTap(ipsi, dC, (float)( 0.30 * sMid));
+    hrtfAccTap(ipsi, dP, (float)(-0.22 * sHi));
+    hrtfAccTap(ipsi, dT, (float)( 0.10 * sLow));
+    // the far ear: the direct wave through the head shadow, the pinna detail
+    // mostly gone, the body still there
+    hrtfAccTap(far, itdFr,      (float)(sh));
+    hrtfAccTap(far, itdFr + dC, (float)( 0.25 * sh * sMid));
+    hrtfAccTap(far, itdFr + dP, (float)( 0.15 * sh * sHi));
+    hrtfAccTap(far, itdFr + dT, (float)( 0.80 * sh * sLow));
+    // unit-DC normalization on the ipsilateral ear, the same factor on BOTH
+    // ears (the shadow stays relative)
+    double sum = 0.0;
+    for (int t = 0; t < ipsi.nTaps; ++t) sum += ipsi.g[t];
+    if (sum <= 1e-6) sum = 1.0;
+    const float k = (float)(1.0 / sum);
+    HrtfPair& P = g_hkPos[pos];
+    for (int t = 0; t < ipsi.nTaps; ++t) { P.l.fr[t] = ipsi.fr[t]; P.l.g[t] = ipsi.g[t] * k; }
+    P.l.nTaps = ipsi.nTaps;
+    for (int t = 0; t < far.nTaps; ++t)  { P.r.fr[t] = far.fr[t];  P.r.g[t] = far.g[t] * k; }
+    P.r.nTaps = far.nTaps;
+    if (G.azDeg < 0.0) { HrtfEar tmp = P.l; P.l = P.r; P.r = tmp; }   // +az = right: the ipsi ear is R
+}
+
+// the lane convolvers -- one state per SOURCE lane per device (the mains and
+// the rears fold on their own threads; states never share). The TSL/TSR and
+// TRL/TRR lanes exist twice: HL_*S for the mains fold, HL_*3 for the rear
+// device's own mix.
+struct HrtfLane {
+    float lineL[kHrLine] = {}, lineR[kHrLine] = {};
+    int   idx = 0;
+};
+enum {
+    HL_TFL, HL_TFR, HL_TFC, HL_TBC, HL_TSL, HL_TSR, HL_TRL, HL_TRR,   // the mains' height folds
+    HL_SL,  HL_SR,  HL_RL,  HL_RR,                                    // the mains' surround upgrade
+    HL_TSL3, HL_TSR3, HL_TRL3, HL_TRR3,                               // the rear device's height folds
+    HL_COUNT
+};
+static HrtfLane g_hlane[HL_COUNT];
+static const int kHlanePos[HL_COUNT] = {
+    HP_TFL, HP_TFR, HP_TFC, HP_TBC, HP_TSL, HP_TSR, HP_TRL, HP_TRR,
+    HP_SL,  HP_SR,  HP_RL,  HP_RR,
+    HP_TSL, HP_TSR, HP_TRL, HP_TRR
+};
+
+// One lane, one sample, through its position's kernel pair (the v9.1.1
+// convolution op: the direct tap reads the sample just written). The caller
+// owns the lane gating -- a lane fed only when its channel is live.
+static inline void hrtfLaneRun(int lane, const float x, float& oL, float& oR)
+{
+    const HrtfPair& P = g_hkPos[kHlanePos[lane]];
+    HrtfLane& Ln = g_hlane[lane];
+    float* ll = Ln.lineL;
+    float* rl = Ln.lineR;
+    const int idx = Ln.idx;
+    ll[idx] = x;
+    rl[idx] = x;
+    float a = 0.0f, b = 0.0f;
+    for (int t = 0; t < P.l.nTaps; ++t) a += P.l.g[t] * ll[(idx + kHrLine - P.l.fr[t]) & kHrLineMsk];
+    for (int t = 0; t < P.r.nTaps; ++t) b += P.r.g[t] * rl[(idx + kHrLine - P.r.fr[t]) & kHrLineMsk];
+    if (++Ln.idx >= kHrLine) Ln.idx = 0;
+    oL = a;
+    oR = b;
+}
+
+// The silence contract, the flush: a skipped bit-zero block leaves no state.
+// hrtfFlushMains is leg1's switch thread only; hrtfFlushRears leg3's.
+static void hrtfFlushLanes(int first, int last) {
+    for (int h = first; h <= last; ++h) {
+        memset(g_hlane[h].lineL, 0, sizeof(g_hlane[h].lineL));
+        memset(g_hlane[h].lineR, 0, sizeof(g_hlane[h].lineR));
+        g_hlane[h].idx = 0;
+    }
+}
+static void hrtfFlushMains() { hrtfFlushLanes(HL_TFL, HL_RR); }
+static void hrtfFlushRears() { hrtfFlushLanes(HL_TSL3, HL_TRR3); }
+
+static void hrtfBuildAll(double sLow, double sMid, double sHi) {
+    for (int p = 0; p < HP_COUNT; ++p) hrtfBuildPair(p, sLow, sMid, sHi);
+}
+static void hrtfInit() {
+    hrtfBuildAll(1.0, 1.0, 1.0);
+    memset(g_hlane, 0, sizeof(g_hlane));
+}
+
+// THE ROOM CORRECTION, applied: the same re-weighting on the v9.1.1 virtual
+// center's kernel (its taps: direct, concha, pinna, torso), rebuilt from the
+// RAW table so a re-run never compounds. The mix thread reads hg[] mid-write
+// for one block at worst -- same-scale weights, inaudible, no lock.
+static void centerVirtualRoomApply(double sLow, double sMid, double sHi)
+{
+    static const float kCvcRaw[4] = { 1.0f, 0.30f, -0.22f, 0.10f };   // kCvcHrTapG's raw taps
+    float g[4];
+    g[0] = kCvcRaw[0];
+    g[1] = (float)(kCvcRaw[1] * sMid);
+    g[2] = (float)(kCvcRaw[2] * sHi);
+    g[3] = (float)(kCvcRaw[3] * sLow);
+    float sum = g[0] + g[1] + g[2] + g[3];
+    if (sum <= 1e-6f) sum = 1.0f;
+    for (int i = 0; i < 4; ++i) g_cvc.hg[i] = g[i] / sum;
+}
+static void hrtfRoomApply(double sLow, double sMid, double sHi) {
+    hrtfBuildAll(sLow, sMid, sHi);
+    centerVirtualRoomApply(sLow, sMid, sHi);
+}
+
 // ----------------------------------------------------------------- mixer ----
 // v6.5: whole-BLOCK mix with the ini gains hoisted into locals. Every
 // per-frame FP op is unchanged (multiply + add, never FMA -- -ffp-contract
@@ -5273,6 +5665,11 @@ static inline float centerVirtualRun(const float x)
 // split: the phase trick at 60% on leg1, the rear device's side fold at
 // 60%), and on an EMPTY leg3 the rears' own fold runs through a 0.51 ms
 // comb (the EQ-APO rear effect, built in). See the v9.1.0 changelog above.
+// v10.0.0: every stride in here reads g_inCh (the negotiated capture width),
+// and the REAL HRTF layer rides the folds -- the surround lanes through
+// their position kernels and the height lanes ch9-16 through their elevation
+// kernels, ALL 16ch-only (an 8ch cable runs the exact v9.1.8 ops,
+// byte-identical). See the v10.0.0 changelog above.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
     if (idx == 0) {
         // v8.4.23 leg1 = THE MASKED STEREO COPY: the chunk arrives with
@@ -5312,13 +5709,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // included.
         bool slLive = false, srLive = false;
         // v9.1.0: the surround lanes feed leg1 in BOTH cases now -- the
-        // bass filter's scan drops the g_rearFold condition.
+        // bass filter's scan drops the g_rearFold condition. v10.0.0: the
+        // scan runs UNCONDITIONALLY (the real-HRTF surround lanes need the
+        // liveness too; with sbeq off the biquad is the identity, so the
+        // fed samples are bit-identical).
+        for (size_t i = 0; i < n; ++i) {
+            if (sc[i * g_inCh + 4] != 0.0f) slLive = true;
+            if (sc[i * g_inCh + 5] != 0.0f) srLive = true;
+            if (slLive && srLive) break;
+        }
         if (g_sbeq.on) {
-            for (size_t i = 0; i < n; ++i) {
-                if (sc[i * kInCh + 4] != 0.0f) slLive = true;
-                if (sc[i * kInCh + 5] != 0.0f) srLive = true;
-                if (slLive && srLive) break;
-            }
             if (!slLive) { g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f; }
             if (!srLive) { g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f; }
         }
@@ -5330,14 +5730,59 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         bool rlLive = false, rrLive = false;
         if (g_rearFold) {
             for (size_t i = 0; i < n; ++i) {
-                if (sc[i * kInCh + 6] != 0.0f) rlLive = true;
-                if (sc[i * kInCh + 7] != 0.0f) rrLive = true;
+                if (sc[i * g_inCh + 6] != 0.0f) rlLive = true;
+                if (sc[i * g_inCh + 7] != 0.0f) rrLive = true;
                 if (rlLive && rrLive) break;
             }
             if (!rlLive) memset(g_rcomb.bufL, 0, sizeof(g_rcomb.bufL));
             if (!rrLive) memset(g_rcomb.bufR, 0, sizeof(g_rcomb.bufR));
         }
         const bool combAdv = g_rearFold && (rlLive || rrLive);
+        // v10.0.0 THE HEIGHT LANES' LIVENESS + the real-HRTF surround paths
+        // (16ch ONLY -- 8ch keeps every v9.1.8 op byte-identical). The
+        // height lanes are ch9-16 of the 16ch cable's own order (TFL TFR
+        // TFC TSL TSR TRL TRR TBC); every dead lane RESETS its convolution
+        // lines (the g*0 = 0 contract, lane by lane).
+        bool tflLive = false, tfrLive = false, tfcLive = false, tbcLive = false;
+        bool t5Live = false, t6Live = false, trlLive = false, trrLive = false;
+        if (g_heightOn) {
+            for (size_t i = 0; i < n; ++i) {
+                const float* f = sc + i * g_inCh;
+                if (f[kTflCh] != 0.0f) tflLive = true;
+                if (f[kTfrCh] != 0.0f) tfrLive = true;
+                if (f[kTfcCh] != 0.0f) tfcLive = true;
+                if (f[kTbcCh] != 0.0f) tbcLive = true;
+                if (f[kTslCh] != 0.0f) t5Live  = true;
+                if (f[kTsrCh] != 0.0f) t6Live  = true;
+                if (f[kTrlCh] != 0.0f) trlLive = true;
+                if (f[kTrrCh] != 0.0f) trrLive = true;
+                if (tflLive && tfrLive && tfcLive && tbcLive
+                    && t5Live && t6Live && trlLive && trrLive) break;
+            }
+            auto flushLane = [](int h) {
+                memset(g_hlane[h].lineL, 0, sizeof(g_hlane[h].lineL));
+                memset(g_hlane[h].lineR, 0, sizeof(g_hlane[h].lineR));
+                g_hlane[h].idx = 0;
+            };
+            if (!tflLive) flushLane(HL_TFL);
+            if (!tfrLive) flushLane(HL_TFR);
+            if (!tfcLive) flushLane(HL_TFC);
+            if (!tbcLive) flushLane(HL_TBC);
+            if (!t5Live)  flushLane(HL_TSL);
+            if (!t6Live)  flushLane(HL_TSR);
+            if (!trlLive) flushLane(HL_TRL);
+            if (!trrLive) flushLane(HL_TRR);
+            if (!slLive)  flushLane(HL_SL);   // the real-HRTF surround lanes too
+            if (!srLive)  flushLane(HL_SR);
+            if (!rlLive)  flushLane(HL_RL);
+            if (!rrLive)  flushLane(HL_RR);
+        }
+        // the height terms' source gains: TSL/TSR ride gain_sl/gain_sr at
+        // the super-wide split (they are height SIDES), TRL/TRR ride
+        // gain_rl/gain_rr (height rears, the rear fold's own knobs), and
+        // TFC/TBC ride gain_center -- the calibrated knobs stay the truth.
+        const float gSL3 = gSL * kSurroundSplit, gSR3 = gSR * kSurroundSplit;
+        const bool heightLive = g_heightOn;
         if (g_centerFold) {
             const float gC = g_cfg.gainCenter;
             // v9.1.1: the center lane gates the virtual chain (the silence
@@ -5348,7 +5793,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 if (sc[i * kInCh + 2] != 0.0f) { cLive = true; break; }
             if (!cLive) centerVirtualFlushZ();
             for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
+                const float* f = sc + i * g_inCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
                 // v9.1.1 THE VIRTUAL CENTER: the HRTF + XTC chain replaces
@@ -5360,27 +5805,93 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 // biquad; a dead lane passes its samples through untouched)
                 const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];
                 const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];
-                // v9.1.0 THE REAR COMB: the comb eats the RAW sample; the
-                // gain applies after -- the EQ-APO order.
-                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
-                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
+                // v10.0.0 THE REAL-HRTF SURROUND (16ch only): the sides ride
+                // their +-90 degree kernel pair; 8ch keeps the matrix phase
+                // trick's own terms in the sum below (slL..srR stay 0).
+                float slL = 0.0f, slR = 0.0f, srL = 0.0f, srR = 0.0f;
+                if (g_heightOn) {
+                    if (t5Live) hrtfLaneRun(HL_SL, s5, slL, slR);
+                    if (t6Live) hrtfLaneRun(HL_SR, s6, srL, srR);
+                }
+                // v9.1.0 THE REAR COMB (v10.0.0: on a 16ch cable the comb
+                // eats the +-135 degree KERNEL's outputs; 8ch eats the RAW
+                // sample -- the EQ-APO order either way, gain after).
+                float r6 = 0.0f, r7 = 0.0f;
+                if (rlLive) {
+                    if (g_heightOn) { float a, b; hrtfLaneRun(HL_RL, f[6], a, b);
+                                      r6 = rearCombRun(a, g_rcomb.bufL, g_rcomb.idx); }
+                    else r6 = rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx);
+                }
+                if (rrLive) {
+                    if (g_heightOn) { float a, b; hrtfLaneRun(HL_RR, f[7], a, b);
+                                      r7 = rearCombRun(b, g_rcomb.bufR, g_rcomb.idx); }
+                    else r7 = rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx);
+                }
                 if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
-                o[0] = gL * f[0] + lfe + cf + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + cf + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
+                // v10.0.0 THE HEIGHT FOLD (16ch only): every lane through its
+                // elevation kernel, onto the mains at the source's own knob.
+                float hL = 0.0f, hR = 0.0f;
+                if (heightLive) {
+                    float a, b;
+                    if (tflLive) { hrtfLaneRun(HL_TFL, f[kTflCh], a, b); hL += a;         hR += b;         }
+                    if (tfrLive) { hrtfLaneRun(HL_TFR, f[kTfrCh], a, b); hL += a;         hR += b;         }
+                    if (tfcLive) { hrtfLaneRun(HL_TFC, f[kTfcCh], a, b); hL += gC * a;    hR += gC * b;    }
+                    if (tbcLive) { hrtfLaneRun(HL_TBC, f[kTbcCh], a, b); hL += gC * a;    hR += gC * b;    }
+                    if (t5Live)  { hL += gSL3 * slL;    hR += gSL3 * slR; }
+                    if (t6Live)  { hL += gSR3 * srR;    hR += gSR3 * srL; }   // TSR: the R kernel's output crosses to L
+                    if (trlLive && g_rearFold)
+                        { hrtfLaneRun(HL_TRL, f[kTrlCh], a, b); hL += gRL * a; hR += gRL * b; }
+                    if (trrLive && g_rearFold)
+                        { hrtfLaneRun(HL_TRR, f[kTrrCh], a, b); hL += gRR * a; hR += gRR * b; }
+                }
+                o[0] = gL * f[0] + lfe + cf + gRL * r6 + gSL * s5 - 0.5f * gSR * s6 + hL;
+                o[1] = gR * f[1] + lfe + cf + gRR * r7 + gSR * s6 - 0.5f * gSL * s5 + hR;
             }
         } else {
+            const float gC = g_cfg.gainCenter;   // v10.0.0: TFC/TBC's height terms ride it
             for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
+                const float* f = sc + i * g_inCh;
                 float* o = chunk + i * kOutCh1;
                 const float lfe = gLfe * f[3];
                 const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];   // v8.5.1
                 const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];   // v8.5.1
-                // v9.1.0 THE REAR COMB (the else branch, same ops)
-                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
-                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
+                // v10.0.0: the real-HRTF surround lanes (16ch only; 0 on 8ch)
+                float slL = 0.0f, slR = 0.0f, srL = 0.0f, srR = 0.0f;
+                if (g_heightOn) {
+                    if (t5Live) hrtfLaneRun(HL_SL, s5, slL, slR);
+                    if (t6Live) hrtfLaneRun(HL_SR, s6, srL, srR);
+                }
+                // v9.1.0 THE REAR COMB (the else branch, same ops; v10.0.0:
+                // the 16ch kernel rides under the comb)
+                float r6 = 0.0f, r7 = 0.0f;
+                if (rlLive) {
+                    if (g_heightOn) { float a, b; hrtfLaneRun(HL_RL, f[6], a, b);
+                                      r6 = rearCombRun(a, g_rcomb.bufL, g_rcomb.idx); }
+                    else r6 = rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx);
+                }
+                if (rrLive) {
+                    if (g_heightOn) { float a, b; hrtfLaneRun(HL_RR, f[7], a, b);
+                                      r7 = rearCombRun(b, g_rcomb.bufR, g_rcomb.idx); }
+                    else r7 = rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx);
+                }
                 if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
-                o[0] = gL * f[0] + lfe + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
+                // v10.0.0 THE HEIGHT FOLD (the no-center-fold branch, same lanes)
+                float hL = 0.0f, hR = 0.0f;
+                if (heightLive) {
+                    float a, b;
+                    if (tflLive) { hrtfLaneRun(HL_TFL, f[kTflCh], a, b); hL += a;      hR += b;      }
+                    if (tfrLive) { hrtfLaneRun(HL_TFR, f[kTfrCh], a, b); hL += a;      hR += b;      }
+                    if (tfcLive) { hrtfLaneRun(HL_TFC, f[kTfcCh], a, b); hL += gC * a; hR += gC * b; }
+                    if (tbcLive) { hrtfLaneRun(HL_TBC, f[kTbcCh], a, b); hL += gC * a; hR += gC * b; }
+                    if (t5Live)  { hL += gSL3 * slL;   hR += gSL3 * slR; }
+                    if (t6Live)  { hL += gSR3 * srR;   hR += gSR3 * srL; }
+                    if (trlLive && g_rearFold)
+                        { hrtfLaneRun(HL_TRL, f[kTrlCh], a, b); hL += gRL * a; hR += gRL * b; }
+                    if (trrLive && g_rearFold)
+                        { hrtfLaneRun(HL_TRR, f[kTrrCh], a, b); hL += gRR * a; hR += gRR * b; }
+                }
+                o[0] = gL * f[0] + lfe + gRL * r6 + gSL * s5 - 0.5f * gSR * s6 + hL;
+                o[1] = gR * f[1] + lfe + gRR * r7 + gSR * s6 - 0.5f * gSL * s5 + hR;
             }
         }
     } else if (idx == 1) {
@@ -5401,24 +5912,24 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             // the filter, internal zeros included.
             bool allZero = true;
             for (size_t i = 0; i < n; ++i)
-                if (sc[i * kInCh + 2] != 0.0f) { allZero = false; break; }
+                if (sc[i * g_inCh + 2] != 0.0f) { allZero = false; break; }
             if (allZero) {
                 g_ceq.z1 = 0.0f;
                 g_ceq.z2 = 0.0f;
                 for (size_t i = 0; i < n; ++i) {
                     float c = 0.0f;
-                    if (lfe4g != 0.0f) c = lfe4g * sc[i * kInCh + 3];   // v9.1.4: the LFE rides a dead center
+                    if (lfe4g != 0.0f) c = lfe4g * sc[i * g_inCh + 3];   // v9.1.4: the LFE rides a dead center
                     chunk[i * 2 + 0] = c;
                     chunk[i * 2 + 1] = c;
                 }
             } else {
                 for (size_t i = 0; i < n; ++i) {
-                    const float x = sc[i * kInCh + 2];
+                    const float x = sc[i * g_inCh + 2];
                     const float y = g_ceq.b0 * x + g_ceq.z1;
                     g_ceq.z1 = g_ceq.b1 * x - g_ceq.a1 * y + g_ceq.z2;
                     g_ceq.z2 = g_ceq.b2 * x - g_ceq.a2 * y;
                     float c = gC * y;
-                    if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4: the fold rides the same sum
+                    if (lfe4g != 0.0f) c += lfe4g * sc[i * g_inCh + 3];   // v9.1.4: the fold rides the same sum
                     // the boost can push past full scale; clamp here so the
                     // EQ mode is self-contained (the device layer would clip
                     // the same peak a moment later, after the keep-alive sum)
@@ -5429,8 +5940,8 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
-                float c = gC * sc[i * kInCh + 2];
-                if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4
+                float c = gC * sc[i * g_inCh + 2];
+                if (lfe4g != 0.0f) c += lfe4g * sc[i * g_inCh + 3];   // v9.1.4
                 chunk[i * 2 + 0] = c;
                 chunk[i * 2 + 1] = c;
             }
@@ -5460,14 +5971,45 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         // both outputs, the sub's channel riding the same device as the
         // rears/surround. Idle the ops are untouched -- bit-exact.
         const float gLfe4 = (g_lfeFoldLeg == 2) ? g_cfg.gainLfe : 0.0f;
-        for (size_t i = 0; i < n; ++i) {
-            const float* f = sc + i * kInCh;
-            chunk[i * 2 + 0] = gRL * f[kRearLCh] + kSurroundSplit * gRL * f[kSideLCh];   // rear L ch7 + side L ch5 at 60%
-            chunk[i * 2 + 1] = gRR * f[kRearRCh] + kSurroundSplit * gRR * f[kSideRCh];   // rear R ch8 + side R ch6 at 60%
-            if (gLfe4 != 0.0f) {
-                chunk[i * 2 + 0] += gLfe4 * f[3];
-                chunk[i * 2 + 1] += gLfe4 * f[3];
+        // v10.0.0 THE HEIGHT LANES ON THE REAR DEVICE (16ch only): TSL/TSR
+        // and TRL/TRR through their +35-degree elevation kernels, the height
+        // sides at the super-wide split like the base sides (the mains carry
+        // their own split -- the full super-wide effect, both at once), the
+        // height rears at their full rear knob. Lane-gated by themselves;
+        // 8ch runs the exact v9.1.8 ops.
+        bool h3sl = false, h3sr = false, h3rl = false, h3rr = false;
+        if (g_heightOn) {
+            for (size_t i = 0; i < n; ++i) {
+                const float* f = sc + i * g_inCh;
+                if (f[kTslCh] != 0.0f) h3sl = true;
+                if (f[kTsrCh] != 0.0f) h3sr = true;
+                if (f[kTrlCh] != 0.0f) h3rl = true;
+                if (f[kTrrCh] != 0.0f) h3rr = true;
+                if (h3sl && h3sr && h3rl && h3rr) break;
             }
+            if (!h3sl) hrtfFlushLanes(HL_TSL3, HL_TSL3);
+            if (!h3sr) hrtfFlushLanes(HL_TSR3, HL_TSR3);
+            if (!h3rl) hrtfFlushLanes(HL_TRL3, HL_TRL3);
+            if (!h3rr) hrtfFlushLanes(HL_TRR3, HL_TRR3);
+        }
+        const float gSSrl = gRL * kSurroundSplit, gSSrr = gRR * kSurroundSplit;
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * g_inCh;
+            float l = gRL * f[kRearLCh] + kSurroundSplit * gRL * f[kSideLCh];   // rear L ch7 + side L ch5 at 60%
+            float r = gRR * f[kRearRCh] + kSurroundSplit * gRR * f[kSideRCh];   // rear R ch8 + side R ch6 at 60%
+            if (g_heightOn) {
+                float a, b;
+                if (h3sl) { hrtfLaneRun(HL_TSL3, f[kTslCh], a, b); l += gSSrl * a; r += gSSrl * b; }
+                if (h3sr) { hrtfLaneRun(HL_TSR3, f[kTsrCh], a, b); l += gSSrr * b; r += gSSrr * a; }
+                if (h3rl) { hrtfLaneRun(HL_TRL3, f[kTrlCh], a, b); l += gRL * a;  r += gRL * b;  }
+                if (h3rr) { hrtfLaneRun(HL_TRR3, f[kTrrCh], a, b); l += gRR * a;  r += gRR * b;  }
+            }
+            if (gLfe4 != 0.0f) {
+                l += gLfe4 * f[3];
+                r += gLfe4 * f[3];
+            }
+            chunk[i * 2 + 0] = l;
+            chunk[i * 2 + 1] = r;
         }
     }
 }
@@ -5479,7 +6021,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
 // word count is exact; the loop bails at the first nonzero word.
 static inline bool bitZero8(const float* p, size_t n) {
     unsigned long long w;
-    const size_t nw = n * (size_t)(kInCh / 2);
+    const size_t nw = n * (size_t)(g_inCh / 2);   // v10.0.0: the negotiated width (always even)
     for (size_t i = 0; i < nw; ++i) {
         memcpy(&w, p + i * 2, sizeof(w));
         if (w) return false;
@@ -6575,7 +7117,7 @@ static bool tryRestartCap(ma_context* ctx) {
     cc.dataCallback = capCallback;
     cc.capture.pDeviceID = &id;
     cc.capture.format = ma_format_f32;
-    cc.capture.channels = kInCh;
+    cc.capture.channels = (ma_uint32)g_inCh;   // v10.0.0: the negotiated width HOLDS across reopens
     cc.capture.shareMode = g_capWantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     ma_result r = ma_device_init(ctx, &cc, &g_capDev);
@@ -6626,7 +7168,7 @@ static void printLegDevice(int idx) {
     // any downmixed) endpoint has literally nothing to upmix -- the center
     // physically cannot appear on out1 no matter how the endpoint is set up.
     if (idx == 0 && d->playback.internalChannels != kOutCh1)
-        tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 6ch -- fine with the strict split:\n"
+        tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 2ch -- fine with the strict split:\n"
                         "            out1 drives FC/LFE AND the 5.1 rear slots as digital silence (the\n"
                         "            rears live on leg3), so no layer (engine, miniaudio converter,\n"
                         "            Speaker Fill) has anything to upmix into a fake center.\n",
@@ -6640,6 +7182,7 @@ static void printLegDevice(int idx) {
                         "            48000 Hz in Windows sound settings.\n",
                 idx + 1, (unsigned)sr, (unsigned)sr);
 }
+
 
 // ============================================================ v6.6.0 GUI ====
 // THE CONTROL WINDOW (no args; console modes unchanged behind flags).
@@ -7844,6 +8387,175 @@ static void guiSetStatus(HWND w, const char* s) {
     // v9.0.2: the band is 3 rows (54px) -- one '\n'-split string.
     const RECT sr = { S(14), S(458), S(866), S(512) };
     InvalidateRect(g_hwnd ? g_hwnd : w, &sr, FALSE);
+}
+
+// ============== v10.0.0 ROOM CORRECTION (the mic, the RT60, the fix) ========
+// THE BUTTON's whole engine: open the calibrate_dv mic, play the three blips
+// (the excitation lives in renderRoomBlips; leg1's device layer sums them),
+// find each blip's onset in the recording FROM THE ENVELOPE (the mic's own
+// latency is measured, never assumed), read the room's reverb as an RT60 per
+// band (150 Hz / 1 kHz / 5 kHz, the decay-slope LSQ on the bandpassed tail),
+// and re-weight the HRTF layer's synthetic reflection cues against a 0.35 s
+// furnished-room reference. Memory-only (an APPLY + RESTART restores the raw
+// geometry); a re-run REBUILDS from raw -- never cumulative.
+static std::atomic<bool> g_roomRun{false};
+static HANDLE            g_roomThread = nullptr;
+
+static double roomMedian3(double a, double b, double c) {
+    if (a > b) { double t = a; a = b; b = t; }
+    if (b > c) { b = c; }
+    return a > b ? a : b;
+}
+
+static DWORD WINAPI roomCorrectionThread(LPVOID)
+{
+    tlog("[twinspeak] room corr    : measuring -- three blips out of the mains, the mic is listening\n");
+    const BOOL coHere = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context ctx;
+    bool ok = false;
+    double rtLow = 0.35, rtMid = 0.35, rtHi = 0.35;
+    if (ma_context_init(be, 1, nullptr, &ctx) == MA_SUCCESS) {
+        ma_device_id id; std::string nm;
+        if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.calibrateDv, &id, &nm)) {
+            tlog("[twinspeak] room corr    : calibrate_dv \"%s\" matched no capture device -- nothing changed\n"
+                 "                            (--list to see names; the key takes any substring of the mic's name)\n",
+                 g_cfg.calibrateDv.c_str());
+        } else {
+            tlog("[twinspeak] room corr    : mic \"%s\" -- recording ~3.4 s\n", nm.c_str());
+            ma_device_config mc = ma_device_config_init(ma_device_type_capture);
+            mc.sampleRate = kSampleRate;
+            mc.periodSizeInMilliseconds = 10;
+            mc.periods = 2;
+            mc.capture.pDeviceID = &id;
+            mc.capture.format = ma_format_f32;
+            mc.capture.channels = 2;              // the mic: plain stereo capture, engine-shared
+            mc.capture.shareMode = ma_share_mode_shared;
+            ma_device dev;
+            memset(&dev, 0, sizeof(dev));
+            if (ma_device_init(&ctx, &mc, &dev) == MA_SUCCESS && ma_device_start(&dev) == MA_SUCCESS) {
+                const size_t target = (size_t)((double)kSampleRate * 3.4);
+                std::vector<float> rec(2 * target, 0.0f);
+                size_t got = 0;
+                while (got < target && g_run.load(std::memory_order_relaxed)) {
+                    size_t want = target - got; if (want > 960) want = 960;
+                    if (ma_device_read(&dev, &rec[2 * got], (ma_uint32)want) != MA_SUCCESS) break;
+                    got += want;
+                }
+                ma_device_uninit(&dev);
+                tlog("[twinspeak] room corr    : captured %.2f s of mic signal\n", (double)got / (double)kSampleRate);
+                // ---- mono + envelope (attack-instant, 48 ms decay) ----
+                std::vector<float> env(got, 0.0f);
+                {
+                    const float a = (float)exp(-1.0 / (0.048 * (double)kSampleRate));
+                    float e = 0.0f;
+                    for (size_t i = 0; i < got; ++i) {
+                        const float m = 0.5f * (rec[2 * i] + rec[2 * i + 1]);
+                        const float v = m < 0.0f ? -m : m;
+                        e = v > e ? v : a * e;
+                        env[i] = e;
+                    }
+                }
+                // ---- onsets from the envelope, threshold cascade ----
+                const double thrTab[4] = { 0.05, 0.02, 0.01, 0.005 };
+                std::vector<size_t> on;
+                for (int ti = 0; ti < 4 && on.size() < 3; ++ti) {
+                    on.clear();
+                    const float thr = (float)thrTab[ti];
+                    for (size_t i = 1; i < got; ++i) {
+                        if (env[i] >= thr && env[i - 1] < thr) {
+                            if (!on.empty() && i - on.back() < (size_t)kSampleRate / 1000 * 60) continue;
+                            on.push_back(i);
+                            if (on.size() >= 3) break;
+                        }
+                    }
+                }
+                if (on.size() < 3) {
+                    tlog("[twinspeak] room corr    : fewer than three blips heard (mic too far? volume?) -- nothing changed\n");
+                } else {
+                    // ---- the RT60 per band: LSQ on each bandpassed tail ----
+                    const double bands[3] = { 150.0, 1000.0, 5000.0 };
+                    double rts[3] = { 0.35, 0.35, 0.35 };
+                    for (int bd = 0; bd < 3; ++bd) {
+                        // RBJ bandpass, Q 1.0
+                        const double f0 = bands[bd];
+                        const double w0 = kTwoPi * f0 / (double)kSampleRate;
+                        const double alpha = sin(w0) / 2.0;
+                        const double a0 = 1.0 + alpha;
+                        const double b0 = alpha, b1 = 0.0, b2 = -alpha;
+                        const double a1 = -2.0 * cos(w0), a2 = 1.0 - alpha;
+                        double r[3];
+                        for (int bi = 0; bi < 3; ++bi) {
+                            const size_t t0 = on[bi] + (size_t)((double)kSampleRate * 0.020);
+                            const size_t t1 = on[bi] + (size_t)((double)kSampleRate * 0.185);
+                            double z1 = 0.0, z2 = 0.0;   // transposed DF2
+                            std::vector<double> db;
+                            db.reserve(t1 - t0);
+                            for (size_t i = t0; i < t1 && i < got; ++i) {
+                                const double x = 0.5 * (rec[2 * i] + rec[2 * i + 1]);
+                                const double y = b0 / a0 * x + z1;
+                                z1 = b1 / a0 * x - a1 / a0 * y + z2;
+                                z2 = b2 / a0 * x - a2 / a0 * y;
+                                const double a = y < 0.0 ? -y : y;
+                                db.push_back(20.0 * log10(a > 1e-9 ? a : 1e-9));
+                            }
+                            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+                            const double n = (double)db.size();
+                            for (size_t j = 0; j < db.size(); ++j) {
+                                const double xj = (double)j;
+                                sx += xj; sy += db[j]; sxx += xj * xj; sxy += xj * db[j];
+                            }
+                            double slope = 0.0;
+                            const double den = n * sxx - sx * sx;
+                            if (fabs(den) > 1e-12) slope = (n * sxy - sx * sy) / den;
+                            double rt = -60.0 / slope;   // seconds (slope is dB/sample)
+                            if (!(rt > 0.0)) rt = 0.35;
+                            if (rt < 0.05) rt = 0.05;
+                            if (rt > 3.0)  rt = 3.0;
+                            r[bi] = rt;
+                        }
+                        rts[bd] = roomMedian3(r[0], r[1], r[2]);
+                    }
+                    rtLow = rts[0]; rtMid = rts[1]; rtHi = rts[2];
+                    // ---- the correction: cue scales vs the 0.35 s reference ----
+                    auto cue = [](double rt) {
+                        double s = 1.0 - 0.45 * (rt - 0.35) / 0.9;
+                        if (s < 0.55) s = 0.55;
+                        if (s > 1.25) s = 1.25;
+                        return s;
+                    };
+                    const double sLow = cue(rtLow), sMid = cue(rtMid), sHi = cue(rtHi);
+                    hrtfRoomApply(sLow, sMid, sHi);   // rebuilds from RAW geometry -- never cumulative
+                    ok = true;
+                    tlog("[twinspeak] room corr    : RT60  %.0f Hz %.2f s | %.0f Hz %.2f s | %.0f Hz %.2f s (median of 3 blips)\n"
+                         "                            cue scales  torso x%.2f  concha x%.2f  pinna x%.2f -- the kernels are\n"
+                         "                            re-weighted in memory (APPLY + RESTART restores; re-run rebuilds)\n",
+                         bands[0], rtLow, bands[1], rtMid, bands[2], rtHi, sLow, sMid, sHi);
+                    char st[160];
+                    snprintf(st, sizeof(st), "room correction: RT60 %.2f/%.2f/%.2f s -- HRTF corrected",
+                             rtLow, rtMid, rtHi);
+                    if (g_hwnd) guiSetStatus(nullptr, st);
+                }
+            } else {
+                tlog("[twinspeak] room corr    : the mic opened shared and FAILED -- nothing changed (in use?)\n");
+            }
+        }
+        ma_context_uninit(&ctx);
+    }
+    if (!ok && g_hwnd) guiSetStatus(nullptr, "room correction: no change (see log)");
+    if (coHere == S_OK || coHere == S_FALSE) CoUninitialize();
+    g_roomRun.store(false, std::memory_order_release);
+    return 0;
+}
+
+static void roomCorrectionStart()
+{
+    bool expect = false;
+    if (!g_roomRun.compare_exchange_strong(expect, true)) return;   // one run at a time
+    g_roomBlipIdx.store(0, std::memory_order_relaxed);
+    g_roomBlipOn.store(true, std::memory_order_release);   // leg1's device layer takes it from here
+    if (g_roomThread) { CloseHandle(g_roomThread); g_roomThread = nullptr; }
+    g_roomThread = CreateThread(nullptr, 0, roomCorrectionThread, nullptr, 0, nullptr);
 }
 
 static DWORD WINAPI guiEngineThread(LPVOID) {
@@ -10873,6 +11585,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v8.5.1: surround bass restore coefficients (ini: surround_bass*)
     surroundBassInit();
 
+    // v10.0.0: the real HRTF kernels -- every fold position's pair, unit-DC,
+    // raw geometry (the room correction rebuilds the weights from these).
+    hrtfInit();
+
     // v9.1.1: the virtual center's coefficients (the synthesized 0-degree
     // HRTF kernel + the XTC branch's highpass) -- no ini keys; the chain
     // arms itself whenever the center fold runs (leg2 empty).
@@ -10886,6 +11602,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         if (cg < 0.0f) cg = 0.0f;
         if (cg > 1.0f) cg = 1.0f;
         g_chimeBuf = renderChime(2093.00, 42.0, 3135.97, 72.0, 20.0, cg);
+        // v10.0.0: the room correction's three full-scale blips (the last
+        // ends 1.70 s in -- all three inside the field's 2 s). Rendered once,
+        // armed by the ROOM CORRECTION button only.
+        g_roomBlipBuf = renderRoomBlips();
+        g_roomBlipOn.store(false, std::memory_order_relaxed);
+        g_roomBlipIdx.store(0, std::memory_order_relaxed);
     }
 
     ma_backend be[] = { ma_backend_wasapi };
@@ -10994,7 +11716,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.outCh = (i == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
         L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3 : std::string();
         if (L.disabled) continue;                 // v8.4.0: no ring, no scratch (v8.4.11: leg4 always disabled)
-        L.scratch.assign((size_t)kInCh * kScratchFrames, 0.0f);
+        // v10.0.0: the scratch sizing moved BELOW the capture open -- it
+        // needs the NEGOTIATED width (g_inCh), not the base map's.
     }
 
     // v3: legs go exclusive TOGETHER or shared TOGETHER. v2 let one leg win
@@ -11108,6 +11831,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // the rings (the ring floor needs the REAL negotiated burst). Exclusive
     // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
     // WaveCyclic/busy and falls back to shared (banner reports the winner).
+    // v10.0.0 THE NEGOTIATED CAPTURE WIDTH: the cable's own channel count is
+    // the engine's now. Exclusive tries 16ch first, then 8 (VAC's exclusive
+    // pin carries EXACTLY the cable's configured count -- one of the two
+    // lands bit-direct); the shared fallback PROBES the endpoint's mix format
+    // (GetMixFormat) and requests exactly that count, so no converter can
+    // exist anywhere in the capture. g_inCh owns the width from here on; the
+    // watchdog reopen holds it (a width change wants APPLY + RESTART).
     ma_device_config cc = ma_device_config_init(ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = capPeriodMs;
@@ -11115,26 +11845,89 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     cc.dataCallback = capCallback;
     cc.capture.pDeviceID = &capId;
     cc.capture.format = ma_format_f32;
-    cc.capture.channels = kInCh;
     cc.capture.shareMode = g_cfg.captureExclusive ? ma_share_mode_exclusive
                                                   : ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     memset(&g_capDev, 0, sizeof(g_capDev));   // v3.8: g_capDev is file-scope (watchdog)
     bool capExclusive = false;
-    ma_result cr = ma_device_init(&ctx, &cc, &g_capDev);
-    if (cr == MA_SUCCESS) {
-        capExclusive = (cc.capture.shareMode == ma_share_mode_exclusive);
-        g_capIsExcl  = capExclusive;
-    } else if (g_cfg.captureExclusive) {
-        tlog( "[twinspeak] capture EXCLUSIVE refused (%s) -- falling back to shared\n",
-                ma_result_description(cr));
+    int  capChans = 0;
+    ma_result cr = MA_SUCCESS;
+    if (g_cfg.captureExclusive) {
+        // the exclusive ladder: the cable's configured width, bit-direct
+        static const int kTryCh[2] = { 16, 8 };
+        for (int ti = 0; ti < 2 && cr != MA_SUCCESS; ++ti) {
+            cc.capture.channels = (ma_uint32)kTryCh[ti];
+            cr = ma_device_init(&ctx, &cc, &g_capDev);
+            if (cr == MA_SUCCESS) capChans = kTryCh[ti];
+        }
+        if (cr != MA_SUCCESS) {
+            tlog( "[twinspeak] capture EXCLUSIVE refused (%s) -- falling back to shared\n",
+                    ma_result_description(cr));
+        } else {
+            capExclusive = true;
+            g_capIsExcl  = true;
+        }
+    }
+    if (cr != MA_SUCCESS) {
+        // shared: probe the endpoint's own mix format and BE it (no converter)
+        const int mixCh = probeCaptureMixChans(capId.wasapi);
+        if (mixCh == 16 || mixCh == 8) cc.capture.channels = (ma_uint32)mixCh;
+        else {
+            cc.capture.channels = (ma_uint32)kInCh;   // probe failed: the base request
+            tlog( "[twinspeak] capture probe  : mix format unreadable (%dch reported) -- requesting %dch\n",
+                    mixCh, (int)kInCh);
+        }
         cc.capture.shareMode = ma_share_mode_shared;
         cr = ma_device_init(&ctx, &cc, &g_capDev);
+        if (cr == MA_SUCCESS) {
+            capChans = (int)cc.capture.channels;
+            capExclusive = false;
+            g_capIsExcl  = false;
+        }
     }
     if (cr != MA_SUCCESS) {
         tlog( "[twinspeak] capture init failed: %s\n", ma_result_description(cr));
         return 1;
     }
+    // ---- the width publish: everything downstream reads g_inCh from here ----
+    g_inCh     = (capChans == 16) ? 16 : kInCh;   // anything unexpected = the base map
+    g_heightOn = (g_inCh == 16);
+    if (g_heightOn)
+        tlog("[twinspeak] capture width : 16ch -- the HEIGHT LANES (ch9-16, TFL TFR TFC TSL TSR\n"
+             "                            TRL TRR TBC) arm: real HRTF on the surround fold and the\n"
+             "                            top-of-the-head elevation kernels on every height lane\n");
+    else if (capChans != 8)
+        tlog("[twinspeak] capture width : %dch negotiated, treated as the base 8ch map (the height\n"
+             "                            layer needs the cable set to 16 -- the VAC control panel's\n"
+             "                            max channels, then the format's)\n", capChans);
+    // the per-leg scratch, sized by the REAL width now
+    for (int i = 0; i < 4; ++i)
+        if (!g_leg[i].disabled)
+            g_leg[i].scratch.assign((size_t)g_inCh * kScratchFrames, 0.0f);
+    // THE FIRST MASK, PREBUILT (v10.0.0): the v8.4.23 rows with the v9.1.x
+    // open conditions folded in (same values, one read per lane per frame),
+    // the height rows open only on a 16ch capture. An 8ch cable = the exact
+    // v9.1.8 mask rows.
+    memset(g_legMask, 0, sizeof(g_legMask));
+    g_legMask[0][0] = 1; g_legMask[0][1] = 1; g_legMask[0][3] = 1;   // leg1: ch1 ch2 + ch4 (the LFE fold)
+    g_legMask[1][2] = 1;                                              // leg2: ch3
+    g_legMask[2][4] = g_legMask[2][5] = g_legMask[2][6] = g_legMask[2][7] = 1;   // leg3: ch5-ch8
+    if (g_centerFold) g_legMask[0][2] = 1;         // v8.4.26: the center fold's lane
+    g_legMask[0][4] = g_legMask[0][5] = 1;         // v9.1.0: the sides feed leg1 in BOTH cases
+    if (g_rearFold) { g_legMask[0][6] = 1; g_legMask[0][7] = 1; }   // the 0.51 ms comb fold, empty leg3
+    if (g_lfeFoldLeg == 1) g_legMask[1][3] = 1;    // v9.1.4: leg4's LFE fold onto leg2
+    if (g_lfeFoldLeg == 2) g_legMask[2][3] = 1;    // v9.1.4: ... onto leg3
+    if (g_heightOn) {
+        g_legMask[0][kTflCh] = 1; g_legMask[0][kTfrCh] = 1;   // TFL TFR: the mains
+        g_legMask[0][kTfcCh] = 1; g_legMask[0][kTbcCh] = 1;   // TFC TBC: the mains at gain_center
+        g_legMask[0][kTslCh] = 1; g_legMask[0][kTsrCh] = 1;   // TSL TSR: the mains' split...
+        g_legMask[2][kTslCh] = 1; g_legMask[2][kTsrCh] = 1;   // ...and the rear device's
+        g_legMask[2][kTrlCh] = 1; g_legMask[2][kTrrCh] = 1;   // TRL TRR: the rear device
+        if (g_rearFold) {
+            g_legMask[0][kTrlCh] = 1; g_legMask[0][kTrrCh] = 1;   // the rear fold carries the height rears too
+        }
+    }
+    if (g_heightOn) hrtfFlushMains(), hrtfFlushRears();   // a fresh run starts the lanes cold
 
     // v4.0: the REAL negotiated device period per leg feeds the ring floor
     // and the gated-drop line. v9.0.1: WASAPI only -- the constant request
@@ -11172,7 +11965,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // (period 96 fr x2) that is 192 fr = 4.0 ms. The depth guard holds
         // the ring at delay + this; margin 0 is the DAC reading silence.
         L.anchorFrames = devPeriodFr * 2;
-        L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 150), kInCh);
+        L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 150), (size_t)g_inCh);   // v10.0.0: the negotiated width
         L.raw.pushSilence(L.delayFrames);   // the delay: bit-exact, seq-less
         L.prefillRemaining = L.delayFrames; // v6.4 lineage: prefill carries no sequence
         // v9.0.1: lastBlock/lastN/haveLast stay inert (the KS lapse guard's
@@ -11487,8 +12280,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
-    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
-           capName.c_str(), kSampleRate,
+    tlog("[twinspeak] capture        : \"%s\"  %uch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
+           capName.c_str(), (unsigned)g_inCh, kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
            g_capPeriodFrames * 1000.0 / kSampleRate);
     if (!capExclusive && g_cfg.captureExclusive)
