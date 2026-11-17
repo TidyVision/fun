@@ -2913,7 +2913,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "10.1.0"
+#define TWS_VERSION "10.0.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -2975,15 +2975,6 @@ static constexpr unsigned kSampleRate    = 48000;
 // nudge beneath it, so a correction is a rare 5 ms event, not ten skips
 // a second; between bites the offset rides at most ~5 ms of true drift.
 static constexpr unsigned kSyncNudgeMs    = 100;    // the depth guard's look window (one look per 100 ms)
-// v10.1.0 THE 1 ms CAPTURE POLL: the capPump's tick. The capture event is
-// still armed (exclusive mode fires it; close() SetEvents it to wake the
-// join), but the pump never WAITS on it -- it sleeps at most kCapPollMs
-// and drains whatever IAudioCaptureClient holds, every millisecond. A
-// missed/late/batched event (the loopback-event pathology) costs at most
-// one tick of pickup, never a period. main() holds timeBeginPeriod(1) for
-// the whole run, so the 1 ms sleep IS ~1 ms (it always did -- the pump
-// just never used a short sleep before).
-static constexpr DWORD kCapPollMs = 1;
 static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.20: the servo's startup hush past the last (re)open
 static constexpr int      kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be the reference
 static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
@@ -3518,42 +3509,11 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
                     // exclusive event mode requires periodicity == duration
                     // (AUDCLNT_E_INVALID_DEVICE_PERIOD otherwise); shared
                     // mode ignores the periodicity argument entirely.
-                    REFERENCE_TIME per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE)
-                                       ? dur : 0;
-                    // v10.1.0 THE ALIGNMENT LADDER: exclusive + a small
-                    // request -> AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED -- the
-                    // HD-audio "alignment dance". Without this ladder the
-                    // 1 ms request silently bounced to shared on alignment-
-                    // picky drivers, and shared WAS the 10 ms.
-                    HRESULT hrInit = E_FAIL;
-                    if (d.ev)
-                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                  dur, per, wf, nullptr);
-                    if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
-                        // MSDN's five-step dance, verbatim: GetBufferSize on
-                        // the FAILED client returns the next-highest-aligned
-                        // size in frames; convert to hns, release, re-
-                        // Activate, Initialize once more with dur == per.
-                        // (The aligned size does NOT ride in the HRESULT --
-                        // the upper bits are the facility, not a period.)
-                        UINT32 nAlign = 0;
-                        if (SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
-                            dur = (REFERENCE_TIME)((10000.0 * 1000 /
-                                                    (double)wf->nSamplesPerSec * nAlign) + 0.5);
-                            per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) ? dur : 0;
-                            d.ac->Release(); d.ac = nullptr;
-                            if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL,
-                                                        nullptr, (void**)&d.ac)) && d.ac) {
-                                hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                          dur, per, wf, nullptr);
-                            } else {
-                                d.ac = nullptr;   // the chain below sees !d.ac and falls to cleanup
-                                hrInit = E_FAIL;
-                            }
-                        }
-                    }
-                    if (d.ev && d.ac &&
-                        SUCCEEDED(hrInit) &&
+                    const REFERENCE_TIME per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE)
+                                             ? dur : 0;
+                    if (d.ev &&
+                        SUCCEEDED(d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                   dur, per, wf, nullptr)) &&
                         SUCCEEDED(d.ac->SetEventHandle(d.ev)) &&
                         SUCCEEDED(d.ac->GetBufferSize(&d.bufFrames))) {
                         if (cap) {
@@ -4369,29 +4329,14 @@ static void capCallback(const float* pInput, unsigned frameCount) {
     }
 }
 
-// v10.1.0 the capture pump: THE 1 ms POLL (field-directed: "a constant 1ms
-// poll running as fast as it can to grab out raw audio frames"). The event
-// handle is still registered with the client (exclusive mode requires one;
-// close() SetEvents it to wake the join), but the loop no longer WAITS on
-// it -- WaitForSingleObject(ev, kCapPollMs) doubles as the tick: signalled
-// = drain (returns immediately), quiet = at most 1 ms of sleep, then drain
-// whatever IAudioCaptureClient holds anyway (GetNextPacketSize is the
-// truth, the event is only a hint). A late or batched event -- the classic
-// loopback pathology -- costs one tick of pickup, never a period; a quiet
-// shared-mode engine costs one GetNextPacketSize call per ms (~single
-// microseconds, audiodg never sees it). The 2 s watchdog timeout survives
-// as the heartbeat's backstop: no frames and no event for 2 s still reads
-// as silence (the health loop reopens on a stale g_hbCap, not on the wait).
+// v10.0.0 the capture pump: wait the event, drain whatever the client holds
+// (one packet or a burst -- same fan-out either way), repeat. The device
+// thread IS this loop; the callback above is the body.
 static void capPump(Dev& d) {
     boostDeviceThread();
     static float zeros[2048 * kInCh];   // SILENT-flag packets: bit-zero frames
     while (d.run.load(std::memory_order_relaxed)) {
-        // v10.1.0: poll, not wait. Returns: WAIT_OBJECT_0 (event fired --
-        // drain now), WAIT_TIMEOUT (1 ms passed -- drain anyway), or the
-        // 2 s backstop (nothing at all for 2 s -- still drain; a silent
-        // engine is not an error state, and capCallback heartbeats only on
-        // real frames, which is exactly what the watchdog watches).
-        WaitForSingleObject(d.ev, kCapPollMs);
+        if (WaitForSingleObject(d.ev, 2000) != WAIT_OBJECT_0) continue;
         BYTE* data = nullptr; UINT32 n = 0; DWORD flags = 0;
         // drain every packet the event made available
         while (d.capc && SUCCEEDED(d.capc->GetNextPacketSize(&n)) && n > 0) {
@@ -6860,10 +6805,9 @@ static bool tryRestartCap() {
     std::wstring id; std::string nm;
     if (!pickDevice(false, g_capNeedle, &id, &nm)) return false;
     bool gotExcl = false;
-    // v10.1.0: the fixed 1 ms capture request (48 fr), in frames -- the
-    // watchdog reopens land on the same 1 ms poll the boot open used
+    // the fixed 4 ms capture request (v8.1.0), in frames
     if (!openDev(g_capDev, id.c_str(), true, kInCh,
-                 (unsigned)(kSampleRate / 1000 * 1), g_capWantExcl, gotExcl))
+                 (unsigned)(kSampleRate / 1000 * 4), g_capWantExcl, gotExcl))
         return false;
     g_capIsExcl = gotExcl;
     if (!startDev(g_capDev, -1)) return false;
@@ -11267,7 +11211,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // request (the field's engine period) and nothing consumes burst math
     // anymore. v9.0.1: out1ms/out2ms are retired -- kOutPeriodFrames (128
     // fr, the CONSTANT bite) is every leg's request.
-    const unsigned capPeriodMs = 1;       // v10.1.0: the 1 ms request (48 fr) -- was 4 (v8.1.0). No cap_ms.
+    const unsigned capPeriodMs = 4;       // v8.1.0: fixed request, no cap_ms
     g_capNeedle    = g_cfg.inputDevice;
     g_capWantExcl  = g_cfg.captureExclusive;
 
@@ -11755,8 +11699,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] v%s         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n",
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
-    tlog("[twinspeak] backend        : WASAPI (raw, v10.1.0 -- 1 ms capture POLL, exclusive-first, no miniaudio)\n");
-    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (1 ms poll, v10.1.0 -- request 48 fr)\n",
+    tlog("[twinspeak] backend        : WASAPI (raw, v10.0.0 -- event mode, exclusive-first, no miniaudio)\n");
+    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
            g_capPeriodFrames * 1000.0 / kSampleRate);
