@@ -3039,7 +3039,7 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // is constant, the anchor/ring math (2 x the negotiated period) follows
 // the real number as before.
 static constexpr unsigned kOutPeriodFrames   = 192;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
-static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 256 fr (~8.0 ms)
+static constexpr unsigned kOutPeriods        = 3;    // the exclusive buffer: 192 fr (~8.0 ms)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
