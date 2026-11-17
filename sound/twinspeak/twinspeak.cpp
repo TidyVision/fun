@@ -1,4 +1,4 @@
-// v10.0.0: the Windows link set, carried by the source so a bare cl.exe line
+// v8.4.11: the Windows link set, carried by the source so a bare cl.exe line
 // needs no .vcxproj (field-directed compile command):
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -15,17 +15,11 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "comdlg32.lib")   // v9.1.5: GetSaveFileNameA -- the diagnosis log's save dialog
+#pragma comment(lib, "Avrt.lib")
 
 // ============================================================================
-//  twinspeak v10.0.0 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
+//  twinspeak v8.4.11 -- ASIO-STRICT bit-exact engine (no resampler anywhere)
 //
-//  v10.0.0: RAW WASAPI (the miniaudio layer is removed whole -- one ~150-line
-//  device layer talks to IAudioClient directly, event mode, exclusive-first)
-//  and NO MMCSS/Avrt registration anywhere (the v9.1.9 "Pro Audio Priority"
-//  jank is gone; REALTIME process class + TIME_CRITICAL threads only). The
-//  engine pins itself to EVERY LOGICAL CORE at start (the VAC control-panel
-//  trick: no core is ever left for the scheduler to park a device thread
-//  away from).
 //  MISSION: one 8ch shared capture of a VAC cable fans out (memcpy only) into
 //  independent per-leg pipelines -- leg1 = Realtek FL/FR + LFE fold (5.1),
 //  leg2 = Adesso Xtream S5 (center-only), leg3 = THE REARS ON ONE DEVICE
@@ -70,24 +64,6 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v10.0.0 RAW WASAPI + ALL CORES. (1) THE MINIAUDIO LAYER IS REMOVED
-//            WHOLE: one ~150-line device layer (struct Dev / openDev /
-//            startDev / capPump / legPump) talks to IAudioClient directly --
-//            event mode, WAVEFORMATEXTENSIBLE f32 @ 48k, exclusive-first
-//            with shared fallback inside a single openDev call, one pump
-//            thread per device running the SAME callbacks (capCallback /
-//            playCore + sumLegExtras). Enumeration, --list and the GUI
-//            pickers ride a raw IMMDeviceEnumerator walk (enumEndpoints /
-//            pickDevice); the ma_context/ma_device plumbing, the four
-//            playCallbackN dispatchers and every share-mode retry ladder at
-//            the call sites are gone. (2) NO MMCSS ANYWHERE: the v9.1.9
-//            Avrt "Pro Audio" registration (and its sub-priority ladder) is
-//            removed per the field -- REALTIME process class + TIME_CRITICAL
-//            threads + FTZ/DAZ is the whole boost story now. (3) RUN ON ALL
-//            CORES: at engine start the process affinity mask is set to
-//            EVERY logical processor the system exposes (the VAC
-//            control-panel trick) -- the scheduler balances freely and no
-//            core is ever parked away from the engine.
 //    v9.1.9 (THIS WAS WRITTEN BY THE REAL TIDYVISION THIS TIME) MCCSS Pro Audio Priority Support
 //    v9.1.8 THE BOOT CHIME WAITS FOR A WORKING DEVICE (field-directed:
 //            "But I still don't hear the chime, even with enable_chime.
@@ -2884,6 +2860,23 @@
 //  Fixed 48 kHz (the cable's rate). Build: bash build.sh  (zig c++, WASAPI).
 // ============================================================================
 
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "propsys.lib")
+
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 #include <windows.h>
 #include <commctrl.h>       // v6.6.0: trackbars for the GUI
 #include <shellapi.h>       // v6.6.1: Shell_NotifyIcon -- the tray icon
@@ -2909,15 +2902,16 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstdarg>
+#include <objbase.h>
+#include <avrt.h>
 
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "10.2.1"
+#define TWS_VERSION "9.1.9"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
-#include <audioclient.h>   // v10.0.1: IAudioClient/IAudioCaptureClient/IAudioRenderClient (miniaudio used to pull this in)
 #include <audiopolicy.h>    // v6.5.16: IAudioSessionManager2/Enumerator (yield re-grab guard)
 #include <endpointvolume.h>
 #include <xmmintrin.h>     // v6.5: FTZ (SSE flush-to-zero)
@@ -2975,15 +2969,6 @@ static constexpr unsigned kSampleRate    = 48000;
 // nudge beneath it, so a correction is a rare 5 ms event, not ten skips
 // a second; between bites the offset rides at most ~5 ms of true drift.
 static constexpr unsigned kSyncNudgeMs    = 100;    // the depth guard's look window (one look per 100 ms)
-// v10.1.0 THE 1 ms CAPTURE POLL: the capPump's tick. The capture event is
-// still armed (exclusive mode fires it; close() SetEvents it to wake the
-// join), but the pump never WAITS on it -- it sleeps at most kCapPollMs
-// and drains whatever IAudioCaptureClient holds, every millisecond. A
-// missed/late/batched event (the loopback-event pathology) costs at most
-// one tick of pickup, never a period. main() holds timeBeginPeriod(1) for
-// the whole run, so the 1 ms sleep IS ~1 ms (it always did -- the pump
-// just never used a short sleep before).
-static constexpr DWORD kCapPollMs = 1;
 static constexpr unsigned kSyncSettleMs   = 2000;   // v8.4.20: the servo's startup hush past the last (re)open
 static constexpr int      kSyncRefDeadMs  = 1000;   // leg1's heartbeat must be this fresh to be the reference
 static constexpr int      kDriftCorrectFr  = 240;  // 5 ms @ 48 kHz (the shipped ini's drift_correct_ms) -- the ONLY bite
@@ -3382,375 +3367,6 @@ struct Ring {
     }
 };
 
-// fwd: defined just below (the layer moved above Leg; these live on)
-static void boostAudioThread();
-static void boostDeviceThread();
-
-// GUIDs spelled out: zig c++ (GNU mode) has no reliable __uuidof.
-static const CLSID kCLSID_MMDeviceEnumerator =
-    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
-static const IID kIID_IMMDeviceEnumerator =
-    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
-static const IID kIID_IAudioEndpointVolume =
-    { 0x5CDF2C82, 0x841E, 0x4546, { 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A } };
-// v10.0.0: the raw device layer's three -- IAudioClient, and its two
-// service interfaces (same spelled-out discipline as the rest).
-static const IID kIID_IAudioClient =
-    { 0x1CB9AD4C, 0xDBFA, 0x4c32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
-static const IID kIID_IAudioCaptureClient =
-    { 0xC8ADBD64, 0xE71E, 0x48a0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
-static const IID kIID_IAudioRenderClient =
-    { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
-static const PROPERTYKEY kPKEY_Device_FriendlyName =
-    { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
-// v6.5.16: yield re-grab guard -- active-session probe on a leg endpoint.
-// (Only IAudioSessionManager2's IID is needed: dev->Activate() takes an IID;
-// the enumerator/control objects come back from plain method calls.)
-static const IID kIID_IAudioSessionManager2 =
-    { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
-// v8.4.24 THE STREAM WINDOW: IAudioSessionControl2 (pid per session) --
-// the app-level visibility the phantom hunt needed: the sessions audiodg
-// is mixing into the cable are listed on the health tick, so an L+R mono
-// ghost in ch3 can be traced to the exact streams that produced it.
-static const IID kIID_IAudioSessionControl2 =
-    { 0x26E49CDA, 0x24B9, 0x4B03, { 0x8F, 0x60, 0x6C, 0x10, 0xA8, 0x18, 0xED, 0xA9 } };
-
-// ============================================================================
-// v10.0.0 THE RAW WASAPI LAYER -- the whole miniaudio replacement, in one
-// place. Event-driven IAudioClient, exclusive-first with shared fallback,
-// f32 @ 48 kHz, no format conversion, no resampler, no ring buffer of our
-// own (the engine's rings are the buffering). A device is: open it, get the
-// event handle, Start(), and pump whole periods in/out when the event
-// fires. That is all miniaudio did for us; that is all this does.
-// ============================================================================
-struct Dev {
-    IAudioClient*       ac     = nullptr;   // the client (event mode, started)
-    IAudioCaptureClient* capc  = nullptr;   // capture only
-    IAudioRenderClient*  rc    = nullptr;   // render only
-    HANDLE              ev     = nullptr;   // the event that paces the pump
-    HANDLE              thread = nullptr;   // the pump thread
-    std::atomic<bool>   run{false};         // the pump's stop flag
-    unsigned            period = 0;         // the negotiated period (frames)
-    unsigned            bufFrames = 0;      // the negotiated buffer (frames)
-    bool                excl = false;       // what Initialize actually got
-    bool                started = false;    // Start() landed
-
-    void close() {
-        // stop the pump FIRST and wait for it: the pump holds raw pointers
-        // into this Dev; once it is gone the client can be stopped and
-        // released safely (the pump's own waits are 2 s-bounded, so this
-        // join always returns).
-        if (thread) {
-            run.store(false, std::memory_order_relaxed);
-            SetEvent(ev);
-            WaitForSingleObject(thread, INFINITE);
-            CloseHandle(thread);
-            thread = nullptr;
-        }
-        if (ac) { if (started) ac->Stop(); ac->Release(); ac = nullptr; }
-        if (capc) { capc->Release(); capc = nullptr; }
-        if (rc)   { rc->Release();   rc   = nullptr; }
-        if (ev) { CloseHandle(ev); ev = nullptr; }
-        started = false;
-        period = bufFrames = 0;
-    }
-    bool good() const { return ac != nullptr; }
-};
-
-// the render pump: wait the event, write one period, repeat. Exclusive mode
-// paces one buffer per event; shared mode fires per period -- either way we
-// ask the client how much room it has and fill exactly that, never more.
-struct DevJob {
-    Dev*  d;
-    int   idx;     // -1 = capture, else the leg index
-};
-static void capPump(Dev& d);
-static void legPump(Dev& d, int idx);
-// fwd: the pump bodies live below with the callbacks they call
-static void playCore(int idx, float* out, unsigned frameCount);
-static void sumLegExtras(int idx, float* out, unsigned frameCount);
-static DWORD WINAPI devPumpThread(LPVOID p) {
-    DevJob* j = (DevJob*)p;
-    if (j->idx < 0) capPump(*j->d); else legPump(*j->d, j->idx);
-    delete j;
-    return 0;
-}
-
-// v10.2.0 name the refusal -- an HRESULT nobody prints is a diagnosis
-// nobody can do (the field's "capture EXCLUSIVE refused" line guessed at
-// causes for two releases). House style: plain compares, no table magic.
-static const char* hresultName(HRESULT hr) {
-    switch (hr) {
-    case AUDCLNT_E_UNSUPPORTED_FORMAT:        return "UNSUPPORTED_FORMAT (the pin will not take this format)";
-    case AUDCLNT_E_DEVICE_IN_USE:             return "DEVICE_IN_USE (another app holds the pin)";
-    case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED:return "EXCLUSIVE_MODE_NOT_ALLOWED (the endpoint forbids it)";
-    case AUDCLNT_E_INVALID_DEVICE_PERIOD:     return "INVALID_DEVICE_PERIOD (under the driver's minimum)";
-    case AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED:   return "BUFFER_SIZE_NOT_ALIGNED (alignment dance handles this)";
-    case AUDCLNT_E_INVALID_SIZE:              return "INVALID_SIZE (format contradicts itself / bad size)";
-    case AUDCLNT_E_ENDPOINT_CREATE_FAILED:    return "ENDPOINT_CREATE_FAILED";
-    case AUDCLNT_E_SERVICE_NOT_RUNNING:       return "SERVICE_NOT_RUNNING";
-    case E_ACCESSDENIED:                      return "ACCESS_DENIED (policy: exclusive disabled system-wide)";
-    default:                                  return "unknown";
-    }
-}
-// v10.2.0 the device's OWN pin format, miniaudio's first exclusive
-// candidate: PKEY_AudioEngine_DeviceFormat from the endpoint's property
-// store. Shared mode converts whatever you send; exclusive hands YOUR
-// format to the pin raw -- asking for the pin's native format first is how
-// miniaudio gets exclusive open at all on picky drivers.
-static const PROPERTYKEY kPKEY_AudioEngine_DeviceFormat =
-    { { 0xF19F064D, 0x082C, 0x4E27, { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } }, 0 };
-
-// open ONE endpoint by id string. cap = capture side; ch = channels (8 in,
-// 2 out); periodFrames = the request (the driver's alignment pass keeps the
-// final word). wantExcl tries AUDCLNT_SHAREMODE_EXCLUSIVE first and falls
-// back to shared when it is refused (the legacy behavior, kept: exclusive
-// TOGETHER or shared TOGETHER is the caller's business).
-static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
-                    unsigned periodFrames, bool wantExcl, bool& gotExcl,
-                    const char** whyOut = nullptr, HRESULT* hrOut = nullptr) {
-    // v10.2.0 the exclusive attempt's story, for the caller to print
-    const char* exclWhy = "never attempted";
-    HRESULT     exclHr  = S_OK;
-    IMMDeviceEnumerator* en = nullptr;
-    IMMDevice* dev = nullptr;
-    // v10.0.0: WAVEFORMATEXTENSIBLE -- an 8ch f32 capture is only expressible
-    // in the extensible form (plain WAVEFORMATEX tops out at 2ch), and the
-    // stereo legs take the same struct happily (KSDATAFORMAT_SUBTYPE_IEEE_FLOAT).
-    WAVEFORMATEXTENSIBLE wfx;
-    memset(&wfx, 0, sizeof(wfx));
-    wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    wfx.Format.nChannels = (WORD)ch;
-    wfx.Format.nSamplesPerSec = kSampleRate;
-    wfx.Format.wBitsPerSample = 32;
-    wfx.Format.nBlockAlign = (WORD)(ch * 4);
-    wfx.Format.nAvgBytesPerSec = kSampleRate * wfx.Format.nBlockAlign;
-    wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    wfx.Samples.wValidBitsPerSample = 32;
-    // v10.2.0 THE MASK LIE, FIXED: 0x3F has SIX bits (FL FR FC LFE BL BR --
-    // "5.1") while nChannels says 8. Shared mode shrugged (audiodg
-    // converts anything); EXCLUSIVE does not -- the pin gets the format
-    // raw and a self-contradictory one is refused. The VAC cable's real
-    // order (L R C LFE SL SR RL RR) is KSAUDIO_SPEAKER_7POINT1_SURROUND.
-    wfx.dwChannelMask = (ch >= 8) ? 0x0000063F /* KSAUDIO_SPEAKER_7POINT1_SURROUND (8 bits set) */
-                        : (ch == 2) ? 0x00000003 /* STEREO */ : 0;
-    static const GUID kSubIeeeFloat =
-        { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
-    wfx.SubFormat = kSubIeeeFloat;
-    WAVEFORMATEX* wf = &wfx.Format;
-    REFERENCE_TIME dur = (REFERENCE_TIME)((double)periodFrames * kOutPeriods * 1e7 / (double)kSampleRate);
-    const AUDCLNT_SHAREMODE tryMode[2] = { wantExcl ? AUDCLNT_SHAREMODE_EXCLUSIVE : AUDCLNT_SHAREMODE_SHARED,
-                                           AUDCLNT_SHAREMODE_SHARED };
-    const int nTry = wantExcl ? 2 : 1;
-    for (int t = 0; t < nTry; ++t) {
-        bool ok = false;
-        if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
-                                       kIID_IMMDeviceEnumerator, (void**)&en)) && en) {
-            if (SUCCEEDED(en->GetDevice(idStr, &dev)) && dev) {
-                if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&d.ac)) && d.ac) {
-                    d.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                    // exclusive event mode requires periodicity == duration
-                    // (AUDCLNT_E_INVALID_DEVICE_PERIOD otherwise); shared
-                    // mode ignores the periodicity argument entirely.
-                    REFERENCE_TIME per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE)
-                                       ? dur : 0;
-                    // v10.2.0 THE EXCLUSIVE LADDER, after miniaudio: the
-                    // period request first rides a doubling ladder past the
-                    // driver's minimum, then the ALIGN dance, and the
-                    // FORMAT itself is tried twice -- the device's own pin
-                    // format (PKEY probe, miniaudio's first candidate)
-                    // before ours (with the v10.2.0 fixed mask). Every
-                    // refusal is named in the log; nothing bounces to
-                    // shared silently any more.
-                    WAVEFORMATEX* tryWf = wf;   // ours first (fixed mask);
-                                                // the PKEY probe may replace it
-                    // the pin format COPY lives here: the property-store
-                    // blob dies at PropVariantClear below, and tryWf stays
-                    // in Initialize calls after that -- never point at the
-                    // blob itself (v10.2.0 self-review: use-after-free).
-                    WAVEFORMATEXTENSIBLE pinWf;
-                    if (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) {
-                        // miniaudio's probe: the endpoint's own format
-                        IPropertyStore* ps = nullptr;
-                        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
-                            PROPVARIANT var; PropVariantInit(&var);
-                            if (SUCCEEDED(ps->GetValue(kPKEY_AudioEngine_DeviceFormat, &var))
-                                && var.vt == VT_BLOB && var.blob.pBlobData) {
-                                WAVEFORMATEX* pf = (WAVEFORMATEX*)var.blob.pBlobData;
-                                // the pin's own format, but ONLY if it fits
-                                // our stream shape (channel count matches;
-                                // the engine is f32 @ 48 kHz end to end and
-                                // does no conversion -- a 44.1 kHz pin or a
-                                // different channel count is not ours to
-                                // ride, miniaudio would convert, we must
-                                // not). Same rule both sides: 8 in, 2 out.
-                                if (pf->nChannels == (WORD)ch
-                                    && pf->nSamplesPerSec == kSampleRate
-                                    && (pf->wBitsPerSample == 32 || pf->wBitsPerSample == 0)) {
-                                    WAVEFORMATEX* closest = nullptr;
-                                    if (SUCCEEDED(d.ac->IsFormatSupported(
-                                            AUDCLNT_SHAREMODE_EXCLUSIVE, pf, &closest))) {
-                                        if (closest) CoTaskMemFree(closest);
-                                        // copy the WHOLE extensible struct
-                                        // (cbSize-guarded) onto the stack;
-                                        // tryWf points at the copy
-                                        WORD extra = pf->wFormatTag == WAVE_FORMAT_EXTENSIBLE
-                                                   ? (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
-                                                   : 0;
-                                        memset(&pinWf, 0, sizeof(pinWf));
-                                        memcpy(&pinWf, pf, sizeof(WAVEFORMATEX) + extra);
-                                        tryWf = (WAVEFORMATEX*)&pinWf;   // THE PIN'S OWN FORMAT (copied)
-                                        exclWhy = "device pin format (PKEY) accepted";
-                                    } else {
-                                        exclWhy = "device pin format (PKEY) refused -- trying ours";
-                                    }
-                                } else {
-                                    exclWhy = "pin format shape mismatch (ch/rate) -- trying ours";
-                                }
-                            }
-                            PropVariantClear(&var);
-                            ps->Release();
-                        }
-                    }
-                    // v10.1.0 THE ALIGNMENT LADDER, kept: exclusive + a
-                    // small request -> AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED --
-                    // the HD-audio "alignment dance".
-                    HRESULT hrInit = E_FAIL;
-                    if (d.ev)
-                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                  dur, per, tryWf, nullptr);
-                    // v10.2.0 THE PERIOD LADDER (miniaudio's): exclusive
-                    // enforces a driver minimum on hnsPeriodicity; doubling
-                    // until it accepts beats falling to shared's 10 ms.
-                    while (hrInit == AUDCLNT_E_INVALID_DEVICE_PERIOD && d.ac
-                           && dur < 500 * 10000) {
-                        dur *= 2;
-                        per = dur;
-                        exclWhy = "INVALID_DEVICE_PERIOD -- period doubled, retrying";
-                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                  dur, per, tryWf, nullptr);
-                    }
-                    if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
-                        // MSDN's five-step dance, verbatim: GetBufferSize on
-                        // the FAILED client returns the next-highest-aligned
-                        // size in frames; convert to hns, release, re-
-                        // Activate, Initialize once more with dur == per.
-                        // (The aligned size does NOT ride in the HRESULT --
-                        // the upper bits are the facility, not a period.)
-                        UINT32 nAlign = 0;
-                        if (d.ac && SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
-                            dur = (REFERENCE_TIME)((10000.0 * 1000 /
-                                                    (double)tryWf->nSamplesPerSec * nAlign) + 0.5);
-                            per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) ? dur : 0;
-                            d.ac->Release(); d.ac = nullptr;
-                            if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL,
-                                                        nullptr, (void**)&d.ac)) && d.ac) {
-                                hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                          dur, per, tryWf, nullptr);
-                            } else {
-                                d.ac = nullptr;   // the chain below sees !d.ac and falls to cleanup
-                                hrInit = E_FAIL;
-                            }
-                        }
-                    }
-                    // v10.2.0: OUR format as the second exclusive candidate
-                    // when the PKEY path replaced it and still failed -- the
-                    // fixed 0x63F mask deserves its own attempt.
-                    if (hrInit != S_OK && tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE
-                        && tryWf != wf && d.ev && d.ac) {
-                        dur = (REFERENCE_TIME)((double)periodFrames * kOutPeriods * 1e7 / (double)kSampleRate);
-                        per = dur;
-                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                  dur, per, wf, nullptr);
-                        while (hrInit == AUDCLNT_E_INVALID_DEVICE_PERIOD && d.ac
-                               && dur < 500 * 10000) {
-                            dur *= 2;
-                            per = dur;
-                            hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                      dur, per, wf, nullptr);
-                        }
-                        if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && d.ac) {
-                            UINT32 nAlign = 0;
-                            if (SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
-                                dur = (REFERENCE_TIME)((10000.0 * 1000 /
-                                                        (double)wf->nSamplesPerSec * nAlign) + 0.5);
-                                per = dur;
-                                d.ac->Release(); d.ac = nullptr;
-                                if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL,
-                                                            nullptr, (void**)&d.ac)) && d.ac) {
-                                    hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                              dur, per, wf, nullptr);
-                                } else { d.ac = nullptr; hrInit = E_FAIL; }
-                            }
-                        }
-                        exclWhy = "our format (fixed mask) after the pin's own refused";
-                    }
-                    if (FAILED(hrInit) && tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) {
-                        exclHr  = hrInit;
-                        exclWhy = hresultName(hrInit);
-                    }
-                    if (d.ev && d.ac &&
-                        SUCCEEDED(hrInit) &&
-                        SUCCEEDED(d.ac->SetEventHandle(d.ev)) &&
-                        SUCCEEDED(d.ac->GetBufferSize(&d.bufFrames))) {
-                        if (cap) {
-                            if (SUCCEEDED(d.ac->GetService(kIID_IAudioCaptureClient, (void**)&d.capc)) && d.capc) {
-                                d.period = d.bufFrames;   // capture: one event = one whole buffer
-                                ok = true;
-                            }
-                        } else {
-                            if (SUCCEEDED(d.ac->GetService(kIID_IAudioRenderClient, (void**)&d.rc)) && d.rc) {
-                                d.period = d.bufFrames / (kOutPeriods ? kOutPeriods : 1);
-                                if (d.period == 0) d.period = d.bufFrames;
-                                // pre-fill the whole buffer with silence so the
-                                // first period event finds real padding in place
-                                BYTE* pFirst = nullptr;
-                                if (SUCCEEDED(d.rc->GetBuffer(d.bufFrames, &pFirst)) && pFirst) {
-                                    memset(pFirst, 0, (size_t)d.bufFrames * ch * sizeof(float));
-                                    d.rc->ReleaseBuffer(d.bufFrames, 0);
-                                }
-                                ok = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (ok) {
-            d.excl = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE);
-            gotExcl = d.excl;
-            dev->Release(); en->Release();
-            if (whyOut) *whyOut = exclWhy;
-            if (hrOut)  *hrOut  = exclHr;
-            return true;
-        }
-        // this mode refused -- clean up and let the loop try shared
-        if (d.ev) { CloseHandle(d.ev); d.ev = nullptr; }
-        if (d.capc) { d.capc->Release(); d.capc = nullptr; }
-        if (d.rc)   { d.rc->Release();   d.rc   = nullptr; }
-        if (d.ac)   { d.ac->Release();   d.ac   = nullptr; }
-        if (dev) dev->Release();
-        if (en) en->Release();
-        dev = nullptr; en = nullptr;
-    }
-    if (whyOut) *whyOut = exclWhy;
-    if (hrOut)  *hrOut  = exclHr;
-    return false;
-}
-
-// start the pump thread (capture: idx = -1). The pump IS the miniaudio
-// device thread: same callbacks, same heartbeats, one thread per device.
-static bool startDev(Dev& d, int idx) {
-    if (!d.ac || !d.ev) return false;
-    if (FAILED(d.ac->Start())) return false;
-    d.started = true;
-    d.run.store(true, std::memory_order_relaxed);
-    DevJob* j = new DevJob{ &d, idx };
-    d.thread = CreateThread(nullptr, 0, devPumpThread, j, 0, nullptr);
-    if (!d.thread) { delete j; d.run.store(false, std::memory_order_relaxed); d.ac->Stop(); d.started = false; return false; }
-    return true;
-}
-
 // ------------------------------------------------------------------ legs ----
 struct Leg {
     int                 index = 0;               // 0-based; printed as +1
@@ -3772,8 +3388,8 @@ struct Leg {
     size_t              lastCap = 0;             // (inert, v9.0.1)
     size_t              lastN = 0;               // (inert, v9.0.1)
     bool                haveLast = false;        // (inert, v9.0.1)
-    Dev                 dev;                     // v10: the raw WASAPI device
-    wchar_t             id[256] = {};            // WASAPI endpoint id string (volume pin)
+    ma_device           dev = {};
+    ma_device_id        id = {};                 // WASAPI endpoint id (volume pin)
     bool                isExclusive = false;
     std::string         name;
 
@@ -3935,6 +3551,25 @@ static std::atomic<bool> g_stopSilence{false};  // v7.0.0: the stop gap emits si
 // sliders stay pinned at 100%. The universal keep-alive (v8.4.5, every
 // leg) is summed at the device layer and is deliberately NOT scaled.
 // GUIDs spelled out: zig c++ (GNU mode) has no reliable __uuidof.
+static const CLSID kCLSID_MMDeviceEnumerator =
+    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const IID kIID_IMMDeviceEnumerator =
+    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const IID kIID_IAudioEndpointVolume =
+    { 0x5CDF2C82, 0x841E, 0x4546, { 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A } };
+static const PROPERTYKEY kPKEY_Device_FriendlyName =
+    { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
+// v6.5.16: yield re-grab guard -- active-session probe on a leg endpoint.
+// (Only IAudioSessionManager2's IID is needed: dev->Activate() takes an IID;
+// the enumerator/control objects come back from plain method calls.)
+static const IID kIID_IAudioSessionManager2 =
+    { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
+// v8.4.24 THE STREAM WINDOW: IAudioSessionControl2 (pid per session) --
+// the app-level visibility the phantom hunt needed: the sessions audiodg
+// is mixing into the cable are listed on the health tick, so an L+R mono
+// ghost in ch3 can be traced to the exact streams that produced it.
+static const IID kIID_IAudioSessionControl2 =
+    { 0x26E49CDA, 0x24B9, 0x4B03, { 0x8F, 0x60, 0x6C, 0x10, 0xA8, 0x18, 0xED, 0xA9 } };
 
 static std::atomic<float>    g_vol{1.0f};             // Line 1 endpoint scalar (0..1)
 static std::atomic<bool>     g_volMuted{false};
@@ -3980,26 +3615,52 @@ static inline unsigned long long hbOutGet(int i) {
 }
 
 // capture-side restart state (filled by main before start; used by watchdog)
-static Dev g_capDev;
+static ma_device g_capDev = {};
 static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
-static const char* g_capExclWhy = nullptr;   // v10.2.0: the refusal's name
-static HRESULT     g_capExclHr  = S_OK;
+static float   g_capPeriodMsF = 5.0f;
 
-// v10.0.0: the audio thread boost, MMCSS removed (the v9.1.9 "Pro Audio
-// Priority" jank is retired per the field: no Avrt registration, no task
-// index, no sub-priority ladder). What survives is the part that always
-// mattered: FTZ/DAZ (a denormal microcode assist can never stall the path)
-// and TIME_CRITICAL -- under the REALTIME process class that is the
-// scheduler's top band already, with nothing left for MMCSS to add.
-static void boostAudioThread() {
+// MMCSS boost for the pump threads (v3.8): at 10 ms targets a normal-
+// priority thread that loses one scheduling quantum can miss a refill
+// window. "Pro Audio" role + time-critical priority keeps the pumps ahead.
+// avrt.dll is loaded dynamically -- no new import-lib dependency.
+static void boostAudioThreadEx(int mmcssSubPrio) {
+    // v6.5: FTZ/DAZ on every realtime thread -- the standard RT denormal
+    // guard. Only touches f32 values below ~-370 dBFS; what it buys is that
+    // a 100+ cycle denormal microcode assist can never stall the path when
+    // volume_follow multiplies quiet content into the denormal range.
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+    static HMODULE av = LoadLibraryW(L"avrt.dll");
+    if (av) {
+        typedef HANDLE (WINAPI *AvSetMmFn)(LPCWSTR, LPDWORD);
+        AvSetMmFn set = (AvSetMmFn)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
+        if (set) {
+            DWORD idx = 0;
+            HANDLE h = set(L"Pro Audio", &idx);
+            // v7.9.0: sub-priority INSIDE the "Pro Audio" task. Within one
+            // task every registered thread shares the same base priority and
+            // MMCSS round-robins them -- twinspeak's center pump and, say,
+            // Chrome's own Pro Audio threads were equals at 100% CPU.
+            // AvSetMmThreadPriority raises a thread above its task mates:
+            // the center pump takes CRITICAL, the mains pump NORMAL. Values
+            // are the AVRT_PRIORITY enum (NORMAL = 0, CRITICAL = 2).
+            if (h && mmcssSubPrio >= 0) {
+                typedef HRESULT (WINAPI *AvPrioFn)(HANDLE, int);
+                AvPrioFn prio = (AvPrioFn)GetProcAddress(av, "AvSetMmThreadPriority");
+                if (prio) prio(h, mmcssSubPrio);
+            }
+        }
+    }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
+static void boostAudioThread() { boostAudioThreadEx(-1); }   // no sub-priority hint
 
-// one registration per device thread, zero cost in the hot path afterwards
+// v4.0: miniaudio's own device threads (capture + both playback callbacks)
+// only get THREAD_PRIORITY from miniaudio -- no MMCSS registration. Register
+// "Pro Audio" on each device thread once (thread_local guard: one
+// registration per thread, zero cost in the hot path afterwards).
 static void boostDeviceThread() {
     thread_local bool done = false;
     if (done) return;
@@ -4490,8 +4151,8 @@ static DWORD WINAPI powerThread(LPVOID) {
 // each pump thread does its own leg's mixing, on its own thread, in parallel.
 // (v9.1.7: the v9.1.6 chime injection is REVERTED -- the chime is leg1's
 // device-layer cue now, and this is the dumb fan-out again, bit-exact.)
-static void capCallback(const float* pInput, unsigned frameCount) {
-    boostDeviceThread();
+static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCount) {
+    boostDeviceThread();                                          // v4.0 MMCSS
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);   // v3.8 watchdog
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
@@ -4509,100 +4170,6 @@ static void capCallback(const float* pInput, unsigned frameCount) {
                                         + dropped);
         }
         g_leg[i].captured.fetch_add(frameCount, std::memory_order_relaxed); // v6.0 off-meter (cable clock)
-    }
-}
-
-// v10.1.0 the capture pump: THE 1 ms POLL (field-directed: "a constant 1ms
-// poll running as fast as it can to grab out raw audio frames"). The event
-// handle is still registered with the client (exclusive mode requires one;
-// close() SetEvents it to wake the join), but the loop no longer WAITS on
-// it -- WaitForSingleObject(ev, kCapPollMs) doubles as the tick: signalled
-// = drain (returns immediately), quiet = at most 1 ms of sleep, then drain
-// whatever IAudioCaptureClient holds anyway (GetNextPacketSize is the
-// truth, the event is only a hint). A late or batched event -- the classic
-// loopback pathology -- costs one tick of pickup, never a period; a quiet
-// shared-mode engine costs one GetNextPacketSize call per ms (~single
-// microseconds, audiodg never sees it). The 2 s watchdog timeout survives
-// as the heartbeat's backstop: no frames and no event for 2 s still reads
-// as silence (the health loop reopens on a stale g_hbCap, not on the wait).
-static void capPump(Dev& d) {
-    boostDeviceThread();
-    static float zeros[2048 * kInCh];   // SILENT-flag packets: bit-zero frames
-    while (d.run.load(std::memory_order_relaxed)) {
-        // v10.1.0: poll, not wait. Returns: WAIT_OBJECT_0 (event fired --
-        // drain now), WAIT_TIMEOUT (1 ms passed -- drain anyway), or the
-        // 2 s backstop (nothing at all for 2 s -- still drain; a silent
-        // engine is not an error state, and capCallback heartbeats only on
-        // real frames, which is exactly what the watchdog watches).
-        WaitForSingleObject(d.ev, kCapPollMs);
-        BYTE* data = nullptr; UINT32 n = 0; DWORD flags = 0;
-        // drain every packet the event made available
-        while (d.capc && SUCCEEDED(d.capc->GetNextPacketSize(&n)) && n > 0) {
-            if (SUCCEEDED(d.capc->GetBuffer(&data, &n, &flags, nullptr, nullptr)) && n > 0) {
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                    // the shared engine flagged the packet silent: whole
-                    // bit-zero frames, in pieces so any n fits
-                    UINT32 done = 0;
-                    while (done < n) {
-                        const UINT32 run = (n - done < 2048) ? (n - done) : 2048;
-                        capCallback(zeros, run);
-                        done += run;
-                    }
-                } else {
-                    capCallback((const float*)data, n);
-                }
-            }
-            if (data) { d.capc->ReleaseBuffer(n); data = nullptr; }
-            else break;
-        }
-        if (!d.run.load(std::memory_order_relaxed)) break;
-    }
-}
-
-// v10.0.0 the render pump: wait the event, ask the client how much room it
-// has, fill exactly that, repeat. Exclusive paces one buffer per event;
-// shared fires per period -- the switch sees whole periods either way.
-// v10.2.1 EXCLUSIVE WRITES THE WHOLE BUFFER, miniaudio's rule
-// (ma_device__get_available_frames__wasapi, miniaudio.h:24474, quoting
-// MSDN): in exclusive event mode "the client typically has no use for the
-// padding value reported by GetCurrentPadding. Instead, the client
-// accesses an entire buffer during each processing pass." The v10.0.0
-// pump queried padding unconditionally -- on the field's Realtek the
-// exclusive padding reads full, write = bufFrames - pad = 0 forever, and
-// the leg NEVER handed in its first switch (raw1 pegged 341 ms, 48480
-// frames evicted, the servo pegged +10000 with err ----: only the shared
-// S5 played). Exclusive: fill the whole buffer per event. Shared: the
-// padding query stands (it is the shared contract).
-static void legPump(Dev& d, int idx) {
-    boostDeviceThread();
-    const int ch = (idx == 0) ? kOutCh1 : kOutCh2;
-    std::vector<float> mix(kScratchFrames * (size_t)ch, 0.0f);
-    while (d.run.load(std::memory_order_relaxed)) {
-        if (WaitForSingleObject(d.ev, 2000) != WAIT_OBJECT_0) continue;
-        UINT32 write = 0;
-        if (d.excl) {
-            // exclusive event mode: one event = one whole buffer, no
-            // padding query (it is meaningless there -- see the header
-            // comment). This is what miniaudio does.
-            write = d.bufFrames;
-        } else {
-            UINT32 pad = 0;
-            if (FAILED(d.ac->GetCurrentPadding(&pad))) continue;
-            write = d.bufFrames - pad;
-        }
-        if (write == 0 || write > d.bufFrames) continue;
-        BYTE* dst = nullptr;
-        if (FAILED(d.rc->GetBuffer(write, &dst)) || !dst) continue;
-        unsigned done = 0;
-        while (done < write) {
-            const unsigned n = (write - done < kScratchFrames) ? (write - done) : (unsigned)kScratchFrames;
-            playCore(idx, mix.data(), n);
-            sumLegExtras(idx, mix.data(), n);   // v8.4.5: the universal wobble, stop gap included
-            memcpy(dst + (size_t)done * ch * sizeof(float), mix.data(),
-                   (size_t)n * ch * sizeof(float));
-            done += n;
-        }
-        d.rc->ReleaseBuffer(write, 0);
     }
 }
 
@@ -5038,7 +4605,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
 // v8.4.5: the device-layer extras -- the UNIVERSAL keep-alive tone on
 // every leg, plus leg2's chime -- as their own function so the device
 // callbacks all sum them exactly alike.
-static void sumLegExtras(int idx, float* out, unsigned frameCount) {
+static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
     // v8.4.5 THE UNIVERSAL KEEP-ALIVE: 20 Hz @ 0.1% rides EVERY leg, every
     // block -- through the lane gates (a gated block is PROGRAM silence,
     // never device silence) and through the stop gap (bridging gaps is the
@@ -5074,11 +4641,11 @@ static void sumLegExtras(int idx, float* out, unsigned frameCount) {
     if (chSel < 0) {
         const unsigned len = g_kaLen;
         unsigned ka = g_kaIdxLeg[idx];
-        unsigned done = 0;
+        ma_uint32 done = 0;
         while (done < frameCount) {
-            const unsigned run = (frameCount - done) < (unsigned)(len - ka)
-                                ? (frameCount - done) : (unsigned)(len - ka);
-            for (unsigned i = 0; i < run; ++i, ++ka) {
+            const ma_uint32 run = (frameCount - done) < (ma_uint32)(len - ka)
+                                ? (frameCount - done) : (ma_uint32)(len - ka);
+            for (ma_uint32 i = 0; i < run; ++i, ++ka) {
                 const float s = g_kaTable[ka];
                 float l = out[(done + i) * och + 0] + s;
                 float r = out[(done + i) * och + 1] + s;
@@ -5093,7 +4660,7 @@ static void sumLegExtras(int idx, float* out, unsigned frameCount) {
         g_kaIdxLeg[idx] = ka;
         return;
     }
-    for (unsigned i = 0; i < frameCount; ++i) {
+    for (ma_uint32 i = 0; i < frameCount; ++i) {
         float l = out[i * och + 0];
         float r = out[i * och + 1];
         const float s = g_kaTable[g_kaIdxLeg[idx]];   // the wobble rides every leg, chime or not
@@ -5118,7 +4685,7 @@ static void sumLegExtras(int idx, float* out, unsigned frameCount) {
     }
 }
 
-static void playCore(int idx, float* out, unsigned frameCount) {
+static void playCore(int idx, float* out, ma_uint32 frameCount) {
     boostDeviceThread();
     // v7.9.0: DEVICE-SWITCH LATENESS METER -- the ground truth the ring
     // cannot see. The event fires with one period still to play, so a
@@ -5155,8 +4722,25 @@ static void playCore(int idx, float* out, unsigned frameCount) {
     bufferSwitchFill(idx, out, (size_t)frameCount);
 }
 
-// v10.0.0: the four playCallbackN wrappers are RETIRED -- legPump calls
-// playCore + sumLegExtras inline, so there is no re-dispatch layer left.
+static void playCallback1(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(0, (float*)pOutput, frameCount);
+    sumLegExtras(0, (float*)pOutput, frameCount);   // v8.4.5: the universal wobble, stop gap included
+}
+
+static void playCallback2(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(1, (float*)pOutput, frameCount);
+    sumLegExtras(1, (float*)pOutput, frameCount);   // v8.4.5: the wobble + the chime, through the stop gap
+}
+// v8.4.0: the rear legs -- 2ch switches. v8.4.5: they sum the universal
+// keep-alive like every leg (no chime -- that stays out2's own test).
+static void playCallback3(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(2, (float*)pOutput, frameCount);
+    sumLegExtras(2, (float*)pOutput, frameCount);
+}
+static void playCallback4(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+    playCore(3, (float*)pOutput, frameCount);
+    sumLegExtras(3, (float*)pOutput, frameCount);
+}
 
 // ------------------------------------------- v6.5.18 center dialogue EQ ----
 // RBJ peaking biquad on the center channel, out2 only. One filter serves
@@ -6029,7 +5613,7 @@ static void writeTemplate(const char* path) {
         "; v9.1.0: the rears' fold to the mains (empty leg3) runs through a\n"
         "; 0.51 ms comb -- the EQ-APO rear effect, built in. A REAL leg3\n"
         "; splits the surround 60/60: the mains carry it with the phase\n"
-        "; trick AND the rears carry it natively, both at 60%%.\n"
+        "; trick AND the rears carry it natively, both at 60%.\n"
         "; v9.1.1: an EMPTY center device folds ch3 onto the mains through a\n"
         "; virtual 0-degree center -- crosstalk cancellation + an HRTF\n"
         "; convolution (the phantom's acoustic comb is pre-notched and the\n"
@@ -6258,8 +5842,7 @@ static void writeTemplate(const char* path) {
         "; (the log announces both directions -- 'legN YIELD').\n"
         "\n"
         "; v9.0.1: THE WDM-KS BACKEND IS REMOVED -- WASAPI EXCLUSIVE is the\n"
-        "; one transport (raw WASAPI event mode, v10.0.0 -- no miniaudio, no\n"
-        "; MMCSS registration anywhere). The\n"
+        "; one transport (miniaudio event mode, MMCSS \"Pro Audio\"). The\n"
         "; engine asks for a CONSTANT buffer size: 128 frames x 3 periods\n"
         "; (~2.67 ms a switch, ~375 switches/s, a 384-fr / 8.0 ms exclusive\n"
         "; buffer) on EVERY leg -- the v8.4.24 field-validated geometry, in\n"
@@ -6400,7 +5983,7 @@ static void writeTemplate(const char* path) {
         ";   out1 gets ch1 (FL) and ch2 (FR) plus gain_lfe * ch4 (LFE) folded\n"
         ";   onto both. FC, the discrete LFE slot AND the 5.1 side slots stay\n"
         ";   DRIVEN DIGITAL SILENCE (the sides ride the rears only, v8.4.6),\n"
-        ";   so no layer (Windows engine, Speaker\n"
+        ";   so no layer (Windows engine, miniaudio\n"
         ";   converter, Speaker Fill) has any signal to upmix into a fake\n"
         ";   center -- the center belongs to out2 alone (v8.4.1: an EMPTY\n"
         ";   output_device2 folds it onto out1's FL/FR at gain_center\n"
@@ -6575,100 +6158,56 @@ static bool loadIni(const char* path) {
 }
 
 // --------------------------------------------------------- enumeration ------
-// v10.0.0: the raw WASAPI walk -- one IMMDeviceEnumerator pass builds the
-// name list, remembers the default, and hands back the endpoint id string.
-static std::string wideToNarrow(const std::wstring& w);   // fwd (defined below)
-struct EndPointInfo {
-    std::string name;      // friendly name (UTF-8)
-    std::wstring id;       // the endpoint id string (openDev takes it verbatim)
-    bool isDefault = false;
-};
-static bool enumEndpoints(bool playback, std::vector<EndPointInfo>& out) {
-    out.clear();
-    IMMDeviceEnumerator* en = nullptr;
-    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
-                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
-        return false;
-    bool ok = true;
-    IMMDevice* defDev = nullptr;
-    LPWSTR defId = nullptr;
-    if (SUCCEEDED(en->GetDefaultAudioEndpoint(playback ? eRender : eCapture, eConsole, &defDev))
-        && defDev) {
-        if (SUCCEEDED(defDev->GetId(&defId)) && defId) { /* keep */ }
-        defDev->Release();
-    }
-    IMMDeviceCollection* col = nullptr;
-    if (SUCCEEDED(en->EnumAudioEndpoints(playback ? eRender : eCapture,
-                                         DEVICE_STATE_ACTIVE, &col)) && col) {
-        UINT n = 0;
-        if (SUCCEEDED(col->GetCount(&n))) {
-            for (UINT i = 0; i < n; ++i) {
-                IMMDevice* dev = nullptr;
-                if (FAILED(col->Item(i, &dev)) || !dev) continue;
-                EndPointInfo ei;
-                LPWSTR id = nullptr;
-                if (SUCCEEDED(dev->GetId(&id)) && id) {
-                    ei.id = id;
-                    if (defId && wcscmp(id, defId) == 0) ei.isDefault = true;
-                    CoTaskMemFree(id);
-                }
-                IPropertyStore* ps = nullptr;
-                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
-                    PROPVARIANT var; PropVariantInit(&var);
-                    if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
-                        var.vt == VT_LPWSTR && var.pwszVal)
-                        ei.name = wideToNarrow(var.pwszVal);
-                    PropVariantClear(&var);
-                    ps->Release();
-                }
-                dev->Release();
-                out.push_back(ei);
-            }
-        } else ok = false;
-        col->Release();
-    } else ok = false;
-    if (defId) CoTaskMemFree(defId);
-    en->Release();
-    return ok;
-}
-
 static void listDevices() {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        tlog("[twinspeak] COM init failed -- cannot enumerate\n");
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context ctx;
+    if (ma_context_init(be, 1, nullptr, &ctx) != MA_SUCCESS) {
+        tlog( "[twinspeak] context init failed\n");
         return;
     }
-    tlog("[twinspeak] backend: WASAPI (raw, v10.0.0)\n\n");
-    std::vector<EndPointInfo> eps;
-    if (enumEndpoints(true, eps)) {
-        tlog("PLAYBACK devices (%u):\n", (unsigned)eps.size());
-        for (size_t i = 0; i < eps.size(); ++i)
-            tlog("  [%u] %s%s\n", (unsigned)i, eps[i].name.c_str(),
-                 eps[i].isDefault ? "   (default)" : "");
-    } else tlog("[twinspeak] playback enumeration failed\n");
-    if (enumEndpoints(false, eps)) {
-        tlog("\nCAPTURE devices (%u):\n", (unsigned)eps.size());
-        for (size_t i = 0; i < eps.size(); ++i)
-            tlog("  [%u] %s%s\n", (unsigned)i, eps[i].name.c_str(),
-                 eps[i].isDefault ? "   (default)" : "");
-    } else tlog("[twinspeak] capture enumeration failed\n");
-    CoUninitialize();
+    ma_device_info* pb = nullptr; ma_uint32 npb = 0;
+    ma_device_info* cp = nullptr; ma_uint32 ncp = 0;
+    if (ma_context_get_devices(&ctx, &pb, &npb, &cp, &ncp) != MA_SUCCESS) {
+        tlog( "[twinspeak] enumeration failed\n");
+        ma_context_uninit(&ctx);
+        return;
+    }
+    tlog("[twinspeak] backend: %s\n\n", ma_get_backend_name(ctx.backend));
+    tlog("PLAYBACK devices (%u):\n", npb);
+    for (ma_uint32 i = 0; i < npb; ++i) {
+        tlog("  [%u] %s%s\n", i, pb[i].name, pb[i].isDefault ? "   (default)" : "");
+        for (ma_uint32 k = 0; k < pb[i].nativeDataFormatCount && k < 4; ++k)
+            tlog("        native: %uch @ %u Hz, %s\n", pb[i].nativeDataFormats[k].channels,
+                   pb[i].nativeDataFormats[k].sampleRate,
+                   ma_get_format_name(pb[i].nativeDataFormats[k].format));
+    }
+    tlog("\nCAPTURE devices (%u):\n", ncp);
+    for (ma_uint32 i = 0; i < ncp; ++i) {
+        tlog("  [%u] %s%s\n", i, cp[i].name, cp[i].isDefault ? "   (default)" : "");
+        for (ma_uint32 k = 0; k < cp[i].nativeDataFormatCount && k < 4; ++k)
+            tlog("        native: %uch @ %u Hz, %s\n", cp[i].nativeDataFormats[k].channels,
+                   cp[i].nativeDataFormats[k].sampleRate,
+                   ma_get_format_name(cp[i].nativeDataFormats[k].format));
+    }
+    ma_context_uninit(&ctx);
 }
 
-// the needle walk: first match wins, a default match wins over an earlier
-// non-default one (the old pickDevice rule, kept verbatim)
-static bool pickDevice(bool playback, const std::string& needle,
-                       std::wstring* outId, std::string* outName) {
-    std::vector<EndPointInfo> eps;
-    if (!enumEndpoints(playback, eps)) return false;
+static bool pickDevice(ma_context* ctx, ma_device_type type, const std::string& needle,
+                       ma_device_id* outId, std::string* outName) {
+    ma_device_info* pb = nullptr; ma_uint32 npb = 0;
+    ma_device_info* cp = nullptr; ma_uint32 ncp = 0;
+    if (ma_context_get_devices(ctx, &pb, &npb, &cp, &ncp) != MA_SUCCESS) return false;
+    ma_device_info* arr = (type == ma_device_type_playback) ? pb : cp;
+    ma_uint32      cnt  = (type == ma_device_type_playback) ? npb : ncp;
     int best = -1;
-    for (size_t i = 0; i < eps.size(); ++i) {
-        if (!containsCI(eps[i].name, needle)) continue;
+    for (ma_uint32 i = 0; i < cnt; ++i) {
+        if (!containsCI(arr[i].name, needle)) continue;
         if (best < 0) best = (int)i;
-        else if (eps[i].isDefault && !eps[best].isDefault) best = (int)i;
+        else if (arr[i].isDefault && !arr[best].isDefault) best = (int)i;
     }
     if (best < 0) return false;
-    *outId = eps[best].id;
-    *outName = eps[best].name;
+    *outId = arr[best].id;
+    *outName = arr[best].name;
     return true;
 }
 
@@ -6806,8 +6345,6 @@ static bool logCableStreams(const std::string& nameNeedle) {
         col->Release();
     }
     en->Release();
-    return logged;   // v10.0.1: the v8.4.26 contract -- silence the fall-off,
-                     // and make the needle cascade work when compiled at -O2
 }
 
 static int foreignActiveSessions(const std::string& nameNeedle) {
@@ -6870,23 +6407,34 @@ static int foreignActiveSessions(const std::string& nameNeedle) {
 }
 
 // ---------------------------------------------------------- device init -----
-// v10.0.0: the request is FRAMES (the constant kOutPeriodFrames x
-// kOutPeriods buffer every leg asks for) and the open is the raw
-// IAudioClient path -- openDev tries exclusive first and falls back to
-// shared itself, so initLegDevice is just: open, remember the id, start.
-static bool initLegDevice(int idx, const std::wstring& id,
-                          unsigned periodFrames, bool wantExcl) {
+// v9.0.1: the request is FRAMES now, not a millisecond hint -- the constant
+// buffer size (kOutPeriodFrames x kOutPeriods) every leg asks for, so no
+// driver's private rounding of "1 ms" can put two legs on different bites.
+// miniaudio passes periodSizeInFrames straight to the backend descriptor;
+// the exclusive path hands it (x periods) to IAudioClient::Initialize and
+// lets the driver's own alignment pass keep the final word.
+static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
+                          ma_uint32 periodFrames, bool wantExcl) {
     Leg& L = g_leg[idx];
-    L.dev.close();
-    bool gotExcl = false;
-    if (!openDev(L.dev, id.c_str(), false, (idx == 0) ? kOutCh1 : kOutCh2,
-                 periodFrames, wantExcl, gotExcl)) {
-        tlog( "[twinspeak] leg%d: %s init failed (HRESULT refused)\n", idx + 1,
-                wantExcl ? "EXCLUSIVE" : "shared");
+    ma_device_config pc = ma_device_config_init(ma_device_type_playback);
+    pc.sampleRate = kSampleRate;
+    pc.periodSizeInFrames = periodFrames;
+    pc.periods = kOutPeriods;
+    pc.playback.pDeviceID = id;
+    pc.playback.format = ma_format_f32;
+    pc.playback.channels = (idx == 0) ? kOutCh1 : kOutCh2;   // legs 2..4 are all 2ch
+    pc.playback.shareMode = wantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
+    pc.dataCallback = (idx == 0) ? playCallback1 : (idx == 1) ? playCallback2
+                   : (idx == 2) ? playCallback3 : playCallback4;
+    pc.wasapi.usage = ma_wasapi_usage_pro_audio;
+    ma_result r = ma_device_init(ctx, &pc, &L.dev);
+    if (r != MA_SUCCESS) {
+        tlog( "[twinspeak] leg%d: %s init failed: %s\n", idx + 1,
+                wantExcl ? "EXCLUSIVE" : "shared", ma_result_description(r));
         return false;
     }
-    L.isExclusive = gotExcl;
-    wcsncpy(L.id, id.c_str(), 255); L.id[255] = 0;
+    L.isExclusive = wantExcl;
+    L.id = *id;
     return true;
 }
 
@@ -6949,7 +6497,7 @@ static void landReopenedRing(int idx) {
 // shared; silent retries until the state changes or it succeeds.
 // v9.0.1: the request is the constant frame bite (kOutPeriodFrames) -- the
 // KS reopen branch is gone with the backend; every reopen lands on WASAPI.
-static bool tryRestartLeg(int idx, unsigned periodFrames,
+static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodFrames,
                           const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
     if (L.disabled) return false;   // v8.4.0: an empty rear leg never reopens
@@ -6963,39 +6511,40 @@ static bool tryRestartLeg(int idx, unsigned periodFrames,
     }
     const char* needle = legNeedle(idx);   // v8.4.0: one table for all four legs
 
-    L.dev.close();
+    if (L.dev.pContext) ma_device_uninit(&L.dev);
+    memset(&L.dev, 0, sizeof(L.dev));
     L.relandPending = true;   // v8.4.14: the NEW device thread lands the ring at its first switch
-    std::wstring id; std::string nm;
-    if (!pickDevice(true, needle, &id, &nm)) return false;
-    // openDev itself falls back exclusive->shared, so one call is the whole
-    // retry ladder now
-    if (!initLegDevice(idx, id, periodFrames, L.isExclusive)) return false;
-    if (!startDev(L.dev, idx)) return false;
+    ma_device_id id; std::string nm;
+    if (!pickDevice(ctx, ma_device_type_playback, needle, &id, &nm)) return false;
+    bool ok = initLegDevice(idx, ctx, &id, periodFrames, L.isExclusive);
+    if (!ok && L.isExclusive) ok = initLegDevice(idx, ctx, &id, periodFrames, false);
+    if (!ok) return false;
+    if (ma_device_start(&L.dev) != MA_SUCCESS) return false;
     L.name = nm;
     hbOut(idx);
     g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
     // v4.0: a reopen can negotiate a different period (exclusive->shared
     // fallback); the ring floor and the v6.0 gated-drop line follow the
     // REAL period.
-    g_periodFrames[idx] = L.dev.period
-                        ? (size_t)L.dev.period
+    g_periodFrames[idx] = L.dev.playback.internalPeriodSizeInFrames
+                        ? (size_t)L.dev.playback.internalPeriodSizeInFrames
                         : g_periodFrames[idx];
     // v3.9: re-pin the endpoint volume right here, on the main thread that
     // owns the reopen (the watcher only enforces level/mute). The endpoint
     // id can change across a re-enumeration, so resolve it fresh.
     if (g_cfg.pinOutputs) {
         if (g_pin[idx].vol) { g_pin[idx].vol->Release(); g_pin[idx].vol = nullptr; }
-        g_pin[idx].id = L.id;
-        if (L.id[0]) {
+        g_pin[idx].id = L.id.wasapi;
+        if (L.id.wasapi[0]) {
             // v7.6.3: THE DEFAULT-DEVICE GUARD -- a reopen that lands on the
             // current default playback endpoint must not write 100% to it
             // (the slider belongs to the user; yield_default re-yields the
             // leg within a tick). The pin stays UNRESOLVED -- the watcher
             // enforces nothing on an endpoint we do not hold.
-            if (isDefaultRenderEndpointId(L.id)) {
+            if (isDefaultRenderEndpointId(L.id.wasapi)) {
                 tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- IS the default playback device, volume left alone\n", idx + 1);
             } else {
-                g_pin[idx].vol = endpointVolFromIdString(L.id);
+                g_pin[idx].vol = endpointVolFromIdString(L.id.wasapi);
                 if (g_pin[idx].vol) {
                     g_pin[idx].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
                     g_pin[idx].vol->SetMute(FALSE, nullptr);
@@ -7010,7 +6559,7 @@ static bool tryRestartLeg(int idx, unsigned periodFrames,
     return true;
 }
 
-static bool tryRestartCap() {
+static bool tryRestartCap(ma_context* ctx) {
     static unsigned long long lastLog = 0;
     const unsigned long long now = GetTickCount64();
     if (now - lastLog >= 10000) {
@@ -7018,17 +6567,28 @@ static bool tryRestartCap() {
                 g_capNeedle.c_str());
         lastLog = now;
     }
-    g_capDev.close();
-    std::wstring id; std::string nm;
-    if (!pickDevice(false, g_capNeedle, &id, &nm)) return false;
-    bool gotExcl = false;
-    // v10.1.0: the fixed 1 ms capture request (48 fr), in frames -- the
-    // watchdog reopens land on the same 1 ms poll the boot open used
-    if (!openDev(g_capDev, id.c_str(), true, kInCh,
-                 (unsigned)(kSampleRate / 1000 * 1), g_capWantExcl, gotExcl))
-        return false;
-    g_capIsExcl = gotExcl;
-    if (!startDev(g_capDev, -1)) return false;
+    if (g_capDev.pContext) ma_device_uninit(&g_capDev);
+    memset(&g_capDev, 0, sizeof(g_capDev));
+    ma_device_id id; std::string nm;
+    if (!pickDevice(ctx, ma_device_type_capture, g_capNeedle, &id, &nm)) return false;
+    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
+    cc.sampleRate = kSampleRate;
+    cc.periodSizeInMilliseconds = (ma_uint32)(g_capPeriodMsF + 0.5f);
+    cc.periods = 2;
+    cc.dataCallback = capCallback;
+    cc.capture.pDeviceID = &id;
+    cc.capture.format = ma_format_f32;
+    cc.capture.channels = kInCh;
+    cc.capture.shareMode = g_capWantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
+    cc.wasapi.usage = ma_wasapi_usage_pro_audio;
+    ma_result r = ma_device_init(ctx, &cc, &g_capDev);
+    if (r != MA_SUCCESS && g_capWantExcl) {
+        cc.capture.shareMode = ma_share_mode_shared;
+        r = ma_device_init(ctx, &cc, &g_capDev);
+    }
+    if (r != MA_SUCCESS) return false;
+    g_capIsExcl = (cc.capture.shareMode == ma_share_mode_exclusive);
+    if (ma_device_start(&g_capDev) != MA_SUCCESS) return false;
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);
     g_driftRecalReq.store(true, std::memory_order_relaxed);   // v6.5.8: baseline re-arm
     tlog( "[twinspeak] capture WATCHDOG: reopened \"%s\" (%s)\n",
@@ -7051,26 +6611,37 @@ static void printLegDevice(int idx) {
              idx + 1, L.name.c_str());
         return;
     }
-    // (v10.0.0: raw WASAPI -- every leg prints its negotiated period below.
-    // The stream is f32 @ 48 kHz by construction; a mismatched endpoint is
-    // refused at open, so there is no resampler warning path any more.)
-    const Dev* d = &L.dev;
-    const unsigned pf = d->period;
-    const unsigned periods = d->bufFrames ? (d->bufFrames / (pf ? pf : 1)) : 0;
-    const double   pms = (pf != 0) ? (pf * 1000.0 / (double)kSampleRate) : 0.0;
-    const double   devms = pms * (double)periods;
-    tlog("[twinspeak] leg%d device     : f32, %uch @ %u Hz, period %u fr (buf %u, ~%.2f ms) | ring %.1f ms%s | est path ~%.1f ms (ring + device + capture)\n",
-           idx + 1,
-           (idx == 0) ? kOutCh1 : kOutCh2, (unsigned)kSampleRate,
-           (unsigned)pf, (unsigned)d->bufFrames, devms, ring,
+    // (v9.0.1: the WDM-KS branch is gone with the backend -- every leg prints
+    // its negotiated WASAPI period below.)
+    const ma_device* d = &L.dev;
+    const ma_uint32  pf = d->playback.internalPeriodSizeInFrames;
+    const ma_uint32  sr = d->playback.internalSampleRate;
+    const double     pms = (sr != 0 && pf != 0) ? (pf * 1000.0 / sr) : 0.0;
+    const double     devms = pms * (double)d->playback.internalPeriods;
+    tlog("[twinspeak] leg%d device     : %s, %uch @ %u Hz, period %u fr x%u (~%.2f ms) | ring %.1f ms%s | est path ~%.1f ms (ring + device + capture)\n",
+           idx + 1, ma_get_format_name(d->playback.internalFormat),
+           (unsigned)d->playback.internalChannels, (unsigned)sr,
+           (unsigned)pf, (unsigned)d->playback.internalPeriods, devms, ring,
            L.delayFrames ? " (delay prefill)" : "",
            ring + devms + burst);
     // v5.0: with the strict split this is INFORMATION, not a warning. The FC
     // and discrete-LFE channels are DRIVEN DIGITAL SILENCE, so a stereo (or
     // any downmixed) endpoint has literally nothing to upmix -- the center
     // physically cannot appear on out1 no matter how the endpoint is set up.
-    // (v10.0.0: every leg opens 2ch stereo by the second mask, so the old
-    // 6ch info line is retired with the request that produced it.)
+    if (idx == 0 && d->playback.internalChannels != kOutCh1)
+        tlog( "[twinspeak] leg1 info       : endpoint mix is %uch, not 6ch -- fine with the strict split:\n"
+                        "            out1 drives FC/LFE AND the 5.1 rear slots as digital silence (the\n"
+                        "            rears live on leg3), so no layer (engine, miniaudio converter,\n"
+                        "            Speaker Fill) has anything to upmix into a fake center.\n",
+                (unsigned)d->playback.internalChannels);
+    // v6.0: a non-48k endpoint means miniaudio inserts a RESAMPLER on this
+    // leg -- a pitch change, which twinspeak itself never does. Say it loud.
+    if (sr != kSampleRate)
+        tlog( "[twinspeak] leg%d WARNING   : endpoint runs at %u Hz -- miniaudio resamples 48000->%u on\n"
+                        "            this leg (a pitch change; v6.0's own path is bit-exact and never\n"
+                        "            resamples). Fix: set this device's default format to 24-bit\n"
+                        "            48000 Hz in Windows sound settings.\n",
+                idx + 1, (unsigned)sr, (unsigned)sr);
 }
 
 // ============================================================ v6.6.0 GUI ====
@@ -7989,13 +7560,16 @@ static void guiSaveSlot(HWND w, int i) {
 
 // ---- live device enumeration for the pickers -------------------------------
 static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>& cp) {
-    // v10.0.0: the picker list rides the raw walk. The GUI thread may not
-    // have COM yet (a picker refresh before START) -- init locally, MTA.
-    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    std::vector<EndPointInfo> eps;
-    if (enumEndpoints(true,  eps)) for (size_t i = 0; i < eps.size(); ++i) pb.push_back(eps[i].name);
-    if (enumEndpoints(false, eps)) for (size_t i = 0; i < eps.size(); ++i) cp.push_back(eps[i].name);
-    if (com) CoUninitialize();
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context ctx;
+    if (ma_context_init(be, 1, nullptr, &ctx) != MA_SUCCESS) return;
+    ma_device_info* p = nullptr; ma_uint32 np = 0;
+    ma_device_info* c = nullptr; ma_uint32 nc = 0;
+    if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
+        for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
+        for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
+    }
+    ma_context_uninit(&ctx);
 }
 
 static void guiFillCombos(HWND w) {
@@ -11260,7 +10834,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
         tlog("[twinspeak] priority      : REALTIME class refused (err %lu) -- HIGH engaged. The token\n"
              "                            does not hold SeIncreaseBasePriorityPrivilege: launch elevated\n"
-             "                            once for the full realtime band.\n", pclErr);
+             "                            once for the full realtime band; MMCSS still orders the audio\n"
+             "                            threads inside it.\n", pclErr);
     }
 
     timeBeginPeriod(1);
@@ -11316,40 +10891,20 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_chimeBuf = renderChime(2093.00, 42.0, 3135.97, 72.0, 20.0, cg);
     }
 
-    // v10.0.0: the whole engine becomes a raw WASAPI client. COM is
-    // initialized once HERE (MTA -- every device open and the watchdog's
-    // reopens ride it; miniaudio's context is gone), and the process is
-    // pinned to EVERY LOGICAL CORE at the same moment -- the VAC
-    // control-panel trick ("run on all cores"): a full-system affinity mask
-    // removes the single-core-park failure mode entirely, and the scheduler
-    // still balances -- it just can never strand a device thread on a core
-    // the engine isn't allowed to run on.
-    const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    if (!comOK) {
-        tlog( "[twinspeak] COM init failed\n");
+    ma_backend be[] = { ma_backend_wasapi };
+    ma_context ctx;
+    if (ma_context_init(be, 1, nullptr, &ctx) != MA_SUCCESS) {
+        tlog( "[twinspeak] WASAPI context init failed\n");
         return 1;
     }
-    {
-        DWORD_PTR pm = 0, sm = 0;
-        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && sm) {
-            if (SetProcessAffinityMask(GetCurrentProcess(), sm)) {
-                SYSTEM_INFO si; GetNativeSystemInfo(&si);
-                int n = 0; for (DWORD_PTR m = sm; m; m &= m - 1) ++n;
-                tlog("[twinspeak] affinity       : ALL CORES -- pinned to every logical processor in the system\n"
-                     "                            mask (%d of %u) -- the VAC \"run on all cores\" rule; the scheduler\n"
-                     "                            balances freely and no core is ever parked away from the engine)\n",
-                     n, (unsigned)si.dwNumberOfProcessors);
-            }
-        }
-    }
 
-    std::wstring capId, id1, id2, id3; std::string capName, n1, n2, n3;   // v8.4.11: id4/n4 retired with leg4
-    if (!pickDevice(false, g_cfg.inputDevice, &capId, &capName)) {
+    ma_device_id capId, id1, id2, id3; std::string capName, n1, n2, n3;   // v8.4.11: id4/n4 retired with leg4
+    if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
         tlog( "[twinspeak] capture device matching \"%s\" not found (--list to see names)\n",
                 g_cfg.inputDevice.c_str());
         return 1;
     }
-    if (!pickDevice(true, g_cfg.outputDevice1, &id1, &n1)) {
+    if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice1, &id1, &n1)) {
         tlog( "[twinspeak] output_device1 matching \"%s\" not found (--list)\n",
                 g_cfg.outputDevice1.c_str());
         return 1;
@@ -11362,7 +10917,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     g_leg[1].disabled = g_cfg.outputDevice2.empty();
     g_centerFold      = g_leg[1].disabled;
     if (!g_leg[1].disabled &&
-        !pickDevice(true, g_cfg.outputDevice2, &id2, &n2)) {
+        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice2, &id2, &n2)) {
         tlog( "[twinspeak] output_device2 matching \"%s\" not found (--list)\n",
                 g_cfg.outputDevice2.c_str());
         return 1;
@@ -11387,7 +10942,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // "the rear and surround channels are not folding to the mains").
     g_rearFold        = g_leg[2].disabled;
     if (!g_leg[2].disabled &&
-        !pickDevice(true, g_cfg.outputDevice3, &id3, &n3)) {
+        !pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice3, &id3, &n3)) {
         tlog( "[twinspeak] output_device3 matching \"%s\" not found (--list)\n",
                 g_cfg.outputDevice3.c_str());
         return 1;
@@ -11405,17 +10960,17 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // leg4 stays idle.
     g_lfeFoldLeg = -1;
     if (!g_cfg.outputDevice4.empty()) {
-        std::wstring id4; std::string n4;
-        if (!pickDevice(true, g_cfg.outputDevice4, &id4, &n4)) {
+        ma_device_id id4; std::string n4;
+        if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.outputDevice4, &id4, &n4)) {
             tlog("[twinspeak] leg4 (LFE fold) : output_device4 matching \"%s\" not found -- leg4 stays idle\n"
                  "                            (a soft note, never an error; --list to see names)\n",
                  g_cfg.outputDevice4.c_str());
-        } else if (id4 == id1) {
+        } else if (memcmp(&id4, &id1, sizeof(ma_device_id)) == 0) {
             tlog("[twinspeak] leg4 (LFE fold) : the device is leg1 (the mains) -- the LFE already folds there; idle\n");
-        } else if (!g_leg[1].disabled && id4 == id2) {
+        } else if (!g_leg[1].disabled && memcmp(&id4, &id2, sizeof(ma_device_id)) == 0) {
             g_lfeFoldLeg = 1;
             tlog("[twinspeak] leg4 (LFE fold) : folding the LFE (ch4) onto leg2's L/R at gain_lfe -- \"%s\"\n", n4.c_str());
-        } else if (!g_leg[2].disabled && id4 == id3) {
+        } else if (!g_leg[2].disabled && memcmp(&id4, &id3, sizeof(ma_device_id)) == 0) {
             g_lfeFoldLeg = 2;
             tlog("[twinspeak] leg4 (LFE fold) : folding the LFE (ch4) onto leg3's L/R at gain_lfe -- \"%s\"\n", n4.c_str());
         } else {
@@ -11429,7 +10984,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // request (the field's engine period) and nothing consumes burst math
     // anymore. v9.0.1: out1ms/out2ms are retired -- kOutPeriodFrames (128
     // fr, the CONSTANT bite) is every leg's request.
-    const unsigned capPeriodMs = 1;       // v10.1.0: the 1 ms request (48 fr) -- was 4 (v8.1.0). No cap_ms.
+    const ma_uint32 capPeriodMs = 4;       // v8.1.0: fixed request, no cap_ms
+    g_capPeriodMsF = 4.0f;                 // v3.8: watchdog restart state
     g_capNeedle    = g_cfg.inputDevice;
     g_capWantExcl  = g_cfg.captureExclusive;
 
@@ -11505,15 +11061,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     int openOrder[4];
     if (g_cfg.out2First) { openOrder[0] = 1; openOrder[1] = 0; openOrder[2] = 2; openOrder[3] = 3; }
     else                 { openOrder[0] = 0; openOrder[1] = 1; openOrder[2] = 2; openOrder[3] = 3; }
-    auto legIdPtr = [&](int i) -> const std::wstring& {
-        return (i == 0) ? id1 : (i == 1) ? id2 : id3;      // v8.4.11: leg4 never reaches here (disabled)
+    auto legIdPtr = [&](int i) -> ma_device_id* {
+        return (i == 0) ? &id1 : (i == 1) ? &id2 : &id3;   // v8.4.11: leg4 never reaches here (disabled)
     };
     bool okLeg[4] = { false, false, false, false };
     for (int oi = 0; oi < 4; ++oi) {
         const int i = openOrder[oi];
         if (g_leg[i].disabled) { okLeg[i] = true; continue; }   // empty rear: fine by design
         if (bootYield[i])      { okLeg[i] = true; continue; }   // released by choice, not broken
-        okLeg[i] = initLegDevice(i, legIdPtr(i), kOutPeriodFrames, g_cfg.exclusive);
+        okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodFrames, g_cfg.exclusive);
     }
     // v3: legs go exclusive TOGETHER or shared TOGETHER (v2 let one leg win
     // and the buffering mismatch skewed them ~10 ms). A driver refusal on
@@ -11532,15 +11088,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 for (int i = 0; i < 4; ++i) {
                     if (g_leg[i].disabled || bootYield[i]) continue;
                     if (okLeg[i]) {
-                        g_leg[i].dev.close();
+                        ma_device_uninit(&g_leg[i].dev);
+                        memset(&g_leg[i].dev, 0, sizeof(g_leg[i].dev));
                         okLeg[i] = false;
                     }
-                    if (!okLeg[i]) okLeg[i] = initLegDevice(i, legIdPtr(i), kOutPeriodFrames, false);
+                    if (!okLeg[i]) okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodFrames, false);
                 }
             } else {
                 for (int i = 0; i < 4; ++i)
                     if (!okLeg[i] && !bootYield[i] && !g_leg[i].disabled)
-                        okLeg[i] = initLegDevice(i, legIdPtr(i), kOutPeriodFrames, false);
+                        okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodFrames, false);
             }
         }
     }
@@ -11554,31 +11111,45 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // the rings (the ring floor needs the REAL negotiated burst). Exclusive
     // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
     // WaveCyclic/busy and falls back to shared (banner reports the winner).
-    // v10.0.0: openDev IS the whole ladder -- exclusive first, shared
-    // fallback, event mode, buffers reported back.
+    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
+    cc.sampleRate = kSampleRate;
+    cc.periodSizeInMilliseconds = capPeriodMs;
+    cc.periods = 2;
+    cc.dataCallback = capCallback;
+    cc.capture.pDeviceID = &capId;
+    cc.capture.format = ma_format_f32;
+    cc.capture.channels = kInCh;
+    cc.capture.shareMode = g_cfg.captureExclusive ? ma_share_mode_exclusive
+                                                  : ma_share_mode_shared;
+    cc.wasapi.usage = ma_wasapi_usage_pro_audio;
+    memset(&g_capDev, 0, sizeof(g_capDev));   // v3.8: g_capDev is file-scope (watchdog)
     bool capExclusive = false;
-    if (!openDev(g_capDev, capId.c_str(), true, kInCh,
-                 (unsigned)(kSampleRate / 1000 * capPeriodMs),
-                 g_cfg.captureExclusive, capExclusive,
-                 &g_capExclWhy, &g_capExclHr)) {
-        tlog( "[twinspeak] capture init failed -- no share mode would open\n");
+    ma_result cr = ma_device_init(&ctx, &cc, &g_capDev);
+    if (cr == MA_SUCCESS) {
+        capExclusive = (cc.capture.shareMode == ma_share_mode_exclusive);
+        g_capIsExcl  = capExclusive;
+    } else if (g_cfg.captureExclusive) {
+        tlog( "[twinspeak] capture EXCLUSIVE refused (%s) -- falling back to shared\n",
+                ma_result_description(cr));
+        cc.capture.shareMode = ma_share_mode_shared;
+        cr = ma_device_init(&ctx, &cc, &g_capDev);
+    }
+    if (cr != MA_SUCCESS) {
+        tlog( "[twinspeak] capture init failed: %s\n", ma_result_description(cr));
         return 1;
     }
-    g_capIsExcl = capExclusive;
-    if (!capExclusive && g_cfg.captureExclusive)
-        tlog( "[twinspeak] capture EXCLUSIVE refused -- opened shared\n");
 
     // v4.0: the REAL negotiated device period per leg feeds the ring floor
     // and the gated-drop line. v9.0.1: WASAPI only -- the constant request
     // is kOutPeriodFrames; the driver's alignment pass keeps the final say.
     for (int i = 0; i < 4; ++i) {
         if (g_leg[i].disabled) { g_periodFrames[i] = 0; continue; }   // v8.4.0: no device
-        g_periodFrames[i] = g_leg[i].dev.period
-                          ? (size_t)g_leg[i].dev.period
+        g_periodFrames[i] = g_leg[i].dev.playback.internalPeriodSizeInFrames
+                          ? (size_t)g_leg[i].dev.playback.internalPeriodSizeInFrames
                           : (size_t)kOutPeriodFrames;
     }
-    g_capPeriodFrames = g_capDev.period
-                      ? (size_t)g_capDev.period
+    g_capPeriodFrames = g_capDev.capture.internalPeriodSizeInFrames
+                      ? (size_t)g_capDev.capture.internalPeriodSizeInFrames
                       : (size_t)(capPeriodMs * (kSampleRate / 1000));
     if (g_capPeriodFrames == 0) g_capPeriodFrames = 192;   // v8.1.0: informational only
 
@@ -11594,7 +11165,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const float delayMs = (i == 0) ? g_cfg.delay1Ms
                           : (i == 1) ? g_cfg.delay2Ms
                           : g_cfg.offset3Ms;           // v8.4.0: the rears' own knob (v8.4.11: ONE rear leg)
-        const size_t devPeriodFr  = (L.dev.period ? L.dev.period : kOutPeriodFrames);
+        const size_t devPeriodFr  = (L.dev.playback.internalPeriodSizeInFrames
+                                     ? L.dev.playback.internalPeriodSizeInFrames : kOutPeriodFrames);
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
         // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
@@ -11644,8 +11216,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // Before any device starts: resolve the cable's playback endpoint, seed
     // the volume atomics, resolve + force 100%/unmuted the out pins. The
     // watcher takes over both jobs once the devices run.
-    // (v10.0.0: COM is already up -- initialized once at the top, with the
-    // affinity pin, before the first endpoint walk.)
+    const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     if (g_cfg.volumeFollow) {
         // v3.9: needle cascade -- volume_endpoint (ini override) first, then
         // input_device, then a generic "virtual audio cable" match. If all
@@ -11714,12 +11285,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // yield_default releases this leg's DAC within a health tick;
             // the yield-release reopen re-pins once the default has moved
             // away, and the pin then writes like any other.
-            if (isDefaultRenderEndpointId(g_leg[i].id)) {
+            if (isDefaultRenderEndpointId(g_leg[i].id.wasapi)) {
                 tlog("[twinspeak] out%d: endpoint IS the default playback device -- volume left alone (no 100%% pin)\n", i + 1);
                 continue;
             }
-            g_pin[i].id = g_leg[i].id;
-            g_pin[i].vol = endpointVolFromIdString(g_leg[i].id);
+            g_pin[i].id = g_leg[i].id.wasapi;
+            g_pin[i].vol = endpointVolFromIdString(g_leg[i].id.wasapi);
             if (g_pin[i].vol) {
                 g_pin[i].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
                 g_pin[i].vol->SetMute(FALSE, nullptr);
@@ -11730,7 +11301,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v3 start order (v8.1.0): capture FIRST, playbacks last -- the raw
     // rings hold real audio before the devices open their mouths (no startup
     // underrun). out2_first still orders the DEVICE starts (center first).
-    if (!startDev(g_capDev, -1)) {
+    if (ma_device_start(&g_capDev) != MA_SUCCESS) {
         tlog( "[twinspeak] capture start failed\n");
         return 1;
     }
@@ -11771,21 +11342,21 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         g_chimeBootServed = 0;
 
     // (v9.0.1: the v6.3 KS pacing-thread start note is gone with the backend
-    // -- startDev applies to every leg.)
+    // -- ma_device_start applies to every leg.)
     // v7.8.2: a boot-yielded leg has no device to start -- count it as
     // success; the quiet re-grab (tryRestartLeg) starts it when it reopens.
     // v8.4.0: one generic pass over the open order -- center first when
     // out2_first, then the mains, then the rears; a disabled leg has
     // nothing to start, success by design.
     {
-        bool sAll = true;
+        ma_result sAll = MA_SUCCESS;
         for (int oi = 0; oi < 4; ++oi) {
             const int i = openOrder[oi];
             Leg& L = g_leg[i];
             if (L.disabled || L.yielded.load(std::memory_order_relaxed)) continue;
-            if (!startDev(L.dev, i)) sAll = false;
+            if (ma_device_start(&L.dev) != MA_SUCCESS) sAll = MA_ERROR;
         }
-        if (!sAll) {
+        if (sAll != MA_SUCCESS) {
             tlog( "[twinspeak] playback start failed\n");
             return 1;
         }
@@ -11794,7 +11365,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v7.1.5 START AT THE SAME INSTANT (half two of the start-latency fix) --
     // the start trim above fixed the RING backlog, but the two output devices
     // also begin EATING their prefills when THEIR start call lands, and the
-    // calls land a few ms apart (v10.0.0: plain startDev calls now).
+    // calls land a few ms apart (v9.0.1: plain ma_device_start calls now).
     // A start stagger shifts that leg's WHOLE stream: the early leg stays
     // early by the gap, the ledger reads a FLAT drift (baseline + gap) from
     // the first real frame, the 5..9 s baseline calibration absorbs the gap
@@ -11918,24 +11489,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] v%s         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n",
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
-    tlog("[twinspeak] backend        : WASAPI (raw, v10.2.1 -- 1 ms capture POLL, the miniaudio exclusive\n"
-           "                            ladder: pin-format probe + period doubling + alignment dance;\n"
-           "                            exclusive render writes the WHOLE buffer per event, no padding query)\n");
-    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (1 ms poll, v10.2.1 -- request 48 fr)\n",
+    tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
+    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
            g_capPeriodFrames * 1000.0 / kSampleRate);
-    if (!capExclusive && g_cfg.captureExclusive) {
-        tlog( "[twinspeak] capture hint   : exclusive was refused (%s, HRESULT 0x%08lX) -- the refusal is\n"
-                        "            NAMED now. EXCLUSIVE_MODE_NOT_ALLOWED (0x8889000E) is the endpoint's\n"
-                        "            own policy: Properties > Levels tab has no box there -- it is the\n"
-                        "            \"Allow applications to take exclusive control\" checkbox on the\n"
-                        "            ADVANCED tab of the cable's recording device (and the group policy\n"
-                        "            \"Allow exclusive mode\" if a domain set it). If the code instead says\n"
-                        "            DEVICE_IN_USE, another app holds the pin; UNSUPPORTED_FORMAT after the\n"
-                        "            0x63F fix means the VAC pin's format genuinely differs -- read the name.\n",
-                        g_capExclWhy ? g_capExclWhy : "unknown", (unsigned long)g_capExclHr);
-    }
+    if (!capExclusive && g_cfg.captureExclusive)
+        tlog( "[twinspeak] capture hint   : exclusive was refused -- the pin is held by the engine or the\n"
+                        "            Line 1 port driver is WaveCyclic. The direct WaveRT capture path\n"
+                        "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
@@ -12062,9 +11624,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     auto estPathOf = [&](int i) -> double {
         const Leg& L = g_leg[i];
         const double delayMsv = (double)L.delayFrames * 1000.0 / (double)kSampleRate;
-        const Dev* d = &L.dev;
-        const double devMs = d->bufFrames
-            ? (double)d->bufFrames * 1000.0 / (double)kSampleRate : 0.0;
+        const ma_device* d = &L.dev;
+        const double devMs = d->playback.internalPeriodSizeInFrames
+            ? (double)d->playback.internalPeriodSizeInFrames * (double)d->playback.internalPeriods
+              * 1000.0 / (double)d->playback.internalSampleRate : 0.0;
         return delayMsv + devMs;
     };
     const double ep1 = estPathOf(0), ep2 = g_centerFold ? 0.0 : estPathOf(1);   // v8.4.1: leg2 may be EMPTY
@@ -12148,10 +11711,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v8.2.0: the v6.0 latency hint is GONE -- it pointed at out1ms/out2ms,
     // and those are engine constants now; its >=10 ms trigger cannot
     // fire. printLegDevice above prints each leg's real negotiated path.
-    tlog("[twinspeak] threads        : one pump thread per device, nothing else (the switches mix inline;\n"
-           "                            v10.0.0: the raw WASAPI event paces every pump -- no pacer, no pool)\n");
-    tlog("[twinspeak] transport      : raw WASAPI, exclusive-first on every leg -- the constant %u fr x %u request,\n"
-           "                            one engine bite for every device (v10.0.0: miniaudio removed)\n",
+    tlog("[twinspeak] threads        : 1 capture + the device threads only (v8.1.0: the switches mix inline,\n"
+           "                            the pumps are gone; v9.0.1: no pacer threads -- WASAPI events pace)\n");
+    tlog("[twinspeak] transport      : WASAPI EXCLUSIVE on every leg -- the constant %u fr x %u request, one engine\n"
+           "                            bite for every device (v9.0.1: WDM-KS removed)\n",
            (unsigned)kOutPeriodFrames, (unsigned)kOutPeriods);
 
     if (g_logToFile)
@@ -12282,7 +11845,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                              "                            device moves elsewhere (yield_default = on);\n"
                              "                            endpoint-volume pin released -- device volume stays yours\n",
                              i + 1, defName.c_str(), yneedle);
-                        Y.dev.close();
+                        if (Y.dev.pContext) {
+                            ma_device_uninit(&Y.dev);
+                            memset(&Y.dev, 0, sizeof(Y.dev));
+                        }
                         // v6.5.15: drop the endpoint-volume pin WITH the DAC --
                         // while this device is the system's main output its
                         // volume belongs to the user; the reopen re-pins.
@@ -12320,41 +11886,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                      "                            -- reopening (\"%s\")\n",
                                      i + 1, Y.name.c_str());
                                 Y.lastReopenMs = nowMs;
-                                tryRestartLeg(i, kOutPeriodFrames,
+                                tryRestartLeg(i, &ctx, kOutPeriodFrames,
                                               "yield release (default device moved away)");
                             }
                         }
                     }
-                }
-            }
-        }
-        // ---- v10.2.1 DEAD-LEG WATCHDOG (the one the start-align message
-        // always promised and v10.0.0 never shipped): a leg that is not
-        // yielded, holds a live device, and has not beaten its heartbeat in
-        // 5 s is DEAD -- the v10.2.0 field log ran one for minutes (an
-        // exclusive pump stuck at write==0 spins forever; a thread that
-        // died silently never fires anything else). The off meter cannot
-        // see it: frozen popped deltas read a flat, "healthy" 0. Boot
-        // grace 10 s (device enumeration, the yield pass, slow drivers).
-        // tryRestartLeg re-opens exclusive-first with the full fallback
-        // ladder -- a driver whose exclusive pin cannot stream lands back
-        // on shared by itself.
-        if (nowMs - g_bootMs > 10000) {
-            for (int i = 0; i < 4; ++i) {
-                Leg& W = g_leg[i];
-                if (W.disabled) continue;
-                if (W.yielded.load(std::memory_order_relaxed)) continue;
-                if (!W.dev.good()) continue;   // nothing held -- the yield path owns it
-                if (nowMs - hbOutGet(i) > 5000) {
-                    static unsigned long long lastDeadLog[4] = { 0, 0, 0, 0 };
-                    if (nowMs - lastDeadLog[i] >= 10000) {
-                        tlog("[twinspeak] leg%d WATCHDOG : no buffer switch in >5 s (device held, pump silent) --\n"
-                             "                            reopening \"%s\" (exclusive-first; the ladder falls\n"
-                             "                            back to shared if the pin refuses to stream)\n",
-                             i + 1, W.name.c_str());
-                        lastDeadLog[i] = nowMs;
-                    }
-                    tryRestartLeg(i, kOutPeriodFrames, "pump silent >5 s (dead-leg watchdog)");
                 }
             }
         }
@@ -12364,7 +11900,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             tlog("[twinspeak] power guard : system resume -- rebuilding capture + both legs\n"
                  "                            (a post-sleep stream is never trusted: the field log\n"
                  "                            shows an S5 consuming at ~42%% with a fresh heartbeat)\n");
-            tryRestartCap();
+            tryRestartCap(&ctx);
             // v6.5.14: a yielded leg STAYS released (its device is ours by
             // choice, not broken); the yield check above re-evaluates the
             // default every tick and reopens it when the default moves.
@@ -12373,7 +11909,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 const int i = g_cfg.out2First ? (oi == 0 ? 1 : oi == 1 ? 0 : oi) : oi;
                 if (g_leg[i].disabled) continue;
                 if (!g_leg[i].yielded.load(std::memory_order_relaxed))
-                    tryRestartLeg(i, kOutPeriodFrames);
+                    tryRestartLeg(i, &ctx, kOutPeriodFrames);
             }
             wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
             for (int k = 0; k < 4; ++k) colStreak[k] = 0;   // v8.4.0: all four legs
@@ -12485,26 +12021,30 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         else
             snprintf(volStr, sizeof(volStr), "%6s", "---");
         // ---- v6.5.9 MEASURED device buffering per leg (the 'devbuf' line) ----
-        // v10.0.0: raw WASAPI -- exclusive = the whole device buffer (WaveRT
-        // drivers misreport padding as 0 and the pump writes the FULL buffer
-        // per event); shared = live GetCurrentPadding. Telemetry only: a
-        // failed call prints ----.
+        // The live reading, from the authoritative source per transport:
+        // WASAPI shared = GetCurrentPadding; exclusive = the whole device
+        // buffer (WaveRT drivers misreport padding as 0 and miniaudio pops
+        // the FULL buffer per event); WDM-KS = the pacer's write-minus-play
+        // lead off the DAC position register. Telemetry only: a failed call
+        // prints ----.
         double      padMs[4]  = { 0.0, 0.0, 0.0, 0.0 };
         const char* padHow[4] = { "----", "----", "----", "----" };
         for (int i = 0; i < 4; ++i) {
             Leg& L = g_leg[i];
             if (L.disabled) continue;   // v8.4.0: no device, no pad
-            if (L.dev.good()) {
+            if (L.dev.pContext) {
+                const unsigned bf = L.dev.wasapi.actualBufferSizeInFramesPlayback;
                 if (L.isExclusive) {
-                    if (L.dev.bufFrames) {
-                        padMs[i]  = (double)L.dev.bufFrames * 1000.0 / (double)kSampleRate;
+                    if (bf) {
+                        padMs[i]  = (double)bf * 1000.0 / (double)kSampleRate;
                         padHow[i] = "excl buf";
                     }
                 } else {
+                    ma_IAudioClient* ac =
+                        (ma_IAudioClient*)(void*)L.dev.wasapi.pAudioClientPlayback;
                     UINT32 pad = 0;
-                    if (L.dev.ac && SUCCEEDED(L.dev.ac->GetCurrentPadding(&pad))
-                        && pad > 0
-                        && (L.dev.bufFrames == 0 || pad <= L.dev.bufFrames * 4)) {  // misreport guard
+                    if (ac && SUCCEEDED(ma_IAudioClient_GetCurrentPadding(ac, &pad))
+                        && pad > 0 && (bf == 0 || pad <= bf * 4)) {  // misreport guard
                         padMs[i]  = (double)pad * 1000.0 / (double)kSampleRate;
                         padHow[i] = "padding ";
                     }
@@ -12617,14 +12157,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     g_run.store(false);
     Sleep(150); // let the device threads drain their tails (v8.1.0: no pumps to join)
     if (hWatch) { WaitForSingleObject(hWatch, 2000); CloseHandle(hWatch); }
-    g_capDev.close();
-    for (int i = 0; i < 4; ++i)   // v8.4.0: the rear legs close the same way
-        g_leg[i].dev.close();
+    if (g_capDev.pContext)     ma_device_uninit(&g_capDev);
+    for (int i = 0; i < 4; ++i) {   // v8.4.0: the rear legs close the same way
+        if (g_leg[i].dev.pContext) ma_device_uninit(&g_leg[i].dev);
+    }
     centerVirtualShutdown();   // v9.1.3: the mask estimator's pool dies with the engine
     if (g_srcVol) { g_srcVol->Release(); g_srcVol = nullptr; }
     for (int i = 0; i < 4; ++i)
         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
     if (comOK) CoUninitialize();
+    ma_context_uninit(&ctx);
     timeEndPeriod(1);
     tlog("[twinspeak] stopped.\n");
     return 0;
