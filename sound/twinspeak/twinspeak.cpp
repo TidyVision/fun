@@ -2913,7 +2913,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "10.1.0"
+#define TWS_VERSION "10.2.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3476,13 +3476,42 @@ static DWORD WINAPI devPumpThread(LPVOID p) {
     return 0;
 }
 
+// v10.2.0 name the refusal -- an HRESULT nobody prints is a diagnosis
+// nobody can do (the field's "capture EXCLUSIVE refused" line guessed at
+// causes for two releases). House style: plain compares, no table magic.
+static const char* hresultName(HRESULT hr) {
+    switch (hr) {
+    case AUDCLNT_E_UNSUPPORTED_FORMAT:        return "UNSUPPORTED_FORMAT (the pin will not take this format)";
+    case AUDCLNT_E_DEVICE_IN_USE:             return "DEVICE_IN_USE (another app holds the pin)";
+    case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED:return "EXCLUSIVE_MODE_NOT_ALLOWED (the endpoint forbids it)";
+    case AUDCLNT_E_INVALID_DEVICE_PERIOD:     return "INVALID_DEVICE_PERIOD (under the driver's minimum)";
+    case AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED:   return "BUFFER_SIZE_NOT_ALIGNED (alignment dance handles this)";
+    case AUDCLNT_E_INVALID_SIZE:              return "INVALID_SIZE (format contradicts itself / bad size)";
+    case AUDCLNT_E_ENDPOINT_CREATE_FAILED:    return "ENDPOINT_CREATE_FAILED";
+    case AUDCLNT_E_SERVICE_NOT_RUNNING:       return "SERVICE_NOT_RUNNING";
+    case E_ACCESSDENIED:                      return "ACCESS_DENIED (policy: exclusive disabled system-wide)";
+    default:                                  return "unknown";
+    }
+}
+// v10.2.0 the device's OWN pin format, miniaudio's first exclusive
+// candidate: PKEY_AudioEngine_DeviceFormat from the endpoint's property
+// store. Shared mode converts whatever you send; exclusive hands YOUR
+// format to the pin raw -- asking for the pin's native format first is how
+// miniaudio gets exclusive open at all on picky drivers.
+static const PROPERTYKEY kPKEY_AudioEngine_DeviceFormat =
+    { { 0xF19F064D, 0x082C, 0x4E27, { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } }, 0 };
+
 // open ONE endpoint by id string. cap = capture side; ch = channels (8 in,
 // 2 out); periodFrames = the request (the driver's alignment pass keeps the
 // final word). wantExcl tries AUDCLNT_SHAREMODE_EXCLUSIVE first and falls
 // back to shared when it is refused (the legacy behavior, kept: exclusive
 // TOGETHER or shared TOGETHER is the caller's business).
 static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
-                    unsigned periodFrames, bool wantExcl, bool& gotExcl) {
+                    unsigned periodFrames, bool wantExcl, bool& gotExcl,
+                    const char** whyOut = nullptr, HRESULT* hrOut = nullptr) {
+    // v10.2.0 the exclusive attempt's story, for the caller to print
+    const char* exclWhy = "never attempted";
+    HRESULT     exclHr  = S_OK;
     IMMDeviceEnumerator* en = nullptr;
     IMMDevice* dev = nullptr;
     // v10.0.0: WAVEFORMATEXTENSIBLE -- an 8ch f32 capture is only expressible
@@ -3498,7 +3527,12 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
     wfx.Format.nAvgBytesPerSec = kSampleRate * wfx.Format.nBlockAlign;
     wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
     wfx.Samples.wValidBitsPerSample = 32;
-    wfx.dwChannelMask = (ch >= 8) ? 0x0000003F /* KSAUDIO_SPEAKER_7POINT1 */
+    // v10.2.0 THE MASK LIE, FIXED: 0x3F has SIX bits (FL FR FC LFE BL BR --
+    // "5.1") while nChannels says 8. Shared mode shrugged (audiodg
+    // converts anything); EXCLUSIVE does not -- the pin gets the format
+    // raw and a self-contradictory one is refused. The VAC cable's real
+    // order (L R C LFE SL SR RL RR) is KSAUDIO_SPEAKER_7POINT1_SURROUND.
+    wfx.dwChannelMask = (ch >= 8) ? 0x0000063F /* KSAUDIO_SPEAKER_7POINT1_SURROUND (8 bits set) */
                         : (ch == 2) ? 0x00000003 /* STEREO */ : 0;
     static const GUID kSubIeeeFloat =
         { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
@@ -3520,15 +3554,82 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
                     // mode ignores the periodicity argument entirely.
                     REFERENCE_TIME per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE)
                                        ? dur : 0;
-                    // v10.1.0 THE ALIGNMENT LADDER: exclusive + a small
-                    // request -> AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED -- the
-                    // HD-audio "alignment dance". Without this ladder the
-                    // 1 ms request silently bounced to shared on alignment-
-                    // picky drivers, and shared WAS the 10 ms.
+                    // v10.2.0 THE EXCLUSIVE LADDER, after miniaudio: the
+                    // period request first rides a doubling ladder past the
+                    // driver's minimum, then the ALIGN dance, and the
+                    // FORMAT itself is tried twice -- the device's own pin
+                    // format (PKEY probe, miniaudio's first candidate)
+                    // before ours (with the v10.2.0 fixed mask). Every
+                    // refusal is named in the log; nothing bounces to
+                    // shared silently any more.
+                    WAVEFORMATEX* tryWf = wf;   // ours first (fixed mask);
+                                                // the PKEY probe may replace it
+                    // the pin format COPY lives here: the property-store
+                    // blob dies at PropVariantClear below, and tryWf stays
+                    // in Initialize calls after that -- never point at the
+                    // blob itself (v10.2.0 self-review: use-after-free).
+                    WAVEFORMATEXTENSIBLE pinWf;
+                    if (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) {
+                        // miniaudio's probe: the endpoint's own format
+                        IPropertyStore* ps = nullptr;
+                        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+                            PROPVARIANT var; PropVariantInit(&var);
+                            if (SUCCEEDED(ps->GetValue(kPKEY_AudioEngine_DeviceFormat, &var))
+                                && var.vt == VT_BLOB && var.blob.pBlobData) {
+                                WAVEFORMATEX* pf = (WAVEFORMATEX*)var.blob.pBlobData;
+                                // the pin's own format, but ONLY if it fits
+                                // our stream shape (channel count matches;
+                                // the engine is f32 @ 48 kHz end to end and
+                                // does no conversion -- a 44.1 kHz pin or a
+                                // different channel count is not ours to
+                                // ride, miniaudio would convert, we must
+                                // not). Same rule both sides: 8 in, 2 out.
+                                if (pf->nChannels == (WORD)ch
+                                    && pf->nSamplesPerSec == kSampleRate
+                                    && (pf->wBitsPerSample == 32 || pf->wBitsPerSample == 0)) {
+                                    WAVEFORMATEX* closest = nullptr;
+                                    if (SUCCEEDED(d.ac->IsFormatSupported(
+                                            AUDCLNT_SHAREMODE_EXCLUSIVE, pf, &closest))) {
+                                        if (closest) CoTaskMemFree(closest);
+                                        // copy the WHOLE extensible struct
+                                        // (cbSize-guarded) onto the stack;
+                                        // tryWf points at the copy
+                                        WORD extra = pf->wFormatTag == WAVE_FORMAT_EXTENSIBLE
+                                                   ? (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
+                                                   : 0;
+                                        memset(&pinWf, 0, sizeof(pinWf));
+                                        memcpy(&pinWf, pf, sizeof(WAVEFORMATEX) + extra);
+                                        tryWf = (WAVEFORMATEX*)&pinWf;   // THE PIN'S OWN FORMAT (copied)
+                                        exclWhy = "device pin format (PKEY) accepted";
+                                    } else {
+                                        exclWhy = "device pin format (PKEY) refused -- trying ours";
+                                    }
+                                } else {
+                                    exclWhy = "pin format shape mismatch (ch/rate) -- trying ours";
+                                }
+                            }
+                            PropVariantClear(&var);
+                            ps->Release();
+                        }
+                    }
+                    // v10.1.0 THE ALIGNMENT LADDER, kept: exclusive + a
+                    // small request -> AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED --
+                    // the HD-audio "alignment dance".
                     HRESULT hrInit = E_FAIL;
                     if (d.ev)
                         hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                  dur, per, wf, nullptr);
+                                                  dur, per, tryWf, nullptr);
+                    // v10.2.0 THE PERIOD LADDER (miniaudio's): exclusive
+                    // enforces a driver minimum on hnsPeriodicity; doubling
+                    // until it accepts beats falling to shared's 10 ms.
+                    while (hrInit == AUDCLNT_E_INVALID_DEVICE_PERIOD && d.ac
+                           && dur < 500 * 10000) {
+                        dur *= 2;
+                        per = dur;
+                        exclWhy = "INVALID_DEVICE_PERIOD -- period doubled, retrying";
+                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                  dur, per, tryWf, nullptr);
+                    }
                     if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
                         // MSDN's five-step dance, verbatim: GetBufferSize on
                         // the FAILED client returns the next-highest-aligned
@@ -3537,20 +3638,56 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
                         // (The aligned size does NOT ride in the HRESULT --
                         // the upper bits are the facility, not a period.)
                         UINT32 nAlign = 0;
-                        if (SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
+                        if (d.ac && SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
                             dur = (REFERENCE_TIME)((10000.0 * 1000 /
-                                                    (double)wf->nSamplesPerSec * nAlign) + 0.5);
+                                                    (double)tryWf->nSamplesPerSec * nAlign) + 0.5);
                             per = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) ? dur : 0;
                             d.ac->Release(); d.ac = nullptr;
                             if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL,
                                                         nullptr, (void**)&d.ac)) && d.ac) {
                                 hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                          dur, per, wf, nullptr);
+                                                          dur, per, tryWf, nullptr);
                             } else {
                                 d.ac = nullptr;   // the chain below sees !d.ac and falls to cleanup
                                 hrInit = E_FAIL;
                             }
                         }
+                    }
+                    // v10.2.0: OUR format as the second exclusive candidate
+                    // when the PKEY path replaced it and still failed -- the
+                    // fixed 0x63F mask deserves its own attempt.
+                    if (hrInit != S_OK && tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE
+                        && tryWf != wf && d.ev && d.ac) {
+                        dur = (REFERENCE_TIME)((double)periodFrames * kOutPeriods * 1e7 / (double)kSampleRate);
+                        per = dur;
+                        hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                  dur, per, wf, nullptr);
+                        while (hrInit == AUDCLNT_E_INVALID_DEVICE_PERIOD && d.ac
+                               && dur < 500 * 10000) {
+                            dur *= 2;
+                            per = dur;
+                            hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                      dur, per, wf, nullptr);
+                        }
+                        if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && d.ac) {
+                            UINT32 nAlign = 0;
+                            if (SUCCEEDED(d.ac->GetBufferSize(&nAlign)) && nAlign > 0) {
+                                dur = (REFERENCE_TIME)((10000.0 * 1000 /
+                                                        (double)wf->nSamplesPerSec * nAlign) + 0.5);
+                                per = dur;
+                                d.ac->Release(); d.ac = nullptr;
+                                if (SUCCEEDED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL,
+                                                            nullptr, (void**)&d.ac)) && d.ac) {
+                                    hrInit = d.ac->Initialize(tryMode[t], AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                              dur, per, wf, nullptr);
+                                } else { d.ac = nullptr; hrInit = E_FAIL; }
+                            }
+                        }
+                        exclWhy = "our format (fixed mask) after the pin's own refused";
+                    }
+                    if (FAILED(hrInit) && tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE) {
+                        exclHr  = hrInit;
+                        exclWhy = hresultName(hrInit);
                     }
                     if (d.ev && d.ac &&
                         SUCCEEDED(hrInit) &&
@@ -3583,6 +3720,8 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
             d.excl = (tryMode[t] == AUDCLNT_SHAREMODE_EXCLUSIVE);
             gotExcl = d.excl;
             dev->Release(); en->Release();
+            if (whyOut) *whyOut = exclWhy;
+            if (hrOut)  *hrOut  = exclHr;
             return true;
         }
         // this mode refused -- clean up and let the loop try shared
@@ -3594,6 +3733,8 @@ static bool openDev(Dev& d, const wchar_t* idStr, bool cap, int ch,
         if (en) en->Release();
         dev = nullptr; en = nullptr;
     }
+    if (whyOut) *whyOut = exclWhy;
+    if (hrOut)  *hrOut  = exclHr;
     return false;
 }
 
@@ -3843,6 +3984,8 @@ static Dev g_capDev;
 static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
+static const char* g_capExclWhy = nullptr;   // v10.2.0: the refusal's name
+static HRESULT     g_capExclHr  = S_OK;
 
 // v10.0.0: the audio thread boost, MMCSS removed (the v9.1.9 "Pro Audio
 // Priority" jank is retired per the field: no Avrt registration, no task
@@ -11397,7 +11540,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     bool capExclusive = false;
     if (!openDev(g_capDev, capId.c_str(), true, kInCh,
                  (unsigned)(kSampleRate / 1000 * capPeriodMs),
-                 g_cfg.captureExclusive, capExclusive)) {
+                 g_cfg.captureExclusive, capExclusive,
+                 &g_capExclWhy, &g_capExclHr)) {
         tlog( "[twinspeak] capture init failed -- no share mode would open\n");
         return 1;
     }
@@ -11755,15 +11899,19 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] v%s         : BIT-EXACT ASIO-strict engine -- the audio path is memcpy; twinspeak\n",
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
-    tlog("[twinspeak] backend        : WASAPI (raw, v10.1.0 -- 1 ms capture POLL, exclusive-first, no miniaudio)\n");
+    tlog("[twinspeak] backend        : WASAPI (raw, v10.2.0 -- 1 ms capture POLL, the miniaudio exclusive\n"
+           "                            ladder: pin-format probe + period doubling + alignment dance)\n");
     tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (1 ms poll, v10.1.0 -- request 48 fr)\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
            g_capPeriodFrames * 1000.0 / kSampleRate);
-    if (!capExclusive && g_cfg.captureExclusive)
-        tlog( "[twinspeak] capture hint   : exclusive was refused -- the pin is held by the engine or the\n"
-                        "            Line 1 port driver is WaveCyclic. The direct WaveRT capture path\n"
-                        "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
+    if (!capExclusive && g_cfg.captureExclusive) {
+        tlog( "[twinspeak] capture hint   : exclusive was refused (%s, HRESULT 0x%08lX) -- v10.2.0:\n"
+                        "            the mask fix (0x63F) and the period ladder ride in this build; if it\n"
+                        "            still refuses, check the VAC Control Panel's port driver (WaveRT, not\n"
+                        "            WaveCyclic) and that no other app (OBS, DAW) holds the cable's pin.\n",
+                        g_capExclWhy ? g_capExclWhy : "unknown", (unsigned long)g_capExclHr);
+    }
     tlog("[twinspeak] clock sync     : v8.1.0 THE STRIPPED PATH -- a shortfall plays SILENCE (counted,\n"
            "                            'short'), capture excess evicts OLDEST at the raw cap (counted,\n"
            "                            'evict'). No replay queue, no rate state, nothing bends pitch: the\n"
