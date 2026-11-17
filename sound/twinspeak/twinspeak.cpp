@@ -3022,8 +3022,8 @@ static unsigned           g_kaIdxLeg[4] = {0, 0, 0, 0};
 // v8.1.0 THE STRIPPED PATH: clock discipline is OBSERVATION ONLY -- a
 // shortfall plays silence and is counted, capture excess evicts oldest at
 // the raw cap (ledger-true), nothing ever repeats or drops on a schedule.
-static size_t             g_capPeriodFrames   = 384;    // real negotiated capture period (informational)
-static size_t             g_periodFrames[4]   = {768, 768, 768, 768}; // real device period per leg (v8.4.0: four)
+static size_t             g_capPeriodFrames   = 192;    // real negotiated capture period (informational)
+static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device period per leg (v8.4.0: four)
 // v9.0.1 THE CONSTANT BUFFER SIZE AGAIN: the engine asks for FRAMES, not a
 // millisecond hint -- kOutPeriodFrames 512 x kOutPeriods 3 on EVERY WASAPI
 // leg (the v8.4.24 field-validated geometry: a 5.33 ms switch, ~375
@@ -3038,7 +3038,7 @@ static size_t             g_periodFrames[4]   = {768, 768, 768, 768}; // real de
 // re-init) still has the final word on the exact frame count; the REQUEST
 // is constant, the anchor/ring math (2 x the negotiated period) follows
 // the real number as before.
-static constexpr unsigned kOutPeriodFrames   = 384;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
+static constexpr unsigned kOutPeriodFrames   = 192;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
 static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 256 fr (~8.0 ms)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
