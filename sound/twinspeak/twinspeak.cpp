@@ -64,6 +64,89 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.3.2 THE FREEZE FIX (field: "now this freezes my screen as
+//            everything's frozen because of it" under v9.3.1 -- audio kept
+//            playing above a frozen desktop). The crackle fix's worker
+//            parked on the futex with a 250 ms timeout, but its seqlock
+//            read loop had an exit for "fresh round" and for "engine stop"
+//            and NONE for "stable but stale" -- so the first time a park
+//            timed out with no new round (parallel_mix toggled off, blocks
+//            under kMixCrewMinFrames, or the adaptive skip's own cooldown
+//            pausing dispatches), the worker spun the read at 100% CPU: no
+//            yield, no syscall, at ABOVE_NORMAL on a pinned core. Five
+//            burners starve every NORMAL thread beneath them -- DWM, the
+//            shell, input rendering -- while the TIME_CRITICAL audio
+//            threads preempt the burners and keep playing. The fix: parking
+//            is a LOOP (re-check the seq word after every wake or timeout),
+//            a stable-but-stale read goes back to the park, and the
+//            mid-write (odd-seq) spin yields after 1024 pauses -- no branch
+//            in the worker can burn unbounded. The harness gained scenario
+//            F (idle a live crew past many park timeouts, meter the
+//            workers' real thread CPU: it must stay ~zero) -- on v9.3.1 it
+//            burned 2212 ms over 1.5 s; on v9.3.2 it is 0 ms.
+//    v9.3.1 THE CRACKLE FIX (field: "legitimately starts to crackle...
+//            like some buzzing" under v9.3.0). The math was never the
+//            problem (the harness proved bit-equality); the TIMING was.
+//            v9.3.0's dispatch parked the workers on a CRITICAL_SECTION and
+//            the audio callback woke them with WakeAllConditionVariable --
+//            entering a kernel lock SHARED WITH NORMAL-PRIORITY WORKERS on
+//            the RT thread, 250x/sec. That is textbook priority inversion:
+//            whenever a worker held the CS (or the wake hand-off stalled),
+//            the MMCSS-boosted leg1 device thread blocked in the kernel
+//            behind a LOWER-priority thread; one blocked entry = one missed
+//            4 ms period = one repeated/glitched period; sustained = the
+//            buzz the field heard. (The estimator pool's CS+CV dispatch is
+//            safe because its dispatcher is a NORMAL-priority background
+//            coordinator -- never an audio thread.) THE FIX, three layers:
+//            (1) THE RT DISCIPLINE -- the mix thread now NEVER enters any
+//            kernel lock, never allocates, never blocks: dispatch is a
+//            futex doorbell (WaitOnAddress/WakeByAddressAll on the seq
+//            word, Win8+ via GetProcAddress, spin+Sleep fallback), and the
+//            RT thread only ever does atomic stores plus the one wake
+//            syscall. (2) THE PLACEMENT -- the five lane workers pin
+//            TOP-DOWN from the machine's last LP (the estimator pool's
+//            pattern: the audio core map holds LP 1..5, so the crew never
+//            contends an audio core on any but the smallest machines) and
+//            run at ABOVE_NORMAL: the RT threads always preempt a lane
+//            worker, never the reverse. (3) THE ADAPTIVE SKIP -- when the
+//            crew is not winning (32 consecutive rounds adopting < 2 of 5
+//            lanes), it stands down for 32 rounds of pure serial (zero
+//            crew overhead on the RT thread), then re-arms and probes: a
+//            busy machine settles into a mostly-serial duty cycle instead
+//            of burning the RT thread on futile syscalls. New meters in
+//            the stop log (rounds / lane ADOPTS / assists / skips) -- if
+//            adopts stays near zero on your machine, the crew is honestly
+//            telling you the serial mix is the right engine there.
+//    v9.3.0 THE MIX CREW (field-directed: "do the thing that's not done
+//            yet" -- v9.2.0's deliberately-skipped half: the audio flow's
+//            mix itself on the threads). Leg1's filter LANES -- the
+//            center's HRTF+XTC chain, the two surround-bass biquads, the
+//            two rear-comb lines, the only per-sample state machines in
+//            the engine's mix -- now run CONCURRENTLY, one worker per
+//            lane, on a persistent five-thread crew (the estimator pool's
+//            exact park/wake pattern). THE CONTRACT HELDS: byte-identical
+//            output to v9.2.0 (each lane is the same op sequence lifted
+//            verbatim into mixCrewLane; the two output sums keep their
+//            original expression order -- that order IS the bit-exactness;
+//            lane state is snapshotted before dispatch and committed only
+//            by leg1's own thread after the merge, so the single-owner
+//            discipline never breaks). THE MERGE NEVER WAITS: the mix
+//            thread feeds the estimator's SPSC ring and runs the LONGEST
+//            lane itself (the head start), then ONE pass over the lanes --
+//            landed lanes are adopted, a lane that missed is self-completed
+//            inline on the same snapshot (identical ops, identical result);
+//            a stalled worker costs nothing but the scan. A straggler
+//            publishing an old round is ignored by the round tag; buffers
+//            are only rewritten after the next dispatch, which the mix
+//            thread issues strictly after its merge. FTZ/DAZ is set on
+//            every worker (a lane must flush denormals exactly like the
+//            serial loop). ini: parallel_mix (default ON; off = the crew
+//            idles and mixCrewLeg1 IS the serial mix -- one code path, no
+//            drift between builds; blocks under 64 frames also run inline:
+//            the handoff would cost more than the work). The center chain
+//            (cvRun) is now a pure state-in/state-out core shared by both
+//            paths. Meters: g_mixCrewRounds/g_mixCrewAssists, logged at
+//            engine stop ("the crew idles (N rounds, M lane assists)").
 //    v9.2.0 THE AUDIO FLOW ON ALL CORES (field-directed: "Make it so this
 //            runs on all cores ... I mean having the audio flow run on all
 //            threads"). The flow was already five MMCSS device threads
@@ -2963,7 +3046,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.2.0"
+#define TWS_VERSION "9.3.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3156,6 +3239,16 @@ struct Config {
     float       surroundBassFreq = 200.0f;  // peak center (Hz, clamped 20..20000; the field's pick)
     float       surroundBassGain = 2.0f;    // peak gain (dB, clamped +-12)
     float       surroundBassQ    = 0.8f;    // peak Q (clamped 0.1..10)
+    // v9.3.0 PARALLEL MIX: the leg1 mix's FILTER LANES run on the mix crew
+    // (the persistent pool from v9.2.0's topology work -- one worker per
+    // logical processor, already running). on = the crew carries the
+    // biquad lanes (ch5/ch6 bass, ch7/ch8 comb) and the center's virtual
+    // chain, one worker per lane, the mix thread merges; off = the inline
+    // loops, byte-identical output (proven by harness). Default ON per the
+    // field's ask ("having the audio flow run on all threads"); the engine
+    // self-completes any lane a stalled worker misses, so the worst case
+    // degrades to the serial path with one extra scan.
+    bool        parallelMix     = true;
     // v7.1.8 CENTER EQ SAVE SLOTS: the four built-in presets are retired --
     // five user slots persist in the ini (eq_slotN_on/freq/gain/q). Slot 1
     // ships reserved with the field's dialogue curve; freq <= 0 = empty slot.
@@ -4510,6 +4603,12 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 // pumps that used to separate them are gone). Definitions stay where they
 // were; only their names are promised here.
 static void mixBlock(int idx, const float* sc, float* chunk, size_t n);
+// v9.3.0: leg1's mix rides the crew (defined with the crew block below)
+static void mixCrewLeg1(const float gL, const float gR, const float gLfe,
+                        const float gRL, const float gRR, const float gSL, const float gSR,
+                        const float gC, bool cLive, bool slLive, bool srLive,
+                        bool rlLive, bool rrLive, bool combAdv,
+                        const float* sc, float* chunk, const size_t n);
 static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore);
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
@@ -5418,6 +5517,55 @@ static void centerVirtualShutdown()
 // acoustic comb of the pair pre-notched (the subtraction is HIGH passed, so
 // the LF stays the harmless phantom) -- then the HRTF convolution over the
 // kernel's four nonzero taps.
+//
+// v9.3.0: the math lives in cvRun -- the EXACT op sequence above lifted to
+// a pure function with the state in/explicit/out (so the mix crew can run
+// the same lane on a SNAPSHOT; see the mix crew block). The globals-
+// writing wrapper below is what the serial path calls; byte-for-byte the
+// same FP ops in the same order.
+static inline float cvRun(const float x, CenterVirtual& cv, float& mask)
+{
+    // 1) CHAIN A -- THE CROSSTALK CANCELLATION (first-order fractional
+    //    delay, the rear comb's pattern)
+    const int   i12 = (cv.xidx + 16 - kCvcXtcInt) & 15;
+    const int   i13 = (cv.xidx + 16 - kCvcXtcInt - 1) & 15;
+    const float d   = (1.0f - kCvcXtcFrac) * cv.xdl[i12] + kCvcXtcFrac * cv.xdl[i13];
+    cv.xdl[cv.xidx] = x;
+    if (++cv.xidx >= 16) cv.xidx = 0;
+    const float dh  = cv.hpB0 * d + cv.hpZ1;
+    cv.hpZ1 = cv.hpB1 * d - cv.hpA1 * dh + cv.hpZ2;
+    cv.hpZ2 = cv.hpB2 * d - cv.hpA2 * dh;
+    const float y   = x - kCvcXtcA * dh;
+    // 2) THE HRTF CONVOLUTION (the direct tap reads the sample just written)
+    cv.hline[cv.hidx] = y;
+    const int iA = (cv.hidx + 32 - kCvcHrTapK[1]) & 31;
+    const int iB = (cv.hidx + 32 - kCvcHrTapK[2]) & 31;
+    const int iC = (cv.hidx + 32 - kCvcHrTapK[3]) & 31;
+    const float zA = cv.hg[0] * y + cv.hg[1] * cv.hline[iA]
+                   + cv.hg[2] * cv.hline[iB] + cv.hg[3] * cv.hline[iC];
+    if (++cv.hidx >= 32) cv.hidx = 0;
+    // 3) CHAIN B -- THE PHASE-SHUFFLED COMB CORRECTION: the recursive
+    //    shuffler comb, the phantom's acoustic comb inverted exactly --
+    //      y[n] = g*y[n - 2tau] + x[n] - x[n - tau]
+    //    (1/(1 + e^-jwt) factored: the numerator kills DC/LF by itself, the
+    //    regularized pole lifts the acoustic nulls back flat)
+    const int   xi12 = (cv.xidx2 + 16 - kCvcXtcInt) & 15;
+    const int   xi13 = (cv.xidx2 + 16 - kCvcXtcInt - 1) & 15;
+    const float xd   = (1.0f - kCvcXtcFrac) * cv.xrng[xi12] + kCvcXtcFrac * cv.xrng[xi13];
+    cv.xrng[cv.xidx2] = x;
+    if (++cv.xidx2 >= 16) cv.xidx2 = 0;
+    const int   yi24 = (cv.bidx + 32 - kCvcXtcInt * 2) & 31;
+    const int   yi25 = (cv.bidx + 32 - kCvcXtcInt * 2 - 1) & 31;
+    const float yd   = (1.0f - kCvcXtcFrac) * cv.brng[yi24] + kCvcXtcFrac * cv.brng[yi25];
+    const float zB   = kCvcShufG * yd + x - xd;
+    cv.brng[cv.bidx] = zB;
+    if (++cv.bidx >= 32) cv.bidx = 0;
+    // 4) THE MASK BLEND (the smoothed one-pole toward the estimator's
+    //    verdict: 1 = pure chain A, 0 = pure chain B)
+    mask += kCvcMaskSm * (g_cvcMaskTarget.load(std::memory_order_relaxed) - mask);
+    return mask * zA + (1.0f - mask) * zB;
+}
+
 static inline float centerVirtualRun(const float x)
 {
     // 0) THE ROBUSTNESS ESTIMATOR'S RING (SPSC -- the mix thread is the only
@@ -5431,45 +5579,496 @@ static inline float centerVirtualRun(const float x)
         if (nh == t) g_cvcTail.store((t + 1) & kCvcRingMask, std::memory_order_release);
         g_cvcHead.store(nh, std::memory_order_release);
     }
-    // 1) CHAIN A -- THE CROSSTALK CANCELLATION (first-order fractional
-    //    delay, the rear comb's pattern)
-    const int   i12 = (g_cvc.xidx + 16 - kCvcXtcInt) & 15;
-    const int   i13 = (g_cvc.xidx + 16 - kCvcXtcInt - 1) & 15;
-    const float d   = (1.0f - kCvcXtcFrac) * g_cvc.xdl[i12] + kCvcXtcFrac * g_cvc.xdl[i13];
-    g_cvc.xdl[g_cvc.xidx] = x;
-    if (++g_cvc.xidx >= 16) g_cvc.xidx = 0;
-    const float dh  = g_cvc.hpB0 * d + g_cvc.hpZ1;
-    g_cvc.hpZ1 = g_cvc.hpB1 * d - g_cvc.hpA1 * dh + g_cvc.hpZ2;
-    g_cvc.hpZ2 = g_cvc.hpB2 * d - g_cvc.hpA2 * dh;
-    const float y   = x - kCvcXtcA * dh;
-    // 2) THE HRTF CONVOLUTION (the direct tap reads the sample just written)
-    g_cvc.hline[g_cvc.hidx] = y;
-    const int iA = (g_cvc.hidx + 32 - kCvcHrTapK[1]) & 31;
-    const int iB = (g_cvc.hidx + 32 - kCvcHrTapK[2]) & 31;
-    const int iC = (g_cvc.hidx + 32 - kCvcHrTapK[3]) & 31;
-    const float zA = g_cvc.hg[0] * y + g_cvc.hg[1] * g_cvc.hline[iA]
-                   + g_cvc.hg[2] * g_cvc.hline[iB] + g_cvc.hg[3] * g_cvc.hline[iC];
-    if (++g_cvc.hidx >= 32) g_cvc.hidx = 0;
-    // 3) CHAIN B -- THE PHASE-SHUFFLED COMB CORRECTION: the recursive
-    //    shuffler comb, the phantom's acoustic comb inverted exactly --
-    //      y[n] = g*y[n - 2tau] + x[n] - x[n - tau]
-    //    (1/(1 + e^-jwt) factored: the numerator kills DC/LF by itself, the
-    //    regularized pole lifts the acoustic nulls back flat)
-    const int   xi12 = (g_cvc.xidx2 + 16 - kCvcXtcInt) & 15;
-    const int   xi13 = (g_cvc.xidx2 + 16 - kCvcXtcInt - 1) & 15;
-    const float xd   = (1.0f - kCvcXtcFrac) * g_cvc.xrng[xi12] + kCvcXtcFrac * g_cvc.xrng[xi13];
-    g_cvc.xrng[g_cvc.xidx2] = x;
-    if (++g_cvc.xidx2 >= 16) g_cvc.xidx2 = 0;
-    const int   yi24 = (g_cvc.bidx + 32 - kCvcXtcInt * 2) & 31;
-    const int   yi25 = (g_cvc.bidx + 32 - kCvcXtcInt * 2 - 1) & 31;
-    const float yd   = (1.0f - kCvcXtcFrac) * g_cvc.brng[yi24] + kCvcXtcFrac * g_cvc.brng[yi25];
-    const float zB   = kCvcShufG * yd + x - xd;
-    g_cvc.brng[g_cvc.bidx] = zB;
-    if (++g_cvc.bidx >= 32) g_cvc.bidx = 0;
-    // 4) THE MASK BLEND (the smoothed one-pole toward the estimator's
-    //    verdict: 1 = pure chain A, 0 = pure chain B)
-    g_cvcMask += kCvcMaskSm * (g_cvcMaskTarget.load(std::memory_order_relaxed) - g_cvcMask);
-    return g_cvcMask * zA + (1.0f - g_cvcMask) * zB;
+    return cvRun(x, g_cvc, g_cvcMask);
+}
+
+// ------------------- v9.3.0 THE MIX CREW (the audio flow on the crew) --------
+// The field's follow-up to v9.2.0: "having the audio flow run on all
+// threads" -- the mix ITSELF, not just the estimator. What is safely
+// parallel in a bit-exact callback is the FILTER LANES: each lane is an
+// independent recurrence over the shared read-only block, and the two
+// output sums keep their ORIGINAL expression order (that order IS the
+// bit-exactness contract). The lanes of leg1's mix (the only filter mix):
+//   lane 0: the center's virtual chain (ch3 -> cvRun -> raw terms)
+//   lane 1: surround bass L   (ch5 -> sbPeak)
+//   lane 2: surround bass R   (ch6 -> sbPeak)
+//   lane 3: rear comb L       (ch7 -> rearCombRun; zeros when the lane is dead)
+//   lane 4: rear comb R       (ch8 -> rearCombRun; zeros when the lane is dead)
+// Everything else (LFE, the straight gains, the final sums) is one op per
+// term -- the merge does those INLINE on leg1's own thread, cheaper than
+// any handoff. One worker per lane, pinned off the audio tickets.
+//
+// THE PROTOCOL (why this cannot corrupt or block):
+//   DISPATCH: the mix thread snapshots the lane state into the job, bumps
+//   the seqlock (odd = mid-write, even = stable), wakes the crew. Workers
+//   park on the FUTEX DOORBELL between rounds (WaitOnAddress on the seq
+//   word; Win8+, spin+Sleep fallback). The RT thread NEVER enters a kernel
+//   lock -- v9.3.0 parked the workers on a critical section and woke them
+//   with WakeAllConditionVariable taken ON the audio thread; that priority
+//   inversion (RT blocked behind a NORMAL worker holding the CS, 250x/sec)
+//   was the field's crackle, and it is gone.
+//   RUN: a worker seqlock-reads the job, runs its lane's EXACT op sequence
+//   on the SNAPSHOT into its own private term buffer + end-state, then
+//   publishes landed = the round's tag (store-release). Workers pin
+//   TOP-DOWN from the last LP at ABOVE_NORMAL -- the audio threads always
+//   preempt them, never the reverse.
+//   MERGE (never waits): the mix thread builds the two output slots per
+//   frame, adopting each lane's term buffer if landed == tag, else
+//   SELF-COMPLETING that lane inline on the same snapshot (identical ops,
+//   identical result). A slow worker costs nothing; the callback returns
+//   when the last frame is written, not when the last worker lands.
+//   COMMIT: the mix thread writes the adopted end states back into the
+//   single-owner globals (g_sbeq / g_rcomb / g_cvc / g_cvcMask), feeds
+//   the estimator's SPSC ring with the center samples (the mix thread
+//   stays its only writer), done. Rounds the crew loses (adopted < 2 of
+//   5, 32 in a row) stand it down for 32 rounds of pure serial, then a
+//   probe re-arms it (the adaptive skip).
+// A straggler publishing an old round's tag is ignored by the tag compare;
+// per-worker buffers are reused only after the next dispatch, which the
+// mix thread issues strictly AFTER this merge -- a late writer can never
+// touch a buffer the merge is reading. FTZ/DAZ are set on every worker
+// (the device threads' denormal guard -- without it a denormal could
+// flush differently between lanes and break the byte contract).
+static constexpr size_t kMixCrewMinFrames = 64;   // below: the inline mix (handoff would cost more than the work)
+static constexpr int    kMixLanes         = 5;    // cf, s5, s6, r6, r7
+// v9.3.1: the adaptive skip's window -- after this many consecutive losing
+// rounds the crew stands down for the same count of rounds (pure serial,
+// zero crew overhead), then re-arms and tries again. Machines that never
+// win settle into a mostly-serial duty cycle with a periodic probe.
+static constexpr unsigned kMixCrewArms    = 32;   // rounds per arm/probe window
+
+// the dispatch job: the snapshot + the lane liveness, published under the seqlock
+struct MixJob {
+    const float* sc = nullptr;
+    size_t       n  = 0;
+    bool centerFold = false, cLive = false;
+    bool sbOn = false, slLive = false, srLive = false;
+    bool rlLive = false, rrLive = false, combAdv = false;
+    float sbZ1L = 0.0f, sbZ2L = 0.0f, sbZ1R = 0.0f, sbZ2R = 0.0f;   // the biquad state
+    float rcBufL[32] = {}, rcBufR[32] = {};                          // the comb lines
+    int   rcIdx = 0;                                                 // the shared cursor
+    CenterVirtual cvc;                                               // the chain state
+    float mask = 1.0f;                                               // the smoothed mask
+};
+static MixJob         g_mixJob;              // written ONLY by the mix thread, under the seqlock
+static std::atomic<long> g_mixSeq{0};        // the seqlock: even = stable, odd = mid-write; the round tag
+
+// one worker's private output (terms + end state + the landed flag)
+struct alignas(64) MixLaneOut {
+    float term[kScratchFrames] = {};        // the lane's per-frame terms
+    float sbZ1L = 0.0f, sbZ2L = 0.0f, sbZ1R = 0.0f, sbZ2R = 0.0f;
+    float rcBufL[32] = {}, rcBufR[32] = {};
+    int   rcIdx = 0;
+    CenterVirtual cvc;
+    float mask = 1.0f;
+    std::atomic<long> landed{0};            // the round tag this output was published under
+};
+static MixLaneOut  g_mixW[kMixLanes];       // the workers' outputs (one per lane)
+static MixLaneOut  g_mixSelf[kMixLanes];    // the mix thread's self-completion outputs
+// v9.3.1 THE RT DISCIPLINE: the mix thread NEVER enters a kernel lock, never
+// allocates, never blocks -- only atomic stores and wake syscalls. The first
+// cut parked the workers on a CRITICAL_SECTION + WakeAllConditionVariable
+// taken ON THE AUDIO THREAD, and the field heard it at once: a buzz. The RT
+// thread entering a lock shared with NORMAL workers is priority inversion
+// 250x/sec -- one blocked handoff is one missed 4 ms period, one glitch; a
+// steady stream of them is a crackle. (The estimator pool's CS+CV dispatch
+// is safe because its dispatcher is a NORMAL background coordinator, never
+// an audio thread.) The doorbell is now a futex: the workers WaitOnAddress
+// on the seq word; the RT thread only WakeByAddressAll's it. WaitOnAddress
+// is Win8+ -- a one-time GetProcAddress, with a spin+sleep fallback if it
+// is missing (the lane math never depends on the wake).
+static std::atomic<bool>  g_mixCrewRun{false};
+static std::atomic<int>   g_mixCrewLive{0}; // workers in the loop (0 = nobody to wake)
+static HANDLE      g_mixCrewThread[kMixLanes] = {};
+static unsigned long long g_mixCrewRounds  = 0;
+static unsigned long long g_mixCrewAssists = 0;   // lanes the mix thread self-completed
+static unsigned long long g_mixCrewAdopted = 0;   // v9.3.1: lanes a worker landed in time
+static unsigned long long g_mixCrewSkips   = 0;   // v9.3.1: rounds not dispatched (the crew was not winning)
+// v9.3.1 THE ADAPTIVE SKIP: when the crew lands too few lanes to pay for the
+// wake, stop waking -- the mix self-completes everything (the serial mix,
+// zero crew overhead) for a cooldown window, then re-arms and probes again.
+// A busy machine backs off to pure serial instead of burning the RT thread's
+// time on futile syscalls; a quiet one never notices (every round wins).
+static unsigned g_mixCrewMissStreak = 0;    // consecutive dispatched rounds that adopted < 2 lanes
+static unsigned g_mixCrewCool       = 0;    // rounds left in the stand-down window (0 = armed)
+
+// One lane's exact op sequence, state in (the job snapshot) / terms + end
+// state out (the caller's MixLaneOut). NOTHING global is touched -- the
+// same function runs on a worker or on the mix thread's self-completion,
+// so the math has ONE definition. Dead lanes: state copies through
+// untouched (identity), terms only filled where the merge reads them
+// (rear lanes must read zeros; bass/center lanes are bypassed by the
+// merge's own liveness ternary, like the serial loops).
+static void mixCrewLane(const MixJob& j, const int lane, MixLaneOut& out)
+{
+    out.sbZ1L = j.sbZ1L; out.sbZ2L = j.sbZ2L;
+    out.sbZ1R = j.sbZ1R; out.sbZ2R = j.sbZ2R;
+    memcpy(out.rcBufL, j.rcBufL, sizeof(out.rcBufL));
+    memcpy(out.rcBufR, j.rcBufR, sizeof(out.rcBufR));
+    out.rcIdx = j.rcIdx;
+    out.cvc   = j.cvc;
+    out.mask  = j.mask;
+    const size_t n = j.n;
+    const float* sc = j.sc;
+    if (lane == 0) {
+        // the center's virtual chain: RAW terms (the merge applies gC after,
+        // the serial order). Only a live chain steps state or fills terms.
+        if (j.centerFold && j.cLive) {
+            CenterVirtual cv = out.cvc;
+            float m = out.mask;
+            for (size_t i = 0; i < n; ++i)
+                out.term[i] = cvRun(sc[i * kInCh + 2], cv, m);
+            out.cvc = cv;
+            out.mask = m;
+        }
+    } else if (lane == 1) {
+        // surround bass L (ch5): only a live lane steps the biquad
+        if (j.sbOn && j.slLive) {
+            float z1 = out.sbZ1L, z2 = out.sbZ2L;
+            for (size_t i = 0; i < n; ++i)
+                out.term[i] = sbPeak(sc[i * kInCh + 4], z1, z2);
+            out.sbZ1L = z1; out.sbZ2L = z2;
+        }
+    } else if (lane == 2) {
+        // surround bass R (ch6)
+        if (j.sbOn && j.srLive) {
+            float z1 = out.sbZ1R, z2 = out.sbZ2R;
+            for (size_t i = 0; i < n; ++i)
+                out.term[i] = sbPeak(sc[i * kInCh + 5], z1, z2);
+            out.sbZ1R = z1; out.sbZ2R = z2;
+        }
+    } else if (lane == 3) {
+        // rear comb L (ch7): a dead lane reads ZEROS (the serial ternary),
+        // but the cursor still advances while the comb is live at all
+        float buf[32];
+        memcpy(buf, j.rcBufL, sizeof(buf));
+        int idx = j.rcIdx;
+        if (j.rlLive) {
+            for (size_t i = 0; i < n; ++i) {
+                out.term[i] = rearCombRun(sc[i * kInCh + 6], buf, idx);
+                if (j.combAdv) { if (++idx >= 32) idx = 0; }
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) out.term[i] = 0.0f;
+            if (j.combAdv) for (size_t i = 0; i < n; ++i) { if (++idx >= 32) idx = 0; }
+        }
+        memcpy(out.rcBufL, buf, sizeof(out.rcBufL));
+        out.rcIdx = idx;
+    } else {
+        // rear comb R (ch8), the mirror
+        float buf[32];
+        memcpy(buf, j.rcBufR, sizeof(buf));
+        int idx = j.rcIdx;
+        if (j.rrLive) {
+            for (size_t i = 0; i < n; ++i) {
+                out.term[i] = rearCombRun(sc[i * kInCh + 7], buf, idx);
+                if (j.combAdv) { if (++idx >= 32) idx = 0; }
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) out.term[i] = 0.0f;
+            if (j.combAdv) for (size_t i = 0; i < n; ++i) { if (++idx >= 32) idx = 0; }
+        }
+        memcpy(out.rcBufR, buf, sizeof(out.rcBufR));
+        out.rcIdx = idx;
+    }
+}
+
+// v9.3.1: the futex doorbell (Win8+; resolved once). WaitOnAddress semantics:
+// park until the 4 bytes at addr != expected. The workers park on the seq
+// word's RAW value (odd values park -- mid-write is transient), the RT
+// thread wakes by storing an even (published) value. A missing API falls
+// back to spin+Sleep(1) -- correctness never depends on the wake arriving.
+static BOOL (WINAPI *g_pWaitOnAddress)(volatile VOID*, PVOID, SIZE_T, DWORD) = nullptr;
+static void (WINAPI *g_pWakeByAddressAll)(PVOID) = nullptr;
+static bool g_futexReady = false;
+static void futexResolve()
+{
+    if (g_futexReady) return;
+    g_futexReady = true;
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return;
+    g_pWaitOnAddress   = (BOOL (WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD))
+                         GetProcAddress(k32, "WaitOnAddress");
+    g_pWakeByAddressAll= (void (WINAPI*)(PVOID)) GetProcAddress(k32, "WakeByAddressAll");
+}
+// park until the seq word changes from 'expect' (futex if available)
+static void futexPark(const long expect)
+{
+    if (g_pWaitOnAddress && g_pWakeByAddressAll) {
+        long e = expect;
+        g_pWaitOnAddress((volatile VOID*)&g_mixSeq, &e, sizeof(e), 250);
+    } else {
+        // the fallback: brief spin, then yield -- a wake-less machine still
+        // serves every round within one 250 ms timeout window
+        for (int i = 0; i < 400; ++i) { _mm_pause(); }
+        Sleep(1);
+    }
+}
+
+// the worker: parked on the futex doorbell, wakes on a dispatch,
+// seqlock-reads the job, runs ITS lane, publishes the tag. A straggler for
+// an old round publishes an old tag -- the merge's tag compare ignores it.
+// v9.3.1: pinned TOP-DOWN (the estimator pool's pattern -- the audio core
+// map holds LP 1..5, so lane workers start from the machine's LAST LP and
+// never contend the audio cores on any but the smallest machines), at
+// ABOVE_NORMAL priority: below the RT threads (they always preempt us --
+// the audio never waits for a lane worker) yet above the UI and background
+// work, so a dispatched lane usually lands inside the merge's runway.
+// FTZ/DAZ on entry (the device threads' denormal guard -- a lane must
+// flush denormals exactly like the serial loop did).
+static DWORD WINAPI mixCrewWorker(LPVOID p)
+{
+    const int lane = (int)(INT_PTR)p;
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+    cpuPinThreadToLp(g_cpu.lpPinnable - 1 - lane);          // top-down, off the audio cores
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    long lastTag = 0;
+    while (g_mixCrewRun.load(std::memory_order_acquire)) {
+        // v9.3.2 THE FREEZE FIX: parking is a LOOP, and a stable-but-STALE
+        // read goes back to the park. v9.3.1's seqlock read had an exit for
+        // "fresh round" and for "engine stop" but none for "stable and
+        // stale" -- so the first time a worker's 250 ms park timed out with
+        // no new round (parallel_mix toggled off, blocks under
+        // kMixCrewMinFrames, or the adaptive skip's own cooldown pausing
+        // dispatches), it spun the read at 100% CPU: a ~300-byte job copy
+        // per iteration, no yield, no syscall, at ABOVE_NORMAL on a pinned
+        // core. Five burners starve every NORMAL thread under them (DWM,
+        // the shell, input rendering) while the TIME_CRITICAL audio threads
+        // preempt them and play on -- the field's frozen screen with the
+        // sound still going. A parked worker's ONLY work is one bounded
+        // wait per 250 ms; anything else is a desktop killer.
+        long cur = g_mixSeq.load(std::memory_order_acquire);
+        while (g_mixCrewRun.load(std::memory_order_acquire) &&
+               cur / 2 <= lastTag) {
+            futexPark(cur);                 // waits while the seq word == cur
+            cur = g_mixSeq.load(std::memory_order_acquire);
+        }
+        if (!g_mixCrewRun.load(std::memory_order_acquire)) break;
+        // seqlock-read a stable, FRESH job (the mix thread writes it under
+        // odd seq). A torn read retries; a stable-but-stale round re-parks;
+        // the odd-spin yields (a worker may yield -- only the RT thread
+        // never may) and re-checks run so no branch can burn unbounded.
+        MixJob j;
+        long tag = 0;
+        bool fresh = false;
+        int pauses = 0;
+        for (;;) {
+            const long s1 = g_mixSeq.load(std::memory_order_acquire);
+            if (s1 & 1) {                   // mid-write: pause; yield now and then
+                if (++pauses >= 1024) {
+                    pauses = 0;
+                    if (!g_mixCrewRun.load(std::memory_order_acquire)) return 0;
+                    Sleep(0);
+                }
+                _mm_pause();
+                continue;
+            }
+            j = g_mixJob;                   // the stable copy
+            tag = s1 / 2;
+            const long s2 = g_mixSeq.load(std::memory_order_acquire);
+            if (s1 != s2) continue;         // torn: re-read
+            if (tag > lastTag) { fresh = true; break; }   // stable and fresh
+            break;                          // stable but stale: re-park, never spin
+        }
+        if (!fresh) continue;               // back to the parking lot
+        if (!g_mixCrewRun.load(std::memory_order_acquire)) break;
+        mixCrewLane(j, lane, g_mixW[lane]);
+        g_mixW[lane].landed.store(tag, std::memory_order_release);
+        lastTag = tag;
+    }
+    return 0;
+}
+
+// the crew's start/stop (engine start/stop; centerVirtualInit's pattern)
+static void mixCrewInit()
+{
+    if (g_mixCrewRun.exchange(true)) return;
+    futexResolve();                      // v9.3.1: resolve the doorbell before any worker parks
+    g_mixCrewLive.store(0, std::memory_order_relaxed);
+    g_mixSeq.store(0, std::memory_order_relaxed);
+    g_mixCrewRounds = 0;
+    g_mixCrewAssists = 0;
+    g_mixCrewAdopted = 0;
+    g_mixCrewSkips = 0;
+    g_mixCrewMissStreak = 0;
+    g_mixCrewCool = 0;
+    int started = 0;
+    for (int lane = 0; lane < kMixLanes; ++lane) {
+        g_mixCrewThread[lane] = CreateThread(nullptr, 0, mixCrewWorker,
+                                             (LPVOID)(INT_PTR)lane, 0, nullptr);
+        if (g_mixCrewThread[lane]) ++started;
+    }
+    g_mixCrewLive.store(started, std::memory_order_release);
+    tlog("[twinspeak] mix          : the crew is up (%d lane workers, %s, %s)\n",
+         started, g_cfg.parallelMix ? "parallel_mix on" : "parallel_mix off -- standing by",
+         (g_pWaitOnAddress && g_pWakeByAddressAll) ? "futex doorbell" : "polling fallback");
+}
+static void mixCrewShutdown()
+{
+    if (!g_mixCrewRun.exchange(false)) return;
+    // wake any parked worker (the seq word itself is the doorbell)
+    if (g_pWakeByAddressAll) g_pWakeByAddressAll((PVOID)&g_mixSeq);
+    for (int lane = 0; lane < kMixLanes; ++lane) {
+        if (g_mixCrewThread[lane]) {
+            WaitForSingleObject(g_mixCrewThread[lane], 2000);
+            CloseHandle(g_mixCrewThread[lane]);
+            g_mixCrewThread[lane] = nullptr;
+        }
+    }
+    g_mixCrewLive.store(0, std::memory_order_relaxed);
+    if (g_mixCrewRounds)
+        tlog("[twinspeak] mix          : the crew idles (%llu rounds, %llu lane adopts, %llu assists, %llu skips)\n",
+             g_mixCrewRounds, g_mixCrewAdopted, g_mixCrewAssists, g_mixCrewSkips);
+}
+
+// THE DISPATCH + MERGE (the mix thread only). Serial-equivalent by
+// construction: the same lane math (mixCrewLane), the same output sums in
+// the same expression order, state committed only here. If the crew is
+// off, empty, or the block too small, this IS the serial mix (the lanes
+// run inline into g_mixSelf) -- one code path, no drift between builds.
+static void mixCrewLeg1(const float gL, const float gR, const float gLfe,
+                        const float gRL, const float gRR, const float gSL, const float gSR,
+                        const float gC, bool cLive, bool slLive, bool srLive,
+                        bool rlLive, bool rrLive, bool combAdv,
+                        const float* sc, float* chunk, const size_t n)
+{
+    // ---- snapshot the lane state into the job ----
+    MixJob j;
+    j.sc = sc;  j.n = n;
+    j.centerFold = g_centerFold;
+    j.cLive = cLive;
+    j.sbOn = g_sbeq.on;  j.slLive = slLive;  j.srLive = srLive;
+    j.rlLive = rlLive;   j.rrLive = rrLive;  j.combAdv = combAdv;
+    j.sbZ1L = g_sbeq.z1L; j.sbZ2L = g_sbeq.z2L;
+    j.sbZ1R = g_sbeq.z1R; j.sbZ2R = g_sbeq.z2R;
+    memcpy(j.rcBufL, g_rcomb.bufL, sizeof(j.rcBufL));
+    memcpy(j.rcBufR, g_rcomb.bufR, sizeof(j.rcBufR));
+    j.rcIdx = g_rcomb.idx;
+    j.cvc = g_cvc;
+    j.mask = g_cvcMask;
+
+    // ---- dispatch (only when the crew can actually carry it) ----
+    // v9.3.1 THE ADAPTIVE SKIP: the RT thread never blocks, but every wake
+    // is still a syscall on the audio thread's time -- so if the crew is not
+    // WINNING (the last dispatched rounds adopted < 2 of 5 lanes), stop
+    // dispatching and run pure serial (zero crew overhead) until the next
+    // WINDOW re-arms the doorbell. A busy machine degrades to exactly the
+    // serial mix instead of buzzing the RT thread with futile syscalls.
+    bool crew = g_cfg.parallelMix &&
+                g_mixCrewLive.load(std::memory_order_acquire) == kMixLanes &&
+                n >= kMixCrewMinFrames &&
+                g_mixCrewCool == 0;          // v9.3.1: 0 = armed; a losing streak stands the crew down
+    if (g_mixCrewCool > 0) --g_mixCrewCool;  // the cooldown window burns one round at a time
+    long tag = 0;
+    if (crew) {
+        tag = g_mixSeq.load(std::memory_order_relaxed) / 2 + 1;
+        g_mixSeq.store(tag * 2 + 1, std::memory_order_release);   // odd: mid-write
+        g_mixJob = j;
+        g_mixSeq.store(tag * 2, std::memory_order_release);       // even: published
+        ++g_mixCrewRounds;
+        // v9.3.1: THE FUTEX WAKE -- a store and one syscall. NO kernel lock
+        // on the audio thread, ever (the first cut took a CS here and the
+        // field heard the buzz of one RT deadline after another missed to a
+        // priority-inverted handoff).
+        if (g_pWakeByAddressAll) g_pWakeByAddressAll((PVOID)&g_mixSeq);
+    }
+
+    // ---- the mix thread's OWN work while the crew runs: the estimator
+    // ring feed (the serial path did this inside centerVirtualRun; the mix
+    // thread stays its only writer) + lane 0 self-completed as the head
+    // start. Lane 0 (the HRTF/XTC chain) is the LONGEST lane -- running it
+    // here gives the workers the whole merge's worth of runway, and if the
+    // crew's lane-0 worker lands in time, the merge simply adopts its
+    // buffer instead (identical values).
+    if (g_centerFold && cLive) {
+        for (size_t i = 0; i < n; ++i) {
+            const float x = sc[i * kInCh + 2];
+            const size_t h = g_cvcHead.load(std::memory_order_relaxed);
+            g_cvcRing[h] = x;
+            const size_t nh = (h + 1) & kCvcRingMask;
+            const size_t t = g_cvcTail.load(std::memory_order_acquire);
+            if (nh == t) g_cvcTail.store((t + 1) & kCvcRingMask, std::memory_order_release);
+            g_cvcHead.store(nh, std::memory_order_release);
+        }
+    }
+    mixCrewLane(j, 0, g_mixSelf[0]);
+    ++g_mixCrewAssists;   // lane 0 always self-run: the head start (counted)
+
+    // ---- the merge: build both output slots per frame, adopting landed
+    // worker buffers, self-completing any lane that missed ----
+    const MixLaneOut* Lc  = &g_mixSelf[0];
+    const MixLaneOut* L5  = nullptr;
+    const MixLaneOut* L6  = nullptr;
+    const MixLaneOut* L6r = nullptr;
+    const MixLaneOut* L7r = nullptr;
+    int adopted = 0;                          // v9.3.1: lanes the crew landed in time
+    if (crew && g_mixW[0].landed.load(std::memory_order_acquire) == tag) {
+        Lc = &g_mixW[0]; ++adopted;           // the worker beat us: adopt
+    }
+    for (int lane = 1; lane < kMixLanes; ++lane) {
+        const bool landed = crew &&
+            g_mixW[lane].landed.load(std::memory_order_acquire) == tag;
+        const MixLaneOut* src = landed ? &g_mixW[lane] : nullptr;
+        if (landed) ++adopted;
+        else { mixCrewLane(j, lane, g_mixSelf[lane]); ++g_mixCrewAssists; src = &g_mixSelf[lane]; }
+        switch (lane) {
+            case 1: L5 = src; break;
+            case 2: L6 = src; break;
+            case 3: L6r = src; break;
+            case 4: L7r = src; break;
+        }
+    }
+    // v9.3.1: meter the round -- the adaptive skip's verdict (and the log's
+    // honesty: adopts vs assists tells you whether the crew ever wins here)
+    if (crew) {
+        g_mixCrewAdopted += adopted;
+        if (adopted >= 2) g_mixCrewMissStreak = 0;
+        else if (++g_mixCrewMissStreak >= kMixCrewArms) {
+            g_mixCrewSkips += kMixCrewArms;   // the cooldown window: kMixCrewArms rounds of pure serial
+            g_mixCrewCool   = kMixCrewArms;   // then re-arm (a busy machine probes periodically)
+        }
+    }
+
+    // the two output sums, the ORIGINAL expression order (bit-exactness):
+    //   with the center fold:   o[0] = gL*f[0] + lfe + cf + gRL*r6 + gSL*s5 - 0.5f*gSR*s6
+    //                           o[1] = gR*f[1] + lfe + cf + gRR*r7 + gSR*s6 - 0.5f*gSL*s5
+    //   without:                o[0] = gL*f[0] + lfe + gRL*r6 + gSL*s5 - 0.5f*gSR*s6
+    //                           o[1] = gR*f[1] + lfe + gRR*r7 + gSR*s6 - 0.5f*gSL*s5
+    // (s5/s6 fall back to the RAW sample when the SCAN said dead -- the
+    // serial ternary, lane by lane; a dead bass lane does not read the
+    // worker's stale terms)
+    if (g_centerFold) {
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * kInCh;
+            float* o = chunk + i * kOutCh1;
+            const float lfe = gLfe * f[3];
+            const float cf  = cLive ? gC * Lc->term[i] : 0.0f;
+            const float s5  = (g_sbeq.on && slLive) ? L5->term[i] : f[4];
+            const float s6  = (g_sbeq.on && srLive) ? L6->term[i] : f[5];
+            o[0] = gL * f[0] + lfe + cf + gRL * L6r->term[i] + gSL * s5 - 0.5f * gSR * s6;
+            o[1] = gR * f[1] + lfe + cf + gRR * L7r->term[i] + gSR * s6 - 0.5f * gSL * s5;
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            const float* f = sc + i * kInCh;
+            float* o = chunk + i * kOutCh1;
+            const float lfe = gLfe * f[3];
+            const float s5  = (g_sbeq.on && slLive) ? L5->term[i] : f[4];
+            const float s6  = (g_sbeq.on && srLive) ? L6->term[i] : f[5];
+            o[0] = gL * f[0] + lfe + gRL * L6r->term[i] + gSL * s5 - 0.5f * gSR * s6;
+            o[1] = gR * f[1] + lfe + gRR * L7r->term[i] + gSR * s6 - 0.5f * gSL * s5;
+        }
+    }
+
+    // ---- commit the lane states back to the single-owner globals ----
+    g_sbeq.z1L = L5->sbZ1L; g_sbeq.z2L = L5->sbZ2L;
+    g_sbeq.z1R = L6->sbZ1R; g_sbeq.z2R = L6->sbZ2R;
+    memcpy(g_rcomb.bufL, L6r->rcBufL, sizeof(g_rcomb.bufL));
+    memcpy(g_rcomb.bufR, L7r->rcBufR, sizeof(g_rcomb.bufR));
+    g_rcomb.idx = L6r->rcIdx;                  // the shared cursor: both comb lanes counted the same steps
+    g_cvc = Lc->cvc;
+    g_cvcMask = Lc->mask;
 }
 
 // ----------------------------------------------------------------- mixer ----
@@ -5560,51 +6159,16 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             if (!rrLive) memset(g_rcomb.bufR, 0, sizeof(g_rcomb.bufR));
         }
         const bool combAdv = g_rearFold && (rlLive || rrLive);
-        if (g_centerFold) {
-            const float gC = g_cfg.gainCenter;
-            // v9.1.1: the center lane gates the virtual chain (the silence
-            // contract, lane by lane) -- a dead ch3 RESETS the chain and
-            // contributes exactly zero.
-            bool cLive = false;
+        // v9.3.0: the center's liveness scan, then THE MIX CREW carries the
+        // filter lanes (or the same code runs inline -- mixCrewLeg1 IS the
+        // serial mix when the crew is off/short/small, one path, no drift).
+        bool cLive = false;
+        if (g_centerFold)
             for (size_t i = 0; i < n; ++i)
                 if (sc[i * kInCh + 2] != 0.0f) { cLive = true; break; }
-            if (!cLive) centerVirtualFlushZ();
-            for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
-                float* o = chunk + i * kOutCh1;
-                const float lfe = gLfe * f[3];
-                // v9.1.1 THE VIRTUAL CENTER: the HRTF + XTC chain replaces
-                // the plain mono fold -- the SAME shaped signal lands on
-                // BOTH mains (symmetric at 0 degrees), so the sum stays the
-                // phantom's position with the virtual speaker's timbre.
-                const float cf  = cLive ? gC * centerVirtualRun(f[2]) : 0.0f;
-                // v8.5.1: the surround bass restore (the scan above gates the
-                // biquad; a dead lane passes its samples through untouched)
-                const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];
-                const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];
-                // v9.1.0 THE REAR COMB: the comb eats the RAW sample; the
-                // gain applies after -- the EQ-APO order.
-                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
-                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
-                if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
-                o[0] = gL * f[0] + lfe + cf + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + cf + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
-            }
-        } else {
-            for (size_t i = 0; i < n; ++i) {
-                const float* f = sc + i * kInCh;
-                float* o = chunk + i * kOutCh1;
-                const float lfe = gLfe * f[3];
-                const float s5 = slLive ? sbPeak(f[4], g_sbeq.z1L, g_sbeq.z2L) : f[4];   // v8.5.1
-                const float s6 = srLive ? sbPeak(f[5], g_sbeq.z1R, g_sbeq.z2R) : f[5];   // v8.5.1
-                // v9.1.0 THE REAR COMB (the else branch, same ops)
-                const float r6 = rlLive ? rearCombRun(f[6], g_rcomb.bufL, g_rcomb.idx) : 0.0f;
-                const float r7 = rrLive ? rearCombRun(f[7], g_rcomb.bufR, g_rcomb.idx) : 0.0f;
-                if (combAdv) { if (++g_rcomb.idx >= 32) g_rcomb.idx = 0; }
-                o[0] = gL * f[0] + lfe + gRL * r6 + gSL * s5 - 0.5f * gSR * s6;
-                o[1] = gR * f[1] + lfe + gRR * r7 + gSR * s6 - 0.5f * gSL * s5;
-            }
-        }
+        if (!cLive && g_centerFold) centerVirtualFlushZ();   // the silence contract, unchanged
+        mixCrewLeg1(gL, gR, gLfe, gRL, gRR, gSL, gSR, g_cfg.gainCenter, cLive,
+                    slLive, srLive, rlLive, rrLive, combAdv, sc, chunk, n);
     } else if (idx == 1) {
         // v6.0 EXPLICIT CENTER ISOLATION: the out2 copy of the block READS
         // ONLY ch3 -- every other channel is muted by never being touched,
@@ -6342,6 +6906,7 @@ static bool loadIni(const char* path) {
         else if (key == "center_eq_q")    g_cfg.centerEqQ    = (float)atof(val.c_str());
         // v8.5.1: the surround bass restore (the fold's phase trick, patched)
         else if (key == "surround_bass")      g_cfg.surroundBass     = !isOff(val);
+        else if (key == "parallel_mix")       g_cfg.parallelMix      = !isOff(val);   // v9.3.0: the mix crew on/off
         else if (key == "surround_bass_freq") g_cfg.surroundBassFreq = (float)atof(val.c_str());
         else if (key == "surround_bass_gain") g_cfg.surroundBassGain = (float)atof(val.c_str());
         else if (key == "surround_bass_q")    g_cfg.surroundBassQ    = (float)atof(val.c_str());
@@ -7827,6 +8392,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", g_cfg.centerEqGain); return b; }
     else if (key == "center_eq_q")       { snprintf(b, 64, "%g", g_cfg.centerEqQ); return b; }
     else if (key == "surround_bass")     return boolText(g_cfg.surroundBass);              // v8.5.1
+    else if (key == "parallel_mix")      return boolText(g_cfg.parallelMix);              // v9.3.0: the mix crew
     else if (key == "surround_bass_freq"){ snprintf(b, 64, "%g", g_cfg.surroundBassFreq); return b; }
     else if (key == "surround_bass_gain"){ snprintf(b, 64, "%g", g_cfg.surroundBassGain); return b; }
     else if (key == "surround_bass_q")   { snprintf(b, 64, "%g", g_cfg.surroundBassQ); return b; }
@@ -7874,6 +8440,7 @@ static const char* kIniKeys[] = {
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
     "center_eq", "center_eq_freq", "center_eq_gain", "center_eq_q",
     "surround_bass", "surround_bass_freq", "surround_bass_gain", "surround_bass_q",   // v8.5.1
+    "parallel_mix",                                                                // v9.3.0: the mix crew
     "eq_slot1_on", "eq_slot1_freq", "eq_slot1_gain", "eq_slot1_q",   // v7.1.8
     "eq_slot2_on", "eq_slot2_freq", "eq_slot2_gain", "eq_slot2_q",
     "eq_slot3_on", "eq_slot3_freq", "eq_slot3_gain", "eq_slot3_q",
@@ -11099,6 +11666,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // HRTF kernel + the XTC branch's highpass) -- no ini keys; the chain
     // arms itself whenever the center fold runs (leg2 empty).
     centerVirtualInit();
+    mixCrewInit();       // v9.3.0: the mix crew (5 lane workers; idle unless parallel_mix)
 
     // v6.2 chimes: render the modernized signature ONCE -- C7 42 ms -> G7
     // 72 ms triangle blips, 20 ms gap, exp decay, peak = chime_gain. Plays
@@ -12381,6 +12949,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         if (g_leg[i].dev.pContext) ma_device_uninit(&g_leg[i].dev);
     }
     centerVirtualShutdown();   // v9.1.3: the mask estimator's pool dies with the engine
+    mixCrewShutdown();        // v9.3.0: the mix crew dies with the engine too
     if (g_srcVol) { g_srcVol->Release(); g_srcVol = nullptr; }
     for (int i = 0; i < 4; ++i)
         if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
