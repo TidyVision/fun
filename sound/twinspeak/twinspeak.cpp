@@ -64,6 +64,61 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.2.0 THE AUDIO FLOW ON ALL CORES (field-directed: "Make it so this
+//            runs on all cores ... I mean having the audio flow run on all
+//            threads"). The flow was already five MMCSS device threads
+//            (capture + one per leg) and the v9.1.3 estimator pool was
+//            already "one thread per processor" -- but two things were
+//            quietly false:
+//            1) THE POOL ONLY KNEW GROUP 0. GetNativeSystemInfo().
+//               dwNumberOfProcessors predates processor groups: above 64
+//               logical processors it reports only the PRIMARY group, and on
+//               Windows 10 a plain process is BORN inside that one group --
+//               every CreateThread lands there no matter how many are made.
+//               "One thread per processor" was really "one thread per
+//               processor of group 0": a 128-LP machine ran the estimator on
+//               64 of its cores. THE FIX (cpuTopoProbe): the Win7 group APIs
+//               (GetActiveProcessorGroupCount + GetActiveProcessorCount per
+//               group, direct kernel32 -- GetNativeSystemInfo stays the
+//               fallback) count EVERY group, each pool worker pins itself
+//               with SetThreadGroupAffinity (the one API that moves a thread
+//               into a group the process was not born in), kCvcMaxWorkers
+//               rises 64 -> 512 (the 341 ms window is 16384 samples; at 512
+//               workers a slice is 32 samples -- past that, extra threads
+//               buy only wakeups), and a CreateThread that fails under
+//               memory pressure now TRIMS the participant set at the first
+//               hole (the old code left a phantom the coordinator waited on
+//               forever -- the verdict never published).
+//            2) THE AUDIO THREADS COULD STACK. Five device threads, zero
+//               affinity: the scheduler was free to run capture and all four
+//               legs on ONE core, and under load it did. Each device thread
+//               now pins to ITS OWN core at first callback (boostDeviceThread
+//               grew a coreIdx: capture -> LP 1, leg1..4 -> LP 2..5 -- LP 0
+//               stays with the system, where the DPC/ISR bias lives), pinned
+//               AFTER the MMCSS registration so the explicit affinity is
+//               final, STABLE across watchdog reopens (the replacement
+//               thread lands on the same core the dead one had). The pool's
+//               workers pin TOP-DOWN (total-1-i) so the background estimator
+//               starts away from the audio cores; on hybrid CPUs the low LPs
+//               are the P-cores, so the flow gets the fast cores and the
+//               estimator the E-cores first. A failed pin leaves the thread
+//               floating -- nothing else changes.
+//            WHAT IS DELIBERATELY NOT DONE: the per-callback DSP is NOT
+//            fanned out to the pool. At the 192-fr request (4.0 ms of
+//            service) a switch's mix is ~192 frames x 8 lanes of multiply-
+//            adds -- single-digit microseconds, inline and bit-exact.
+//            Waking a pool for that means a condition-variable handoff whose
+//            WORST case (a worker preempted the instant it was woken) is
+//            longer than the whole callback, on the real-time path, with the
+//            DAC's cushion as the only shock absorber -- the classic way to
+//            turn a stable engine into a crackling one. Parallelism is for
+//            the WORK (the estimator's 341 ms windows); the audio flow's
+//            cores are kept SEPARATE instead, which is what "runs on all
+//            cores" means for a real-time engine: every core available to
+//            the machine, none shared, none contended.
+//            NO ini key, NO UI row. The startup log now states the pool's
+//            true span ("N threads, one per logical processor across G
+//            groups").
 //    v9.1.9 (THIS WAS WRITTEN BY THE REAL TIDYVISION THIS TIME) MCCSS Pro Audio Priority Support
 //    v9.1.8 THE BOOT CHIME WAITS FOR A WORKING DEVICE (field-directed:
 //            "But I still don't hear the chime, even with enable_chime.
@@ -2908,7 +2963,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.1.9"
+#define TWS_VERSION "9.2.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3039,7 +3094,7 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // is constant, the anchor/ring math (2 x the negotiated period) follows
 // the real number as before.
 static constexpr unsigned kOutPeriodFrames   = 192;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
-static constexpr unsigned kOutPeriods        = 3;    // the exclusive buffer: 192 fr (~8.0 ms)
+static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 256 fr (~8.0 ms)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3621,6 +3676,122 @@ static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
 static float   g_capPeriodMsF = 5.0f;
 
+// -------------------------------------------------- v9.2.0: the CPU map ----
+// THE FIELD'S ASK: "the audio flow run on all threads". Two halves: the
+// pool must reach every logical processor on the machine (not just group
+// 0 -- see centerVirtualInit), and the five device threads must not share
+// cores with each other. This block builds the map both use.
+//
+// THE TOPOLOGY PROBE. GetNativeSystemInfo().dwNumberOfProcessors predates
+// processor groups: above 64 logical processors it reports only the
+// PRIMARY group's count, and on Windows 10 a plain CreateProcess is born
+// inside that single group -- every CreateThread lands there too. The
+// Win7 group APIs are the group-aware truth: GetActiveProcessorGroupCount,
+// then GetActiveProcessorCount per group (kernel32, called directly like
+// every other kernel32 API in this file -- the engine's floor is Win7,
+// the D3D11/DWrite imports see to that, and both APIs shipped with it);
+// GetNativeSystemInfo stays the answer when the sum is degenerate.
+struct CpuTopo {
+    int groups = 1;                 // active processor groups
+    int lpTotal = 1;                // logical processors across ALL groups
+    int lpPinnable = 1;             // LPs with a table entry (lpTotal capped at 512)
+    int lpByGroup[64] = { 1 };      // per-group active LP count (groups max 64 by contract)
+    bool viaGroups = false;         // true = the group APIs answered
+    // LP index -> (group, mask) for the FIRST lpPinnable indices, in group
+    // order: LP 0..n0-1 live in group 0, LP n0..n0+n1-1 in group 1, ...
+    // (built by probe; a group count of 0 (hot-add hole) is skipped)
+    WORD       grp[512] = {};
+    DWORD_PTR  mask[512] = {};      // DWORD_PTR: a group holds up to 64 LPs -- the mask is wider than 32 bits
+    bool       ok[512]  = {};       // an entry is pinnable
+};
+static CpuTopo g_cpu;
+static void cpuTopoProbe()
+{
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    int total = (int)si.dwNumberOfProcessors;
+    if (total < 1) total = 1;
+    g_cpu.groups = 1;
+    g_cpu.viaGroups = false;
+    g_cpu.lpByGroup[0] = total;
+    {
+        int g = (int)GetActiveProcessorGroupCount();
+        if (g < 1) g = 1;
+        if (g > 64) g = 64;         // MAXIMUM_GROUPS: the table's width, the OS's own ceiling
+        int sum = 0;
+        for (int i = 0; i < g; ++i) {
+            const int c = (int)GetActiveProcessorCount((WORD)i);
+            g_cpu.lpByGroup[i] = c;
+            sum += c;
+        }
+        if (sum >= 1) { g_cpu.groups = g; g_cpu.lpTotal = sum; g_cpu.viaGroups = true; }
+    }
+    // the fallback must UN-WRITE the group loop's zeros: lpByGroup[0] was
+    // overwritten with the failed group API's answer (0), and the table
+    // builder below reads that array -- without this restore it would find
+    // no LPs at all and go degenerate, clobbering the honest GNSI count
+    if (!g_cpu.viaGroups) { g_cpu.lpTotal = total; g_cpu.lpByGroup[0] = total; }
+    // the LP table: group order, one mask bit per LP within the group
+    int lp = 0;
+    for (int gi = 0; gi < g_cpu.groups && lp < 512; ++gi) {
+        const int n = g_cpu.lpByGroup[gi];
+        if (n < 1) continue;        // a group with no active LPs is skipped
+        for (int li = 0; li < n && lp < 512; ++li) {
+            g_cpu.grp[lp]  = (WORD)gi;
+            g_cpu.mask[lp] = ((DWORD_PTR)1) << li;
+            g_cpu.ok[lp]   = true;
+            ++lp;
+        }
+    }
+    if (lp < 1) {                   // degenerate fallback: one entry, unpinned
+        g_cpu.ok[0] = false;
+        g_cpu.lpTotal = 1;
+        lp = 1;
+    }
+    g_cpu.lpPinnable = lp;          // the table's true width (lpTotal may exceed it)
+}
+
+// v9.2.0: pin the CALLING thread to LP slot slotIdx of the machine (a
+// CpuTopo index, group order). Called once per thread, after its MMCSS
+// registration (the explicit affinity is final, the task's own mask
+// follows). A failed pin leaves the thread floating -- audio is never
+// held hostage by topology.
+static void cpuPinThreadToLp(const int slotIdx)
+{
+    if (slotIdx < 0 || slotIdx >= 512 || !g_cpu.ok[slotIdx]) return;
+    GROUP_AFFINITY ga;
+    ga.Group = g_cpu.grp[slotIdx];
+    ga.Mask  = g_cpu.mask[slotIdx];
+    ga.Reserved[0] = ga.Reserved[1] = ga.Reserved[2] = 0;
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr))
+        g_cpu.ok[slotIdx] = false;  // never try this slot again this run
+}
+
+// v9.2.0: THE AUDIO CORE MAP. Five realtime threads, five cores, no
+// sharing: capture owns LP 1, leg1..4 own LP 2..5 (LP 0 stays with the
+// system -- DPCs and ISRs bias low). If the machine has fewer slots than
+// tickets, the map wraps and threads share cores only by necessity; a
+// machine that cannot even name a slot leaves everything floating (the
+// scheduler's default spread). The ticket is STABLE across watchdog
+// reopens: a replacement thread lands on the SAME core its dead one had.
+// (tickets: capture + the four legs = 5)
+static int audioCoreTicket(const int coreIdx)
+{
+    if (g_cpu.lpTotal < 2) return -1;   // one LP: everything floats (the system owns it)
+    // LP 0 stays with the system; the tickets start at LP 1 and wrap the
+    // pinnable table (a small box SHARES rather than stacks -- 2 LPs:
+    // capture+leg2+leg4 on LP 1, leg1+leg3 on LP 0; 6+ LPs: every thread
+    // its own core)
+    return (1 + coreIdx) % g_cpu.lpPinnable;
+}
+// v9.2.0: the pin happens INSIDE the thread, at its first callback, so the
+// reopen path (a new thread) re-pins identically -- same ticket, same core.
+static void cpuPinAudioThread(const int coreIdx)
+{
+    const int slot = audioCoreTicket(coreIdx);
+    cpuPinThreadToLp(slot);
+}
+
 // MMCSS boost for the pump threads (v3.8): at 10 ms targets a normal-
 // priority thread that loses one scheduling quantum can miss a refill
 // window. "Pro Audio" role + time-critical priority keeps the pumps ahead.
@@ -3657,15 +3828,19 @@ static void boostAudioThreadEx(int mmcssSubPrio) {
 }
 static void boostAudioThread() { boostAudioThreadEx(-1); }   // no sub-priority hint
 
-// v4.0: miniaudio's own device threads (capture + both playback callbacks)
-// only get THREAD_PRIORITY from miniaudio -- no MMCSS registration. Register
-// "Pro Audio" on each device thread once (thread_local guard: one
-// registration per thread, zero cost in the hot path afterwards).
-static void boostDeviceThread() {
+// v4.0/v9.2.0: miniaudio's own device threads (capture + the playback
+// callbacks) only get THREAD_PRIORITY from miniaudio -- no MMCSS
+// registration, no placement. Register "Pro Audio" on each device thread
+// once, then pin it to its own LP slot (the audio core map above): the
+// capture thread calls with coreIdx 0 (LP 1), leg1..4 with 1..4 (LP 2..5).
+// The thread_local guard makes it once-per-thread -- a watchdog reopen
+// thread re-pins to the SAME slot its dead one had.
+static void boostDeviceThreadCore(const int coreIdx) {
     thread_local bool done = false;
     if (done) return;
     done = true;
     boostAudioThread();
+    cpuPinAudioThread(coreIdx);   // v9.2.0: one core per realtime thread
 }
 
 // v5.0: ONE locked logger. v4.0 printed servo/recovery lines to stderr and
@@ -4152,7 +4327,7 @@ static DWORD WINAPI powerThread(LPVOID) {
 // (v9.1.7: the v9.1.6 chime injection is REVERTED -- the chime is leg1's
 // device-layer cue now, and this is the dumb fan-out again, bit-exact.)
 static void capCallback(ma_device*, void*, const void* pInput, ma_uint32 frameCount) {
-    boostDeviceThread();                                          // v4.0 MMCSS
+    boostDeviceThreadCore(0);                                      // v9.2.0: MMCSS + the capture core pin (LP 1)
     g_hbCap.store(GetTickCount64(), std::memory_order_relaxed);   // v3.8 watchdog
     if (!pInput || frameCount == 0) return;
     const float* in = (const float*)pInput;
@@ -4686,7 +4861,7 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
 }
 
 static void playCore(int idx, float* out, ma_uint32 frameCount) {
-    boostDeviceThread();
+    boostDeviceThreadCore(1 + idx);   // v9.2.0: MMCSS + one core per leg (LP 2..5)
     // v7.9.0: DEVICE-SWITCH LATENESS METER -- the ground truth the ring
     // cannot see. The event fires with one period still to play, so a
     // service interval beyond period + 1 ms means this thread was scheduled
@@ -4994,7 +5169,12 @@ static std::atomic<size_t> g_cvcTail{0};
 // window splits into disjoint slices, each worker computes its part, the
 // coordinator merges). Generation-counted: a slow worker publishing an old
 // round can never pollute the current one.
-static constexpr int kCvcMaxWorkers = 64;
+// v9.2.0: 64 -> 512. The old cap matched GetNativeSystemInfo's blind spot
+// (one group = at most 64 LPs); the group-aware probe can count far more
+// (a 4-socket 128-core box = 512 LPs). The window is 16384 samples, so at
+// 512 workers a slice is 32 samples -- the floor where extra threads buy
+// only wakeups, which is why the cap STOPS there.
+static constexpr int kCvcMaxWorkers = 512;
 static std::vector<float> g_cvcWin;             // the window copy (the coordinator fills it)
 static int                g_cvcWinN = 0;
 static HANDLE             g_cvcPool[kCvcMaxWorkers] = {};
@@ -5039,6 +5219,21 @@ static void cvcPartial(const float* w, const int n, const int a, const int b, Cv
 static DWORD WINAPI cvcWorkerThread(LPVOID p)
 {
     const int me = (int)(INT_PTR)p;
+    // v9.2.0: every worker pins ITSELF, top-down (pinnable-1-me; the
+    // coordinator takes the top LP -- together the participant set spans
+    // every pinnable LP exactly once). Two reasons: (1) above 64 LPs the
+    // process is born in group 0 and every plain CreateThread lands there --
+    // SetThreadGroupAffinity is the ONE API that moves a thread into a
+    // group the process was not born in, so without this pin the "one per
+    // processor" pool is really one per processor OF GROUP 0; (2) top-down
+    // starts the background estimator from the machine's LAST LP while the
+    // audio map holds LP 1..5 -- on a full-width pool the bottom workers
+    // eventually reach down and share those LPs with the audio threads, but
+    // the estimator is preemptible background work riding MMCSS-boosted
+    // threads -- the audio preempts it, never the reverse.
+    // A failed pin leaves the worker floating in group 0 (still a correct
+    // participant -- only its placement is lost).
+    cpuPinThreadToLp(g_cpu.lpPinnable - 1 - me);
     while (g_cvcRun.load(std::memory_order_acquire)) {
         EnterCriticalSection(&g_cvcPoolCS);
         while (g_cvcRun.load(std::memory_order_acquire) && g_cvcSeen[me] == g_cvcGen)
@@ -5069,6 +5264,9 @@ static DWORD WINAPI cvcWorkerThread(LPVOID p)
 // smooth content (dialogue, most music) reads low and keeps chain A pure.
 static DWORD WINAPI cvcEstimatorThread(LPVOID)
 {
+    // v9.2.0: the coordinator takes the pool's TOP LP (the workers walk
+    // down from pinnable-2) -- the participant set spans the table exactly
+    cpuPinThreadToLp(g_cpu.lpPinnable - 1);
     while (g_cvcRun.load(std::memory_order_acquire)) {
         Sleep(100);
         if (!g_cvcRun.load(std::memory_order_acquire)) break;
@@ -5151,9 +5349,13 @@ static void centerVirtualInit()
     InitializeCriticalSection(&g_cvcPoolCS);
     InitializeConditionVariable(&g_cvcWorkCv);
     InitializeConditionVariable(&g_cvcDoneCv);
-    SYSTEM_INFO si;
-    GetNativeSystemInfo(&si);
-    int cores = (int)si.dwNumberOfProcessors;
+    // v9.2.0: THE GROUP-AWARE COUNT. GetNativeSystemInfo reported one
+    // group (at most 64 LPs) no matter the machine; the probe counts every
+    // active group. The audio core map is already built (the probe ran at
+    // engine start, before any device opens) -- the workers pin themselves
+    // top-down against it.
+    cpuTopoProbe();
+    int cores = g_cpu.lpTotal;
     if (cores < 1) cores = 1;
     if (cores > kCvcMaxWorkers) cores = kCvcMaxWorkers;
     g_cvcWorkers = cores;
@@ -5164,10 +5366,27 @@ static void centerVirtualInit()
     g_cvcGen = 0;
     g_cvcWinN = 0;
     for (int i = 0; i < kCvcMaxWorkers; ++i) g_cvcSeen[i] = 0;
-    for (int i = 1; i < g_cvcWorkers; ++i)
+    for (int i = 1; i < g_cvcWorkers; ++i) {
         g_cvcPool[i] = CreateThread(nullptr, 0, cvcWorkerThread, (LPVOID)(INT_PTR)i, 0, nullptr);
+        // v9.2.0: THE FAILED-CREATE TRIM. The old loop let a failed
+        // CreateThread leave a phantom participant -- g_cvcWorkers still
+        // counted it, the coordinator's generation test waited for a
+        // 'seen' that would never come, and the verdict never published.
+        // Now the first hole trims the participant set for THIS run; a
+        // later start retries the full width.
+        if (!g_cvcPool[i]) {
+            tlog("[twinspeak] center        : pool thread %d could not start -- trimming to %d threads\n",
+                 i, i);
+            g_cvcWorkers = i;
+            break;
+        }
+    }
     g_cvcThread = CreateThread(nullptr, 0, cvcEstimatorThread, nullptr, 0, nullptr);
-    tlog("[twinspeak] center        : the mask estimator is up (%d threads, one per processor)\n", g_cvcWorkers);
+    if (g_cvcThread)
+        tlog("[twinspeak] center        : the mask estimator is up (%d threads, one per logical processor across %d group%s)\n",
+             g_cvcWorkers, g_cpu.groups, g_cpu.groups == 1 ? "" : "s");
+    else
+        tlog("[twinspeak] center        : the mask estimator's coordinator could not start -- the pool idles\n");
 }
 
 static void centerVirtualShutdown()
