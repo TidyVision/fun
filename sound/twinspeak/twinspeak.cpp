@@ -64,41 +64,8 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
-//    v9.4.0 THE OUTPUT-AS-SOURCE (field-directed: "have it so that you can
-//            select an output ... and that output replaces the input routing
-//            to be the output routing instead for stuff like Virtual Audio
-//            Cable by VB"; the crackle was VAC's own, pre-dating twinspeak).
-//            input_is_output = on turns input_device into the name of a
-//            RENDER endpoint (e.g. "CABLE Input (Virtual Audio Cable)"):
-//            the capture side stops opening capture endpoints and opens that
-//            render endpoint as its source instead -- the one door Windows
-//            gives a reader for an explicit output's data (a loopback
-//            client on the named endpoint ID; NOT what-you-hear mix capture,
-//            NOT the default-mix tap). The stream then routes exactly as
-//            before: FL/FR -> leg1, ch3 -> leg2 (or the center fold), the
-//            rears/sides -> leg3, LFE folds per gain_lfe -- the speakers
-//            keep their channels; only the SOURCE of the data changes.
-//            NOTHING is written back to any endpoint: a one-way read has no
-//            echo path (the v7-era "loopback-sounding echo" was twinspeak
-//            re-feeding audio, a routing bug fixed then and impossible in
-//            this path by construction). Shared mode only -- Windows has no
-//            exclusive loopback; exclusive is neither attempted nor hinted.
-//            VOLUME: the tap is post-volume by Windows architecture, so the
-//            engine's volume-follow multiply is SKIPPED in this mode -- the
-//            endpoint's own slider is honored natively, once (applying the
-//            multiply again would square the slider). IDLE: a loopback
-//            reader is event-paced and simply stays parked while the
-//            endpoint renders nothing -- no callback storm, no watchdog
-//            misfire; the moment audio flows, frames arrive. The input
-//            picker in the GUI lists render endpoints too (marked
-//            " -- output"); picking one sets input_is_output automatically,
-//            and the picker round-trips through the ini like every key.
-//            HARD GUARD: a source that resolves to an OUTPUT LEG's own
-//            endpoint is refused at start (routing a leg back into itself
-//            is the echo bug wearing a new hat).
-//            Harness: harness3.cpp proves the decision table (mode/needle/
-//            self-route/shared-only) against the extracted resolver.
 //    v9.3.2 THE FREEZE FIX (field: "now this freezes my screen as
+//            everything's frozen because of it" under v9.3.1 -- audio kept
 //            playing above a frozen desktop). The crackle fix's worker
 //            parked on the futex with a 250 ms timeout, but its seqlock
 //            read loop had an exit for "fresh round" and for "engine stop"
@@ -3079,7 +3046,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.4.0"
+#define TWS_VERSION "9.3.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3309,12 +3276,6 @@ struct Config {
     bool        pinOutputs     = true;   // v3.8: out1/out2 endpoints pinned 100%/unmuted.
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
-    // v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on means input_device
-    // names a RENDER endpoint (e.g. VB VAC's "CABLE Input") -- it becomes
-    // the source, opened as a loopback read of that one endpoint (the only
-    // door Windows gives a reader for an explicit output's data). off (the
-    // default) keeps v9.3.2 behavior: capture endpoints only.
-    bool        inputIsOutput   = false;
     // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
     // kKeepAliveGain; v7.1.24: 40 Hz @ 0.005; v8.4.5: 20 Hz @ 0.001, every
     // leg, through the gates) -- no struct fields, no ini
@@ -3806,7 +3767,6 @@ static ma_device g_capDev = {};
 static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
-static bool    g_capLoopback = false;   // v9.4.0: the source is a render endpoint (output-as-source)
 static float   g_capPeriodMsF = 5.0f;
 
 // -------------------------------------------------- v9.2.0: the CPU map ----
@@ -4773,13 +4733,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // -- applied to the raw 8ch block BEFORE the per-leg mix. Both legs
         // track the same knob; the ini gains still stack on it.
         {
-        // v9.4.0: in OUTPUT-AS-SOURCE the tap is POST-volume by Windows
-        // architecture -- the endpoint's own slider is already baked into
-        // every frame. Multiplying again would square the slider; the
-        // engine's volume multiply is SKIPPED in this mode (the watcher
-        // still reports the slider on the health line).
-            const float vg = g_capLoopback ? 1.0f :
-                           g_volMuted.load(std::memory_order_relaxed) ? 0.0f
+            const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
                            : g_vol.load(std::memory_order_relaxed);
             if (vg != 1.0f) {
                 const size_t tot = n * (size_t)kInCh;
@@ -6513,13 +6467,6 @@ static void writeTemplate(const char* path) {
         "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
-        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on turns the line below\n"
-        "; into the name of a RENDER endpoint -- e.g. \"CABLE Input\" for\n"
-        "; Virtual Audio Cable by VB -- and that output becomes the SOURCE:\n"
-        "; its data is read (a one-way loopback of that one endpoint; nothing\n"
-        "; is written back, so no echo) and routed to the legs by channel,\n"
-        "; exactly as the capture path did. off = capture endpoints only.\n"
-        "input_is_output = off\n"
         "input_device   = Line 1\n"
         "output_device1 = Realtek\n"
         "output_device2 = Xtream\n"
@@ -6939,7 +6886,6 @@ static bool loadIni(const char* path) {
                  key == "background"        || key == "pin_outputs" ||
                  key == "lfe_fold") { }         // v8.4.0: the fold is built in
         else if (key == "input_device")   g_cfg.inputDevice = val;
-        else if (key == "input_is_output")  g_cfg.inputIsOutput = !isOff(val);   // v9.4.0: source is a render endpoint
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
         else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs (v8.4.11: ONE device, both rears)
@@ -7408,14 +7354,8 @@ static bool tryRestartCap(ma_context* ctx) {
     if (g_capDev.pContext) ma_device_uninit(&g_capDev);
     memset(&g_capDev, 0, sizeof(g_capDev));
     ma_device_id id; std::string nm;
-    // v9.4.0: the restart path mirrors the main open exactly -- loopback
-    // mode re-resolves the needle against RENDER endpoints and reopens the
-    // source shared-only; capture mode is unchanged (exclusive then
-    // shared). A watchdog reopen must never land in the other mode.
-    if (!pickDevice(ctx, g_capLoopback ? ma_device_type_playback : ma_device_type_capture,
-                    g_capNeedle, &id, &nm)) return false;
-    ma_device_config cc = ma_device_config_init(g_capLoopback ? ma_device_type_loopback
-                                                              : ma_device_type_capture);
+    if (!pickDevice(ctx, ma_device_type_capture, g_capNeedle, &id, &nm)) return false;
+    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = (ma_uint32)(g_capPeriodMsF + 0.5f);
     cc.periods = 2;
@@ -7423,12 +7363,10 @@ static bool tryRestartCap(ma_context* ctx) {
     cc.capture.pDeviceID = &id;
     cc.capture.format = ma_format_f32;
     cc.capture.channels = kInCh;
-    cc.capture.shareMode = g_capLoopback ? ma_share_mode_shared
-                                         : (g_capWantExcl ? ma_share_mode_exclusive
-                                                          : ma_share_mode_shared);
+    cc.capture.shareMode = g_capWantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     ma_result r = ma_device_init(ctx, &cc, &g_capDev);
-    if (r != MA_SUCCESS && !g_capLoopback && g_capWantExcl) {
+    if (r != MA_SUCCESS && g_capWantExcl) {
         cc.capture.shareMode = ma_share_mode_shared;
         r = ma_device_init(ctx, &cc, &g_capDev);
     }
@@ -8414,12 +8352,6 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
     if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
         for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
         for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
-        // v9.4.0 OUTPUT-AS-SOURCE: the capture-input picker also lists
-        // RENDER endpoints, each tagged " -- output": picking one (e.g.
-        // "CABLE Input (Virtual Audio Cable)") makes THAT endpoint the
-        // source (input_is_output goes on automatically). The tag is a
-        // display marker only -- the stored needle is the plain name.
-        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(std::string(p[i].name) + " -- output");
     }
     ma_context_uninit(&ctx);
 }
@@ -8478,7 +8410,6 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "out2_first")        return boolText(g_cfg.out2First);
     else if (key == "chimes")            return boolText(g_cfg.chimes);
     else if (key == "input_device")      return g_cfg.inputDevice;
-    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.4.0
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
@@ -8503,8 +8434,7 @@ static std::string cfgValueText(const std::string& key) {
 // rides the same verbatim-copy path.
 static const char* kIniKeys[] = {
     "delay1_ms", "delay2_ms", "offset3_ms",                    // v8.4.0 rears (v8.4.11: offset4_ms retired)
-    "input_device", "input_is_output",                       // v9.4.0: source-side routing key
-    "output_device1", "output_device2",
+    "input_device", "output_device1", "output_device2",
     "output_device3",                                          // v8.4.0 rears
     "output_device4",                                          // v9.1.4: leg4 -- the LFE fold to an existing leg
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
@@ -8592,23 +8522,7 @@ static void cfgFromControls(HWND w) {
     // when the window is built later, controlsFromCfg fills the controls
     // from the same g_cfg, so START in the window still edits what runs.
     if (!w || !GetDlgItem(w, IDC_INDEV)) return;
-    // v9.4.0 OUTPUT-AS-SOURCE: a picker entry ending in " -- output" is a
-    // render endpoint -- strip the marker, store the plain name, and turn
-    // input_is_output ON. A hand-typed name with the key already on keeps
-    // it; with it off, stays off (the engine still hard-errors if the
-    // needle only matches a render endpoint while the key is off -- the
-    // banner says exactly that).
-    {
-        std::string in = editStr(w, IDC_INDEV);
-        const std::string tag = " -- output";
-        if (in.size() > tag.size() &&
-            in.compare(in.size() - tag.size(), tag.size(), tag) == 0) {
-            in.resize(in.size() - tag.size());
-            while (!in.empty() && in.back() == ' ') in.pop_back();
-            g_cfg.inputIsOutput = true;
-        }
-        g_cfg.inputDevice = in;
-    }
+    g_cfg.inputDevice    = editStr(w, IDC_INDEV);
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
     g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent (v8.4.11: ONE rear device)
@@ -8647,11 +8561,7 @@ static void cfgFromControls(HWND w) {
 
 static void controlsFromCfg(HWND w) {
     char b[64];
-    // v9.4.0: show the mode in the box -- a source on the output side
-    // carries the " -- output" marker, the same one the picker offers.
-    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputIsOutput
-                     ? (g_cfg.inputDevice + " -- output").c_str()
-                     : g_cfg.inputDevice.c_str());
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
@@ -11776,24 +11686,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
 
     ma_device_id capId, id1, id2, id3; std::string capName, n1, n2, n3;   // v8.4.11: id4/n4 retired with leg4
-    // v9.4.0 OUTPUT-AS-SOURCE: with input_is_output the needle is resolved
-    // against RENDER endpoints (e.g. VB VAC's "CABLE Input"); the resolved
-    // id then opens as the loopback source below. The resolver is
-    // share-mode-agnostic -- share is forced shared at the open (Windows
-    // has no exclusive loopback). THE HARD GUARD lives after the legs are
-    // picked: a source that IS an output leg's endpoint is refused.
-    g_capLoopback = g_cfg.inputIsOutput;
-    if (g_capLoopback) {
-        if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.inputDevice, &capId, &capName)) {
-            tlog( "[twinspeak] input_is_output is on -- no RENDER endpoint matching \"%s\" (--list to see names)\n",
-                    g_cfg.inputDevice.c_str());
-            return 1;
-        }
-        tlog("[twinspeak] source        : OUTPUT-AS-SOURCE -- \"%s\" is a render endpoint; its data is\n"
-             "                            read (one-way, shared loopback; nothing is written back -- no echo)\n"
-             "                            and routed to the legs by channel, exactly as the capture path did\n",
-             capName.c_str());
-    } else if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
+    if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
         tlog( "[twinspeak] capture device matching \"%s\" not found (--list to see names)\n",
                 g_cfg.inputDevice.c_str());
         return 1;
@@ -11852,28 +11745,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // mains already fold the LFE); no match -- or an empty needle, or a
     // needle that resolves to nothing (a soft note, never an error) -- and
     // leg4 stays idle.
-    // v9.4.0 THE SELF-ROUTE GUARD: the source endpoint must never be an
-    // output leg's own endpoint. Reading a leg and writing it back to
-    // itself is the echo bug in new clothes; it is refused at start, by
-    // resolved endpoint id (the same comparison the LFE fold uses).
-    if (g_capLoopback) {
-        if (memcmp(&capId, &id1, sizeof(ma_device_id)) == 0) {
-            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg1's device -- routing a leg\n"
-                    "                            back into itself is an echo loop; refused. Point input_device\n"
-                    "                            at the cable's INPUT endpoint and output_device1 at the speakers.\n");
-            return 1;
-        }
-        if (!g_leg[1].disabled && memcmp(&capId, &id2, sizeof(ma_device_id)) == 0) {
-            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg2's device -- echo loop; refused\n"
-                    "                            (see above; the source and the legs must be distinct endpoints)\n");
-            return 1;
-        }
-        if (!g_leg[2].disabled && memcmp(&capId, &id3, sizeof(ma_device_id)) == 0) {
-            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg3's device -- echo loop; refused\n"
-                    "                            (see above; the source and the legs must be distinct endpoints)\n");
-            return 1;
-        }
-    }
     g_lfeFoldLeg = -1;
     if (!g_cfg.outputDevice4.empty()) {
         ma_device_id id4; std::string n4;
@@ -11903,7 +11774,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     const ma_uint32 capPeriodMs = 4;       // v8.1.0: fixed request, no cap_ms
     g_capPeriodMsF = 4.0f;                 // v3.8: watchdog restart state
     g_capNeedle    = g_cfg.inputDevice;
-    g_capWantExcl  = g_capLoopback ? false : g_cfg.captureExclusive;   // v9.4.0: shared only in output-as-source
+    g_capWantExcl  = g_cfg.captureExclusive;
 
     // per-leg identity + work buffers (rings come later -- their size needs
     // the negotiated device period)
@@ -12023,16 +11894,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v9.4.0 OUTPUT-AS-SOURCE: in loopback mode the source opens as
-    // ma_device_type_loopback on the resolved RENDER endpoint id (the id
-    // rides config.capture.pDeviceID -- that is miniaudio's loopback
-    // contract), SHARED mode only: Windows has no exclusive loopback, and
-    // exclusive is neither attempted nor hinted (a refused hint log would
-    // be a lie in this mode). The one-way read never writes to the
-    // endpoint; event-paced, it simply parks while the endpoint renders
-    // nothing and resumes the moment audio flows.
-    ma_device_config cc = ma_device_config_init(g_capLoopback ? ma_device_type_loopback
-                                                              : ma_device_type_capture);
+    // v3.6: the CAPTURE side gets its own period + share mode, opened BEFORE
+    // the rings (the ring floor needs the REAL negotiated burst). Exclusive
+    // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
+    // WaveCyclic/busy and falls back to shared (banner reports the winner).
+    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = capPeriodMs;
     cc.periods = 2;
@@ -12040,9 +11906,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     cc.capture.pDeviceID = &capId;
     cc.capture.format = ma_format_f32;
     cc.capture.channels = kInCh;
-    cc.capture.shareMode = g_capLoopback ? ma_share_mode_shared
-                                         : (g_cfg.captureExclusive ? ma_share_mode_exclusive
-                                                                   : ma_share_mode_shared);
+    cc.capture.shareMode = g_cfg.captureExclusive ? ma_share_mode_exclusive
+                                                  : ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     memset(&g_capDev, 0, sizeof(g_capDev));   // v3.8: g_capDev is file-scope (watchdog)
     bool capExclusive = false;
@@ -12050,14 +11915,6 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (cr == MA_SUCCESS) {
         capExclusive = (cc.capture.shareMode == ma_share_mode_exclusive);
         g_capIsExcl  = capExclusive;
-    } else if (g_capLoopback) {
-        // v9.4.0: no exclusive fallback exists for a loopback source
-        // (there is no exclusive loopback in Windows) -- a failure here is
-        // the endpoint itself; report it straight, no shared-mode retry.
-        tlog( "[twinspeak] output-as-source open FAILED: %s -- the render endpoint refused the\n"
-                "                            loopback read (busy format change, endpoint disabled?); check --list\n",
-                ma_result_description(cr));
-        return 1;
     } else if (g_cfg.captureExclusive) {
         tlog( "[twinspeak] capture EXCLUSIVE refused (%s) -- falling back to shared\n",
                 ma_result_description(cr));
@@ -12420,13 +12277,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
-    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)%s\n",
+    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
-           g_capPeriodFrames * 1000.0 / kSampleRate,
-           g_capLoopback ? " | SOURCE = this render endpoint (one-way loopback read; volume native; no echo)"
-                         : "");
-    if (!capExclusive && g_cfg.captureExclusive && !g_capLoopback)   // v9.4.0: never in output-as-source
+           g_capPeriodFrames * 1000.0 / kSampleRate);
+    if (!capExclusive && g_cfg.captureExclusive)
         tlog( "[twinspeak] capture hint   : exclusive was refused -- the pin is held by the engine or the\n"
                         "            Line 1 port driver is WaveCyclic. The direct WaveRT capture path\n"
                         "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
