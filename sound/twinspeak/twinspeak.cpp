@@ -233,6 +233,42 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.2 THE 12 ms PACKET (field-directed: "I would do a 12ms packet
+//            mode instead. I think that's what I want, since clearly
+//            consumer usb speakers aren't designed for 4ms buffers").
+//            The 2026-11-20 log (v9.5.1, output-as-source): both legs
+//            phase-locked into late service at the 192-fr request --
+//            leg1 an 8.15 ms stride, leg2 a 12.91 ms stride, margins
+//            -0.15/-4.96 ms, "the DAC crossed into stale audio", the
+//            meter counting 169-176k late switches. The same close as
+//            v9.3.2's log: 4 ms is below what consumer USB DACs
+//            service, and v8.0.0 already proved no priority fixes a
+//            stride. kOutPeriodFrames 192 -> 576 (12.0 ms), periods
+//            still 2 (a 24 ms cushion): every stride the field showed
+//            now lands with margin, and the anchor/health/servo follow
+//            the negotiated period as they always have. kPktEmaAlpha
+//            scales 192/48000 -> 576/48000 so the servo's ~1 s average
+//            stays a second of REAL time (the P-gain is time-invariant:
+//            error and correction both scale with the period). No new
+//            ini key, no UI row; old inis load identically. Cost: the
+//            per-leg device path grows 8 ms (4->12 ms period + 8->24
+//            ms cushion... the est-path line prints it live); leg
+//            ALIGNMENT is frame-exact and moves with it, so the
+//            calibration holds. loop_sim_v2 at 576: ratio 1.00000,
+//            delay floors held, zero flow-time shorts, conservation
+//            exact; harness4 S/T at 576-anchor 1152: servo settled,
+//            burst drained, no flip-flop.
+//    v9.5.1d OUTPUTS-ONLY, PLAIN PICKER (field-directed: v9.5.1c
+//            restored the capture list -- not what "only the outputs
+//            on the cable input list, no more inputs" asked for). The
+//            capture-input picker now lists RENDER endpoints ONLY,
+//            plain names -- no capture fill, no " -- output" tag; the
+//            box shows the plain name; input_is_output defaults ON
+//            (the outputs-only workflow IS output-as-source); a legacy
+//            tagged entry still strips on load, so old inis keep
+//            resolving exactly as they did. The engine (resolve/open/
+//            guard/volume) is untouched -- dual-mode since v9.4.0;
+//            harness3 K re-proves the store rule.
 //    v9.3.2 THE FREEZE FIX (field: "now this freezes my screen as
 //            playing above a frozen desktop). The crackle fix's worker
 //            parked on the futex with a 250 ms timeout, but its seqlock
@@ -355,9 +391,9 @@
 //               estimator the E-cores first. A failed pin leaves the thread
 //               floating -- nothing else changes.
 //            WHAT IS DELIBERATELY NOT DONE: the per-callback DSP is NOT
-//            fanned out to the pool. At the 192-fr request (4.0 ms of
-//            service) a switch's mix is ~192 frames x 8 lanes of multiply-
-//            adds -- single-digit microseconds, inline and bit-exact.
+//            fanned out to the pool. At the 576-fr request (12.0 ms of
+//            service) a switch's mix is ~576 frames x 8 lanes of multiply-
+//            adds -- still single-digit microseconds, inline and bit-exact.
 //            Waking a pool for that means a condition-variable handoff whose
 //            WORST case (a worker preempted the instant it was woken) is
 //            longer than the whole callback, on the real-time path, with the
@@ -3214,7 +3250,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.1"
+#define TWS_VERSION "9.5.2"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3331,21 +3367,29 @@ static unsigned           g_kaIdxLeg[4] = {0, 0, 0, 0};
 static size_t             g_capPeriodFrames   = 192;    // real negotiated capture period (informational)
 static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device period per leg (v8.4.0: four)
 // v9.0.1 THE CONSTANT BUFFER SIZE AGAIN: the engine asks for FRAMES, not a
-// millisecond hint -- kOutPeriodFrames 512 x kOutPeriods 3 on EVERY WASAPI
-// leg (the v8.4.24 field-validated geometry: a 5.33 ms switch, ~375
-// switches/s, a 512-fr / 8.0 ms exclusive buffer). A 1 ms HINT let each
+// millisecond hint -- one request on EVERY WASAPI leg (a 1 ms HINT let each
 // driver round its own way (the field's Realteks negotiated 96, the S5 48
 // -- two different bites on one engine); the frame request lands both legs
-// on the SAME constant switch, and the exclusive event-mode cushion (the
-// two periods the DAC still holds when the event fires, 256 fr = 5.3 ms)
-// equals the v8.0.0 KS write lead it replaces -- a late service has the
-// same margin before the DAC grazes the edge, with no pacer thread to
-// feed. The driver's own alignment pass (AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
-// re-init) still has the final word on the exact frame count; the REQUEST
-// is constant, the anchor/ring math (2 x the negotiated period) follows
-// the real number as before.
-static constexpr unsigned kOutPeriodFrames   = 192;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
-static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 256 fr (~8.0 ms)
+// on the SAME constant switch. The driver's own alignment pass
+// (AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED re-init) still has the final word on
+// the exact frame count; the REQUEST is constant, the anchor/ring math
+// (2 x the negotiated period) follows the real number as before.
+// v9.5.2 THE 12 ms BITE (field-directed: "I would do a 12ms packet mode
+// instead... clearly consumer usb speakers aren't designed for 4ms
+// buffers"). The v8.4.24 192-fr geometry was superseded by the 2026-11-20
+// log: BOTH DACs served every switch at a fixed multiple of the period
+// (leg1 a 2-period 8.15 ms stride, leg2 a 3-period 12.91 ms stride) with
+// the cushion eaten -- "-0.15 ms / -4.96 ms of device-buffer margin
+// left -- the DAC crossed into stale audio", 169-176k late switches since
+// boot. That is the v8.0.0 PHASE LOCK at 4 ms: no priority fixes a stride,
+// and consumer USB silicon does not service a 4 ms exclusive buffer on
+// time. 576 fr makes the bite 12 ms: a 2-period cushion is then 24 ms, so
+// even the observed 3-period stride (12.9 ms) lands with +11 ms of margin
+// and the lock has nothing to bite. The engine's alignment, anchor, ring
+// floor and servo all key off the NEGOTIATED period -- nothing else moves.
+static constexpr unsigned kOutPeriodFrames   = 576;  // v9.5.2: the 12 ms bite (the 2026-11-20 log -- consumer USB
+                                                     // DACs phase-lock into late service at 4 ms; 3x the period)
+static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 1152 fr = 24.0 ms (a full stride of slack)
 // ---- v9.5.0 PACKET MODE constants (per-leg trim servo + async sampler) ----
 // Pure-P, zero-centered: trim = clamp(kPktPpmPerFrame * err, +-kPktMaxPpm).
 // 50 ppm/frame: a 1 ms (48 fr) depth error bends the rate 0.24%; the cap
@@ -3358,7 +3402,8 @@ static constexpr long kPktFloorFr    = 512;  // v9.5.1: one full VAC burst (10.7
                                               // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
 // v9.5.1 SERVO v2: steer the AVERAGED depth, engage with hysteresis.
-static constexpr double kPktEmaAlpha  = 192.0 / 48000.0;  // ~1 s of packets
+static constexpr double kPktEmaAlpha  = 576.0 / 48000.0;  // v9.5.2: ~1 s of packets at the 12 ms bite (192/48000
+                                                           // would stretch the average to ~3 s of real time)
 static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
 static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this: back to bit-exact
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
@@ -3465,11 +3510,12 @@ struct Config {
     // v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on means input_device
     // names a RENDER endpoint (e.g. VB VAC's "CABLE Input") -- it becomes
     // the source, opened as a loopback read of that one endpoint (the only
-    // door Windows gives a reader for an explicit output's data). off (the
-    // default) keeps v9.3.2 behavior: capture endpoints only.
-    // v9.5.1c: a real toggle again -- v9.5.1's always-on lock went with
-    // its render-only picker (the capture list is restored with it).
-    bool        inputIsOutput   = false;
+    // door Windows gives a reader for an explicit output's data). off keeps
+    // v9.3.2 behavior: capture endpoints only (a hand-typed capture name
+    // still resolves; the picker simply does not offer them).
+    // v9.5.1d: defaults ON -- the outputs-only picker IS the output-as-
+    // source workflow; the key still loads, so old inis run either way.
+    bool        inputIsOutput   = true;
     // v9.5.0 PACKET MODE: every leg trims its playout ratio each packet to
     // hold the ring at delay + anchor (continuous, inaudible, self-nulling
     // to the bit-exact path), and a non-48k device gets an ENGINE-side
@@ -6897,14 +6943,16 @@ static void writeTemplate(const char* path) {
         "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
-        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on turns the line below\n"
-        "; into the name of a RENDER endpoint -- e.g. \"CABLE Input\" for\n"
-        "; Virtual Audio Cable by VB -- and that output becomes the SOURCE:\n"
-        "; its data is read (a one-way loopback of that one endpoint; nothing\n"
-        "; is written back, so no echo) and routed to the legs by channel,\n"
-        "; exactly as the capture path did. off = capture endpoints only\n"
-        "; (v9.5.1c: the toggle -- and the capture picker list -- restored).\n"
-        "input_is_output = off\n"
+        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on (the default, and\n"
+        "; the only thing the picker offers) means input_device names a\n"
+        "; RENDER endpoint -- e.g. \"CABLE Input\" for Virtual Audio Cable\n"
+        "; by VB -- and that output becomes the SOURCE: its data is read (a\n"
+        "; one-way loopback of that one endpoint; nothing is written back,\n"
+        "; so no echo) and routed to the legs by channel, exactly as the\n"
+        "; capture path did. The picker lists OUTPUTS only, plain names.\n"
+        "; off = capture endpoints (hand-typed; the picker does not offer\n"
+        "; them).\n"
+        "input_is_output = on\n"
         "; v9.5.0 PACKET MODE: on (default) = every leg corrects clock drift\n"
         "; EVERY packet (a sub-0.1% rate bend -- the ring never runs dry,\n"
         "; nothing clicks) and a device set to a non-48k rate is resampled\n"
@@ -8852,17 +8900,14 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
     ma_device_info* c = nullptr; ma_uint32 nc = 0;
     if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
         for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
-        for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
-        // v9.5.1c THE LIST RESTORED: the capture names are back, first
-        // and untagged (the field: "the capture input list restored
-        // (only have outputs)" -- v9.5.1's render-only picker was an
-        // overreach). The RENDER entries follow, each tagged
-        // " -- output": picking one (e.g. "CABLE Input (Virtual Audio
-        // Cable)") makes THAT endpoint the source (input_is_output goes
-        // on automatically). The tag is a display marker only -- the
-        // stored needle is the plain name. A capture name picks the
-        // v9.3.2 capture path (input_is_output off).
-        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(std::string(p[i].name) + " -- output");
+        // v9.5.1d OUTPUTS-ONLY, PLAIN (field-directed: "only the
+        // outputs on the cable input list, no more inputs"). The
+        // capture-input picker lists RENDER endpoints only, PLAIN
+        // names -- no capture fill, no " -- output" tag anywhere. The
+        // workflow sources a render endpoint (VB VAC's "CABLE Input");
+        // the engine stays dual-mode underneath (the key, the resolver),
+        // but the picker offers what the field asked for: outputs only.
+        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(p[i].name);
     }
     ma_context_uninit(&ctx);
 }
@@ -9035,11 +9080,11 @@ static void cfgFromControls(HWND w) {
     // when the window is built later, controlsFromCfg fills the controls
     // from the same g_cfg, so START in the window still edits what runs.
     if (!w || !GetDlgItem(w, IDC_INDEV)) return;
-    // v9.5.1c THE TAG IS BACK: a picker entry ending in " -- output" is a
-    // render endpoint -- strip the marker, store the plain name, and turn
-    // input_is_output ON. A plain name (a capture device, hand-typed)
-    // leaves the key where it was: off = the v9.3.2 capture path. The
-    // engine resolves either way and the banner says which it hit.
+    // v9.5.1d PLAIN PICKER: the box's text IS the needle -- nothing to
+    // strip, the key stays ON (the outputs-only workflow IS output-as-
+    // source). A legacy " -- output" marker (a v9.5.0/1c ini or a
+    // hand-pasted entry) is stripped and the key set ON so it keeps
+    // resolving exactly as it did; the marker itself never comes back.
     {
         std::string in = editStr(w, IDC_INDEV);
         const std::string tag = " -- output";
@@ -9047,8 +9092,8 @@ static void cfgFromControls(HWND w) {
             in.compare(in.size() - tag.size(), tag.size(), tag) == 0) {
             in.resize(in.size() - tag.size());
             while (!in.empty() && in.back() == ' ') in.pop_back();
-            g_cfg.inputIsOutput = true;
         }
+        if (!in.empty()) g_cfg.inputIsOutput = true;
         g_cfg.inputDevice = in;
     }
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
@@ -9088,11 +9133,9 @@ static void cfgFromControls(HWND w) {
 
 static void controlsFromCfg(HWND w) {
     char b[64];
-    // v9.5.1c: show the mode in the box -- a source on the output side
-    // carries the " -- output" marker, the same one the picker offers.
-    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputIsOutput
-                     ? (g_cfg.inputDevice + " -- output").c_str()
-                     : g_cfg.inputDevice.c_str());
+    // v9.5.1d: the box shows the PLAIN name -- no tag anywhere (the
+    // picker offers plain render names; the mode is the default).
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
