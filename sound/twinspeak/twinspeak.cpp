@@ -170,6 +170,15 @@
 //            (VB VAC's "CABLE Input"), and the resolve banner says
 //            exactly which endpoint the needle hit. A legacy entry still
 //            carrying the old marker is stripped on load.
+//    v9.5.1b THE BUILD FIX (the field's MSVC line): the v9.5.1 rewrite of
+//            the volume-fallback banner dropped the comma between the
+//            format string and g_cfg.inputDevice.c_str() -- C2146 at the
+//            build line. The sandbox gates (brace balance, preprocessing,
+//            extracted-harness compiles) never fully parsed the file;
+//            scripts/syntax_check.py now runs a REAL g++ -fsyntax-only
+//            parse over the whole translation unit (same stub headers as
+//            the structural check), so a pure-syntax break anywhere in
+//            the file fails the gate that ships it.
 //    v9.5.1 ROUND 2 (the four field symptoms -- all one root cluster,
 //            the loopback tap's burst cadence + two v9.4.0 assumptions
 //            the field disproved):
@@ -13040,7 +13049,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                             "            fix: set input_device to the cable's name (its render endpoint,\n"
                             "            e.g. \"CABLE Input\") -- that endpoint's own slider IS the master\n"
                             "            volume, and it must be ACTIVE in Windows sound settings\n"
-                            "            (the full endpoint list with states was printed above this line)\n"
+                            "            (the full endpoint list with states was printed above this line)\n",
                     g_cfg.inputDevice.c_str());
     } else {
         tlog("[twinspeak] volume        : follow off (volume_follow = off)\n");
