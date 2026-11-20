@@ -158,6 +158,58 @@
 //            is the echo bug wearing a new hat).
 //            Harness: harness3.cpp proves the decision table (mode/needle/
 //            self-route/shared-only) against the extracted resolver.
+//    v9.5.1 RENDER-ONLY SOURCE (field-directed: "I'm just gonna have it so
+//            only the outputs are on the cable input list, so no more
+//            inputs and definitely no more of that ' -- input' postfix").
+//            The input picker lists RENDER endpoints only, PLAIN names,
+//            no " -- output" marker anywhere (not in the list, not in the
+//            box, not in the ini); input_is_output is always on (the key
+//            stays in the schema so old files load clean, but it is
+//            accepted and ignored -- always on). Capture endpoints are
+//            not offered: a cable workflow sources a render endpoint
+//            (VB VAC's "CABLE Input"), and the resolve banner says
+//            exactly which endpoint the needle hit. A legacy entry still
+//            carrying the old marker is stripped on load.
+//    v9.5.1 ROUND 2 (the four field symptoms -- all one root cluster,
+//            the loopback tap's burst cadence + two v9.4.0 assumptions
+//            the field disproved):
+//            TWEETING: the v9.5.0 servo steered the RAW ring depth;
+//            VAC delivers loopback audio in ~10 ms bursts, so the depth
+//            sawtooths +-240 fr at burst rate and the servo chased every
+//            tooth with a saturated +-4000 ppm ratio wobble (a warble
+//            riding the music). The servo now steers a ~1 s EMA of the
+//            depth with an engage/release hysteresis (on |8| fr, off
+//            |2|): a matched clock rides the bit-exact bypass through
+//            burst jitter; loop_sim_v2 proves 2 trim sign flips over
+//            9000 burst periods (v9.5.0: thousands).
+//            DELAY: while the cable renders silence the loopback reader
+//            is idle, and BOTH pop paths could eat the delay PREFILL
+//            chasing the period (bypass: no floor; engaged: take frames
+//            a period) -- every silent gap collapsed delayN_ms to ~0.
+//            The pop floor is delayFrames in both paths (loop_sim_v2:
+//            ring min 2880.8 against a 2880 fr floor through a 5 s
+//            idle); the shortfall plays zeros, the prefill survives,
+//            the first frame of the next burst lands exactly delayMs
+//            late. 'short' counts only while audio FLOWS (capture
+//            heartbeat fresh): the "+250/250/0/0" phantom was the idle
+//            itself, counted as starvation. 'off' prints idle while
+//            the capture is idle (no delta to divide -- the stale ppm
+//            the field rightly distrusted).
+//            VOLUME/MUTE: the v9.4.0 loopback skip of the volume
+//            multiply is REVERTED -- the field proved VAC's tap is
+//            PRE-volume (muting the cable input left every speaker
+//            playing). The cable input's own endpoint (input_device's
+//            render endpoint) is THE volume endpoint: volume_endpoint
+//            is retired from the ini, the GUI and the needle cascades
+//            (input_device, then the generic cable match); slider AND
+//            mute apply in every mode.
+//            OUT2_FIRST: retired (key + GUI pill) -- the center-first
+//            open/start order is integrated; the key is accepted and
+//            ignored on old files. The servo floor is 512 fr (one full
+//            burst of headroom) and the raw ring carries 200 ms over
+//            the delay. Harnesses: harness3 J/K re-prove the vg gate
+//            and the tag-less input row; loop_sim_v2.cpp proves the
+//            servo v2 (burst, idle, 44.1k, conservation).
 //    v9.3.2 THE FREEZE FIX (field: "now this freezes my screen as
 //            playing above a frozen desktop). The crackle fix's worker
 //            parked on the futex with a 250 ms timeout, but its seqlock
@@ -3139,7 +3191,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.0"
+#define TWS_VERSION "9.5.1"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3277,9 +3329,15 @@ static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 25
 // (4000 ppm = 0.4%) drains a 4096-fr cable burst in ~21 s with NO click
 // (a rate bend has no discontinuity; the warden's 240-fr skip clicked).
 static constexpr long kPktPpmPerFrame = 50;
-static constexpr long kPktFloorFr    = 8;    // v9.5.0c: the engaged span's lookahead floor --
+static constexpr long kPktFloorFr    = 512;  // v9.5.1: one full VAC burst (10.7 ms) of headroom --
                                               // the servo target rides delay+anchor+this, never below
+                                              // (v9.5.0c's 8 fr left the 4-knot window stranded on
+                                              // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
+// v9.5.1 SERVO v2: steer the AVERAGED depth, engage with hysteresis.
+static constexpr double kPktEmaAlpha  = 192.0 / 48000.0;  // ~1 s of packets
+static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
+static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this: back to bit-exact
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3309,7 +3367,9 @@ struct Config {
     // empty in = empty out, the truth.
     std::string outputDevice3;
     std::string outputDevice4;   // v9.1.4: leg4 -- the LFE fold to an EXISTING leg's device (never opens its own)
-    std::string volumeEndpoint;      // v3.9: needle for the cable's PLAYBACK endpoint
+    // v9.5.1: volumeEndpoint is RETIRED -- the volume endpoint IS the
+    // input_device's own render endpoint (the cable input), resolved by
+    // the two-needle cascade at start; no key, no GUI row, no storage.
                                      //       (volume follow); empty = use input_device
     float       gainL          = 1.0f;
     float       gainR          = 1.0f;
@@ -3377,13 +3437,14 @@ struct Config {
                                           // on, no key, no pill; nothing can flip it
     bool        pinOutputs     = true;   // v3.8: out1/out2 endpoints pinned 100%/unmuted.
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
-    bool        out2First      = true;   // v3.8: center leg opens and starts first
+    // v9.5.1: out2First RETIRED (field-directed: "remove the out2_first\n    // key from both ini and gui, as I don't need that anymore") -- the\n    // open/start order is INTEGRATED: center leg first, then the mains,\n    // then the rears. The only order the field ever ran.
+    bool        out2First      = true;
     // v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on means input_device
     // names a RENDER endpoint (e.g. VB VAC's "CABLE Input") -- it becomes
     // the source, opened as a loopback read of that one endpoint (the only
     // door Windows gives a reader for an explicit output's data). off (the
     // default) keeps v9.3.2 behavior: capture endpoints only.
-    bool        inputIsOutput   = false;
+    bool        inputIsOutput   = true;    // v9.5.1: render-only source (always on)
     // v9.5.0 PACKET MODE: every leg trims its playout ratio each packet to
     // hold the ring at delay + anchor (continuous, inaudible, self-nulling
     // to the bit-exact path), and a non-48k device gets an ENGINE-side
@@ -3684,6 +3745,8 @@ struct Leg {
     double              pktRatio    = 1.0;    // SOURCE frames per DEVICE frame (48000/rate x trim)
     std::vector<float>  pktRs;                 // engaged path's 8ch resample buffer (kInCh x kScratchFrames)
     unsigned long long  pktLastTrimLogMs = 0;  // v9.5.0b: the sustained-trim one-shot's 1-min gate
+    double              pktDepthEma  = -1.0;  // v9.5.1: EMA of ring depth (~1 s); -1 = not yet seeded
+    bool                pktEngagedOn = false; // v9.5.1: the servo's hysteresis latch
     // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
     // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
     // mains are the anchor the ears calibrate against). Leg1's own ring
@@ -4920,10 +4983,24 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             // click every few periods, the last field crackle). The trim
             // bends the playout ratio to hold depth AT the floor -- a
             // sub-0.1% rate change, no discontinuity, no click.
-            const long long perr = (long long)avail - (long long)L.delayFrames
+            // v9.5.1 SERVO v2: steer the EMA of the depth, not the raw
+            // sample -- VAC delivers loopback audio in ~10 ms bursts, so
+            // the raw depth sawtooths +-240 fr and the v9.5.0 servo
+            // chased every tooth with a saturated +-4000 ppm ratio
+            // wobble at burst rate (the field's "tweeting"). The EMA
+            // (~1 s) sees through the bursts; the hysteresis latch keeps
+            // a matched clock on the bit-exact bypass while the averaged
+            // error sits in the +-8..2 fr band.
+            if (L.pktDepthEma < 0.0) L.pktDepthEma = (double)avail;
+            L.pktDepthEma += kPktEmaAlpha * ((double)avail - L.pktDepthEma);
+            const long long perr = (long long)(L.pktDepthEma + 0.5)
+                                 - (long long)L.delayFrames
                                  - (long long)L.anchorFrames - (long long)kPktFloorFr;
             long ptrim = 0;
-            if (perr > 2 || perr < -2) {
+            if      (perr >  kPktEngageFr) L.pktEngagedOn = true;
+            else if (perr < -kPktEngageFr) L.pktEngagedOn = true;
+            else if (perr <  kPktRelaxFr && perr > -kPktRelaxFr) L.pktEngagedOn = false;
+            if (L.pktEngagedOn) {
                 ptrim = kPktPpmPerFrame * perr;
                 if (ptrim > kPktMaxPpm)  ptrim = kPktMaxPpm;
                 if (ptrim < -kPktMaxPpm) ptrim = -kPktMaxPpm;
@@ -4971,17 +5048,45 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 // ring. One period of held frames is inaudible; a
                 // stranded carry repeats.
                 if (avail < take) break;
+                // v9.5.1 THE ENGAGED PATH'S DELAY FLOOR: the bypass
+                // pop floor (below) is not enough -- an ENGAGED servo
+                // popping `take` frames a period still drains the
+                // prefill through a silent cable (loop_sim_v2: ring
+                // min 6.8 fr against a 2880 fr floor). The delay
+                // prefill is untouchable in BOTH paths: an engaged
+                // `take` that would eat below delayFrames pops
+                // NOTHING and breaks -- the period holds its last
+                // mixed frame (the partial-pop semantics), the
+                // prefill survives the idle, and the first frame of
+                // the next burst lands exactly delayMs late.
+                if (avail >= L.delayFrames && (size_t)(avail - L.delayFrames) < take) break;
                 n = take;
             } else {
+                // v9.5.1 POP FLOOR: the bypass never pops below the
+                // delay PREFILL. While the cable renders silence the
+                // loopback reader is idle (no callbacks), and the
+                // v9.5.0 pump happily ate the prefill chasing the
+                // period -- every silent gap collapsed delayN_ms to ~0
+                // (the field's "the delayN_ms also doesn't work").
+                // Popping stops AT delayFrames; the shortfall plays
+                // zeros, the prefill survives, and the first frame of
+                // the next burst lands exactly delayMs late -- the
+                // knob's promise, held through idle.
+                const size_t floor = L.delayFrames;
+                const size_t usable = (avail > floor) ? (avail - floor) : 0;
                 const size_t take = (want < (size_t)kScratchFrames) ? want
                                  : (size_t)kScratchFrames;
-                n = (avail < take) ? avail : take;
+                n = (usable < take) ? usable : take;
                 L.pktBypass++;
             }
         } else {
+            // v9.5.1: the same POP FLOOR on the v9.4.0 discipline --
+            // the delay prefill is never eaten, in either mode.
+            const size_t floor = L.delayFrames;
+            const size_t usable = (avail > floor) ? (avail - floor) : 0;
             const size_t take = (want < (size_t)kScratchFrames) ? want
                              : (size_t)kScratchFrames;
-            n = (avail < take) ? avail : take;
+            n = (usable < take) ? usable : take;
         }
         if (n == 0) break;
         const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
@@ -4997,15 +5102,16 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             }
             g_ch3InPeak.store(pk, std::memory_order_relaxed);
         }
-        // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint volume
-        // -- applied to the raw 8ch block BEFORE the per-leg mix. Both legs
-        // track the same knob; the ini gains still stack on it.
-        // v9.4.0: in OUTPUT-AS-SOURCE the tap is POST-volume by Windows
-        // architecture -- the endpoint's own slider is already baked into
-        // every frame; the multiply is SKIPPED in that mode.
+        // v3.8 VOLUME FOLLOW: one master gain -- the cable input's own
+        // endpoint volume -- applied to the raw 8ch block BEFORE the
+        // per-leg mix. Every leg tracks the same knob; the ini gains
+        // still stack on it. v9.5.1: the v9.4.0 loopback skip is
+        // REVERTED -- the field proved VAC's loopback tap is PRE-volume
+        // (muting the cable input left the speakers playing), so the
+        // multiply AND the mute apply in output-as-source exactly like
+        // capture mode: one knob, every leg, mute included.
         {
-            const float vg = g_capLoopback ? 1.0f :
-                           g_volMuted.load(std::memory_order_relaxed) ? 0.0f
+            const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
                            : g_vol.load(std::memory_order_relaxed);
             if (vg != 1.0f) {
                 const size_t tot = n * (size_t)kInCh;
@@ -5140,8 +5246,17 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
     // restart, never an escalation. (v8.4.7: the sync pad's frame is not a
     // hole -- it repeated, above; only real holes count.)
-    if (done + padApplied < frameCount)
-        L.und.fetch_add(1);
+    // v9.5.1 IDLE GATE: a silent cable (loopback idle, no callbacks) is
+    // NOT a starved source -- the delay prefill legitimately floors the
+    // pops through the gap. 'short' counts only while audio FLOWS (the
+    // capture heartbeat is fresh); the idle case is the pop floor doing
+    // its job, not a fault. (The v9.5.0 line read "+250/250/0/0" on
+    // every silent cable -- a phantom the field rightly distrusted.)
+    if (done + padApplied < frameCount) {
+        const unsigned long long hb = g_hbCap.load(std::memory_order_relaxed);
+        const bool flowing = hb && (GetTickCount64() - hb) <= 250;
+        if (flowing) L.und.fetch_add(1);
+    }
     // v8.4.23: THE ABSOLUTE LANE GATE and the device-layer lane verdicts
     // are RETIRED with the mask-copy-mask fan-out -- a masked leg can only
     // ever play its own channels, so there is nothing left to gate, and
@@ -6757,13 +6872,15 @@ static void writeTemplate(const char* path) {
         "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
-        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on turns the line below\n"
-        "; into the name of a RENDER endpoint -- e.g. \"CABLE Input\" for\n"
-        "; Virtual Audio Cable by VB -- and that output becomes the SOURCE:\n"
-        "; its data is read (a one-way loopback of that one endpoint; nothing\n"
-        "; is written back, so no echo) and routed to the legs by channel,\n"
-        "; exactly as the capture path did. off = capture endpoints only.\n"
-        "input_is_output = off\n"
+        "; v9.5.1 RENDER-ONLY SOURCE: input_device is the name of a RENDER\n"
+        "; endpoint -- e.g. \"CABLE Input\" for Virtual Audio Cable by VB --\n"
+        "; and that output is the SOURCE: its data is read (a one-way\n"
+        "; loopback of that one endpoint; nothing is written back, so no\n"
+        "; echo) and routed to the legs by channel, exactly as capture did.\n"
+        "; The input picker offers render endpoints only, plain names --\n"
+        "; no marker, and input_is_output is always on (the key below is\n"
+        "; kept so old files load; it no longer switches anything).\n"
+        "input_is_output = on\n"
         "; v9.5.0 PACKET MODE: on (default) = every leg corrects clock drift\n"
         "; EVERY packet (a sub-0.1% rate bend -- the ring never runs dry,\n"
         "; nothing clicks) and a device set to a non-48k rate is resampled\n"
@@ -6867,22 +6984,20 @@ static void writeTemplate(const char* path) {
         "surround_bass_gain = 2.0\n"
         "surround_bass_q = 0.8\n"
         "\n"
-        "; VOLUME (v8.3.0: volume_follow is BUILT IN, hardcoded on): the\n"
-        "; Windows volume of the cable's PLAYBACK side (the Line 1 slider in\n"
-        "; sndvol, or the volume hotkeys when Line 1 is the default device) is\n"
-        "; the single master knob -- twinspeak multiplies every captured frame\n"
-        "; by it, so EVERY leg tracks it identically (v8.4.0: all four). The\n"
-        "; endpoint is matched by name: volume_endpoint first (substring),\n"
-        "; then input_device, then any 'Virtual Audio Cable' render endpoint.\n"
-        "; If nothing matches, the banner prints EVERY render endpoint with its\n"
-        "; state -- copy the cable's playback name into volume_endpoint and\n"
-        "; rerun.\n"
-        "volume_endpoint =\n"
+        "; VOLUME (v9.5.1: volume_endpoint RETIRED): the Windows volume of\n"
+        "; the cable input itself -- input_device's own render endpoint -- is\n"
+        "; THE single master knob. twinspeak multiplies every captured frame\n"
+        "; by it (MUTE included, v9.5.1: the loopback tap proved pre-volume),\n"
+        "; so every leg tracks it identically. The endpoint is matched by\n"
+        "; name: input_device first, then any 'Virtual Audio Cable' render\n"
+        "; endpoint. If nothing matches, the banner prints EVERY render\n"
+        "; endpoint with its state.\n"
         "; v7.0.0: pin_outputs is part of the engine now -- ALWAYS ON: both\n"
         "; endpoint volumes are pinned 100%% / unmuted while the engine runs,\n"
         "; EXCEPT a leg whose device IS the current default playback device:\n"
         "; that slider belongs to the user and is never written (v7.6.3).\n"
-        "out2_first = on\n"
+        "; v9.5.1: out2_first is RETIRED -- the center-first open order is part of\n"
+        "; the engine now (the key is accepted and ignored on old files).\n"
         "\n"
         "; KEEP-ALIVE (v7.1.7: BUILT IN -- no keys, no UI; v8.4.5: UNIVERSAL):\n"
         "; EVERY output leg sums a sine on its driven slots every frame\n"
@@ -7189,7 +7304,7 @@ static bool loadIni(const char* path) {
                  key == "background"        || key == "pin_outputs" ||
                  key == "lfe_fold") { }         // v8.4.0: the fold is built in
         else if (key == "input_device")   g_cfg.inputDevice = val;
-        else if (key == "input_is_output")  g_cfg.inputIsOutput = !isOff(val);   // v9.4.0: source is a render endpoint
+        else if (key == "input_is_output")  g_cfg.inputIsOutput = true;   // v9.5.1: render-only source -- accepted, always on
         else if (key == "packet_mode")     g_cfg.packetMode = !isOff(val);      // v9.5.0: per-packet trim servo + engine ASRC
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
@@ -7229,8 +7344,8 @@ static bool loadIni(const char* path) {
         else if (key == "delay2_ms")      g_cfg.delay2Ms = (float)atof(val.c_str());
         else if (key == "offset3_ms")     g_cfg.offset3Ms = (float)atof(val.c_str()); // v8.4.0 rears (v8.4.11: the one rear leg)
         // v8.4.11: offset4_ms is RETIRED -- read-and-ignored, like out1ms.
-        else if (key == "out2_first")     g_cfg.out2First    = !isOff(val);
-        else if (key == "volume_endpoint") g_cfg.volumeEndpoint = val;
+        else if (key == "out2_first")     g_cfg.out2First = true;   // v9.5.1: retired -- accepted, always center-first
+        else if (key == "volume_endpoint") ;   // v9.5.1: retired -- volume follows input_device's own endpoint
         else if (key == "chimes")         g_cfg.chimes        = !isOff(val);   // v6.2
         else if (key == "chime_gain")     g_cfg.chimeGain     = (float)atof(val.c_str()); // v6.2
         else if (key == "gui_theme") {
@@ -7868,7 +7983,9 @@ enum {
     // page: configuration (v8.3.0: was devices -- the chime pills from the
     // late SETTINGS page live here; v8.4.2: the startup row is this page's
     // LAST row)
-    IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,
+    IDC_INDEV = 300, IDC_OUT1, IDC_OUT2, IDC_VOLEP,   // v9.5.1: IDC_VOLEP retired
+                                             // (volume = the cable input's own slider)
+                                             // -- id reserved, nothing creates it
     IDC_GAIN_L, IDC_GAIN_R, IDC_GAIN_LFE, IDC_GAIN_CTR,
     IDC_TGL_LFEFOLD,            // v8.4.0: retired (the fold is built in) --
                                  // id reserved, nothing creates it
@@ -8711,13 +8828,15 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
     ma_device_info* c = nullptr; ma_uint32 nc = 0;
     if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
         for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
-        for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
-        // v9.4.0 OUTPUT-AS-SOURCE: the capture-input picker also lists
-        // RENDER endpoints, each tagged " -- output": picking one (e.g.
-        // "CABLE Input (Virtual Audio Cable)") makes THAT endpoint the
-        // source (input_is_output goes on automatically). The tag is a
-        // display marker only -- the stored needle is the plain name.
-        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(std::string(p[i].name) + " -- output");
+        // v9.5.1 RENDER-ONLY SOURCE: the capture-input picker lists
+        // RENDER endpoints, plain names, no tag (the field: "only the
+        // outputs on the cable input list, no more inputs, no more of
+        // that ' -- input' postfix"). input_device is now, by
+        // definition, a render endpoint (VB VAC's "CABLE Input" etc.)
+        // -- output-as-source is the only source mode. Capture
+        // endpoints are not offered; a hand-typed capture name still
+        // resolves where it always did (the loopback open), and the
+        // resolve banner says exactly which endpoint the needle hit.
     }
     ma_context_uninit(&ctx);
 }
@@ -8773,16 +8892,16 @@ static std::string cfgValueText(const std::string& key) {
         else if (t == "_q")    { snprintf(b, 64, "%g", g_cfg.eqSlotQ[n]); return b; }
     }
     else if (key == "center_eq")         return boolText(g_cfg.centerEq);
-    else if (key == "out2_first")        return boolText(g_cfg.out2First);
+    else if (key == "out2_first")        return boolText(g_cfg.out2First);   // v9.5.1: always "on"
     else if (key == "chimes")            return boolText(g_cfg.chimes);
     else if (key == "input_device")      return g_cfg.inputDevice;
-    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.4.0
+    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.5.1: always "on"
     else if (key == "packet_mode")      return boolText(g_cfg.packetMode);      // v9.5.0
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
     else if (key == "output_device4")    return g_cfg.outputDevice4;   // v9.1.4: leg4's fold target
-    else if (key == "volume_endpoint")   return g_cfg.volumeEndpoint;
+    else if (key == "volume_endpoint")   return g_cfg.inputDevice;   // v9.5.1: retired -- the value follows input_device
     else if (key == "gui_theme")        { snprintf(b, 64, "%u", (unsigned)g_theme); return b; }
     else if (key == "startup_engine")   return boolText(g_cfg.startupEngine);   // v7.1.2
     else if (key == "gui_window_x")     { snprintf(b, 64, "%d", g_guiWinX); return b; }   // v7.1.20
@@ -8815,7 +8934,6 @@ static const char* kIniKeys[] = {
     "eq_slot3_on", "eq_slot3_freq", "eq_slot3_gain", "eq_slot3_q",
     "eq_slot4_on", "eq_slot4_freq", "eq_slot4_gain", "eq_slot4_q",
     "eq_slot5_on", "eq_slot5_freq", "eq_slot5_gain", "eq_slot5_q",
-    "volume_endpoint", "out2_first",
     "chimes", "chime_gain",
     "gui_theme",                // v7.0.4: the GUI theme persists
     "startup_engine",           // v7.1.2: the startup launch auto-starts the engine
@@ -8891,12 +9009,11 @@ static void cfgFromControls(HWND w) {
     // when the window is built later, controlsFromCfg fills the controls
     // from the same g_cfg, so START in the window still edits what runs.
     if (!w || !GetDlgItem(w, IDC_INDEV)) return;
-    // v9.4.0 OUTPUT-AS-SOURCE: a picker entry ending in " -- output" is a
-    // render endpoint -- strip the marker, store the plain name, and turn
-    // input_is_output ON. A hand-typed name with the key already on keeps
-    // it; with it off, stays off (the engine still hard-errors if the
-    // needle only matches a render endpoint while the key is off -- the
-    // banner says exactly that).
+    // v9.5.1 RENDER-ONLY SOURCE: no tag exists anywhere -- the picker
+    // offers plain render names, input_is_output is simply ON (the
+    // field retired capture-side sourcing). A legacy entry still
+    // carrying the old " -- output" marker is stripped (old ini /
+    // muscle memory); the stored needle is always the plain name.
     {
         std::string in = editStr(w, IDC_INDEV);
         const std::string tag = " -- output";
@@ -8904,15 +9021,14 @@ static void cfgFromControls(HWND w) {
             in.compare(in.size() - tag.size(), tag.size(), tag) == 0) {
             in.resize(in.size() - tag.size());
             while (!in.empty() && in.back() == ' ') in.pop_back();
-            g_cfg.inputIsOutput = true;
         }
         g_cfg.inputDevice = in;
+        g_cfg.inputIsOutput = true;
     }
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
     g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent (v8.4.11: ONE rear device)
     g_cfg.outputDevice4  = editStr(w, IDC_OUT4);   // v9.1.4: leg4's LFE fold target (empty = idle)
-    g_cfg.volumeEndpoint = editStr(w, IDC_VOLEP);
     g_cfg.gainL     = editFloat(w, IDC_GAIN_L,  1.0f);
     g_cfg.gainR     = editFloat(w, IDC_GAIN_R,  1.0f);
     g_cfg.gainRl    = editFloat(w, IDC_GAIN_RL, 1.0f);   // v8.4.0 gain quad
@@ -8929,7 +9045,7 @@ static void cfgFromControls(HWND w) {
     g_cfg.delay1Ms = editFloat(w, IDC_DELAY1, 0.0f);
     g_cfg.delay2Ms = editFloat(w, IDC_DELAY2, 0.0f);
     g_cfg.offset3Ms = editFloat(w, IDC_OFF3, 0.0f);   // v8.4.0 timing quad (v8.4.11: the one rear leg)
-    g_cfg.out2First  = g_tog[IDC_TGL_OUT2FIRST];
+    // v9.5.1: out2_first is integrated (always center-first) -- nothing to read.
     // v7.0.0: pinOutputs is integrated -- always on; no control can change it.
     // v9.0.1: backend1/backend2 are gone with WDM-KS -- read-and-ignored.
     // v6.6.8: clockSync / driftGuard / powerGuard / yieldDefault integrated.
@@ -8946,16 +9062,14 @@ static void cfgFromControls(HWND w) {
 
 static void controlsFromCfg(HWND w) {
     char b[64];
-    // v9.4.0: show the mode in the box -- a source on the output side
-    // carries the " -- output" marker, the same one the picker offers.
-    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputIsOutput
-                     ? (g_cfg.inputDevice + " -- output").c_str()
-                     : g_cfg.inputDevice.c_str());
+    // v9.5.1: the source is always a render endpoint -- the plain name,
+    // no mode marker in the box (the picker offers the same plain list).
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
     SetDlgItemTextA(w, IDC_OUT4,  g_cfg.outputDevice4.c_str());   // v9.1.4
-    SetDlgItemTextA(w, IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
+    // v9.5.1: no IDC_VOLEP box exists to sync (volume_endpoint retired).
     snprintf(b, 64, "%g", g_cfg.gainL);      SetDlgItemTextA(w, IDC_GAIN_L, b);
     snprintf(b, 64, "%g", g_cfg.gainR);      SetDlgItemTextA(w, IDC_GAIN_R, b);
     snprintf(b, 64, "%g", g_cfg.gainRl);     SetDlgItemTextA(w, IDC_GAIN_RL, b);
@@ -8968,7 +9082,7 @@ static void controlsFromCfg(HWND w) {
     snprintf(b, 64, "%g", g_cfg.delay1Ms); SetDlgItemTextA(w, IDC_DELAY1, b);
     snprintf(b, 64, "%g", g_cfg.delay2Ms); SetDlgItemTextA(w, IDC_DELAY2, b);
     snprintf(b, 64, "%g", g_cfg.offset3Ms); SetDlgItemTextA(w, IDC_OFF3, b);   // v8.4.0
-    g_tog[IDC_TGL_OUT2FIRST] = g_cfg.out2First;
+    // v9.5.1: no IDC_TGL_OUT2FIRST pill exists to sync (out2_first retired).
     // v9.0.1: backend1/backend2 are gone with WDM-KS -- nothing to sync.
     // v8.3.0: the drift trio + volume_follow have no controls to sync.
     g_tog[IDC_TGL_CHIMES]     = g_cfg.chimes;
@@ -9132,10 +9246,12 @@ static void guiBuildPages(HWND w) {
     // another leg and that leg's outputs gain the LFE channel. The left
     // column reflows: leg4 256, volume_endpoint 290, REFRESH 318, note 352.
     comboRow(w, COLA_X, 256, "output leg4 (LFE fold)", IDC_OUT4, false, g_cfg.outputDevice4.c_str());
-    row(w, COLA_X, 290, "volume_endpoint", IDC_VOLEP, g_cfg.volumeEndpoint.c_str());
-    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 318, 150, 26, "REFRESH DEVICES");
+    // v9.5.1: the volume_endpoint row is RETIRED -- volume is the cable
+    // input's own slider (input_device), no separate endpoint key. The
+    // column pulls up: REFRESH 290, note 324.
+    HWND b = mkBtn(w, IDC_REFRESH, COLA_X, 290, 150, 26, "REFRESH DEVICES");
     regPage(b);                        // v6.6.2: page 0 only
-    note(w, COLA_X, 352,
+    note(w, COLA_X, 324,
          "We recommend you wait 10 seconds before doing the tick test to prepare the audio buffer preload for accurate latency compensation measurements between each audio device.", 3);
     header(w, COLB_X, KHDR_Y, "GAIN");
     // v8.4.0 THE GAIN QUAD: gain_l/gain_r/gain_rl/gain_rr as four short
@@ -9213,7 +9329,8 @@ static void guiBuildPages(HWND w) {
         const char* vals[3] = { b1, b2, b3 };
         quadRow(w, COLA_X, 118, 3, lbl, ids, vals);
     }
-    tglRow(w, COLA_X, 170, "out2_first (center opens first)", IDC_TGL_OUT2FIRST, g_cfg.out2First);
+    // v9.5.1: the out2_first pill is RETIRED -- the center-first order is
+    // integrated; the timing note pulls up to its slot.
     // v7.0.0: the pin_outputs pill is gone -- output pinning is part of the
     // engine now (always on): both endpoint volumes are pinned 100% / unmuted,
     // except a leg that IS the current default playback device (v7.6.3 --
@@ -9224,7 +9341,7 @@ static void guiBuildPages(HWND w) {
     // "remove the two whole paragraphs after the first one from the timing
     // tab, because it's overflowing") -- the KS-bite and slow-sync stories
     // stay told by the boot banner and the ini.
-    note(w, COLA_X, 204,
+    note(w, COLA_X, 170,
          "delay1/delay2 push one leg later, bit for bit -- put the delay on the\n"
          "EARLY leg. offset3_ms is the same knob for the rear leg (leg3 = the\n"
          "rears on ONE device; an empty rear device = no rear output). The\n"
@@ -10638,7 +10755,8 @@ static bool anySliderDragging() {
 static bool guiIsToggle(int id) {
     switch (id) {
         // v8.4.0: IDC_TGL_LFEFOLD retired (the fold is built in, always on)
-        case IDC_TGL_OUT2FIRST:   // v7.0.0: IDC_TGL_PINOUT retired (integrated)
+        // v9.5.1: IDC_TGL_OUT2FIRST retired with out2_first (integrated;
+        // the id stays reserved like IDC_TGL_PINOUT before it)
         case IDC_TGL_STARTUP:   // v6.6.6: the startup pill (v8.4.2: the LAST row of page 0's right column)
         case IDC_TGL_CHIMES:    // v8.3.0: on page 0; IDC_TGL_VOLFOLLOW retired
         case IDC_TGL_EQ:
@@ -12274,9 +12392,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // GONE with WDM-KS -- every leg opens WASAPI (exclusive first) with the
     // CONSTANT frame request. out2_first still orders the opens (center,
     // mains, then the rears).
-    int openOrder[4];
-    if (g_cfg.out2First) { openOrder[0] = 1; openOrder[1] = 0; openOrder[2] = 2; openOrder[3] = 3; }
-    else                 { openOrder[0] = 0; openOrder[1] = 1; openOrder[2] = 2; openOrder[3] = 3; }
+    // v9.5.1: the order is integrated (out2_first retired): center first.
+    const int openOrder[4] = { 1, 0, 2, 3 };
     auto legIdPtr = [&](int i) -> ma_device_id* {
         return (i == 0) ? &id1 : (i == 1) ? &id2 : &id3;   // v8.4.11: leg4 never reaches here (disabled)
     };
@@ -12405,7 +12522,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // (period 96 fr x2) that is 192 fr = 4.0 ms. The depth guard holds
         // the ring at delay + this; margin 0 is the DAC reading silence.
         L.anchorFrames = devPeriodFr * 2;
-        L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 150), kInCh);
+        // v9.5.1: 200 ms over the delay -- the 512 fr servo floor + a
+        // full burst of jitter headroom must fit below the cap.
+        L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 200), kInCh);
         L.raw.pushSilence(L.delayFrames);   // the delay: bit-exact, seq-less
         L.prefillRemaining = L.delayFrames; // v6.4 lineage: prefill carries no sequence
         // v9.0.1: lastBlock/lastN/haveLast stay inert (the KS lapse guard's
@@ -12430,6 +12549,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
         L.biteDue      = 0;                                            // v8.4.21: no armed drift bite either
         L.biteForced   = false;
+        L.pktDepthEma  = -1.0;                                         // v9.5.1: the EMA reseeds on the first packet
+        L.pktEngagedOn = false;                                        // v9.5.1: the hysteresis latch starts open
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -12448,13 +12569,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // watcher takes over both jobs once the devices run.
     const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     if (g_cfg.volumeFollow) {
-        // v3.9: needle cascade -- volume_endpoint (ini override) first, then
-        // input_device, then a generic "virtual audio cable" match. If all
+        // v9.5.1: the needle cascade is TWO long -- volume_endpoint is
+        // retired (field-directed: "hardcode volume control to come from
+        // the cable_input itself"): input_device's own render endpoint
+        // is THE volume endpoint, then the generic cable match. If both
         // miss, logRenderEndpoints() prints every render endpoint Windows
-        // has (with state) so the exact playback-side name is visible.
-        std::string volNeedles[3];
+        // has (with state) so the exact cable name is visible.
+        std::string volNeedles[2];
         int nN = 0;
-        if (!g_cfg.volumeEndpoint.empty()) volNeedles[nN++] = g_cfg.volumeEndpoint;
         volNeedles[nN++] = g_cfg.inputDevice;
         volNeedles[nN++] = "virtual audio cable";
         for (int k = 0; k < nN && !g_srcVol; ++k) {
@@ -12481,10 +12603,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // source, once per engine start, on the same needle cascade the volume
     // follow uses (volume_endpoint, then input_device, then the generic
     // cable match). Best effort and logged.
-    if (g_cfg.volumeFollow || !g_cfg.volumeEndpoint.empty()) {
-        std::string fxNeedles[3];
+    if (g_cfg.volumeFollow) {
+        std::string fxNeedles[2];
         int nFx = 0;
-        if (!g_cfg.volumeEndpoint.empty()) fxNeedles[nFx++] = g_cfg.volumeEndpoint;
         fxNeedles[nFx++] = g_cfg.inputDevice;
         fxNeedles[nFx++] = "virtual audio cable";
         for (int k = 0; k < nFx; ++k) {
@@ -12916,8 +13037,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                    g_volMuted.load() ? ", MUTED" : "");
         else
             tlog( "[twinspeak] volume        : no render endpoint matching \"%s\" (or \"virtual audio cable\") -- volume follow is OFF\n"
-                            "            fix: set volume_endpoint = <the cable's PLAYBACK-side name> in the ini\n"
-                            "            (the full endpoint list with states was printed above this line)\n",
+                            "            fix: set input_device to the cable's name (its render endpoint,\n"
+                            "            e.g. \"CABLE Input\") -- that endpoint's own slider IS the master\n"
+                            "            volume, and it must be ACTIVE in Windows sound settings\n"
+                            "            (the full endpoint list with states was printed above this line)\n"
                     g_cfg.inputDevice.c_str());
     } else {
         tlog("[twinspeak] volume        : follow off (volume_follow = off)\n");
@@ -12926,8 +13049,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         tlog("[twinspeak] output pins   : every WASAPI leg's endpoint forced 100%%/unmuted -- re-checked every 2 s\n");
     tlog("[twinspeak] start order   : %s\n",
            g_leg[1].disabled ? "out2 is EMPTY -- leg1 opens first, the rears follow; the center rides the FL/FR fold" :
-           g_cfg.out2First ? "out2 (center) FIRST -- its device opens first; out1 follows (v8.1.0: no pumps)"
-                           : "out1 first, then out2 (out2_first = off)");
+           "out2 (center) FIRST -- its device opens first; out1 follows (v9.5.1: the order is integrated)");
     tlog("[twinspeak] dac yield     : %s -- the leg whose device IS the Windows default render endpoint\n"
            "                            is released the same second (WASAPI device freed) so the main\n"
            "                            device plays untouched; it reopens the\n"
@@ -12997,14 +13119,26 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     while (g_run.load()) {
         Sleep(1000);
         ++sec;
+        const unsigned long long nowMs0 = GetTickCount64();   // v9.5.1: the off-meter's idle gate
         // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 over the
         // last second (both counters integrate the real clocks; bursts and
         // pop phase cancel in the deltas). Positive = cable runs fast.
+        // v9.5.1: the capture heartbeat decides the off-meter's mood --
+        // while the cable is silent (loopback idle) there is no capture
+        // delta to divide, and the old meter kept printing a stale
+        // number built from the pre-idle window (the field's "off value
+        // is suspiciously off"). IDLE prints idle; the meter resumes
+        // with fresh deltas the moment audio flows again.
+        const unsigned long long hbCapNow = g_hbCap.load(std::memory_order_relaxed);
+        const bool capFlowing0 = hbCapNow && (nowMs0 - hbCapNow) <= 1500;
+        const bool capFlowing = capFlowing0;
         for (int i = 0; i < 4; ++i) {
             const unsigned long long Ai = g_leg[i].captured.load(std::memory_order_relaxed);
             const unsigned long long Ci = g_leg[i].popped.load(std::memory_order_relaxed);
-            if (pB[i] != 0 && Ci > pB[i] && Ai > aB[i])
+            if (capFlowing && pB[i] != 0 && Ci > pB[i] && Ai > aB[i])
                 offV[i] = (long)(((double)(Ai - aB[i]) / (double)(Ci - pB[i]) - 1.0) * 1000000.0);
+            else if (!capFlowing)
+                offV[i] = 0;
             aB[i] = Ai; pB[i] = Ci;   // v8.4.0: a disabled leg holds 0/0 -> off stays 0
         }
         // v8.1.0 fields: off = measured clock offset ppm; short ('und') =
@@ -13147,7 +13281,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             // default every tick and reopens it when the default moves.
             // v8.4.0: one pass over the legs, out2_first symmetry kept.
             for (int oi = 0; oi < 4; ++oi) {
-                const int i = g_cfg.out2First ? (oi == 0 ? 1 : oi == 1 ? 0 : oi) : oi;
+                const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;   // v9.5.1: center first (integrated)
                 if (g_leg[i].disabled) continue;
                 if (!g_leg[i].yielded.load(std::memory_order_relaxed))
                     tryRestartLeg(i, &ctx, kOutPeriodFrames);
@@ -13334,9 +13468,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 // ("Line 1 (Virtual Audio Cable)") never contains-matches the
                 // endpoint's real name ("Speakers (Virtual Audio Cable)"),
                 // and that silent miss cost the whole window in the field.
-                std::string fxNeedles[3];
+                std::string fxNeedles[2];
                 int nFx = 0;
-                if (!g_cfg.volumeEndpoint.empty()) fxNeedles[nFx++] = g_cfg.volumeEndpoint;
                 fxNeedles[nFx++] = g_cfg.inputDevice;
                 fxNeedles[nFx++] = "virtual audio cable";
                 for (int k = 0; k < nFx; ++k) {
@@ -13378,7 +13511,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             snprintf(b1[0], 32, "raw1 %5.1f", g_leg[0].raw.count() * 1000.0f / kSampleRate);
             snprintf(b1[1], 32, "raw2 %5.1f", g_leg[1].raw.count() * 1000.0f / kSampleRate);
             snprintf(b1[2], 32, "vol %s",     volStr);
-            snprintf(b2[0], 32, "off %+6ld/%+6ld", offV[0], offV[1]);
+            if (capFlowing0)
+                snprintf(b2[0], 32, "off %+6ld/%+6ld", offV[0], offV[1]);
+            else
+                snprintf(b2[0], 32, "off    idle/idle");   // v9.5.1: silent cable, no delta to divide
             snprintf(b2[1], 32, "drift %s",   driftStr);
             snprintf(b2[2], 32, "err %s",     errStr);
             snprintf(b3[0], 32, "short +%llu/%llu/%llu/%llu",
