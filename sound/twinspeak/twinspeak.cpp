@@ -170,6 +170,20 @@
 //            (VB VAC's "CABLE Input"), and the resolve banner says
 //            exactly which endpoint the needle hit. A legacy entry still
 //            carrying the old marker is stripped on load.
+//    v9.5.1c THE CAPTURE INPUT LIST RESTORED (field-directed: "I just
+//            need the capture input list restored (only have outputs)").
+//            v9.5.1's render-only picker deleted the capture fill in
+//            guiEnumNames -- an overreach: the engine's source path
+//            stayed dual-mode the whole time; only the picker and the
+//            config layer were locked to render. Restored the v9.5.0
+//            shape: the picker lists capture names first (untagged),
+//            then render names tagged " -- output"; input_is_output
+//            toggles again (on = output-as-source loopback; off = the
+//            v9.3.2 capture path); the box shows the marker when on;
+//            the ini template documents both modes. The engine side
+//            (resolve + open + watchdog + volume gate) needed no
+//            change -- it was already dual-mode; harness3 G/H/I/J
+//            prove both paths, K proves the tag round-trip.
 //    v9.5.1b THE BUILD FIX (the field's MSVC line): the v9.5.1 rewrite of
 //            the volume-fallback banner dropped the comma between the
 //            format string and g_cfg.inputDevice.c_str() -- C2146 at the
@@ -3453,7 +3467,9 @@ struct Config {
     // the source, opened as a loopback read of that one endpoint (the only
     // door Windows gives a reader for an explicit output's data). off (the
     // default) keeps v9.3.2 behavior: capture endpoints only.
-    bool        inputIsOutput   = true;    // v9.5.1: render-only source (always on)
+    // v9.5.1c: a real toggle again -- v9.5.1's always-on lock went with
+    // its render-only picker (the capture list is restored with it).
+    bool        inputIsOutput   = false;
     // v9.5.0 PACKET MODE: every leg trims its playout ratio each packet to
     // hold the ring at delay + anchor (continuous, inaudible, self-nulling
     // to the bit-exact path), and a non-48k device gets an ENGINE-side
@@ -6881,15 +6897,14 @@ static void writeTemplate(const char* path) {
         "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
-        "; v9.5.1 RENDER-ONLY SOURCE: input_device is the name of a RENDER\n"
-        "; endpoint -- e.g. \"CABLE Input\" for Virtual Audio Cable by VB --\n"
-        "; and that output is the SOURCE: its data is read (a one-way\n"
-        "; loopback of that one endpoint; nothing is written back, so no\n"
-        "; echo) and routed to the legs by channel, exactly as capture did.\n"
-        "; The input picker offers render endpoints only, plain names --\n"
-        "; no marker, and input_is_output is always on (the key below is\n"
-        "; kept so old files load; it no longer switches anything).\n"
-        "input_is_output = on\n"
+        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on turns the line below\n"
+        "; into the name of a RENDER endpoint -- e.g. \"CABLE Input\" for\n"
+        "; Virtual Audio Cable by VB -- and that output becomes the SOURCE:\n"
+        "; its data is read (a one-way loopback of that one endpoint; nothing\n"
+        "; is written back, so no echo) and routed to the legs by channel,\n"
+        "; exactly as the capture path did. off = capture endpoints only\n"
+        "; (v9.5.1c: the toggle -- and the capture picker list -- restored).\n"
+        "input_is_output = off\n"
         "; v9.5.0 PACKET MODE: on (default) = every leg corrects clock drift\n"
         "; EVERY packet (a sub-0.1% rate bend -- the ring never runs dry,\n"
         "; nothing clicks) and a device set to a non-48k rate is resampled\n"
@@ -7313,7 +7328,7 @@ static bool loadIni(const char* path) {
                  key == "background"        || key == "pin_outputs" ||
                  key == "lfe_fold") { }         // v8.4.0: the fold is built in
         else if (key == "input_device")   g_cfg.inputDevice = val;
-        else if (key == "input_is_output")  g_cfg.inputIsOutput = true;   // v9.5.1: render-only source -- accepted, always on
+        else if (key == "input_is_output")  g_cfg.inputIsOutput = !isOff(val);   // v9.5.1c: honored again (v9.4.0 semantics)
         else if (key == "packet_mode")     g_cfg.packetMode = !isOff(val);      // v9.5.0: per-packet trim servo + engine ASRC
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
@@ -8837,15 +8852,17 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
     ma_device_info* c = nullptr; ma_uint32 nc = 0;
     if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
         for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
-        // v9.5.1 RENDER-ONLY SOURCE: the capture-input picker lists
-        // RENDER endpoints, plain names, no tag (the field: "only the
-        // outputs on the cable input list, no more inputs, no more of
-        // that ' -- input' postfix"). input_device is now, by
-        // definition, a render endpoint (VB VAC's "CABLE Input" etc.)
-        // -- output-as-source is the only source mode. Capture
-        // endpoints are not offered; a hand-typed capture name still
-        // resolves where it always did (the loopback open), and the
-        // resolve banner says exactly which endpoint the needle hit.
+        for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
+        // v9.5.1c THE LIST RESTORED: the capture names are back, first
+        // and untagged (the field: "the capture input list restored
+        // (only have outputs)" -- v9.5.1's render-only picker was an
+        // overreach). The RENDER entries follow, each tagged
+        // " -- output": picking one (e.g. "CABLE Input (Virtual Audio
+        // Cable)") makes THAT endpoint the source (input_is_output goes
+        // on automatically). The tag is a display marker only -- the
+        // stored needle is the plain name. A capture name picks the
+        // v9.3.2 capture path (input_is_output off).
+        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(std::string(p[i].name) + " -- output");
     }
     ma_context_uninit(&ctx);
 }
@@ -8904,7 +8921,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "out2_first")        return boolText(g_cfg.out2First);   // v9.5.1: always "on"
     else if (key == "chimes")            return boolText(g_cfg.chimes);
     else if (key == "input_device")      return g_cfg.inputDevice;
-    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.5.1: always "on"
+    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.5.1c: the real value (v9.4.0)
     else if (key == "packet_mode")      return boolText(g_cfg.packetMode);      // v9.5.0
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
@@ -9018,11 +9035,11 @@ static void cfgFromControls(HWND w) {
     // when the window is built later, controlsFromCfg fills the controls
     // from the same g_cfg, so START in the window still edits what runs.
     if (!w || !GetDlgItem(w, IDC_INDEV)) return;
-    // v9.5.1 RENDER-ONLY SOURCE: no tag exists anywhere -- the picker
-    // offers plain render names, input_is_output is simply ON (the
-    // field retired capture-side sourcing). A legacy entry still
-    // carrying the old " -- output" marker is stripped (old ini /
-    // muscle memory); the stored needle is always the plain name.
+    // v9.5.1c THE TAG IS BACK: a picker entry ending in " -- output" is a
+    // render endpoint -- strip the marker, store the plain name, and turn
+    // input_is_output ON. A plain name (a capture device, hand-typed)
+    // leaves the key where it was: off = the v9.3.2 capture path. The
+    // engine resolves either way and the banner says which it hit.
     {
         std::string in = editStr(w, IDC_INDEV);
         const std::string tag = " -- output";
@@ -9030,9 +9047,9 @@ static void cfgFromControls(HWND w) {
             in.compare(in.size() - tag.size(), tag.size(), tag) == 0) {
             in.resize(in.size() - tag.size());
             while (!in.empty() && in.back() == ' ') in.pop_back();
+            g_cfg.inputIsOutput = true;
         }
         g_cfg.inputDevice = in;
-        g_cfg.inputIsOutput = true;
     }
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
@@ -9071,9 +9088,11 @@ static void cfgFromControls(HWND w) {
 
 static void controlsFromCfg(HWND w) {
     char b[64];
-    // v9.5.1: the source is always a render endpoint -- the plain name,
-    // no mode marker in the box (the picker offers the same plain list).
-    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
+    // v9.5.1c: show the mode in the box -- a source on the output side
+    // carries the " -- output" marker, the same one the picker offers.
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputIsOutput
+                     ? (g_cfg.inputDevice + " -- output").c_str()
+                     : g_cfg.inputDevice.c_str());
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
