@@ -64,8 +64,101 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.5.0 PACKET MODE (field-directed: "have a packet mode system built
+//            into twinspeak where it immediately corrects any mismatches
+//            and also resamples in the most efficient way to a device's
+//            selected sample rate if the 48khz sample rate of the current
+//            frame data doesn't match what the device plays"). Every leg
+//            gets a PER-PACKET trim servo + async sampler:
+//            ratio = nominal(48000/deviceRate) * (1 + trim_ppm * 1e-6),
+//            trim_ppm = clamp(50 * err, +-4000 ppm), err = ring depth -
+//            (delay + anchor) measured EVERY packet. A clock mismatch (the
+//            Adesso center device running dry and glitching out) is
+//            absorbed CONTINUOUSLY as an inaudible sub-0.1% rate bend --
+//            the ring never runs dry, no 2-s warden bite, no held frame,
+//            no skip. At trim == 0 and nominal == 1.0 the switch takes the
+//            BIT-EXACT BYPASS (the v9.4.0 pop path, byte-identical); the
+//            servo is pure-P and self-nulls back to it on matched clocks.
+//            DEVICE RATE MISMATCH: a leg whose negotiated rate is not
+//            48000 re-opens AT the device's native rate and the ENGINE
+//            resamples 48k -> device rate itself (Hermite / Catmull-Rom,
+//            4-point, 8ch, wrap-free) -- miniaudio's converter is out of
+//            the path by construction, and the v6.0 pitch warning becomes
+//            a packet-mode honesty line. packet_mode = on is the default;
+//            off restores the v9.4.0 clock discipline exactly (warden
+//            bites, sync servo, no resampler, warning back).
+//            v9.5.0c (the field report: pitch up + crackle on non-48k
+//            legs): three coupled flaws in the first cut, all found by
+//            the full-loop simulation (scripts/loop_sim.cpp). (1) THE
+//            STRANDED CARRY: an output-limited exit lands the phase
+//            carry in (-3,-2], below the 3-knot window floor -- every
+//            following chunk died at entry (j=0), the leg fell to raw
+//            48k frames at 44.1k = +8.8% pitch, or with part 8's reset
+//            a 3-frame skip EVERY period = crackle; the fallback also
+//            wrote produced > want PAST the callback buffer. Fix: a
+//            4-KNOT HISTORY (floor -3, prime 4) + a re-track that
+//            plays min(n,want) raw and advances the curve by exactly
+//            what played (no skip, no overrun). (2) THE OVER-GRAB
+//            LEAK: take = ceil(phase + want*ratio + 2) popped ~ratio
+//            frames more per packet than the sampler read -- ~345
+//            fr/s at 44.1k, a drain the servo answered with a
+//            saturated -4000 ppm bend (pitch error) while the ring
+//            sawtoothed to dryout. Fix: the EXACT KNOT SPAN --
+//            floor(ph + (want-1)*ratio) + 3, prime-aware, nothing
+//            discarded. (3) STARVATION: the servo's zero-centered
+//            dead-band let the ring ride below the span's lookahead;
+//            the partial pop short-changed the period (tail silence =
+//            clicks). Fix: the LOOKAHEAD FLOOR (target = delay +
+//            anchor + 8) + the PARTIAL-POP GUARD (avail < take ->
+//            hold, never a partial pop). loop_sim at 22.05k/44.1k/
+//            48k/88.2k/96k x -1000..+10000 ppm skew: frame
+//            conservation EXACT, ratio 1.00000, zero short periods.
+//            v9.5.0b (in-sandbox hardening, harness-directed): the ratio
+//            base is 48000/deviceRate (source frames per device frame --
+//            the first cut had it inverted); floor() replaces a
+//            truncating cast on the carried (-2,0) lookahead; the knot
+//            window is >= (an off-by-one read sc[n]); bypass packets
+//            track hist+phase so an engage is frame-exact; a thin chunk
+//            resets the curve (no stale carry); the native-rate re-open
+//            is packet-mode-only (off keeps the v9.4.0 path whole).
+//            Harness: harness4.cpp proves the sampler (bypass exactness,
+//            continuity at engage, sine purity at 44.1k) and the servo
+//            (a +1000 ppm sink never dries the ring; a burst drains).
+//    v9.4.0 THE OUTPUT-AS-SOURCE (field-directed: "have it so that you can
+//            select an output ... and that output replaces the input routing
+//            to be the output routing instead for stuff like Virtual Audio
+//            Cable by VB"; the crackle was VAC's own, pre-dating twinspeak).
+//            input_is_output = on turns input_device into the name of a
+//            RENDER endpoint (e.g. "CABLE Input (Virtual Audio Cable)"):
+//            the capture side stops opening capture endpoints and opens that
+//            render endpoint as its source instead -- the one door Windows
+//            gives a reader for an explicit output's data (a loopback
+//            client on the named endpoint ID; NOT what-you-hear mix capture,
+//            NOT the default-mix tap). The stream then routes exactly as
+//            before: FL/FR -> leg1, ch3 -> leg2 (or the center fold), the
+//            rears/sides -> leg3, LFE folds per gain_lfe -- the speakers
+//            keep their channels; only the SOURCE of the data changes.
+//            NOTHING is written back to any endpoint: a one-way read has no
+//            echo path (the v7-era "loopback-sounding echo" was twinspeak
+//            re-feeding audio, a routing bug fixed then and impossible in
+//            this path by construction). Shared mode only -- Windows has no
+//            exclusive loopback; exclusive is neither attempted nor hinted.
+//            VOLUME: the tap is post-volume by Windows architecture, so the
+//            engine's volume-follow multiply is SKIPPED in this mode -- the
+//            endpoint's own slider is honored natively, once (applying the
+//            multiply again would square the slider). IDLE: a loopback
+//            reader is event-paced and simply stays parked while the
+//            endpoint renders nothing -- no callback storm, no watchdog
+//            misfire; the moment audio flows, frames arrive. The input
+//            picker in the GUI lists render endpoints too (marked
+//            " -- output"); picking one sets input_is_output automatically,
+//            and the picker round-trips through the ini like every key.
+//            HARD GUARD: a source that resolves to an OUTPUT LEG's own
+//            endpoint is refused at start (routing a leg back into itself
+//            is the echo bug wearing a new hat).
+//            Harness: harness3.cpp proves the decision table (mode/needle/
+//            self-route/shared-only) against the extracted resolver.
 //    v9.3.2 THE FREEZE FIX (field: "now this freezes my screen as
-//            everything's frozen because of it" under v9.3.1 -- audio kept
 //            playing above a frozen desktop). The crackle fix's worker
 //            parked on the futex with a 250 ms timeout, but its seqlock
 //            read loop had an exit for "fresh round" and for "engine stop"
@@ -3046,7 +3139,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.3.2"
+#define TWS_VERSION "9.5.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3178,6 +3271,15 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // the real number as before.
 static constexpr unsigned kOutPeriodFrames   = 192;  // the CONSTANT bite: ~5.33 ms of service @ 48 kHz (v8.4.24 geometry)
 static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 256 fr (~8.0 ms)
+// ---- v9.5.0 PACKET MODE constants (per-leg trim servo + async sampler) ----
+// Pure-P, zero-centered: trim = clamp(kPktPpmPerFrame * err, +-kPktMaxPpm).
+// 50 ppm/frame: a 1 ms (48 fr) depth error bends the rate 0.24%; the cap
+// (4000 ppm = 0.4%) drains a 4096-fr cable burst in ~21 s with NO click
+// (a rate bend has no discontinuity; the warden's 240-fr skip clicked).
+static constexpr long kPktPpmPerFrame = 50;
+static constexpr long kPktFloorFr    = 8;    // v9.5.0c: the engaged span's lookahead floor --
+                                              // the servo target rides delay+anchor+this, never below
+static constexpr long kPktMaxPpm      = 4000;
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3276,6 +3378,17 @@ struct Config {
     bool        pinOutputs     = true;   // v3.8: out1/out2 endpoints pinned 100%/unmuted.
                                           // v7.0.0: INTEGRATED -- always on, no key, no pill
     bool        out2First      = true;   // v3.8: center leg opens and starts first
+    // v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on means input_device
+    // names a RENDER endpoint (e.g. VB VAC's "CABLE Input") -- it becomes
+    // the source, opened as a loopback read of that one endpoint (the only
+    // door Windows gives a reader for an explicit output's data). off (the
+    // default) keeps v9.3.2 behavior: capture endpoints only.
+    bool        inputIsOutput   = false;
+    // v9.5.0 PACKET MODE: every leg trims its playout ratio each packet to
+    // hold the ring at delay + anchor (continuous, inaudible, self-nulling
+    // to the bit-exact path), and a non-48k device gets an ENGINE-side
+    // 48k->deviceRate Hermite resampler. off = the v9.4.0 discipline exact.
+    bool        packetMode      = true;
     // v7.1.7: keepalive_hz / keepalive_gain are BUILT IN (kKeepAliveHz /
     // kKeepAliveGain; v7.1.24: 40 Hz @ 0.005; v8.4.5: 20 Hz @ 0.001, every
     // leg, through the gates) -- no struct fields, no ini
@@ -3558,6 +3671,19 @@ struct Leg {
     // thread, before any device thread exists. The guard holds the ring at
     // delayFrames + anchorFrames; margin 0 is the DAC reading silence.
     size_t              anchorFrames = 0;
+    // ---- v9.5.0 PACKET MODE state (this leg's device thread only) ----
+    unsigned            pktRate     = 48000;  // negotiated device rate (nominal ratio base)
+    long                pktTrimPpm  = 0;      // live servo trim (the sustained-trim one-shot line)
+    unsigned long long  pktEngaged  = 0;      // packets that took the resample path
+    unsigned long long  pktBypass   = 0;      // packets that took the bit-exact bypass
+    float               pktHist[4][8];        // 4 Hermite look-back knots (kInCh = 8; v9.5.0b: the
+                                                // output-limited carry lands in (-3,-2], so the window
+                                                // floor is -3 and the history must reach n-4)
+    bool                pktHaveHist = false;
+    double              pktPhase    = 0.0;    // fractional playout position, chunk-local
+    double              pktRatio    = 1.0;    // SOURCE frames per DEVICE frame (48000/rate x trim)
+    std::vector<float>  pktRs;                 // engaged path's 8ch resample buffer (kInCh x kScratchFrames)
+    unsigned long long  pktLastTrimLogMs = 0;  // v9.5.0b: the sustained-trim one-shot's 1-min gate
     // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
     // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
     // mains are the anchor the ears calibrate against). Leg1's own ring
@@ -3767,6 +3893,7 @@ static ma_device g_capDev = {};
 static std::string g_capNeedle;
 static bool    g_capWantExcl = false;
 static bool    g_capIsExcl   = false;
+static bool    g_capLoopback = false;   // v9.4.0: the source is a render endpoint (output-as-source)
 static float   g_capPeriodMsF = 5.0f;
 
 // -------------------------------------------------- v9.2.0: the CPU map ----
@@ -4627,6 +4754,88 @@ static std::atomic<bool> g_tickOn{false};        // moved up from the tick block
 // into 'und'; capture excess evicts oldest at the raw cap
 // (capCallback's pushOverwrite, ledger-true). frameCount = the REAL device
 // bite (the negotiated period; v9.0.1: one constant request everywhere).
+// -------------------------------------- v9.5.0 PACKET MODE: the sampler ----
+// Hermite 4-point, 8ch, stream-continuous across chunks (the 3-knot history
+// rides the Leg). Produces up to maxOut DEVICE frames from the popped source
+// chunk sc[0..n); returns the count produced. pktPhase is CHUNK-LOCAL: the
+// curve's position relative to this chunk's first frame (may be negative --
+// knot lookahead the previous chunk left behind); pktHist holds the 3 frames
+// before the chunk. At integer positions the Hermite basis is EXACT (h00=1,
+// the rest 0); the curve is continuous across chunk seams by construction
+// (same knots, same phase).
+static size_t pktResample(Leg& L, const float* sc, size_t n, float* dst8, size_t maxOut)
+{
+    if (!L.pktHaveHist) {
+        if (n < 4) return 0;   // too thin to interpolate: the caller re-tracks
+        for (int c = 0; c < kInCh; ++c) {
+            L.pktHist[0][c] = sc[0 * kInCh + c];
+            L.pktHist[1][c] = sc[1 * kInCh + c];
+            L.pktHist[2][c] = sc[2 * kInCh + c];
+            L.pktHist[3][c] = sc[3 * kInCh + c];
+        }
+        L.pktPhase = 4.0;      // the one-time prime: the curve starts ON sc[4]
+        L.pktHaveHist = true;
+    }
+    const double ratio = L.pktRatio;
+    double s = L.pktPhase;
+    size_t j = 0;
+    while (j < maxOut) {
+        if (s < -3.0 || s + 2.0 >= (double)n) break;  // window out (i0 >= -3 and i0+2 <= n-1: every index in range)
+        const double fs = floor(s);                   // v9.5.0b: a truncating cast
+        const long long i0 = (long long)fs;           // bends t negative on the
+        const double t = s - fs;                      // carried (-2,0) lookahead
+        const float* kn[4];
+        for (int q = 0; q < 4; ++q) {
+            const long long k = i0 - 1 + q;
+            kn[q] = (k < 0) ? L.pktHist[4 + (int)k] : sc + (size_t)k * (size_t)kInCh;
+        }
+        const double t2 = t * t, t3 = t2 * t;
+        const double h00 =  2.0*t3 - 3.0*t2 + 1.0;
+        const double h10 =        t3 - 2.0*t2 + t;
+        const double h01 = -2.0*t3 + 3.0*t2;
+        const double h11 =        t3 -       t2;
+        float* o = dst8 + j * (size_t)kInCh;
+        for (int c = 0; c < kInCh; ++c) {
+            const double p1 = kn[1][c], p2 = kn[2][c];
+            const double m1 = (kn[2][c] - kn[0][c]) * 0.5;
+            const double m2 = (kn[3][c] - kn[1][c]) * 0.5;
+            o[c] = (float)(h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2);
+        }
+        s += ratio;
+        ++j;
+    }
+    L.pktPhase = s - (double)n;   // carry: next chunk's local space
+    if (n >= 4)
+        for (int c = 0; c < kInCh; ++c) {
+            L.pktHist[0][c] = sc[(n - 4) * kInCh + c];
+            L.pktHist[1][c] = sc[(n - 3) * kInCh + c];
+            L.pktHist[2][c] = sc[(n - 2) * kInCh + c];
+            L.pktHist[3][c] = sc[(n - 1) * kInCh + c];
+        }
+    return j;
+}
+
+static inline void pktRetrack(Leg& L, const float* sc, size_t k) {
+    // v9.5.0b: advance the curve's history over k RAW-played frames --
+    // the last 4 of (old hist ++ the k chunk frames) become the new
+    // hist, phase 0. The next engaged packet's first output is then
+    // exactly its sc[0] (h00 = 1 at t = 0): frame-exact, no kink.
+    if (k >= 4) {
+        for (size_t i = 0; i < 4; ++i)
+            for (int c = 0; c < kInCh; ++c)
+                L.pktHist[i][c] = sc[(k - 4 + i) * (size_t)kInCh + (size_t)c];
+    } else {
+        for (size_t sh = 0; sh + k < 4; ++sh)
+            for (int c = 0; c < kInCh; ++c)
+                L.pktHist[sh][c] = L.pktHist[sh + k][c];
+        for (size_t i = 0; i < k; ++i)
+            for (int c = 0; c < kInCh; ++c)
+                L.pktHist[4 - k + i][c] = sc[i * (size_t)kInCh + (size_t)c];
+    }
+    L.pktPhase = 0.0;
+    L.pktHaveHist = true;
+}
+
 static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     Leg& L = g_leg[idx];
     // v7.0.0: the STOP GAP. APPLY + RESTART (and STOP) silences the legs
@@ -4680,41 +4889,100 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
     // leg2 raw2 = 0.0 trough -- staticey silence holes whenever the center
     // content started). The per-leg floor guard pads at the floor itself
     // and bites 5 ms over it; the servo still tracks leg1 above the floor.
-    size_t padFr = masterDepthGuard(L, frameCount);
-    if (idx != 0) {
+    // v9.5.0 PACKET MODE: the servo owns each leg's depth CONTINUOUSLY --
+    // the warden guards and their pads/bites stand down (padFr = 0; biteDue
+    // never arms). off = the v9.4.0 clock discipline, byte for byte.
+    const bool pktOn = g_cfg.packetMode;
+    size_t padFr = pktOn ? (size_t)0 : masterDepthGuard(L, frameCount);
+    if (!pktOn && idx != 0) {
         const size_t servoPad = syncToFirst(idx, L, frameCount);
         if (servoPad > padFr) padFr = servoPad;
     }
-    // v8.4.23 THE MASK-COPY-MASK FAN-OUT (field-directed: "make sure that
-    // there are copies of the input 8-channel audio data for every single
-    // device you're sending the data to so that there's no possible upmix
-    // risk and no staticey crackling"). Each leg's raw ring IS the private
-    // copy; the switch now MASKS the popped chunk to the leg's own channels
-    // (everything else zeroed, in place):
-    //   leg1: mask {ch1, ch2} (+ ch4, the confirmed LFE fold; + ch3 when
-    //         the center fold is active on an empty leg2)
-    //   leg2: mask {ch3}
-    //   leg3: mask {ch5, ch6, ch7, ch8}
-    // The mix then copies the kept channels into the stereo output, and
-    // the SECOND mask is the output itself: every device stream is
-    // requested 2ch and only ever carries L+R -- no channel conversion can
-    // exist anywhere downstream, so there is no upmix risk by
-    // construction. THE CENTER GATE, THE LANE GATES AND THE UPMIX GUARD
-    // ARE RETIRED WITH IT (v8.4.23: the field found the gates mistaking
-    // complex game noise for silence and chopping the center; the mask
-    // makes them moot -- a masked leg can only ever play its own
-    // channels). Dithering is retired too (v8.4.22's TPDF): the masked
-    // pipeline has no truncation-structure problem to hide.
+    // v8.4.23 THE MASK-COPY-MASK FAN-OUT: each leg's raw ring IS the private
+    // copy; the switch MASKS the popped chunk to the leg's own channels.
     static const unsigned char kLegMask[3][kInCh] = {
         { 1, 1, 0, 1, 0, 0, 0, 0 },   // leg1: ch1 ch2 (+ ch4 LFE, + ch3 fold)
         { 0, 0, 1, 0, 0, 0, 0, 0 },   // leg2: ch3
         { 0, 0, 0, 0, 1, 1, 1, 1 },   // leg3: ch5 ch6 ch7 ch8
     };
+    float* rs = L.pktRs.data();   // v9.5.0: the engaged path's 8ch resample buffer
     while (done + padFr < frameCount) {
         const size_t want = frameCount - padFr - done;
-        const size_t take = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
         const size_t avail = L.raw.count();
-        const size_t n = (avail < take) ? avail : take;
+        bool engage = false;
+        size_t n;
+        if (pktOn) {
+            // v9.5.0c servo: measure + trim EVERY packet. err = depth -
+            // (delay + anchor + kPktFloorFr) -- the LOOKAHEAD FLOOR, not
+            // zero: the engaged span needs 3+ frames beyond its outputs
+            // (2 knots ahead + carry), and a zero-centered dead-band let
+            // the ring ride where the span starves (a short period = a
+            // click every few periods, the last field crackle). The trim
+            // bends the playout ratio to hold depth AT the floor -- a
+            // sub-0.1% rate change, no discontinuity, no click.
+            const long long perr = (long long)avail - (long long)L.delayFrames
+                                 - (long long)L.anchorFrames - (long long)kPktFloorFr;
+            long ptrim = 0;
+            if (perr > 2 || perr < -2) {
+                ptrim = kPktPpmPerFrame * perr;
+                if (ptrim > kPktMaxPpm)  ptrim = kPktMaxPpm;
+                if (ptrim < -kPktMaxPpm) ptrim = -kPktMaxPpm;
+            }
+            L.pktTrimPpm = ptrim;
+            // v9.5.0b: pktRatio is SOURCE frames per DEVICE frame =
+            // 48000/rate x trim (the deviceRate/48000 base was inverted
+            // -- a 44.1k leg made MORE device frames than it consumed
+            // source; at 48k both bases are 1.0, so only non-48k legs
+            // were hit). trim > 0 raises the ratio and DRAINS a full
+            // ring -- the sign the servo needs.
+            L.pktRatio = ((double)kSampleRate / (double)L.pktRate)
+                       * (1.0 + (double)ptrim * 1e-6);
+            engage = (L.pktRate != (unsigned)kSampleRate) || (ptrim != 0);
+            if (engage) {
+                // v9.5.0c THE EXACT KNOT SPAN: pop exactly the frames
+                // the sampler will READ -- the last output's last knot
+                // (floor(phase + (want-1)*ratio) + 2), +1 to include it.
+                // The old ceil(phase + want*ratio + 2) over-grabbed up
+                // to ~ratio frames per packet and DISCARDED them: a
+                // ~345 fr/s ring leak at 44.1k that the servo could
+                // only answer with a saturated -4000 ppm bend (pitch
+                // error) while the ring sawtoothed to dryout (crackle).
+                // The exact span discards NOTHING; the carry lands in
+                // (ratio-3, ratio-2], inside the 4-knot history, and
+                // the window guard admits exactly `want` outputs.
+                // v9.5.0c: the span is computed from the phase the
+                // SAMPLER will use -- the prime's 4.0, not the stale
+                // 0 (the first engaged chunk was 4 short and truncated);
+                // the floor is 1, not 4 (a fragmented tail chunk needs
+                // as little as 1 frame -- forcing 4 popped more than
+                // its outputs consumed and stranded the carry below
+                // -3, and the sampler is safe for any n >= 1).
+                const double ph0 = L.pktHaveHist ? L.pktPhase : 4.0;
+                double need = floor(ph0 + (double)(want - 1) * L.pktRatio) + 3.0;
+                size_t take = (size_t)(need + 0.999999);
+                if (take < 1) take = 1;
+                if (take > (size_t)kScratchFrames) take = (size_t)kScratchFrames;
+                // v9.5.0c THE PARTIAL-POP GUARD: a partial pop strands
+                // the carry and short-changes the period (the tail is
+                // silence = a click). Instead: pop NOTHING this
+                // iteration and break -- the callback's remaining frames
+                // hold the last mixed frame (the engine's own v8.4.7 pad
+                // semantics), and the next period opens with a full
+                // ring. One period of held frames is inaudible; a
+                // stranded carry repeats.
+                if (avail < take) break;
+                n = take;
+            } else {
+                const size_t take = (want < (size_t)kScratchFrames) ? want
+                                 : (size_t)kScratchFrames;
+                n = (avail < take) ? avail : take;
+                L.pktBypass++;
+            }
+        } else {
+            const size_t take = (want < (size_t)kScratchFrames) ? want
+                             : (size_t)kScratchFrames;
+            n = (avail < take) ? avail : take;
+        }
         if (n == 0) break;
         const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
         L.raw.pop(sc, n);
@@ -4732,60 +5000,93 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // v3.8 VOLUME FOLLOW: one master gain -- the Line 1 endpoint volume
         // -- applied to the raw 8ch block BEFORE the per-leg mix. Both legs
         // track the same knob; the ini gains still stack on it.
+        // v9.4.0: in OUTPUT-AS-SOURCE the tap is POST-volume by Windows
+        // architecture -- the endpoint's own slider is already baked into
+        // every frame; the multiply is SKIPPED in that mode.
         {
-            const float vg = g_volMuted.load(std::memory_order_relaxed) ? 0.0f
+            const float vg = g_capLoopback ? 1.0f :
+                           g_volMuted.load(std::memory_order_relaxed) ? 0.0f
                            : g_vol.load(std::memory_order_relaxed);
             if (vg != 1.0f) {
                 const size_t tot = n * (size_t)kInCh;
-                for (size_t s = 0; s < tot; ++s) sc[s] *= vg;
+                for (size_t s2 = 0; s2 < tot; ++s2) sc[s2] *= vg;
             }
         }
-        // THE FIRST MASK: zero every channel outside this leg's own set,
-        // in place. After this the chunk carries ONLY the channels this
-        // device may ever hear.
+        // THE FIRST MASK: zero every channel outside this leg's own set.
         {
             const unsigned char* mk = kLegMask[idx];
             for (size_t i = 0; i < n; ++i)
                 for (int c = 0; c < kInCh; ++c) {
                     unsigned char keep = mk[c];
-                    // v8.4.26 THE FOLD CHANNELS: leg1's mask opens for the
-                    // center fold (ch3, leg2 empty) and the fold channels
-                    // -- the folds fold INTO the stereo output, never onto
-                    // another device's slots. v9.1.0: the SURROUND slots
-                    // (0-based 4/5 = ch5 SL / ch6 SR) open for leg1 in BOTH
-                    // cases now -- the super-wide split folds them onto the
-                    // mains at 60% even when a real rear device exists. The
-                    // REAR slots (6/7 = ch7 RL / ch8 RR) still open only on
-                    // an empty leg3 (the 0.51 ms comb fold).
+                    // v8.4.26 THE FOLD CHANNELS (leg1's mask opens for the
+                    // folds); v9.1.0: the SURROUND slots open for leg1 in
+                    // both cases; the REAR slots only on an empty leg3.
                     if (idx == 0 && c == 2 && g_centerFold) keep = 1;
                     if (idx == 0 && (c == 4 || c == 5)) keep = 1;
                     if (idx == 0 && g_rearFold && (c == 6 || c == 7)) keep = 1;
-                    // v9.1.4 LEG4: the fold target's mask opens ch4 (0-based
-                    // 3) -- the LFE lane rides that leg's own mix. leg1
-                    // already keeps it (the built-in LFE fold), so this
-                    // line only ever widens leg2/leg3.
                     if (idx == g_lfeFoldLeg && c == 3) keep = 1;
                     if (!keep) sc[i * kInCh + c] = 0.0f;
                 }
         }
-        // v6.6.9: silence compression -- a bit-zero masked chunk needs no
-        // mix: same bytes out, none of the work. Post-mask, a bit-zero
-        // chunk means the leg's OWN channels are silent.
+        // v9.5.0b BYPASS RE-TRACK: a bypass packet plays all n frames
+        // raw, so the curve's continuation point is exactly the next
+        // chunk's frame 0, with the last 4 played frames as history.
+        // Re-tracking on EVERY raw chunk makes the next engaged packet
+        // frame-exact -- its first output is exactly sc[0]: no skip,
+        // no repeat, no fade.
+        if (pktOn && !engage && n >= 1) pktRetrack(L, sc, n);
+        // v9.5.0: the engaged path resamples the masked chunk (the mask
+        // commutes with the per-channel interpolator); the bypass path is
+        // the v9.4.0 mix, bit for bit. produced = frames written to dst.
         float* dst = out + done * L.outCh;
-        const bool skipMix = (L.zeroFast && bitZero8(sc, n));
+        const float* mixSrc = sc;
+        size_t produced = n;
+        bool skipMix = (L.zeroFast && bitZero8(sc, n));
+        size_t rawK = 0;   // v9.5.0b: frames this chunk plays RAW (re-track)
+        if (pktOn && engage && n >= 4) {
+            const size_t cap = (want < (size_t)kScratchFrames) ? want : (size_t)kScratchFrames;
+            const size_t j = pktResample(L, sc, n, rs, cap);
+            if (j > 0) {
+                produced = j;
+                mixSrc = rs;
+                skipMix = (L.zeroFast && bitZero8(rs, j));
+                L.pktEngaged++;
+            } else {
+                // v9.5.0b: the window guard refused at entry (the 4-knot
+                // carry invariant makes this unreachable in steady
+                // state). Play k = min(n, want) frames RAW and re-track
+                // by exactly k: no reset, no 3-frame skip, and produced
+                // never exceeds want (the old fallback played all n --
+                // up to ~215 frames into 192 slots, PAST the end of the
+                // callback buffer: heap corruption on the audio thread).
+                L.pktBypass++;
+                rawK = (n < want) ? n : want;
+            }
+        } else if (pktOn && engage) {
+            // v9.5.0b: engaged but TOO THIN to interpolate (n < 4): the
+            // same re-track -- play min(n, want) raw, advance the curve
+            // by exactly what played (the old code left the carry stale,
+            // pointing into frames that were about to be discarded).
+            L.pktBypass++;
+            rawK = (n < want) ? n : want;
+        }
+        if (rawK) {
+            produced = rawK;
+            skipMix = (L.zeroFast && bitZero8(sc, rawK));
+            pktRetrack(L, sc, rawK);
+        }
+        // v6.6.9: silence compression -- a bit-zero masked chunk needs no mix.
         if (skipMix) {
             if (idx == 1) centerEqFlushZ();
             if (idx == 0) { surroundBassFlushZ(); rearCombFlushZ(); centerVirtualFlushZ(); }   // v8.5.1/v9.1.0/v9.1.1: the fold's filters start clean after a skipped block
-            // dst is already silence
         } else {
-            mixBlock(idx, sc, dst, n);         // v6.5: the bulk mix, inline now
+            mixBlock(idx, mixSrc, dst, produced);   // v6.5: the bulk mix, inline now
         }
         if (g_tickOn.load(std::memory_order_relaxed))
-            tickSum(idx, dst, n, seqBefore);   // v7.0.0: the sync tick, both legs
+            tickSum(idx, dst, produced, seqBefore);   // v7.0.0: the sync tick
         // v6.4: advance the play boundary by the REAL frames just played.
-        // The delay prefill (pushSilence) carries no sequence -- it is
-        // subtracted here exactly once per frame, so the boundary lives in
-        // true capture-sequence space and the drift math stays absolute.
+        // v9.5.0: the ring popped n SOURCE frames; the engaged path's
+        // produced DEVICE frames map onto exactly those n source frames.
         {
             size_t real = n;
             if (L.prefillRemaining) {
@@ -4796,12 +5097,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         if (real)
             L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed) + real);
         }
-        // v8.4.21 QUIET-WINDOW DRIFT CORRECTION: the armed drop lands HERE,
-        // inside a chunk whose masked content is digital silence -- a skip
-        // inside silence is bit-silent and cannot click. Post-mask,
-        // bitZero8 IS the leg's own quiet test. The valve (biteForced,
-        // past 10 ms of accumulated drift) executes regardless -- 10 ms of
-        // desync is worse than one gentle skip.
+        // v8.4.21 QUIET-WINDOW DRIFT CORRECTION (dormant in packet mode --
+        // the guards never arm a bite; kept whole for packet_mode = off).
         if (L.biteDue) {
             const bool chunkQuiet = (L.zeroFast && bitZero8(sc, n));
             if (chunkQuiet || L.biteForced) {
@@ -4821,15 +5118,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 }
             }
         }
-        done += n;
+        done += produced;
     }
-    // v8.4.7 THE SYNC PAD, v8.4.9 THE WIDE NUDGE: this switch deliberately
-    // popped padApplied frames less -- the pad region HOLDS the last mixed
-    // frame (a held sample: the DAC receives its full frameCount, the
-    // boundary stalls by padApplied frames, the wobble rides the hold like
-    // any frame; at padApplied = 1 this is byte-for-byte the v8.4.7 pad).
-    // A starved switch abandons its pad (the shortfall already stalled
-    // the boundary).
     const size_t padApplied = (padFr && done + padFr >= frameCount) ? padFr : 0;
     if (padApplied) {
         const float* holdSrc = out + (frameCount - padApplied - 1) * L.outCh;
@@ -6467,6 +6757,19 @@ static void writeTemplate(const char* path) {
         "; device carries both -- v8.4.11).\n"
         "; v8.4.1: output_device2 may stay EMPTY too -- the center then folds\n"
         "; onto leg1's FL/FR at gain_center (see THE CENTER FOLD above).\n"
+        "; v9.4.0 OUTPUT-AS-SOURCE: input_is_output = on turns the line below\n"
+        "; into the name of a RENDER endpoint -- e.g. \"CABLE Input\" for\n"
+        "; Virtual Audio Cable by VB -- and that output becomes the SOURCE:\n"
+        "; its data is read (a one-way loopback of that one endpoint; nothing\n"
+        "; is written back, so no echo) and routed to the legs by channel,\n"
+        "; exactly as the capture path did. off = capture endpoints only.\n"
+        "input_is_output = off\n"
+        "; v9.5.0 PACKET MODE: on (default) = every leg corrects clock drift\n"
+        "; EVERY packet (a sub-0.1% rate bend -- the ring never runs dry,\n"
+        "; nothing clicks) and a device set to a non-48k rate is resampled\n"
+        "; BY THE ENGINE (Hermite) to exactly that rate; matched clocks ride\n"
+        "; the bit-exact path unchanged. off = the v9.4.0 warden discipline.\n"
+        "packet_mode = on\n"
         "input_device   = Line 1\n"
         "output_device1 = Realtek\n"
         "output_device2 = Xtream\n"
@@ -6886,6 +7189,8 @@ static bool loadIni(const char* path) {
                  key == "background"        || key == "pin_outputs" ||
                  key == "lfe_fold") { }         // v8.4.0: the fold is built in
         else if (key == "input_device")   g_cfg.inputDevice = val;
+        else if (key == "input_is_output")  g_cfg.inputIsOutput = !isOff(val);   // v9.4.0: source is a render endpoint
+        else if (key == "packet_mode")     g_cfg.packetMode = !isOff(val);      // v9.5.0: per-packet trim servo + engine ASRC
         else if (key == "output_device1") g_cfg.outputDevice1 = val;
         else if (key == "output_device2") g_cfg.outputDevice2 = val;
         else if (key == "output_device3") g_cfg.outputDevice3 = val;   // v8.4.0 rear legs (v8.4.11: ONE device, both rears)
@@ -7217,6 +7522,47 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
                 wantExcl ? "EXCLUSIVE" : "shared", ma_result_description(r));
         return false;
     }
+    // v9.5.0 PACKET MODE, THE NATIVE-RATE OPEN: the request is 48k, but a
+    // device whose endpoint is set to another rate (44.1k, 96k...) would
+    // silently insert miniaudio's own converter (a pitch change outside the
+    // engine). Instead: re-open AT the negotiated rate and let the ENGINE's
+    // packet-mode sampler do 48k -> deviceRate itself. A failed native open
+    // falls back to the 48k device (the old path, warned in printLegDevice).
+    // packet_mode = off: NO reopen -- off is the v9.4.0 discipline exactly
+    // (a native-rate device with no engine resampler would play at the
+    // wrong pitch; the v9.4.0 converter + v6.0 warning is the honest path).
+    if (g_cfg.packetMode) {
+        const ma_uint32 got = L.dev.playback.internalSampleRate
+                            ? L.dev.playback.internalSampleRate : (ma_uint32)kSampleRate;
+        if (got != (ma_uint32)kSampleRate) {
+            ma_device_uninit(&L.dev);
+            memset(&L.dev, 0, sizeof(L.dev));
+            pc.sampleRate = got;
+            r = ma_device_init(ctx, &pc, &L.dev);
+            if (r != MA_SUCCESS) {
+                pc.sampleRate = kSampleRate;
+                r = ma_device_init(ctx, &pc, &L.dev);
+                if (r != MA_SUCCESS) {
+                    tlog( "[twinspeak] leg%d: native-rate (%u Hz) AND 48k re-init both failed: %s\n",
+                            idx + 1, (unsigned)got, ma_result_description(r));
+                    return false;
+                }
+                tlog( "[twinspeak] leg%d device    : native-rate open refused -- staying at 48k (miniaudio converts)\n",
+                        idx + 1);
+            }
+        }
+    }
+    // v9.5.0: the packet-mode state resets on EVERY open/reopen -- the
+    // nominal ratio follows the device just opened; the curve starts cold.
+    L.pktRate     = L.dev.playback.internalSampleRate
+                  ? L.dev.playback.internalSampleRate : (ma_uint32)kSampleRate;
+    L.pktRatio    = (double)kSampleRate / (double)L.pktRate;   // v9.5.0b: source frames per device frame
+    L.pktTrimPpm  = 0;
+    L.pktHaveHist = false;
+    L.pktPhase    = 0.0;
+    L.pktEngaged  = 0;
+    L.pktBypass   = 0;
+    L.pktLastTrimLogMs = 0;
     L.isExclusive = wantExcl;
     L.id = *id;
     return true;
@@ -7354,8 +7700,14 @@ static bool tryRestartCap(ma_context* ctx) {
     if (g_capDev.pContext) ma_device_uninit(&g_capDev);
     memset(&g_capDev, 0, sizeof(g_capDev));
     ma_device_id id; std::string nm;
-    if (!pickDevice(ctx, ma_device_type_capture, g_capNeedle, &id, &nm)) return false;
-    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
+    // v9.4.0: the restart path mirrors the main open exactly -- loopback
+    // mode re-resolves the needle against RENDER endpoints and reopens the
+    // source shared-only; capture mode is unchanged (exclusive then
+    // shared). A watchdog reopen must never land in the other mode.
+    if (!pickDevice(ctx, g_capLoopback ? ma_device_type_playback : ma_device_type_capture,
+                    g_capNeedle, &id, &nm)) return false;
+    ma_device_config cc = ma_device_config_init(g_capLoopback ? ma_device_type_loopback
+                                                              : ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = (ma_uint32)(g_capPeriodMsF + 0.5f);
     cc.periods = 2;
@@ -7363,10 +7715,12 @@ static bool tryRestartCap(ma_context* ctx) {
     cc.capture.pDeviceID = &id;
     cc.capture.format = ma_format_f32;
     cc.capture.channels = kInCh;
-    cc.capture.shareMode = g_capWantExcl ? ma_share_mode_exclusive : ma_share_mode_shared;
+    cc.capture.shareMode = g_capLoopback ? ma_share_mode_shared
+                                         : (g_capWantExcl ? ma_share_mode_exclusive
+                                                          : ma_share_mode_shared);
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     ma_result r = ma_device_init(ctx, &cc, &g_capDev);
-    if (r != MA_SUCCESS && g_capWantExcl) {
+    if (r != MA_SUCCESS && !g_capLoopback && g_capWantExcl) {
         cc.capture.shareMode = ma_share_mode_shared;
         r = ma_device_init(ctx, &cc, &g_capDev);
     }
@@ -7420,12 +7774,18 @@ static void printLegDevice(int idx) {
                 (unsigned)d->playback.internalChannels);
     // v6.0: a non-48k endpoint means miniaudio inserts a RESAMPLER on this
     // leg -- a pitch change, which twinspeak itself never does. Say it loud.
-    if (sr != kSampleRate)
-        tlog( "[twinspeak] leg%d WARNING   : endpoint runs at %u Hz -- miniaudio resamples 48000->%u on\n"
-                        "            this leg (a pitch change; v6.0's own path is bit-exact and never\n"
-                        "            resamples). Fix: set this device's default format to 24-bit\n"
-                        "            48000 Hz in Windows sound settings.\n",
-                idx + 1, (unsigned)sr, (unsigned)sr);
+    if (sr != kSampleRate) {
+        if (g_cfg.packetMode)
+            tlog( "[twinspeak] leg%d packet    : endpoint runs at %u Hz -- the ENGINE resamples 48000->%u\n"
+                            "                            (packet mode, Hermite 4-point; miniaudio's converter is bypassed)\n",
+                    idx + 1, (unsigned)sr, (unsigned)sr);
+        else
+            tlog( "[twinspeak] leg%d WARNING   : endpoint runs at %u Hz -- miniaudio resamples 48000->%u on\n"
+                            "            this leg (a pitch change; v6.0's own path is bit-exact and never\n"
+                            "            resamples). Fix: set this device's default format to 24-bit\n"
+                            "            48000 Hz in Windows sound settings, or packet_mode = on.\n",
+                    idx + 1, (unsigned)sr, (unsigned)sr);
+    }
 }
 
 // ============================================================ v6.6.0 GUI ====
@@ -8352,6 +8712,12 @@ static void guiEnumNames(std::vector<std::string>& pb, std::vector<std::string>&
     if (ma_context_get_devices(&ctx, &p, &np, &c, &nc) == MA_SUCCESS) {
         for (ma_uint32 i = 0; i < np; ++i) pb.push_back(p[i].name);
         for (ma_uint32 i = 0; i < nc; ++i) cp.push_back(c[i].name);
+        // v9.4.0 OUTPUT-AS-SOURCE: the capture-input picker also lists
+        // RENDER endpoints, each tagged " -- output": picking one (e.g.
+        // "CABLE Input (Virtual Audio Cable)") makes THAT endpoint the
+        // source (input_is_output goes on automatically). The tag is a
+        // display marker only -- the stored needle is the plain name.
+        for (ma_uint32 i = 0; i < np; ++i) cp.push_back(std::string(p[i].name) + " -- output");
     }
     ma_context_uninit(&ctx);
 }
@@ -8410,6 +8776,8 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "out2_first")        return boolText(g_cfg.out2First);
     else if (key == "chimes")            return boolText(g_cfg.chimes);
     else if (key == "input_device")      return g_cfg.inputDevice;
+    else if (key == "input_is_output")   return boolText(g_cfg.inputIsOutput);   // v9.4.0
+    else if (key == "packet_mode")      return boolText(g_cfg.packetMode);      // v9.5.0
     else if (key == "output_device1")    return g_cfg.outputDevice1;
     else if (key == "output_device2")    return g_cfg.outputDevice2;
     else if (key == "output_device3")    return g_cfg.outputDevice3;   // v8.4.0
@@ -8434,7 +8802,8 @@ static std::string cfgValueText(const std::string& key) {
 // rides the same verbatim-copy path.
 static const char* kIniKeys[] = {
     "delay1_ms", "delay2_ms", "offset3_ms",                    // v8.4.0 rears (v8.4.11: offset4_ms retired)
-    "input_device", "output_device1", "output_device2",
+    "input_device", "input_is_output", "packet_mode",         // v9.5.0: per-packet trim + ASRC
+    "output_device1", "output_device2",
     "output_device3",                                          // v8.4.0 rears
     "output_device4",                                          // v9.1.4: leg4 -- the LFE fold to an existing leg
     "gain_l", "gain_r", "gain_rl", "gain_rr", "gain_sl", "gain_sr", "gain_lfe", "gain_center",
@@ -8522,7 +8891,23 @@ static void cfgFromControls(HWND w) {
     // when the window is built later, controlsFromCfg fills the controls
     // from the same g_cfg, so START in the window still edits what runs.
     if (!w || !GetDlgItem(w, IDC_INDEV)) return;
-    g_cfg.inputDevice    = editStr(w, IDC_INDEV);
+    // v9.4.0 OUTPUT-AS-SOURCE: a picker entry ending in " -- output" is a
+    // render endpoint -- strip the marker, store the plain name, and turn
+    // input_is_output ON. A hand-typed name with the key already on keeps
+    // it; with it off, stays off (the engine still hard-errors if the
+    // needle only matches a render endpoint while the key is off -- the
+    // banner says exactly that).
+    {
+        std::string in = editStr(w, IDC_INDEV);
+        const std::string tag = " -- output";
+        if (in.size() > tag.size() &&
+            in.compare(in.size() - tag.size(), tag.size(), tag) == 0) {
+            in.resize(in.size() - tag.size());
+            while (!in.empty() && in.back() == ' ') in.pop_back();
+            g_cfg.inputIsOutput = true;
+        }
+        g_cfg.inputDevice = in;
+    }
     g_cfg.outputDevice1  = editStr(w, IDC_OUT1);
     g_cfg.outputDevice2  = editStr(w, IDC_OUT2);
     g_cfg.outputDevice3  = editStr(w, IDC_OUT3);   // v8.4.0: empty = the leg stays silent (v8.4.11: ONE rear device)
@@ -8561,7 +8946,11 @@ static void cfgFromControls(HWND w) {
 
 static void controlsFromCfg(HWND w) {
     char b[64];
-    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputDevice.c_str());
+    // v9.4.0: show the mode in the box -- a source on the output side
+    // carries the " -- output" marker, the same one the picker offers.
+    SetDlgItemTextA(w, IDC_INDEV, g_cfg.inputIsOutput
+                     ? (g_cfg.inputDevice + " -- output").c_str()
+                     : g_cfg.inputDevice.c_str());
     SetDlgItemTextA(w, IDC_OUT1,  g_cfg.outputDevice1.c_str());
     SetDlgItemTextA(w, IDC_OUT2,  g_cfg.outputDevice2.c_str());
     SetDlgItemTextA(w, IDC_OUT3,  g_cfg.outputDevice3.c_str());   // v8.4.0
@@ -11686,7 +12075,24 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     }
 
     ma_device_id capId, id1, id2, id3; std::string capName, n1, n2, n3;   // v8.4.11: id4/n4 retired with leg4
-    if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
+    // v9.4.0 OUTPUT-AS-SOURCE: with input_is_output the needle is resolved
+    // against RENDER endpoints (e.g. VB VAC's "CABLE Input"); the resolved
+    // id then opens as the loopback source below. The resolver is
+    // share-mode-agnostic -- share is forced shared at the open (Windows
+    // has no exclusive loopback). THE HARD GUARD lives after the legs are
+    // picked: a source that IS an output leg's endpoint is refused.
+    g_capLoopback = g_cfg.inputIsOutput;
+    if (g_capLoopback) {
+        if (!pickDevice(&ctx, ma_device_type_playback, g_cfg.inputDevice, &capId, &capName)) {
+            tlog( "[twinspeak] input_is_output is on -- no RENDER endpoint matching \"%s\" (--list to see names)\n",
+                    g_cfg.inputDevice.c_str());
+            return 1;
+        }
+        tlog("[twinspeak] source        : OUTPUT-AS-SOURCE -- \"%s\" is a render endpoint; its data is\n"
+             "                            read (one-way, shared loopback; nothing is written back -- no echo)\n"
+             "                            and routed to the legs by channel, exactly as the capture path did\n",
+             capName.c_str());
+    } else if (!pickDevice(&ctx, ma_device_type_capture, g_cfg.inputDevice, &capId, &capName)) {
         tlog( "[twinspeak] capture device matching \"%s\" not found (--list to see names)\n",
                 g_cfg.inputDevice.c_str());
         return 1;
@@ -11745,6 +12151,28 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // mains already fold the LFE); no match -- or an empty needle, or a
     // needle that resolves to nothing (a soft note, never an error) -- and
     // leg4 stays idle.
+    // v9.4.0 THE SELF-ROUTE GUARD: the source endpoint must never be an
+    // output leg's own endpoint. Reading a leg and writing it back to
+    // itself is the echo bug in new clothes; it is refused at start, by
+    // resolved endpoint id (the same comparison the LFE fold uses).
+    if (g_capLoopback) {
+        if (memcmp(&capId, &id1, sizeof(ma_device_id)) == 0) {
+            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg1's device -- routing a leg\n"
+                    "                            back into itself is an echo loop; refused. Point input_device\n"
+                    "                            at the cable's INPUT endpoint and output_device1 at the speakers.\n");
+            return 1;
+        }
+        if (!g_leg[1].disabled && memcmp(&capId, &id2, sizeof(ma_device_id)) == 0) {
+            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg2's device -- echo loop; refused\n"
+                    "                            (see above; the source and the legs must be distinct endpoints)\n");
+            return 1;
+        }
+        if (!g_leg[2].disabled && memcmp(&capId, &id3, sizeof(ma_device_id)) == 0) {
+            tlog( "[twinspeak] FATAL       : input_is_output's endpoint IS leg3's device -- echo loop; refused\n"
+                    "                            (see above; the source and the legs must be distinct endpoints)\n");
+            return 1;
+        }
+    }
     g_lfeFoldLeg = -1;
     if (!g_cfg.outputDevice4.empty()) {
         ma_device_id id4; std::string n4;
@@ -11774,7 +12202,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     const ma_uint32 capPeriodMs = 4;       // v8.1.0: fixed request, no cap_ms
     g_capPeriodMsF = 4.0f;                 // v3.8: watchdog restart state
     g_capNeedle    = g_cfg.inputDevice;
-    g_capWantExcl  = g_cfg.captureExclusive;
+    g_capWantExcl  = g_capLoopback ? false : g_cfg.captureExclusive;   // v9.4.0: shared only in output-as-source
 
     // per-leg identity + work buffers (rings come later -- their size needs
     // the negotiated device period)
@@ -11785,6 +12213,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.name  = (i == 0) ? n1 : (i == 1) ? n2 : (i == 2) ? n3 : std::string();
         if (L.disabled) continue;                 // v8.4.0: no ring, no scratch (v8.4.11: leg4 always disabled)
         L.scratch.assign((size_t)kInCh * kScratchFrames, 0.0f);
+        L.pktRs.assign((size_t)kInCh * kScratchFrames, 0.0f);   // v9.5.0: the engaged path's 8ch resample buffer
     }
 
     // v3: legs go exclusive TOGETHER or shared TOGETHER. v2 let one leg win
@@ -11894,11 +12323,16 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         return 1;
     }
 
-    // v3.6: the CAPTURE side gets its own period + share mode, opened BEFORE
-    // the rings (the ring floor needs the REAL negotiated burst). Exclusive
-    // on the VAC pin = the direct WaveRT cyclic read; it usually refuses on
-    // WaveCyclic/busy and falls back to shared (banner reports the winner).
-    ma_device_config cc = ma_device_config_init(ma_device_type_capture);
+    // v9.4.0 OUTPUT-AS-SOURCE: in loopback mode the source opens as
+    // ma_device_type_loopback on the resolved RENDER endpoint id (the id
+    // rides config.capture.pDeviceID -- that is miniaudio's loopback
+    // contract), SHARED mode only: Windows has no exclusive loopback, and
+    // exclusive is neither attempted nor hinted (a refused hint log would
+    // be a lie in this mode). The one-way read never writes to the
+    // endpoint; event-paced, it simply parks while the endpoint renders
+    // nothing and resumes the moment audio flows.
+    ma_device_config cc = ma_device_config_init(g_capLoopback ? ma_device_type_loopback
+                                                              : ma_device_type_capture);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = capPeriodMs;
     cc.periods = 2;
@@ -11906,8 +12340,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     cc.capture.pDeviceID = &capId;
     cc.capture.format = ma_format_f32;
     cc.capture.channels = kInCh;
-    cc.capture.shareMode = g_cfg.captureExclusive ? ma_share_mode_exclusive
-                                                  : ma_share_mode_shared;
+    cc.capture.shareMode = g_capLoopback ? ma_share_mode_shared
+                                         : (g_cfg.captureExclusive ? ma_share_mode_exclusive
+                                                                   : ma_share_mode_shared);
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     memset(&g_capDev, 0, sizeof(g_capDev));   // v3.8: g_capDev is file-scope (watchdog)
     bool capExclusive = false;
@@ -11915,6 +12350,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     if (cr == MA_SUCCESS) {
         capExclusive = (cc.capture.shareMode == ma_share_mode_exclusive);
         g_capIsExcl  = capExclusive;
+    } else if (g_capLoopback) {
+        // v9.4.0: no exclusive fallback exists for a loopback source
+        // (there is no exclusive loopback in Windows) -- a failure here is
+        // the endpoint itself; report it straight, no shared-mode retry.
+        tlog( "[twinspeak] output-as-source open FAILED: %s -- the render endpoint refused the\n"
+                "                            loopback read (busy format change, endpoint disabled?); check --list\n",
+                ma_result_description(cr));
+        return 1;
     } else if (g_cfg.captureExclusive) {
         tlog( "[twinspeak] capture EXCLUSIVE refused (%s) -- falling back to shared\n",
                 ma_result_description(cr));
@@ -12277,11 +12720,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            TWS_VERSION);   // v7.9.0: the banner carried a stale v7.1.19 literal
     tlog("                            never resamples and never shifts pitch. Center isolation: out2 carries ONLY ch3.\n");
     tlog("[twinspeak] backend        : %s\n", ma_get_backend_name(ctx.backend));
-    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)\n",
+    tlog("[twinspeak] capture        : \"%s\"  8ch @ %u Hz | %s | delivery ~%.1f ms (fixed 4 ms request, v8.1.0)%s\n",
            capName.c_str(), kSampleRate,
            capExclusive ? "EXCLUSIVE direct pin" : "shared",
-           g_capPeriodFrames * 1000.0 / kSampleRate);
-    if (!capExclusive && g_cfg.captureExclusive)
+           g_capPeriodFrames * 1000.0 / kSampleRate,
+           g_capLoopback ? " | SOURCE = this render endpoint (one-way loopback read; volume native; no echo)"
+                         : "");
+    if (!capExclusive && g_cfg.captureExclusive && !g_capLoopback)   // v9.4.0: never in output-as-source
         tlog( "[twinspeak] capture hint   : exclusive was refused -- the pin is held by the engine or the\n"
                         "            Line 1 port driver is WaveCyclic. The direct WaveRT capture path\n"
                         "            needs the WaveRT port driver selected in the VAC Control Panel.\n");
@@ -12312,6 +12757,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            (depth1-delay1)) -- a delay on one leg can never drag the others;\n"
            "                            and a STARVED leg is never reopened (only a thread that stopped\n"
            "                            switching entirely is).\n");
+    tlog("[twinspeak] packet mode   : %s -- every leg measures its ring depth EVERY packet and trims\n"
+           "                            its playout ratio to hold it at delay + anchor (err = depth -\n"
+           "                            delay - anchor; trim = clamp(%d ppm x err, +-%d ppm), a sub-0.1%%\n"
+           "                            rate bend -- the Adesso-class clock sink never dries the ring, no\n"
+           "                            warden bite, no held frame). trim = 0 on a matched clock rides the\n"
+           "                            BIT-EXACT path unchanged; a non-48k endpoint re-opens AT its native\n"
+           "                            rate and the ENGINE resamples 48k -> device rate (Hermite 4-point).\n",
+           g_cfg.packetMode ? "ON (v9.5.0 default)" : "OFF (packet_mode = off -- the v9.4.0 warden discipline)",
+           (int)kPktPpmPerFrame, (int)kPktMaxPpm);
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
@@ -12903,6 +13357,23 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // line format below, byte-identical to v8.5.1, so the sink's
         // "raw1 " prefix match and the log's grep-ability are untouched.
         {
+            // v9.5.0b: a packet-mode leg riding a SUSTAINED trim says so
+            // on its own one-shot line, at most once a minute -- the
+            // Adesso-class sink now shows as a steady ~-1000 ppm bend
+            // holding the ring up, not as a dry-out. The raw1 line's
+            // byte-identical contract and the log cadence are untouched.
+            for (int pi = 0; pi < 4; ++pi) {
+                Leg& PL = g_leg[pi];
+                const long pt = PL.pktTrimPpm;
+                if (g_cfg.packetMode && (pt > 500 || pt < -500)) {
+                    const unsigned long long ptn = GetTickCount64();
+                    if (ptn - PL.pktLastTrimLogMs >= 60000) {
+                        PL.pktLastTrimLogMs = ptn;
+                        tlog("[twinspeak] pkt out%d     : clock mismatch held at %+ld ppm (ring %5.1f ms, never dry -- packet mode bends the rate instead of dropping)\n",
+                             pi + 1, pt, PL.raw.count() * 1000.0f / kSampleRate);
+                    }
+                }
+            }
             char b1[3][32], b2[3][32], b3[2][32];
             snprintf(b1[0], 32, "raw1 %5.1f", g_leg[0].raw.count() * 1000.0f / kSampleRate);
             snprintf(b1[1], 32, "raw2 %5.1f", g_leg[1].raw.count() * 1000.0f / kSampleRate);
