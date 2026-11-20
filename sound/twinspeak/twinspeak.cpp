@@ -233,6 +233,41 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.3 THE 16 ms PACKET (field-directed: "There are less late
+//            switches than before now. But not all of it. So I would
+//            do a 16ms packet mode"). The 12 ms bite did what the
+//            v9.5.2 math said -- the late-switch counter fell hard --
+//            but not to zero: the center device still rides the stale
+//            edge, its service stride a bigger multiple of the period
+//            than 12 ms of cushion buys. Same lever, one more notch:
+//            kOutPeriodFrames 576 -> 768 (16.0 ms of service),
+//            periods still 2 (a 1536-fr / 32.0 ms cushion) -- and
+//            16 ms is where consumer USB DACs live natively (16 whole
+//            1-ms USB frames, past the 10 ms shared-mode Windows
+//            default), so the request now sits INSIDE the silicon's
+//            comfort zone. kPktEmaAlpha scales 576/48000 -> 768/48000
+//            (the ~1 s EMA stays a second of REAL time; the P-gain is
+//            time-invariant by construction). The anchor (2 x the
+//            negotiated period), the health line, the lateness meter,
+//            the start trim and the start align follow the negotiated
+//            period as always; leg alignment stays frame-exact; the
+//            8192-fr scratch swallows the bite whole. No new ini key,
+//            no UI row; old inis load identically. Cost: the per-leg
+//            device path grows 4 ms more (12->16 ms period, 24->32 ms
+//            cushion), both legs together -- alignment preserved, the
+//            est-path line prints it live. loop_sim_v2 at 768: ratio
+//            1.00000 on every flowing run (matched/skewed clocks,
+//            0/25/60 ms delays, 44.1k sinks); through 5 s idle gaps
+//            the pop floor holds the delay prefill (worst case
+//            +54.8 fr over the floor: 44.1k + 60 ms delay + 5 s
+//            idle) and the shorts land inside the idle, by design
+//            -- zero FLOW-time shorts; trim sign flips 2-8 per 9000
+//            periods, frame conservation exact (pushed - popped ==
+//            ring end - start to the frame); harness4 S/T at
+//            the 768-anchor 1536: the sink converges -1000 ppm with
+//            0 sign flips (min depth 2009.9, target 2048), a 4096-fr
+//            burst drains home (2056.4) with 3 flips, bypass->engage
+//            frame-exact.
 //    v9.5.2 THE 12 ms PACKET (field-directed: "I would do a 12ms packet
 //            mode instead. I think that's what I want, since clearly
 //            consumer usb speakers aren't designed for 4ms buffers").
@@ -391,8 +426,8 @@
 //               estimator the E-cores first. A failed pin leaves the thread
 //               floating -- nothing else changes.
 //            WHAT IS DELIBERATELY NOT DONE: the per-callback DSP is NOT
-//            fanned out to the pool. At the 576-fr request (12.0 ms of
-//            service) a switch's mix is ~576 frames x 8 lanes of multiply-
+//            fanned out to the pool. At the 768-fr request (16.0 ms of
+//            service) a switch's mix is ~768 frames x 8 lanes of multiply-
 //            adds -- still single-digit microseconds, inline and bit-exact.
 //            Waking a pool for that means a condition-variable handoff whose
 //            WORST case (a worker preempted the instant it was woken) is
@@ -3250,7 +3285,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.2"
+#define TWS_VERSION "9.5.3"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3387,9 +3422,17 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // even the observed 3-period stride (12.9 ms) lands with +11 ms of margin
 // and the lock has nothing to bite. The engine's alignment, anchor, ring
 // floor and servo all key off the NEGOTIATED period -- nothing else moves.
-static constexpr unsigned kOutPeriodFrames   = 576;  // v9.5.2: the 12 ms bite (the 2026-11-20 log -- consumer USB
-                                                     // DACs phase-lock into late service at 4 ms; 3x the period)
-static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 1152 fr = 24.0 ms (a full stride of slack)
+// v9.5.3 THE 16 ms BITE (field-directed: "There are less late switches
+// than before now. But not all of it. So I would do a 16ms packet
+// mode"). The 12 ms bite cut the counter hard but not to zero -- the
+// center DAC's stride still lapped the 24 ms cushion's edge. 768 fr
+// makes the bite 16 ms: a 2-period cushion is then 32 ms, and 16 ms
+// sits where consumer USB silicon lives natively (16 whole 1-ms USB
+// frames, past the 10 ms shared-mode default). The EMA alpha scales
+// with it; the anchor/health/servo key off the negotiated period.
+static constexpr unsigned kOutPeriodFrames   = 768;  // v9.5.3: the 16 ms bite (the field: 12 ms cut the late switches
+                                                     // hard but not to zero; one more notch of the same lever)
+static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 1536 fr = 32.0 ms (a full stride of slack)
 // ---- v9.5.0 PACKET MODE constants (per-leg trim servo + async sampler) ----
 // Pure-P, zero-centered: trim = clamp(kPktPpmPerFrame * err, +-kPktMaxPpm).
 // 50 ppm/frame: a 1 ms (48 fr) depth error bends the rate 0.24%; the cap
@@ -3402,8 +3445,8 @@ static constexpr long kPktFloorFr    = 512;  // v9.5.1: one full VAC burst (10.7
                                               // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
 // v9.5.1 SERVO v2: steer the AVERAGED depth, engage with hysteresis.
-static constexpr double kPktEmaAlpha  = 576.0 / 48000.0;  // v9.5.2: ~1 s of packets at the 12 ms bite (192/48000
-                                                           // would stretch the average to ~3 s of real time)
+static constexpr double kPktEmaAlpha  = 768.0 / 48000.0;  // v9.5.3: ~1 s of packets at the 16 ms bite (alpha scales
+                                                           // with the period; the average stays a second of REAL time)
 static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
 static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this: back to bit-exact
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
