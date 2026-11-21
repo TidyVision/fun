@@ -233,6 +233,54 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.4 SERVO v3, THE PI BIAS + THE OFF-METER'S CLEAN WINDOW
+//            (field-directed: "This actually works, but I don't want
+//            that headphone pitch oscillate thing like I get with
+//            jbl tune 510t. The gui status text's off text is also
+//            inaccurate only because it fluctuates sometimes and it
+//            doesn't really update in time. Is there even a way to
+//            fix this ever?").
+//            THE WOBBLE: servo v2 is pure P under an engage/relax
+//            latch, and a real DAC crystal (+-20..150 ppm) limit-
+//            cycles it: relax -> drift -> engage at -450 ppm ->
+//            squash -> relax, ~14-28 cycles/min -- the trim square-
+//            waves 0 <-> -450 ppm at 0.2-0.5 Hz, an ~8-cent warble
+//            speakers mask and HEADPHONES do not (the JBL Tune
+//            510T report; a 44.1k endpoint is the worst case --
+//            permanently engaged, the hunt rides the P-term).
+//            Servo v3 is the textbook PI, saturation-frozen with a
+//            deep heal (form F2, hunt_final.py -- two intermediate
+//            forms died in the sweep: the pure integrator learned
+//            burst transients, and the learn-window form limit-
+//            cycled a 60 ppm offset 139 latch flips: P engaged
+//            -350 ppm for a 60 ppm problem and swept the error
+//            through the band faster than the integrator could
+//            follow). F2: the bias LEARNS everywhere inside the
+//            engage band (|EMA err| <= 8 fr, kI = 0.05 ppm/frame)
+//            and is FROZEN outside it (startup descents and burst
+//            drains are transients, never learned); inside the
+//            relax band (|err| < 2 fr) it HEALS at 0.05 ppm/packet
+//            -- matched clocks drain to the bit-exact bypass (tail
+//            std 0) while a true equilibrium's learn rate
+//            outpaces the heal and holds. P acts only outside the
+//            dead-band; relax requires the bias spent (|bias| <
+//            1 ppm, snapped to 0). hunt_final.py F2: 60 ppm -> 1
+//            latch flip, held trim within +-0.13 cents of the
+//            offset; 150 -> 1 flip; 441 -> 1; 1000 -> 1 (exact);
+//            matched+seeded and T+4096 -> the bypass, tail std 0.
+//            The whole sweep: hunt_final.py.
+//            THE OFF TEXT: the meter divided ONE second of ring-
+//            counter deltas -- the ~10 ms burst sawtooth (+-240 fr)
+//            beat against the window (the "fluctuates"), and the
+//            first window after an idle was catch-up backlog (the
+//            "doesn't update in time"). The window is now FIVE
+//            consecutive fully-flowing seconds, divided once
+//            (~+-2 ppm quantization); a window spanning an idle is
+//            discarded whole; after a resume the meter prints
+//            warm (n/5) until the first window closes. (v9.5.4b:
+//            the first cut advanced the baselines unbraced and
+//            re-closed the window every second after the first --
+//            a saturating latch plus a cycling phase fixes both.)
 //    v9.5.3 THE 16 ms PACKET (field-directed: "There are less late
 //            switches than before now. But not all of it. So I would
 //            do a 16ms packet mode"). The 12 ms bite did what the
@@ -3285,7 +3333,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.3"
+#define TWS_VERSION "9.5.4"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3448,7 +3496,16 @@ static constexpr long kPktMaxPpm      = 4000;
 static constexpr double kPktEmaAlpha  = 768.0 / 48000.0;  // v9.5.3: ~1 s of packets at the 16 ms bite (alpha scales
                                                            // with the period; the average stays a second of REAL time)
 static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
-static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this: back to bit-exact
+static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this AND |bias| < 1 ppm: back to bit-exact
+static constexpr double  kPktBiasKI   = 0.05; // v9.5.4 servo v3: ppm of bias learned per packet per frame of
+                                                 // EMA error, ONLY while the error is outside the dead-band (the
+                                                 // sustained-offset signature; a real crystal offset loads the
+                                                 // bias in ~15 s and holds the trim constant -- no pitch wobble)
+static constexpr double  kPktBiasLeak = 0.05; // v9.5.4d: ppm of bias HEALED per packet while the error is inside
+                                                 // the RELAX band (the deep-heal -- 0.2 fought the equilibrium: a
+                                                 // 60 ppm offset needs the bias to HOLD, and a coarse leak made
+                                                 // the latch cycle 139x; 0.05 heals a transient in seconds yet
+                                                 // never outpaces the 0.2 ppm/packet equilibrium learn rate)
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3860,6 +3917,7 @@ struct Leg {
     std::vector<float>  pktRs;                 // engaged path's 8ch resample buffer (kInCh x kScratchFrames)
     unsigned long long  pktLastTrimLogMs = 0;  // v9.5.0b: the sustained-trim one-shot's 1-min gate
     double              pktDepthEma  = -1.0;  // v9.5.1: EMA of ring depth (~1 s); -1 = not yet seeded
+    double              pktBiasPpm   = 0.0;   // v9.5.4 servo v3: the PI integrator's learned trim (ppm)
     bool                pktEngagedOn = false; // v9.5.1: the servo's hysteresis latch
     // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
     // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
@@ -5113,11 +5171,62 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             long ptrim = 0;
             if      (perr >  kPktEngageFr) L.pktEngagedOn = true;
             else if (perr < -kPktEngageFr) L.pktEngagedOn = true;
-            else if (perr <  kPktRelaxFr && perr > -kPktRelaxFr) L.pktEngagedOn = false;
+            // v9.5.4 servo v3: relax ALSO requires the bias to be spent --
+            // a sustained offset no longer cycles the latch (the
+            // hunt_proof.py wobble); the snap clears the integrator so
+            // a truly matched clock returns to the bypass exactly as
+            // before.
+            else if (perr <  kPktRelaxFr && perr > -kPktRelaxFr
+                     && L.pktBiasPpm > -1.0 && L.pktBiasPpm < 1.0) {
+                L.pktEngagedOn = false;
+                L.pktBiasPpm = 0.0;
+            }
             if (L.pktEngagedOn) {
-                ptrim = kPktPpmPerFrame * perr;
+                // v9.5.4 servo v3 (PI): the bias is the trim; P acts
+                // only OUTSIDE the +-2 fr dead-band (transient catch-
+                // up), so the held trim is CONSTANT between bursts --
+                // constant pitch. The integrator is conditional (it
+                // freezes while P is saturated -- no windup).
+                ptrim = (long)(L.pktBiasPpm + (L.pktBiasPpm >= 0.0 ? 0.5 : -0.5));
+                if      (perr >  kPktRelaxFr) ptrim += kPktPpmPerFrame * (perr - kPktRelaxFr);
+                else if (perr < -kPktRelaxFr) ptrim += kPktPpmPerFrame * (perr + kPktRelaxFr);
                 if (ptrim > kPktMaxPpm)  ptrim = kPktMaxPpm;
                 if (ptrim < -kPktMaxPpm) ptrim = -kPktMaxPpm;
+                if (kPktPpmPerFrame * perr < kPktMaxPpm
+                 && kPktPpmPerFrame * perr > -kPktMaxPpm) {
+                    // v9.5.4d THE INTEGRATOR (form F2, hunt_final.py):
+                    // LEARN everywhere inside the engage band (|perr|
+                    // <= 8) -- a sustained offset's equilibrium lives
+                    // at ANY ripple phase (the v954c window form let P
+                    // sweep the error through a 2<|perr|<=8 band faster
+                    // than the integrator could follow: a 60 ppm offset
+                    // limit-cycled the latch 139x). HEAL only inside
+                    // the relax band (|perr| < 2) at the deep-heal rate
+                    // -- matched clocks drain to the bit-exact bypass
+                    // (std 0) while a true equilibrium's learn rate
+                    // (~0.2 ppm/packet at 60 ppm) outpaces the heal.
+                    // The P-saturation freeze stands: startup EMA
+                    // descents and burst drains (|perr| > 8) are
+                    // transients, never learned (v954c-as-shipped rang
+                    // 291 flips on a matched clock from the startup
+                    // descent alone).
+                    if (perr > -kPktEngageFr && perr < kPktEngageFr) {
+                        L.pktBiasPpm += kPktBiasKI * (double)perr;
+                        // the deep heal RIDES ON TOP inside the relax
+                        // band (an else-chain made it unreachable in
+                        // v954d: ripple learned freely, 154 flips on a
+                        // matched clock -- learn+heal together is the
+                        // tested form: ripple nets ~zero, a sustained
+                        // offset at the band edge out-learns the heal)
+                        if (perr < kPktRelaxFr && perr > -kPktRelaxFr) {
+                            if      (L.pktBiasPpm >  kPktBiasLeak) L.pktBiasPpm -= kPktBiasLeak;
+                            else if (L.pktBiasPpm < -kPktBiasLeak) L.pktBiasPpm += kPktBiasLeak;
+                            else                              L.pktBiasPpm = 0.0;
+                        }
+                    }   // else: frozen -- a transient, never learned
+                    if (L.pktBiasPpm >  (double)kPktMaxPpm) L.pktBiasPpm =  (double)kPktMaxPpm;
+                    if (L.pktBiasPpm < -(double)kPktMaxPpm) L.pktBiasPpm = -(double)kPktMaxPpm;
+                }
             }
             L.pktTrimPpm = ptrim;
             // v9.5.0b: pktRatio is SOURCE frames per DEVICE frame =
@@ -7179,7 +7288,9 @@ static void writeTemplate(const char* path) {
         ";     the UNDERRUN RULE block below) -- never a replay tile.\n"
         ";   * ring excess above the natural sawtooth (cable faster than device)\n"
         ";     is dropped OLDEST-first, at most once per 5 s per leg, logged.\n"
-        "; The health line shows the measured offset ('off +N ppm'). At crystal\n"
+        "; The health line shows the measured offset ('off +N ppm', a 5-second\n"
+        "; window over fully-flowing seconds -- burst-quiet and idle-clean; 'warm'\n"
+        "; fills the first window after audio resumes). At crystal\n"
         "; level both events are minutes apart. If 'off' sits far from 0, the\n"
         "; one-shot hint prints the value -- enable Clock Correction for the\n"
         "; cable in the VAC Control Panel and trim it until 'off' reads ~0; a\n"
@@ -7793,6 +7904,7 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     L.pktEngaged  = 0;
     L.pktBypass   = 0;
     L.pktLastTrimLogMs = 0;
+    L.pktBiasPpm  = 0.0;   // v9.5.4 servo v3: the integrator starts cold on every (re)open
     L.isExclusive = wantExcl;
     L.id = *id;
     return true;
@@ -12665,6 +12777,7 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.biteForced   = false;
         L.pktDepthEma  = -1.0;                                         // v9.5.1: the EMA reseeds on the first packet
         L.pktEngagedOn = false;                                        // v9.5.1: the hysteresis latch starts open
+        L.pktBiasPpm   = 0.0;                                          // v9.5.4 servo v3: the integrator starts cold
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
@@ -13206,6 +13319,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     unsigned long long aB[4] = { 0, 0, 0, 0 };           // off-meter captured baselines
     unsigned long long pB[4] = { 0, 0, 0, 0 };           // off-meter popped baselines
     long offV[4] = { 0, 0, 0, 0 };                       // measured clock offset ppm per leg
+    int  offWarm = 0;                                    // v9.5.4: the warmup latch (0..5 flowing seconds; 5 = reading)
+    int  offPhase = 0;                                   // v9.5.4b: the rolling window phase (0..4 flowing seconds)
     int colStreak[4] = { 0, 0, 0, 0 };                   // v6.5.2 collapse sentinel
     unsigned long long colLastMs[4] = { 0, 0, 0, 0 };    // per-leg reopen cooldown
     bool ccHintDone = false;
@@ -13234,26 +13349,52 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         Sleep(1000);
         ++sec;
         const unsigned long long nowMs0 = GetTickCount64();   // v9.5.1: the off-meter's idle gate
-        // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 over the
-        // last second (both counters integrate the real clocks; bursts and
-        // pop phase cancel in the deltas). Positive = cable runs fast.
-        // v9.5.1: the capture heartbeat decides the off-meter's mood --
-        // while the cable is silent (loopback idle) there is no capture
-        // delta to divide, and the old meter kept printing a stale
-        // number built from the pre-idle window (the field's "off value
-        // is suspiciously off"). IDLE prints idle; the meter resumes
-        // with fresh deltas the moment audio flows again.
+        // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 (both
+        // counters integrate the real clocks; pop phase cancels in the
+        // deltas). Positive = cable runs fast.
+        // v9.5.1: the capture heartbeat gates the meter -- while the
+        // cable is silent (loopback idle) there is no capture delta to
+        // divide, and the old meter kept printing a stale number built
+        // from the pre-idle window (the field's "off value is
+        // suspiciously off"). IDLE prints idle.
+        // v9.5.4 THE CLEAN WINDOW: the meter used to divide ONE second
+        // of deltas -- VAC's ~10 ms burst sawtooth (+-240 fr) beat
+        // against the 1-s window, so the reading jittered a few tens
+        // of ppm (the field's "fluctuates"), and the FIRST window
+        // after a resume was catch-up backlog, not clock (the "doesn't
+        // update in time"). Now: dCaptured/dPopped accumulate over FIVE
+        // consecutive fully-flowing seconds and divide once (burst
+        // quantization ~+-2 ppm); a window that spans an idle is
+        // discarded whole -- the pre-idle tail is a burst artifact,
+        // not a clock; and after a resume the meter prints warm until
+        // the first full window closes, then reads steady.
         const unsigned long long hbCapNow = g_hbCap.load(std::memory_order_relaxed);
         const bool capFlowing0 = hbCapNow && (nowMs0 - hbCapNow) <= 1500;
         const bool capFlowing = capFlowing0;
+        // v9.5.4b: offWarm is the warmup LATCH (saturates at 5); offPhase
+        // is the rolling window (cycles 0..4 over flowing seconds). The
+        // window closes on the tick whose pre-increment phase is 4 --
+        // every 5th FLOWING second, before the baselines advance, so
+        // every divide spans a clean 5 s of flowing audio (the first
+        // closes exactly as offWarm saturates).
+        const bool offClose = capFlowing && offPhase == 4;
+        if (capFlowing) {
+            if (offWarm < 5) ++offWarm;
+            if (++offPhase >= 5) offPhase = 0;
+        } else {
+            offWarm = 0;    // idle: the window resets; nothing divides
+            offPhase = 0;
+        }
         for (int i = 0; i < 4; ++i) {
             const unsigned long long Ai = g_leg[i].captured.load(std::memory_order_relaxed);
             const unsigned long long Ci = g_leg[i].popped.load(std::memory_order_relaxed);
-            if (capFlowing && pB[i] != 0 && Ci > pB[i] && Ai > aB[i])
+            if (offClose && pB[i] != 0 && Ci > pB[i] && Ai > aB[i])
                 offV[i] = (long)(((double)(Ai - aB[i]) / (double)(Ci - pB[i]) - 1.0) * 1000000.0);
             else if (!capFlowing)
                 offV[i] = 0;
-            aB[i] = Ai; pB[i] = Ci;   // v8.4.0: a disabled leg holds 0/0 -> off stays 0
+            if (offClose || !capFlowing) {
+                aB[i] = Ai; pB[i] = Ci;   // baselines advance only at window close (or idle reset)
+            }
         }
         // v8.1.0 fields: off = measured clock offset ppm; short ('und') =
         // switches the raw ring could not fill; evict ('drop') = passive
@@ -13625,10 +13766,12 @@ static int engineMain(const std::string& iniPath, bool fgForce,
             snprintf(b1[0], 32, "raw1 %5.1f", g_leg[0].raw.count() * 1000.0f / kSampleRate);
             snprintf(b1[1], 32, "raw2 %5.1f", g_leg[1].raw.count() * 1000.0f / kSampleRate);
             snprintf(b1[2], 32, "vol %s",     volStr);
-            if (capFlowing0)
-                snprintf(b2[0], 32, "off %+6ld/%+6ld", offV[0], offV[1]);
-            else
+            if (!capFlowing0)
                 snprintf(b2[0], 32, "off    idle/idle");   // v9.5.1: silent cable, no delta to divide
+            else if (offWarm < 5)
+                snprintf(b2[0], 32, "off    warm %d/5", offWarm);   // v9.5.4: the window is still filling
+            else
+                snprintf(b2[0], 32, "off %+6ld/%+6ld", offV[0], offV[1]);
             snprintf(b2[1], 32, "drift %s",   driftStr);
             snprintf(b2[2], 32, "err %s",     errStr);
             snprintf(b3[0], 32, "short +%llu/%llu/%llu/%llu",
