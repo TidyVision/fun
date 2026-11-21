@@ -233,6 +233,38 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.5 SERVO v5 HOLD-AND-SMOOTH (field-directed: "I still get
+//            the pitch oscillation even with this. I don't want to
+//            hold a constant ppm. I want to have literally the least
+//            oscillation possible. My cpu has variable load, so
+//            reduce the pitch oscillation even further to the point
+//            you don't hear it anymore.").
+//            THE DEEPER ROOT the v9.5.4 round missed: the servo
+//            sampled ring depth PER CHUNK at whatever burst phase
+//            each chunk caught -- VAC's ~10 ms delivery bursts put a
+//            +288..518 fr phase bias on every sample, and CPU load
+//            waves modulate the burst cadence, so the MEASURED depth
+//            wobbles with load even with clocks matched. F2's P term
+//            answered that wobbling measurement every packet (50 ppm
+//            per frame of error): the persistent headphone wobble
+//            (sim: F2 under load waves -- |dTrim| max 950..1300 ppm,
+//            28-30 audible-class steps per 2.4 min).
+//            SERVO v5 (loop-model-proven; every gated heuristic
+//            tried first -- hold-and-step, freeze bands, integral
+//            clamps -- either wobbled or limit-cycled, see
+//            hunt_jitter.py): sample ONCE PER PERIOD (first chunk,
+//            a fixed burst phase), steer a tau~8 s slow EMA via PI
+//            (Kp 2, Ki 5e-4) with back-calculation anti-windup (Kb
+//            0.1) -- unconditionally stable, exactly convergent --
+//            and SLEW-LIMIT the applied trim: <= 0.2 ppm/period
+//            near target (0.0036 cents/s, below any pitch-motion
+//            hearing threshold), 5 ppm/period only while far (a
+//            brief glide). Measured (loop_sim_v2): 60/150/441/1000
+//            ppm sinks -- |dTrim| mean 0.3 ppm max 5 ppm, ZERO big
+//            steps (F2: 14.6/450); 150 ppm over 15 min: trim +150.0
+//            then FROZEN; under load jitter: v5 max 5 ppm (F2 max
+//            950..1300); delays/44.1k/idle: ratio 1.00000, zero
+//            flow-time shorts, conservation exact.
 //    v9.5.4 SERVO v3, THE PI BIAS + THE OFF-METER'S CLEAN WINDOW
 //            (field-directed: "This actually works, but I don't want
 //            that headphone pitch oscillate thing like I get with
@@ -3333,7 +3365,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.4"
+#define TWS_VERSION "9.5.5"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3506,6 +3538,16 @@ static constexpr double  kPktBiasLeak = 0.05; // v9.5.4d: ppm of bias HEALED per
                                                  // 60 ppm offset needs the bias to HOLD, and a coarse leak made
                                                  // the latch cycle 139x; 0.05 heals a transient in seconds yet
                                                  // never outpaces the 0.2 ppm/packet equilibrium learn rate)
+// v9.5.5 SERVO v5 HOLD-AND-SMOOTH (the loop-model-proven form; every
+// gated heuristic tried first -- hold-and-step, freeze bands, integral
+// clamps -- either wobbled under load or limit-cycled: hunt_jitter.py)
+static constexpr double  kPktEmaSlowAlpha = 96.0 / 48000.0;  // once-per-period, tau ~8 s: load waves cannot move it
+static constexpr double  kPktPiKp  = 2.0;    // P on the slow EMA (stability)
+static constexpr double  kPktPiKi  = 5e-4;   // I on the slow EMA (exact convergence)
+static constexpr double  kPktAwKb  = 0.1;    // back-calculation anti-windup
+static constexpr double  kPktSlewSlow = 0.2; // ppm/period steady-state (0.0036 cents/s -- inaudible motion)
+static constexpr double  kPktSlewFast = 5.0; // ppm/period while |tgt-appl| > 150 ppm (a brief glide)
+static constexpr double  kPktSlewThr  = 150.0; // ppm: the fast/slow slew threshold
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3918,6 +3960,9 @@ struct Leg {
     unsigned long long  pktLastTrimLogMs = 0;  // v9.5.0b: the sustained-trim one-shot's 1-min gate
     double              pktDepthEma  = -1.0;  // v9.5.1: EMA of ring depth (~1 s); -1 = not yet seeded
     double              pktBiasPpm   = 0.0;   // v9.5.4 servo v3: the PI integrator's learned trim (ppm)
+    double              pktDepthEma2 = -1.0;  // v9.5.5 servo v5: slow EMA of depth (tau ~8 s, once per period)
+    double              pktPiI       = 0.0;   // v9.5.5 servo v5: the PI integrator (on the slow EMA)
+    double              pktAppliedPpm = 0.0;  // v9.5.5 servo v5: the SLEW-LIMITED applied trim (the pitch)
     bool                pktEngagedOn = false; // v9.5.1: the servo's hysteresis latch
     // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
     // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
@@ -5163,70 +5208,65 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             // (~1 s) sees through the bursts; the hysteresis latch keeps
             // a matched clock on the bit-exact bypass while the averaged
             // error sits in the +-8..2 fr band.
-            if (L.pktDepthEma < 0.0) L.pktDepthEma = (double)avail;
-            L.pktDepthEma += kPktEmaAlpha * ((double)avail - L.pktDepthEma);
-            const long long perr = (long long)(L.pktDepthEma + 0.5)
+            // v9.5.5 SERVO v5 HOLD-AND-SMOOTH. The v9.5.4 F2 servo
+            // steered a PER-CHUNK fast EMA whose every sample carried a
+            // burst-phase bias (+288..518 fr) that CPU load waves
+            // modulate -- the field's persistent headphone wobble even
+            // on a converged offset (F2 under load waves in the sim:
+            // |dTrim| max 950..1300 ppm, 28-30 audible-class steps per
+            // 2.4 min). v5 steers ONLY a once-per-period slow EMA via
+            // PI with back-calculation anti-windup, and the APPLIED
+            // trim is SLEW-LIMITED: 0.2 ppm/period steady (0.0036
+            // cents/s -- below any pitch-motion hearing threshold),
+            // 5 ppm/period while far from target (a brief glide). The
+            // loop model proved the form stable and exactly convergent
+            // (a 150 ppm sink -> trim +150.0, then FROZEN); matched
+            // clocks still relax to the bit-exact bypass.
+            // ONCE-PER-PERIOD SAMPLING: the EMAs update only on the
+            // FIRST chunk of each period -- a fixed burst phase (the
+            // per-chunk samples of v9.5.0..9.5.4 caught varying phases;
+            // the modulated bias IS the wobble). avail stays live for
+            // the span/partial-pop guards below, which read it fresh.
+            if (done == 0) {
+                if (L.pktDepthEma < 0.0) L.pktDepthEma = (double)avail;
+                L.pktDepthEma += kPktEmaAlpha * ((double)avail - L.pktDepthEma);
+                if (L.pktDepthEma2 < 0.0) L.pktDepthEma2 = (double)avail;
+                L.pktDepthEma2 += kPktEmaSlowAlpha * ((double)avail - L.pktDepthEma2);
+            }
+            const long long perr = (long long)(L.pktDepthEma2 + 0.5)
                                  - (long long)L.delayFrames
                                  - (long long)L.anchorFrames - (long long)kPktFloorFr;
             long ptrim = 0;
             if      (perr >  kPktEngageFr) L.pktEngagedOn = true;
             else if (perr < -kPktEngageFr) L.pktEngagedOn = true;
-            // v9.5.4 servo v3: relax ALSO requires the bias to be spent --
-            // a sustained offset no longer cycles the latch (the
-            // hunt_proof.py wobble); the snap clears the integrator so
-            // a truly matched clock returns to the bypass exactly as
-            // before.
+            // v9.5.5: relax requires the servo fully spent -- the PI
+            // integrator near zero AND the applied trim at zero -- so a
+            // converged offset stays engaged (constant trim) and a
+            // truly matched clock returns to the bit-exact bypass.
             else if (perr <  kPktRelaxFr && perr > -kPktRelaxFr
-                     && L.pktBiasPpm > -1.0 && L.pktBiasPpm < 1.0) {
+                     && L.pktPiI > -1.0 && L.pktPiI < 1.0
+                     && L.pktAppliedPpm > -0.5 && L.pktAppliedPpm < 0.5) {
                 L.pktEngagedOn = false;
-                L.pktBiasPpm = 0.0;
+                L.pktPiI = 0.0;
+                L.pktAppliedPpm = 0.0;
             }
             if (L.pktEngagedOn) {
-                // v9.5.4 servo v3 (PI): the bias is the trim; P acts
-                // only OUTSIDE the +-2 fr dead-band (transient catch-
-                // up), so the held trim is CONSTANT between bursts --
-                // constant pitch. The integrator is conditional (it
-                // freezes while P is saturated -- no windup).
-                ptrim = (long)(L.pktBiasPpm + (L.pktBiasPpm >= 0.0 ? 0.5 : -0.5));
-                if      (perr >  kPktRelaxFr) ptrim += kPktPpmPerFrame * (perr - kPktRelaxFr);
-                else if (perr < -kPktRelaxFr) ptrim += kPktPpmPerFrame * (perr + kPktRelaxFr);
+                // PI on the slow EMA + back-calculation anti-windup
+                const double tgt = kPktPiKp * (double)perr
+                                 + kPktPiKi * L.pktPiI;
+                const double d = tgt - L.pktAppliedPpm;
+                const double R = (d > kPktSlewThr || d < -kPktSlewThr)
+                               ? kPktSlewFast : kPktSlewSlow;
+                if      (d >  R) L.pktAppliedPpm += R;
+                else if (d < -R) L.pktAppliedPpm -= R;
+                else             L.pktAppliedPpm = tgt;
+                L.pktPiI += (double)perr
+                          + kPktAwKb * (L.pktAppliedPpm - tgt);
+                if (L.pktPiI >  8000000.0) L.pktPiI =  8000000.0;  // Ki*I <= +-4000 ppm
+                if (L.pktPiI < -8000000.0) L.pktPiI = -8000000.0;
+                ptrim = (long)(L.pktAppliedPpm + (L.pktAppliedPpm >= 0.0 ? 0.5 : -0.5));
                 if (ptrim > kPktMaxPpm)  ptrim = kPktMaxPpm;
                 if (ptrim < -kPktMaxPpm) ptrim = -kPktMaxPpm;
-                if (kPktPpmPerFrame * perr < kPktMaxPpm
-                 && kPktPpmPerFrame * perr > -kPktMaxPpm) {
-                    // v9.5.4d THE INTEGRATOR (form F2, hunt_final.py):
-                    // LEARN everywhere inside the engage band (|perr|
-                    // <= 8) -- a sustained offset's equilibrium lives
-                    // at ANY ripple phase (the v954c window form let P
-                    // sweep the error through a 2<|perr|<=8 band faster
-                    // than the integrator could follow: a 60 ppm offset
-                    // limit-cycled the latch 139x). HEAL only inside
-                    // the relax band (|perr| < 2) at the deep-heal rate
-                    // -- matched clocks drain to the bit-exact bypass
-                    // (std 0) while a true equilibrium's learn rate
-                    // (~0.2 ppm/packet at 60 ppm) outpaces the heal.
-                    // The P-saturation freeze stands: startup EMA
-                    // descents and burst drains (|perr| > 8) are
-                    // transients, never learned (v954c-as-shipped rang
-                    // 291 flips on a matched clock from the startup
-                    // descent alone).
-                    if (perr > -kPktEngageFr && perr < kPktEngageFr) {
-                        L.pktBiasPpm += kPktBiasKI * (double)perr;
-                        // the deep heal RIDES ON TOP inside the relax
-                        // band (an else-chain made it unreachable in
-                        // v954d: ripple learned freely, 154 flips on a
-                        // matched clock -- learn+heal together is the
-                        // tested form: ripple nets ~zero, a sustained
-                        // offset at the band edge out-learns the heal)
-                        if (perr < kPktRelaxFr && perr > -kPktRelaxFr) {
-                            if      (L.pktBiasPpm >  kPktBiasLeak) L.pktBiasPpm -= kPktBiasLeak;
-                            else if (L.pktBiasPpm < -kPktBiasLeak) L.pktBiasPpm += kPktBiasLeak;
-                            else                              L.pktBiasPpm = 0.0;
-                        }
-                    }   // else: frozen -- a transient, never learned
-                    if (L.pktBiasPpm >  (double)kPktMaxPpm) L.pktBiasPpm =  (double)kPktMaxPpm;
-                    if (L.pktBiasPpm < -(double)kPktMaxPpm) L.pktBiasPpm = -(double)kPktMaxPpm;
-                }
             }
             L.pktTrimPpm = ptrim;
             // v9.5.0b: pktRatio is SOURCE frames per DEVICE frame =
@@ -7905,6 +7945,9 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     L.pktBypass   = 0;
     L.pktLastTrimLogMs = 0;
     L.pktBiasPpm  = 0.0;   // v9.5.4 servo v3: the integrator starts cold on every (re)open
+    L.pktDepthEma2 = -1.0;   // v9.5.5 servo v5: the slow EMA reseeds on (re)open
+    L.pktPiI      = 0.0;    // v9.5.5 servo v5: the PI integrator starts cold
+    L.pktAppliedPpm = 0.0;  // v9.5.5 servo v5: the applied trim starts at zero
     L.isExclusive = wantExcl;
     L.id = *id;
     return true;
@@ -12778,6 +12821,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.pktDepthEma  = -1.0;                                         // v9.5.1: the EMA reseeds on the first packet
         L.pktEngagedOn = false;                                        // v9.5.1: the hysteresis latch starts open
         L.pktBiasPpm   = 0.0;                                          // v9.5.4 servo v3: the integrator starts cold
+        L.pktDepthEma2 = -1.0;                                         // v9.5.5 servo v5: the slow EMA reseeds too
+        L.pktPiI       = 0.0;                                          // v9.5.5 servo v5: the PI integrator starts cold
+        L.pktAppliedPpm = 0.0;                                         // v9.5.5 servo v5: the applied trim starts at zero
         // v6.6.9: the bit-zero fast-path gate, frozen at start (the pumps
         // that froze it at pump-start are gone).
         L.zeroFast = (i == 0)
