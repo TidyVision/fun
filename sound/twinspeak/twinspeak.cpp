@@ -233,6 +233,31 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.6 THE LATENCY CUT + THE GLIDE RATIO (field-directed: "Now
+//            reduce the latency and patch the pitch oscillation even
+//            further. Right now, I'm hanging on like 20ms of
+//            latency.").
+//            THE STACK at 48k/delay-0/WASAPI (~20 ms measured):
+//            device exclusive request kOutPeriods 2 x 768 fr = 32 ms
+//            (the dominant term, mostly slack) + ring target 704 fr
+//            = 14.7 ms (anchor 2x negotiated + floor 512). THE CUT,
+//            each piece sim-proven: kOutPeriods 2 -> 1 (the request
+//            halves, 32 -> 16 ms; the stride slack was KS-era
+//            belt-and-suspenders), kPktFloorFr 512 -> 384 (8.0 ms;
+//            the CORRECTED deadline-form load-jitter sim -- the old
+//            fmod(t, interval(t)) model skipped releases when the
+//            interval waved, starving the run 0.4% and faking a
+//            dryout that mis-sized the floor -- troughs 443.6 fr
+//            above the delay floor at 384 with zero flow-time
+//            shorts), anchor 2x -> 1.5x negotiated (the callback
+//            interval is the physics). Net ~20 -> ~10-12 ms on
+//            WASAPI legs.
+//            THE GLIDE RATIO: pktRatio now takes the UNROUNDED
+//            applied trim (double) -- the 1-ppm integer stairs, the
+//            last pitch quantization (max 5 ppm/packet), are gone;
+//            pitch changes are an exact continuous glide at
+//            <= 0.2 ppm/period. The integer trim survives only in
+//            the log line and the engage gate.
 //    v9.5.5 SERVO v5 HOLD-AND-SMOOTH (field-directed: "I still get
 //            the pitch oscillation even with this. I don't want to
 //            hold a constant ppm. I want to have literally the least
@@ -3365,7 +3390,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.5"
+#define TWS_VERSION "9.5.6"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3512,15 +3537,20 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // with it; the anchor/health/servo key off the negotiated period.
 static constexpr unsigned kOutPeriodFrames   = 768;  // v9.5.3: the 16 ms bite (the field: 12 ms cut the late switches
                                                      // hard but not to zero; one more notch of the same lever)
-static constexpr unsigned kOutPeriods        = 2;    // the exclusive buffer: 1536 fr = 32.0 ms (a full stride of slack)
+static constexpr unsigned kOutPeriods        = 1;    // v9.5.6: the exclusive buffer request halves, 768 fr = 16.0 ms
+                                                    // (the stride slack was KS-era belt-and-suspenders; the 16 ms bite
+                                                    // keeps the late-switch fix, the stride did not earn its 16 ms)
 // ---- v9.5.0 PACKET MODE constants (per-leg trim servo + async sampler) ----
 // Pure-P, zero-centered: trim = clamp(kPktPpmPerFrame * err, +-kPktMaxPpm).
 // 50 ppm/frame: a 1 ms (48 fr) depth error bends the rate 0.24%; the cap
 // (4000 ppm = 0.4%) drains a 4096-fr cable burst in ~21 s with NO click
 // (a rate bend has no discontinuity; the warden's 240-fr skip clicked).
 static constexpr long kPktPpmPerFrame = 50;
-static constexpr long kPktFloorFr    = 512;  // v9.5.1: one full VAC burst (10.7 ms) of headroom --
-                                              // the servo target rides delay+anchor+this, never below
+static constexpr long kPktFloorFr    = 384;  // v9.5.6: 8.0 ms -- one VAC burst minus the margin the corrected
+                                              // deadline-form jitter sim proved spare (trough 443.6 fr above the
+                                              // delay floor at 384, zero flow-time shorts; the old 512 was sized
+                                              // by a jitter model that skipped releases and faked a dryout --
+                                              // v9.5.1 lineage: the servo target rides delay+anchor+this, never below
                                               // (v9.5.0c's 8 fr left the 4-knot window stranded on
                                               // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
@@ -5275,8 +5305,14 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             // source; at 48k both bases are 1.0, so only non-48k legs
             // were hit). trim > 0 raises the ratio and DRAINS a full
             // ring -- the sign the servo needs.
+            // v9.5.6 THE GLIDE RATIO: the ratio takes the UNROUNDED
+            // applied trim (a double slewing <= 0.2 ppm/period) -- the
+            // 1-ppm integer stairs (the last pitch quantization, max
+            // 5 ppm/packet observed) are gone; the ratio glides exactly.
+            // The integer trim stays for the log line and the engage
+            // gate (ptrim != 0), which want integers.
             L.pktRatio = ((double)kSampleRate / (double)L.pktRate)
-                       * (1.0 + (double)ptrim * 1e-6);
+                       * (1.0 + L.pktAppliedPpm * 1e-6);
             engage = (L.pktRate != (unsigned)kSampleRate) || (ptrim != 0);
             if (engage) {
                 // v9.5.0c THE EXACT KNOT SPAN: pop exactly the frames
@@ -12785,12 +12821,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                                      ? L.dev.playback.internalPeriodSizeInFrames : kOutPeriodFrames);
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
-        // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer (2 x the
-        // negotiated period) -- the sound card's own pre-load and the floor
-        // the pipeline physically allows. On the field's WASAPI legs
-        // (period 96 fr x2) that is 192 fr = 4.0 ms. The depth guard holds
-        // the ring at delay + this; margin 0 is the DAC reading silence.
-        L.anchorFrames = devPeriodFr * 2;
+        // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer -- the
+        // sound card's own pre-load and the floor the pipeline physically
+        // allows. v9.5.6: 1.5 x the negotiated period (the callback
+        // interval is the physics; the old 2x double-covered it -- on the
+        // field's WASAPI legs 96 fr -> 144 fr = 3.0 ms, on a KS leg 768 ->
+        // 1152 fr = 24.0 ms). The depth guard holds the ring at delay +
+        // this; margin 0 is the DAC reading silence.
+        L.anchorFrames = devPeriodFr + devPeriodFr / 2;
         // v9.5.1: 200 ms over the delay -- the 512 fr servo floor + a
         // full burst of jitter headroom must fit below the cap.
         L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 200), kInCh);
