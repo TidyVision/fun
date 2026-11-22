@@ -233,6 +233,35 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.9 THE EXTERNAL TICK WAV (field-directed: "the audio delay
+//            is not consistent per device on the tick test. Just
+//            rewrite the tick test so it generates a 8 channel wav
+//            file featuring the same tick test except you also open
+//            it immediately after. When the tick test has already
+//            been generated, just open it. I want that fixed,
+//            because I strictly require that there be consistent
+//            latency across devices, and that tick test code that
+//            currently exists isn't cutting it."). The v7.0.0
+//            injection summed the SAME samples at the SAME
+//            capture-seq position on every leg with NO latency
+//            compensation ("the flam IS the data") -- per-device
+//            delay differences were its MEASUREMENT, so consistency
+//            was impossible by construction. The test is now a REAL
+//            FILE: twinspeak-tick.wav beside the INI -- 48 kHz, 8ch,
+//            16-bit PCM, the same 1500 Hz / 7.5 ms / 0.3 / 120 bpm /
+//            8 beats tick on ch1-4 (FL/FR/FC/LFE -- exactly the
+//            channels the mask-copy-mask fan-out keeps for leg1 and
+//            leg2), ch5-8 digital silence. The button: if the file
+//            exists it is OPENED, if not it is generated once and
+//            opened (ShellExecuteA, the associated player). One
+//            submission through the system graph = one shared-mode
+//            mixer = the same latency class on every device in it.
+//            RETIRED with the injection: tickSum, tickRender,
+//            g_tickWave, the v9.5.8 ride-through and idle-timeline
+//            ledger (their only consumer), the auto-stop timer
+//            branch, the STOP side of the button, the restart
+//            voiding. g_tickOn stays as a tombstone (never armed).
+//            The no-shutdown rule and the v9.5.6 geometry stand.
 //    v9.5.8 THE MINIMAL ROUND: TICK FIX + NO-SHUTDOWN, GEOMETRY
 //            REVERTED (field-directed: "Now the delayN_ms doesn't work
 //            immediately and it's very unstable, leading to 1250 late
@@ -3427,7 +3456,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.8"
+#define TWS_VERSION "9.5.9"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -5083,7 +5112,7 @@ static void mixCrewLeg1(const float gL, const float gR, const float gLfe,
                         const float gC, bool cLive, bool slLive, bool srLive,
                         bool rlLive, bool rrLive, bool combAdv,
                         const float* sc, float* chunk, const size_t n);
-static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore);
+// v9.5.9: the tickSum prototype is RETIRED with the injection tick.
 static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static void rearCombFlushZ();                    // v9.1.0, defined next to g_rcomb
@@ -5524,8 +5553,9 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         } else {
             mixBlock(idx, mixSrc, dst, produced);   // v6.5: the bulk mix, inline now
         }
-        if (g_tickOn.load(std::memory_order_relaxed))
-            tickSum(idx, dst, produced, seqBefore);   // v7.0.0: the sync tick
+        // v9.5.9: the sync tick is RETIRED -- the test plays a real WAV
+        // through the system mixer now (one graph, one latency for every
+        // device); nothing is injected inside the engine anymore.
         // v6.4: advance the play boundary by the REAL frames just played.
         // v9.5.0: the ring popped n SOURCE frames; the engaged path's
         // produced DEVICE frames map onto exactly those n source frames.
@@ -5593,38 +5623,11 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const bool flowing = hb && (GetTickCount64() - hb) <= 250;
         if (flowing) L.und.fetch_add(1);
     }
-    // v9.5.8 THE TICK RIDES THROUGH: the tick is the one signal that
-    // must sound through a starved or idle cable (it IS the cable
-    // test). If the pop loop ended with unfilled frames and the tick
-    // is live, sum it over the remainder -- on top of the held frames,
-    // exactly like the keep-alive rides every block. The position is
-    // the playout boundary the pop loop left (its own advance already
-    // covered the frames it really played).
-    if (g_tickOn.load(std::memory_order_relaxed) && done < frameCount)
-        tickSum(idx, out + done * L.outCh, frameCount - done,
-                L.raw.seqTail.load(std::memory_order_relaxed));
-    // v9.5.8 THE IDLE-TIMELINE LEDGER: while the cable is idle
-    // (heartbeat stale >250 ms) the capture writes NOTHING -- the
-    // leg's cable-time clock (seqTail) would freeze, and the tick's
-    // beat zero (anchored on this ledger) with it. Each switch
-    // advances the leg's OWN ledger by the frames the DEVICE consumed
-    // that the ring did not cover (uncovered only -- the pop loop's
-    // advance already counted the covered ones; the two can never
-    // overlap), scaled by pktRatio (their cable-time equivalent).
-    // Monotonic CAS on both sides: capture re-takes the timeline the
-    // moment it resumes, the ledger can never go backward, and the
-    // writers never fight (this path runs only while idle; capture
-    // writes only while fresh).
-    {
-        const unsigned long long hb = g_hbCap.load(std::memory_order_relaxed);
-        const bool idle = !hb || (GetTickCount64() - hb) > 250;
-        const long long uncovered = (long long)frameCount
-                                  - (long long)done - (long long)padApplied;
-        if (idle && uncovered > 0)
-            L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed)
-                                 + (unsigned long long)((double)uncovered
-                                                        * L.pktRatio + 0.5));
-    }
+    // v9.5.9: the ride-through and the idle-timeline ledger are RETIRED
+    // with the injection tick (their only consumer). The pop loop's own
+    // advance (seqTailAdvance by really-played source frames) is the
+    // base behavior and stands untouched -- the ledger is the capture
+    // side's again, exactly as in the field-built v9.5.6.
     // v8.4.23: THE ABSOLUTE LANE GATE and the device-layer lane verdicts
     // are RETIRED with the mask-copy-mask fan-out -- a masked leg can only
     // ever play its own channels, so there is nothing left to gate, and
@@ -7047,63 +7050,75 @@ static inline bool bitZero8(const float* p, size_t n) {
 }
 
 // ---- v7.0.0: the 120 BPM tempo tick (the sync test) ------------------------
-// One sharp 7.5 ms burst every 500 ms, 8 beats = 4 s, rendered ONCE, RAW BY
-// DESIGN: the pumps sum the SAME tick samples at the SAME capture-sequence
-// position on BOTH legs -- no latency compensation -- so whatever each
-// speaker's path adds is exactly what you hear: the flam IS the measurement.
-// PLAY/STOP toggle; ends itself after 4 s. 1500 Hz, fast decay.
-static std::atomic<long long> g_tickSeq0{-1};      // capture-seq of tick beat zero
-                                                 // (g_tickOn now lives above the
-                                                 // playback core -- v8.1.0)
-static std::atomic<unsigned long long> g_tickEndMs{0};   // wall time the 4 s run ends
-                                                 // (0 = idle; the GUI timer flips
-                                                 // the button back when it passes)
-static std::vector<float>     g_tickWave;          // ONE pre-rendered tick (48 kHz mono)
+// v9.5.9 THE EXTERNAL TICK WAV -- the same tick, one latency for every
+// device (field-directed: "I strictly require that there be consistent
+// latency across devices, and that tick test code that currently
+// exists isn't cutting it"). The v7.0.0 injection was a MEASUREMENT
+// tool -- it summed the same samples at the same capture-seq position
+// on every leg BY DESIGN with "no latency compensation -- the flam IS
+// the data", so per-device delay differences were the POINT; they can
+// never be consistent. The test is now a REAL FILE: 48 kHz, 8ch,
+// 16-bit PCM, the same 1500 Hz / 7.5 ms / 0.3 amplitude / 120 bpm / 8
+// beats tick on ch1-4 (FL/FR/FC/LFE -- exactly what the mask-copy-mask
+// fan-out keeps: leg1 ch1+ch2 (+ch4 for the LFE fold), leg2 ch3),
+// ch5-8 digital silence (an empty rear leg folds nothing, the mask
+// strips nothing). Played by the associated player through the system
+// graph: ONE submission, ONE shared-mode mixer, every device on the
+// same timeline -- consistent latency is the property of the path,
+// not a knob to trim.
+static std::atomic<long long> g_tickSeq0{-1};      // RETIRED (v9.5.9): the
+                                                 // injection anchor -- kept as a
+                                                 // tombstone; never armed now
+static std::atomic<unsigned long long> g_tickEndMs{0};   // RETIRED (v9.5.9):
+                                                 // the 4 s auto-end -- the
+                                                 // player owns playback now
 static constexpr size_t kTickPeriod = 24000;       // 500 ms @ 48 kHz = 120 bpm
 static constexpr size_t kTickCount  = 8;           // 8 beats = 4 s, then it stops
 
-static void tickRender() {
-    if (!g_tickWave.empty()) return;
-    const size_t n = 360;                          // 7.5 ms burst
-    g_tickWave.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        const double t = (double)i / (double)kSampleRate;
-        g_tickWave[i] = (float)(0.3 * sin(kTwoPi * 1500.0 * t) * exp(-t / 0.002));
-    }
+// Generate the WAV if it does not exist yet. Returns the full path (or
+// empty on a write failure -- the caller reports it and does NOT open).
+static std::string tickWavPath(const char* iniDir) {
+    return std::string(iniDir && *iniDir ? iniDir : ".") + "\\twinspeak-tick.wav";
 }
 
-// Sum the tick onto FL/FR (leg1) or both channels (leg2). seqBefore is the
-// popped block's capture sequence -- the SAME clock on both legs.
-static void tickSum(int idx, float* chunk, size_t n, unsigned long long seqBefore) {
-    const long long t0 = g_tickSeq0.load(std::memory_order_acquire);
-    if (t0 < 0) return;
-    // v7.0.0 RAW dispatch: no latency compensation of any kind -- the tick
-    // lands at the same capture-sequence position on both legs and rides
-    // whatever path each leg actually has. The flam is the measurement.
-    const long long pos = (long long)seqBefore - t0;
-    if (pos < 0 || pos >= (long long)(kTickCount * kTickPeriod)) return;
-    const size_t wn = g_tickWave.size();
-    const int    ch = (idx == 0) ? kOutCh1 : 2;
-    for (size_t i = 0; i < n; ++i) {
-        const long long t = pos + (long long)i;
-        if (t >= (long long)(kTickCount * kTickPeriod)) break;
-        const size_t ph = (size_t)t % kTickPeriod;
-        if (ph >= wn) continue;
-        const float s = g_tickWave[ph];
-        float* o = chunk + i * (size_t)ch;
-        // v7.0.0: the tick channels -- leg1: FL, FR, LFE (FC is DRIVEN
-        // SILENCE on purpose and SL/SR are unused); leg2: the center pair.
-        static const int kTickCh1[3] = { 0, 1, 3 };
-        static const int kTickCh2[2] = { 0, 1 };
-        const int   nc = (idx == 0) ? 3 : 2;
-        const int*  tc = (idx == 0) ? kTickCh1 : kTickCh2;
-        for (int k = 0; k < nc; ++k) {
-            const int c = tc[k];
-            float v = o[c] + s;
-            if (v >  1.0f) v =  1.0f; else if (v < -1.0f) v = -1.0f;
-            o[c] = v;
-        }
+static bool tickWavWrite(const std::string& path) {
+    const size_t nBurst = 360;                     // 7.5 ms @ 48 kHz
+    const size_t nTail  = 4800;                    // 100 ms of silence after the last beat
+    const size_t nFrames = kTickCount * kTickPeriod + nTail;
+    const size_t nCh     = 8;                      // the capture cable's own width
+    const unsigned dataBytes = (unsigned)(nFrames * nCh * 2);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    unsigned char hdr[44];
+    auto wr32 = [&](unsigned off, unsigned v) { for (int b = 0; b < 4; ++b) hdr[off + b] = (unsigned char)((v >> (8 * b)) & 0xFF); };
+    auto wr16 = [&](unsigned off, unsigned v) { for (int b = 0; b < 2; ++b) hdr[off + b] = (unsigned char)((v >> (8 * b)) & 0xFF); };
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr +  0, "RIFF", 4);  wr32(4, 36 + dataBytes);
+    memcpy(hdr +  8, "WAVE", 4);
+    memcpy(hdr + 12, "fmt ", 4);  wr32(16, 16);
+    wr16(20, 1);                    // PCM
+    wr16(22, (unsigned)nCh);        // 8 channels
+    wr32(24, kSampleRate);          // 48000
+    wr32(28, (unsigned)(kSampleRate * nCh * 2));  // byte rate
+    wr16(32, (unsigned)(nCh * 2));  // block align
+    wr16(34, 16);                   // bits per sample
+    memcpy(hdr + 36, "data", 4);  wr32(40, dataBytes);
+    fwrite(hdr, 1, sizeof(hdr), f);
+    std::vector<short> row(nCh, 0);
+    for (size_t fr = 0; fr < nFrames; ++fr) {
+        const size_t ph = fr % kTickPeriod;
+        const double s  = (ph < nBurst)
+            ? 0.3 * sin(kTwoPi * 1500.0 * (double)ph / (double)kSampleRate)
+                     * exp(-(double)ph / (double)kSampleRate / 0.002)
+            : 0.0;
+        const short pcm = (short)(s > 0.0 ? s * 32767.0 + 0.5 : s * 32767.0 - 0.5);
+        // ch1-4 = FL/FR/FC/LFE (the fan-out's kept channels), ch5-8 = 0
+        for (int c = 0; c < 4; ++c) row[c] = pcm;
+        for (int c = 4; c < (int)nCh; ++c) row[c] = 0;
+        fwrite(row.data(), sizeof(short) * nCh, 1, f);
     }
+    fclose(f);
+    return true;
 }
 
 // ----------------------------------------------------------------- pacing --
@@ -11581,37 +11596,43 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     guiSetStatus(w, ok ? "diagnosis log saved" : "diagnosis log save FAILED");
                 }
                 return 0; }
-            case IDC_TICK: {                   // v7.0.0: the 120 bpm sync tick -- PLAY/STOP toggle
+            case IDC_TICK: {                   // v9.5.9: the 120 bpm tick -- an EXTERNAL 8ch WAV.
                 if (g_engState.load() == 0) {
                     guiSetStatus(w, "tick test: start the engine first");
                     return 0;
                 }
-                if (g_tickOn.load(std::memory_order_acquire)) {
-                    // v7.0.0: second press -- stop the test where it is
-                    g_tickOn.store(false, std::memory_order_release);
-                    g_tickSeq0.store(-1, std::memory_order_relaxed);
-                    g_tickEndMs.store(0, std::memory_order_relaxed);
-                    SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
-                    guiSetStatus(w, "tempo tick: stopped");
-                    return 0;
+                // The path sits beside the INI (the same dir the engine's
+                // own files live in). If the WAV already exists it is
+                // OPENED, not regenerated (field-directed: "When the tick
+                // test has already been generated, just open it"); if it
+                // does not, it is generated once and opened. ShellExecuteA
+                // hands it to the associated player -- one graph, one
+                // shared-mode mixer, the SAME latency class on every
+                // device in it. No STOP state anymore: the player owns
+                // playback (close it there); the button is a pure PLAY.
+                char iniDir[MAX_PATH];
+                {
+                    const size_t ds = g_guiIniPath.find_last_of("\\/");
+                    snprintf(iniDir, MAX_PATH, "%s",
+                             ds == std::string::npos ? "." : g_guiIniPath.substr(0, ds).c_str());
                 }
-                tickRender();
-                // Raw dispatch: beat zero = one second of cable time ahead;
-                // both pumps write the SAME samples at the SAME seq
-                // position, onto FL/FR/LFE and the center pair. No latency
-                // compensation -- the flam between the speakers IS the data.
-                // v9.5.8: the anchor is leg1's LIVE LEDGER (seqTail), not
-                // `captured` -- the ledger runs on a fresh AND an idle
-                // cable (the idle-timeline ledger below), so the tick
-                // works at the exact moment it is used: a silent cable.
-                g_tickSeq0.store((long long)g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
-                                 + (long long)kSampleRate, std::memory_order_release);
-                g_tickEndMs.store(GetTickCount64() + 1000ULL + 4000ULL,
-                                  std::memory_order_relaxed);
-                g_tickOn.store(true, std::memory_order_release);
-                SetDlgItemTextA(w, IDC_TICK, "STOP TICK TEST");
-                guiSetStatus(w,
-                    "tempo tick: 120 bpm, 8 beats (4 s) -- raw, all four channels");
+                const std::string wav = tickWavPath(iniDir);
+                if (GetFileAttributesA(wav.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    if (!tickWavWrite(wav)) {
+                        guiSetStatus(w, "tick test: cannot write twinspeak-tick.wav");
+                        tlog("[twinspeak] tick test  : CANNOT write \"%s\" -- not opened\n",
+                             wav.c_str());
+                        return 0;
+                    }
+                    tlog("[twinspeak] tick test  : generated \"%s\" (48 kHz, 8ch, 16-bit PCM,\n"
+                         "                            120 bpm, 8 beats, FL/FR/FC/LFE) -- opening\n",
+                         wav.c_str());
+                } else {
+                    tlog("[twinspeak] tick test  : \"%s\" already generated -- opening\n",
+                         wav.c_str());
+                }
+                ShellExecuteA(w, "open", wav.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                guiSetStatus(w, "tick test: 8ch WAV opened -- one graph, consistent latency");
                 return 0; }
             case IDC_THEME: {                  // v7.0.0: cycle the eleven themes
                 applyTheme(g_theme + 1);
@@ -11739,27 +11760,9 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        // v7.0.2: the tick test ends itself AND the button untoggles with it
-        // -- nothing on the engine side cleared g_tickOn at the natural end,
-        // so the GUI timer owns it: flag, anchor, label. The else side keeps
-        // the old job: an engine restart voids the run and the stale endMs
-        // restores the label.
-        if (g_tickOn.load(std::memory_order_relaxed)) {
-            const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
-            if (end != 0 && GetTickCount64() > end) {
-                g_tickOn.store(false, std::memory_order_release);
-                g_tickSeq0.store(-1, std::memory_order_relaxed);
-                g_tickEndMs.store(0, std::memory_order_relaxed);
-                SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
-                guiSetStatus(w, "tempo tick: finished");
-            }
-        } else {
-            const unsigned long long end = g_tickEndMs.load(std::memory_order_relaxed);
-            if (end != 0 && GetTickCount64() > end) {
-                g_tickEndMs.store(0, std::memory_order_relaxed);
-                SetDlgItemTextA(w, IDC_TICK, "120 BPM TICK TEST");
-            }
-        }
+        // v9.5.9: the tick auto-stop is RETIRED -- the external WAV's
+        // player owns start AND end now; there is no in-engine run to
+        // stop, no button label to restore, no stale endMs to clear.
         // v7.1.20: the async stop's backup reap -- if WM_APP+2's bounded wait
         // expired (hidden window, timer asleep), the next tick closes the
         // handle. The thread itself already set state 0.
@@ -12454,8 +12457,8 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     (void)allowMulti;   // the lock is the caller's business
     g_run.store(true);  // v6.6.0: fresh run -- a GUI restart arrives with it false
     g_stopSilence.store(false, std::memory_order_relaxed);  // v7.0.0: restart-safety
-    g_tickOn.store(false, std::memory_order_relaxed);       // v7.0.0: a restart voids a running tick test
-    g_tickSeq0.store(-1, std::memory_order_relaxed);
+    g_tickOn.store(false, std::memory_order_relaxed);       // v9.5.9: always false now (the tick is
+                                                            // external); kept for the GUI/engine readers
     if (!loadIni(iniPath.c_str())) {
         writeTemplate(iniPath.c_str());
         tlog( "[twinspeak] no config at %s\n"
