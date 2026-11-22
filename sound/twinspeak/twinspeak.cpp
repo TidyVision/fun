@@ -233,6 +233,60 @@
 //            the delay. Harnesses: harness3 J/K re-prove the vg gate
 //            and the tag-less input row; loop_sim_v2.cpp proves the
 //            servo v2 (burst, idle, 44.1k, conservation).
+//    v9.5.7 THE TICK FIX + THE NO-SHUTDOWN RULE + THE 4 MS PERIOD
+//            (field-directed: "I have one thing that needs fixed: the
+//            tick test no longer actually plays anything"; "now when
+//            the center device craps out eventually it just no longer
+//            plays anything"; "I don't want any device shutdown";
+//            "Do a 4ms wasapi exclusive period. That way it aligns
+//            with the 8ms ring device period").
+//            THE TICK: the v7.0.0 anchor froze on an idle cable (no
+//            capture callbacks -> `captured` parked -> beat zero never
+//            arrived -> 4 s of nothing). Two fixes: (1) THE
+//            IDLE-TIMELINE LEDGER -- while the capture heartbeat is
+//            stale each switch advances the leg's OWN seqTail by the
+//            frames it played (monotonic CAS; capture re-takes the
+//            timeline on resume), so cable time never freezes; (2) the
+//            tick anchors on the LIVE ledger and RIDES THROUGH the
+//            starved remainder (the pop loop's unfilled frames get
+//            tickSum too -- the tick is the cable test; it must sound
+//            through silence, like the keep-alive does).
+//            THE NO-SHUTDOWN RULE (the audit of every active mid-play
+//            shutdown): (1) the yield RELEASE killed a live DAC
+//            mid-play -> now a SOFT PARK (the flag parks the pump;
+//            the stream never closes; the re-grab and its quiet rule
+//            are retired with it); (2) the resume rebuild uninit'd
+//            EVERY leg after sleep -> now only the stale-heartbeat
+//            ones (>5 s = the v3.8 definition of dead); (3) the
+//            recovery gap -- a leg that died at any non-resume moment
+//            had NO reopen path at all (the v3.8 comment promised one;
+//            the code only ran on power/yield events) and the v6.5.2
+//            collapse sentinel computed `li` and dropped it. Now the
+//            v3.8 watchdog RUNS every tick (stale heartbeat >5 s ->
+//            reopen by name), the collapse verdict ACTS (fresh
+//            heartbeat + |off| >10% for 2 s = a bogus-rate stream:
+//            only that meter sees it), and a FAILED reopen retries
+//            every 10 s FOREVER (the device is already gone; the
+//            replug recovers the leg). Only LIVE devices are
+//            protected from shutdown; dead ones are recovered.
+//            THE 4 MS PERIOD: kOutPeriodFrames 768 -> 192, kOutPeriods
+//            1 -> 2 -- the exclusive request 2 x 192 = 384 fr = 8.0 ms
+//            = kPktFloorFr EXACTLY (the alignment the field named: one
+//            aligned device buffer above the delay). The anchor returns
+//            to 2x the negotiated period (the physical exclusive
+//            buffer; v9.5.6's 1.5x was a shared-mode interval measure).
+//            The servo's per-period constants scale with the 4x faster
+//            bite (EMA 192/24, slews 0.05/1.25 -- the SAME ~1 s / ~8 s
+//            / 0.2 ppm/ms real-time constants; sim-proven at
+//            loop_sim_v3 across the matrix: matched, +-500/1000 ppm,
+//            44.1k, burst, jitter waves, idle gaps, delay knobs --
+//            zero flow-time shorts at realistic skews, zero big pitch
+//            steps, exact conservation). BONUS, structural: at 768 fr
+//            the engaged span (~771 fr) EXCEEDED the depth kept above
+//            the delay floor (anchor 144 + floor 384 = 528 fr) -- with
+//            a delay knob set, engaged pops starved the span guard ~3
+//            of every 4 periods (held frames = silence). At 192 fr the
+//            span (~195 fr) fits in the kept 768 fr with 140 fr spare.
 //    v9.5.6 THE LATENCY CUT + THE GLIDE RATIO (field-directed: "Now
 //            reduce the latency and patch the pitch oscillation even
 //            further. Right now, I'm hanging on like 20ms of
@@ -3390,7 +3444,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.6"
+#define TWS_VERSION "9.5.7"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3535,11 +3589,15 @@ static size_t             g_periodFrames[4]   = {96, 96, 96, 96}; // real device
 // sits where consumer USB silicon lives natively (16 whole 1-ms USB
 // frames, past the 10 ms shared-mode default). The EMA alpha scales
 // with it; the anchor/health/servo key off the negotiated period.
-static constexpr unsigned kOutPeriodFrames   = 768;  // v9.5.3: the 16 ms bite (the field: 12 ms cut the late switches
-                                                     // hard but not to zero; one more notch of the same lever)
-static constexpr unsigned kOutPeriods        = 1;    // v9.5.6: the exclusive buffer request halves, 768 fr = 16.0 ms
-                                                    // (the stride slack was KS-era belt-and-suspenders; the 16 ms bite
-                                                    // keeps the late-switch fix, the stride did not earn its 16 ms)
+static constexpr unsigned kOutPeriodFrames   = 192;  // v9.5.7: the 4 ms WASAPI-exclusive bite (field-directed: "Do a
+                                                     // 4ms wasapi exclusive period. That way it aligns with the 8ms ring
+                                                     // device period" -- 4 ms = 8 whole 0.5 ms USB microframes, and the
+                                                     // v9.5.3 late-switch class stays answered: a missed 16 ms callback
+                                                     // was 4 late switches at this bite, the same margin in frames)
+static constexpr unsigned kOutPeriods        = 2;    // v9.5.7: the exclusive request = 2 x 192 = 384 fr = 8.0 ms =
+                                                    // kPktFloorFr EXACTLY (the alignment the field named: the ring keeps
+                                                    // ONE aligned device buffer above the delay; periods 1 let the
+                                                    // driver pick its own buffer -- 2 pins it to the alignment)
 // ---- v9.5.0 PACKET MODE constants (per-leg trim servo + async sampler) ----
 // Pure-P, zero-centered: trim = clamp(kPktPpmPerFrame * err, +-kPktMaxPpm).
 // 50 ppm/frame: a 1 ms (48 fr) depth error bends the rate 0.24%; the cap
@@ -3555,7 +3613,7 @@ static constexpr long kPktFloorFr    = 384;  // v9.5.6: 8.0 ms -- one VAC burst 
                                               // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
 // v9.5.1 SERVO v2: steer the AVERAGED depth, engage with hysteresis.
-static constexpr double kPktEmaAlpha  = 768.0 / 48000.0;  // v9.5.3: ~1 s of packets at the 16 ms bite (alpha scales
+static constexpr double kPktEmaAlpha  = 192.0 / 48000.0;  // v9.5.7: ~1 s of packets at the 4 ms bite (alpha scales
                                                            // with the period; the average stays a second of REAL time)
 static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
 static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this AND |bias| < 1 ppm: back to bit-exact
@@ -3571,12 +3629,14 @@ static constexpr double  kPktBiasLeak = 0.05; // v9.5.4d: ppm of bias HEALED per
 // v9.5.5 SERVO v5 HOLD-AND-SMOOTH (the loop-model-proven form; every
 // gated heuristic tried first -- hold-and-step, freeze bands, integral
 // clamps -- either wobbled under load or limit-cycled: hunt_jitter.py)
-static constexpr double  kPktEmaSlowAlpha = 96.0 / 48000.0;  // once-per-period, tau ~8 s: load waves cannot move it
+static constexpr double  kPktEmaSlowAlpha = 24.0 / 48000.0;  // v9.5.7: once-per-period at the 4 ms bite, tau ~8 s
+                                                             // (real-time constant; load waves cannot move it)
 static constexpr double  kPktPiKp  = 2.0;    // P on the slow EMA (stability)
 static constexpr double  kPktPiKi  = 5e-4;   // I on the slow EMA (exact convergence)
 static constexpr double  kPktAwKb  = 0.1;    // back-calculation anti-windup
-static constexpr double  kPktSlewSlow = 0.2; // ppm/period steady-state (0.0036 cents/s -- inaudible motion)
-static constexpr double  kPktSlewFast = 5.0; // ppm/period while |tgt-appl| > 150 ppm (a brief glide)
+static constexpr double  kPktSlewSlow = 0.05; // v9.5.7: ppm/period at the 4 ms bite (0.2 ppm/ms -- the same real-
+                                              // time glide as v9.5.5's 0.2 at 16 ms; inaudible motion)
+static constexpr double  kPktSlewFast = 1.25; // v9.5.7: ppm/period while far (5 ppm/ms, the same real-time glide)
 static constexpr double  kPktSlewThr  = 150.0; // ppm: the fast/slow slew threshold
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
@@ -5543,8 +5603,8 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         }
     }
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
-    // restart, never an escalation. (v8.4.7: the sync pad's frame is not a
-    // hole -- it repeated, above; only real holes count.)
+    // restart, never an escalation. (v8.4.7: the sync pad's frame is not
+    // a hole -- it repeated, above; only real holes count.)
     // v9.5.1 IDLE GATE: a silent cable (loopback idle, no callbacks) is
     // NOT a starved source -- the delay prefill legitimately floors the
     // pops through the gap. 'short' counts only while audio FLOWS (the
@@ -5555,6 +5615,48 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const unsigned long long hb = g_hbCap.load(std::memory_order_relaxed);
         const bool flowing = hb && (GetTickCount64() - hb) <= 250;
         if (flowing) L.und.fetch_add(1);
+    }
+    // v9.5.7 THE TICK RIDES THROUGH: the tick is the one signal that must
+    // sound through a starved or idle cable (it IS the cable test). If
+    // the pop loop ended with unfilled frames and the tick is live, sum
+    // it over the remainder too -- on top of the held frames, exactly
+    // like the keep-alive rides every block. The region's ledger
+    // position is read HERE, right after the pop loop's own advance
+    // (real frames -> seqTail): the unfilled region starts exactly where
+    // the pop loop left the playout boundary.
+    if (g_tickOn.load(std::memory_order_relaxed) && done < frameCount)
+        tickSum(idx, out + done * L.outCh, frameCount - done,
+                L.raw.seqTail.load(std::memory_order_relaxed));
+    // v9.5.7 THE IDLE-TIMELINE LEDGER: while the cable is idle (heartbeat
+    // stale >250 ms) the capture writes NOTHING -- the leg's cable-time
+    // clock (seqTail) would freeze, and everything anchored on it (the
+    // tick's beat zero, the lag display) with it. The field's tick test
+    // runs at EXACTLY this moment (the cable is silent -- that is the
+    // point of the test). Here: while idle, each switch advances the
+    // leg's OWN ledger by the frames the DEVICE consumed that the ring
+    // did not cover (frameCount - done - padApplied, scaled by the
+    // source-per-device ratio -- the uncovered device frames' cable-time
+    // equivalent). The pop loop already advanced the ledger for the
+    // frames it really played -- advancing for those again would run the
+    // ledger 2x under a load-induced capture gap with backlog draining
+    // (the >250 ms gap class the field's logs show); the UNCOVERED count
+    // is exactly the complement, so the two advances can never overlap.
+    // When capture resumes, the producer's own seqTailAdvance (monotonic
+    // CAS, both sides) re-takes the timeline; the ledger can never go
+    // backward, and the writers never fight (this path runs only while
+    // idle; capture writes only while fresh). The ledger's absolute value
+    // now counts device-consumed silence as cable time -- by design: it
+    // is the playout clock, and every reader (the drift column, the tick,
+    // the sync) is leg-to-leg or self-relative, never capture-absolute.
+    {
+        const unsigned long long hb = g_hbCap.load(std::memory_order_relaxed);
+        const bool idle = !hb || (GetTickCount64() - hb) > 250;
+        const long long uncovered = (long long)frameCount
+                                  - (long long)done - (long long)padApplied;
+        if (idle && uncovered > 0)
+            L.raw.seqTailAdvance(L.raw.seqTail.load(std::memory_order_relaxed)
+                                 + (unsigned long long)((double)uncovered
+                                                        * L.pktRatio + 0.5));
     }
     // v8.4.23: THE ABSOLUTE LANE GATE and the device-layer lane verdicts
     // are RETIRED with the mask-copy-mask fan-out -- a masked leg can only
@@ -11527,11 +11629,18 @@ static LRESULT CALLBACK guiWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 }
                 tickRender();
-                // Raw dispatch: beat zero = one second of capture time ahead;
-                // both pumps write the SAME samples at the SAME capture-seq
+                // Raw dispatch: beat zero = one second of cable time ahead;
+                // both pumps write the SAME samples at the SAME seq
                 // position, onto FL/FR/LFE and the center pair. No latency
                 // compensation -- the flam between the speakers IS the data.
-                g_tickSeq0.store((long long)g_leg[0].captured.load(std::memory_order_relaxed)
+                // v9.5.7: the anchor is leg1's LIVE LEDGER (seqTail), not
+                // `captured` -- the ledger runs on BOTH a fresh cable and
+                // an idle one (the idle-timeline ledger), so the tick
+                // works at the exact moment it is used: a silent cable.
+                // (The v7.0.0 anchor froze on an idle cable -- no capture
+                // callbacks, `captured` parked, beat zero never arrived:
+                // "the tick test no longer actually plays anything".)
+                g_tickSeq0.store((long long)g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
                                  + (long long)kSampleRate, std::memory_order_release);
                 g_tickEndMs.store(GetTickCount64() + 1000ULL + 4000ULL,
                                   std::memory_order_relaxed);
@@ -12672,9 +12781,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                 g_leg[i].isExclusive = g_cfg.exclusive;   // the quiet re-grab opens exclusive first
                 g_leg[i].lastReopenMs = GetTickCount64();
                 tlog("[twinspeak] leg%d BOOT-YIELD : the Windows default render device (\"%s\") matches\n"
-                     "                            this leg's needle -- starting the leg RELEASED (the DAC is\n"
-                     "                            never touched at boot); it reopens when the default moves\n"
-                     "                            away and the device is quiet\n",
+                     "                            this leg's needle -- starting the leg PARKED (the DAC is\n"
+                     "                            never touched at boot -- nothing is playing yet); it opens\n"
+                     "                            when the default moves away and the device is quiet (the\n"
+                     "                            v3.8 watchdog then guards it like every live leg)\n",
                      i + 1, defNm.c_str());
                 continue;
             }
@@ -12823,12 +12933,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.delayMs     = delayMs;
         // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer -- the
         // sound card's own pre-load and the floor the pipeline physically
-        // allows. v9.5.6: 1.5 x the negotiated period (the callback
-        // interval is the physics; the old 2x double-covered it -- on the
-        // field's WASAPI legs 96 fr -> 144 fr = 3.0 ms, on a KS leg 768 ->
-        // 1152 fr = 24.0 ms). The depth guard holds the ring at delay +
-        // this; margin 0 is the DAC reading silence.
-        L.anchorFrames = devPeriodFr + devPeriodFr / 2;
+        // allows. v9.5.7: 2 x the negotiated period = the physical
+        // exclusive buffer (2 x 192 = 384 fr = 8.0 ms = the ring floor:
+        // the alignment). v9.5.6's 1.5x was measured against the shared-
+        // mode interval; the v9.5.7 exclusive request IS 2 periods. The
+        // depth guard holds the ring at delay + this; margin 0 is the
+        // DAC reading silence.
+        L.anchorFrames = devPeriodFr * 2;
         // v9.5.1: 200 ms over the delay -- the 512 fr servo floor + a
         // full burst of jitter headroom must fit below the cap.
         L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 200), kInCh);
@@ -13525,9 +13636,47 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         }
         // v3.8 WATCHDOG: a device thread whose callback has not ticked for
         // 5 s is dead (endpoint invalidated, USB re-enumeration, driver
-        // reset). Reopen it by name; retry every tick until it returns.
-        // Out2 is checked first (start-order symmetry).
+        // reset). v9.5.7: THIS NOW ACTUALLY RUNS. The v6.5.2 power guard
+        // reduced it to the resume path only -- a leg that died at any
+        // OTHER moment stayed dead forever (the field's "when the center
+        // device craps out eventually it just no longer plays anything").
+        // Every tick, every live leg: heartbeat stale > 5 s -> reopen by
+        // name. THE NO-SHUTDOWN RULE is not violated -- a stale heartbeat
+        // means the device thread is ALREADY dead (its stream stopped on
+        // its own); the uninit inside tryRestartLeg reaps the corpse.
+        // A FAILED reopen (device unplugged, endpoint gone) retries every
+        // 10 s FOREVER: there is nothing left to interrupt, and the
+        // moment the device returns (replug, re-dock) the leg recovers.
         const unsigned long long nowMs = GetTickCount64();
+        if (!g_powerPark.load(std::memory_order_relaxed)
+            && nowMs - g_bootMs > 5000) {
+            for (int oi = 0; oi < 4; ++oi) {
+                const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;   // center first
+                Leg& W = g_leg[i];
+                if (W.disabled || W.yielded.load(std::memory_order_relaxed)) continue;
+                if (!W.dev.pContext) continue;   // never opened / boot-yielded: nothing held
+                const unsigned long long hb = hbOutGet(i);
+                // hb == 0: the device OPENED and STARTED but never beat
+                // once (a real failure class) -- stale too, after the boot
+                // grace; event-driven WASAPI callbacks fire continuously
+                // on a running stream, silence included (the keep-alive
+                // guarantees the content; the clock guarantees the rhythm).
+                const bool stale = (hb == 0) || (nowMs - hb) > 5000;
+                // v6.5.2 collapse verdict, finally WIRED (li was computed
+                // and dropped since v6.5.2): a half-alive stream ticks at
+                // a bogus rate with a FRESH heartbeat -- the stale meter
+                // cannot see it; |off| > 10% for 2 s can. Same 10 s retry.
+                const bool bogus = colStreak[i] >= 2;
+                if ((stale || bogus)
+                    && nowMs - colLastMs[i] >= 10000   // the retry clock: 10 s, both verdicts
+                    && nowMs - W.lastReopenMs >= 3000) {
+                    colLastMs[i] = nowMs;
+                    tryRestartLeg(i, &ctx, kOutPeriodFrames,
+                                  stale ? "device thread silent > 5 s"
+                                        : "consumption collapsed (bogus-rate stream)");
+                }
+            }
+        }
         // v6.5.2: while parked (suspend in flight) the heartbeats go stale
         // by definition -- do NOT storm reopen attempts at a device the OS
         // is putting to sleep; the resume path rebuilds everything.
@@ -13552,56 +13701,62 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     Leg& Y = g_leg[i];
                     const bool mine = containsCI(defName, yneedle);
                     if (mine && !Y.yielded.load(std::memory_order_relaxed)) {
+                        // v9.5.7 THE NO-SHUTDOWN RULE (field-directed: "I
+                        // don't want any device shutdown"): the yield
+                        // becomes a SOFT PARK. The flag does everything the
+                        // release did -- the pump parks (the ring overflows
+                        // harmlessly, the v6.5.15 boot contract), the sync
+                        // freezes (a parked leg is no clock to follow),
+                        // pinCheckTick skips the pin (the default device's
+                        // volume belongs to the user) -- but the DAC KEEPS
+                        // ITS STREAM: no uninit, no release, no gap, no
+                        // re-grab handshake to get wrong. The old release
+                        // killed a LIVE stream mid-play and a failed
+                        // re-grab left the leg dead forever (the field's
+                        // "it just no longer plays anything").
                         Y.yielded.store(true, std::memory_order_relaxed);
                         tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
-                             "                            this leg's needle (\"%s\") -- releasing the DAC now so the\n"
-                             "                            main device plays; it reopens the moment the default\n"
-                             "                            device moves elsewhere (yield_default = on);\n"
-                             "                            endpoint-volume pin released -- device volume stays yours\n",
+                             "                            this leg's needle (\"%s\") -- SOFT PARK (v9.5.7: the stream\n"
+                             "                            is NOT closed; the pump parks, the device keeps playing its\n"
+                             "                            ring; no shutdown, no re-grab -- the park clears when the\n"
+                             "                            default device moves elsewhere)\n",
                              i + 1, defName.c_str(), yneedle);
-                        if (Y.dev.pContext) {
-                            ma_device_uninit(&Y.dev);
-                            memset(&Y.dev, 0, sizeof(Y.dev));
-                        }
-                        // v6.5.15: drop the endpoint-volume pin WITH the DAC --
-                        // while this device is the system's main output its
-                        // volume belongs to the user; the reopen re-pins.
-                        if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
-                        g_pin[i].id.clear();
                         Y.lastReopenMs = nowMs;   // warden settle gates stay coherent
                     } else if (!mine && Y.yielded.load(std::memory_order_relaxed)) {
-                        // v6.5.16: the default moved away -- but the app that
-                        // played here while it WAS the default does not
-                        // re-route instantly; its stream stays attached.
-                        // Re-grabbing under a live stream doubled the audio
-                        // and wedged miniaudio apps. Wait for a QUIET device;
-                        // a failed probe fails OPEN (logged).
+                        // v6.5.16 lineage, v9.5.7 shape: the default moved
+                        // away -- but the app that played here while it WAS
+                        // the default does not re-route instantly. The park
+                        // simply HOLDS while foreign sessions are active (a
+                        // parked pump interferes with nothing); it clears
+                        // when the device goes quiet. No re-grab exists to
+                        // get wrong (the doubled-audio bug class is retired
+                        // with the release).
                         const int busy = foreignActiveSessions(yneedle);
                         if (busy > 0) {
                             static unsigned long long lastBusyLog[4] = { 0, 0, 0, 0 };
                             if (nowMs - lastBusyLog[i] >= 5000) {
                                 tlog("[twinspeak] leg%d YIELD     : the default moved away, but %d foreign audio\n"
                                      "                            session(s) are still ACTIVE on this device --\n"
-                                     "                            holding the release until they finish (re-grabbing\n"
-                                     "                            under them is the doubled-audio/deadlock bug)\n",
+                                     "                            the park holds until they finish (the stream never\n"
+                                     "                            closed; v9.5.7: no release, no re-grab)\n",
                                      i + 1, busy);
                                 lastBusyLog[i] = nowMs;
                             }
                         } else {
-                            if (busy < 0) {
-                                static unsigned long long lastProbeLog[4] = { 0, 0, 0, 0 };
-                                if (nowMs - lastProbeLog[i] >= 5000) {
-                                    tlog("[twinspeak] leg%d YIELD     : session probe unavailable -- releasing fail-open\n", i + 1);
-                                    lastProbeLog[i] = nowMs;
-                                }
-                            }
+                            // v9.5.7: nothing was ever released (the soft
+                            // park holds the stream) -- there is NOTHING
+                            // to re-grab, and the quiet rule (foreign
+                            // sessions gating a reopen) gates nothing.
+                            // Clear the park; the pump resumes on the
+                            // leg's LIVE ring. A truly dead leg is the
+                            // v3.8 watchdog's job now (stale heartbeat),
+                            // not this block's.
                             if (Y.yielded.exchange(false, std::memory_order_relaxed)) {
                                 tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
-                                     "                            -- reopening (\"%s\")\n",
-                                     i + 1, Y.name.c_str());
+                                     "                            -- park CLEARED, the pump resumes on the live ring\n"
+                                     "                            (the stream never closed; v9.5.7)\n",
+                                     i + 1);
                                 Y.lastReopenMs = nowMs;
-                                tryRestartLeg(i, &ctx, kOutPeriodFrames,
-                                              "yield release (default device moved away)");
                             }
                         }
                     }
@@ -13611,19 +13766,23 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // ---- v6.5.2 power guard: resume rebuild + collapse sentinel ----
         if (g_cfg.powerGuard && g_powerWoken.exchange(false)) {
             g_powerPark.store(false, std::memory_order_relaxed);
-            tlog("[twinspeak] power guard : system resume -- rebuilding capture + both legs\n"
+            tlog("[twinspeak] power guard : system resume -- rebuilding the capture and any DEAD leg\n"
                  "                            (a post-sleep stream is never trusted: the field log\n"
-                 "                            shows an S5 consuming at ~42%% with a fresh heartbeat)\n");
+                 "                            shows an S5 consuming at ~42%% with a fresh heartbeat; v9.5.7:\n"
+                 "                            a leg whose heartbeat SURVIVED the sleep is live -- the\n"
+                 "                            no-shutdown rule leaves it untouched)\n");
             tryRestartCap(&ctx);
-            // v6.5.14: a yielded leg STAYS released (its device is ours by
-            // choice, not broken); the yield check above re-evaluates the
-            // default every tick and reopens it when the default moves.
-            // v8.4.0: one pass over the legs, out2_first symmetry kept.
+            // v9.5.7 THE NO-SHUTDOWN RULE: rebuild ONLY the stale ones (>
+            // 5 s without a callback = the v3.8 definition of dead). A
+            // live leg keeps its stream across the sleep -- no uninit,
+            // no gap, no re-grab. (A parked leg's heartbeat is fresh too:
+            // its device never closed.)
             for (int oi = 0; oi < 4; ++oi) {
                 const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;   // v9.5.1: center first (integrated)
                 if (g_leg[i].disabled) continue;
-                if (!g_leg[i].yielded.load(std::memory_order_relaxed))
-                    tryRestartLeg(i, &ctx, kOutPeriodFrames);
+                if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
+                if (g_leg[i].dev.pContext && nowMs - hbOutGet(i) <= 5000) continue;   // LIVE: untouched
+                tryRestartLeg(i, &ctx, kOutPeriodFrames);
             }
             wardenStreak = 0; hintStreak = 0; prevDom = 0;  // stale pre-sleep meters
             for (int k = 0; k < 4; ++k) colStreak[k] = 0;   // v8.4.0: all four legs
