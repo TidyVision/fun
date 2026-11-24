@@ -1,4 +1,4 @@
-// twinspeak_core.cpp -- v9.7.0 THE AUDIO-ROUTING CORE.
+// twinspeak_core.cpp -- v9.6.0 THE AUDIO-ROUTING CORE.
 //
 // Everything audio lives here; twinspeak.cpp is the GUI/ini/main shell.
 // The flow (field-directed, "a simple audio pipeline with nothing extra"):
@@ -22,15 +22,6 @@
 //   The futex mix crew (WaitOnAddress / WakeByAddressAll on the seqlock
 //   word) is preserved tightly: workers park on the doorbell, the RT mix
 //   thread only stores and wakes, never enters a kernel lock.
-//
-// v9.7.0 THE DEFAULT-SOURCE GATE: the engine exists ONLY while the Windows
-//   default render endpoint IS the configured source (input_device).
-//   Off it: every device (all legs AND the capture) is released at once --
-//   nothing held, no "device in use" for other players -- and the health
-//   loop reopens the whole engine when the default returns to the source.
-//   This REPLACES v9.6.0's per-leg yield guard, which could hold an
-//   exclusive stream on a leg while "released" (the "in use" warnings) and
-//   leave legs dead when a boot yield never cleared (dead routing).
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -58,7 +49,7 @@
 #include <atomic>
 #include <algorithm>
 
-#define TWS_VERSION_C "9.7.0"
+#define TWS_VERSION_C "9.6.0"
 const char* TWS_VERSION = TWS_VERSION_C;
 
 // ============================================================ constants ===
@@ -365,15 +356,13 @@ struct Leg {
     bool                haveSwQpc = false;
     unsigned long long  lastLateLogMs = 0;
     std::atomic<unsigned long long> lateSwitches{0};
+    std::atomic<bool>   yielded{false};
     size_t              prefillRemaining = 0;
     std::atomic<double> lagMs{0.0};
     std::atomic<unsigned long long> firstSwitchUs{0};
     unsigned long long  lastReopenMs = 0;
 };
 static Leg g_leg[4];
-
-// the source endpoint id snapshot (the echo guard for leg reopens; v9.7.0)
-static ma_device_id g_capIdSnap = {};
 
 // leg4's LFE fold target (-1 = idle; 0 = leg1, 1 = leg2, 2 = leg3)
 static int  g_lfeFoldLeg = -1;
@@ -514,7 +503,6 @@ struct OutPin {
     IAudioEndpointVolume*  vol = nullptr;
 };
 static OutPin g_pin[4];
-static std::atomic<bool> g_parked{false};   // v9.7.0: the default-source gate's park state
 
 static std::atomic<unsigned long long> g_hbCap{0};
 static std::atomic<unsigned long long> g_hbOutTab[4];
@@ -623,11 +611,81 @@ static IAudioEndpointVolume* findRenderEndpointVolume(const std::string& nameNee
     return result;
 }
 
+// yield guard: foreign ACTIVE sessions on a leg's device
+static int foreignActiveSessions(const std::string& nameNeedle) {
+    const std::wstring wNeedle = narrowToWide(nameNeedle);
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIID_IMMDeviceEnumerator, (void**)&en)) || !en)
+        return -1;
+    int count = -1;
+    IMMDeviceCollection* col = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col) {
+        count = 0;
+        UINT n = 0;
+        if (SUCCEEDED(col->GetCount(&n))) {
+            for (UINT i = 0; i < n; ++i) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(col->Item(i, &dev)) || !dev) continue;
+                IPropertyStore* ps = nullptr;
+                bool match = false;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
+                    PROPVARIANT var; PropVariantInit(&var);
+                    if (SUCCEEDED(ps->GetValue(kPKEY_Device_FriendlyName, &var)) &&
+                        var.vt == VT_LPWSTR && var.pwszVal)
+                        match = wContainsCI(var.pwszVal, wNeedle);
+                    PropVariantClear(&var);
+                    ps->Release();
+                }
+                if (match) {
+                    IAudioSessionManager2* sm2 = nullptr;
+                    if (SUCCEEDED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL,
+                                                nullptr, (void**)&sm2)) && sm2) {
+                        IAudioSessionEnumerator* se = nullptr;
+                        if (SUCCEEDED(sm2->GetSessionEnumerator(&se)) && se) {
+                            int sn = 0;
+                            if (SUCCEEDED(se->GetCount(&sn))) {
+                                for (int s = 0; s < sn; ++s) {
+                                    IAudioSessionControl* sc = nullptr;
+                                    if (FAILED(se->GetSession(s, &sc)) || !sc) continue;
+                                    AudioSessionState st = AudioSessionStateInactive;
+                                    sc->GetState(&st);
+                                    if (st == AudioSessionStateActive) {
+                                        DWORD pid = 0;
+                                        IAudioSessionControl2* sc2 = nullptr;
+                                        if (SUCCEEDED(sc->QueryInterface(kIID_IAudioSessionControl2,
+                                                                         (void**)&sc2)) && sc2) {
+                                            sc2->GetProcessId(&pid);
+                                            sc2->Release();
+                                        }
+                                        ++count;
+                                        tlog("[twinspeak] yield check  : pid %lu ACTIVE on \"%s\"\n",
+                                             (unsigned long)pid, nameNeedle.c_str());
+                                    }
+                                    sc->Release();
+                                }
+                            }
+                            se->Release();
+                        }
+                        sm2->Release();
+                    }
+                    dev->Release();
+                    break;
+                }
+                dev->Release();
+            }
+        }
+        col->Release();
+    }
+    en->Release();
+    return count;
+}
+
 static void pinCheckTick() {
     if (!twsCfg.pinOutputs) return;
-    if (g_parked.load(std::memory_order_relaxed)) return;   // v9.7.0: nothing held while parked
     for (int i = 0; i < 4; ++i) {
         if (g_leg[i].disabled) continue;
+        if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
         IAudioEndpointVolume* v = g_pin[i].vol;
         if (!v) continue;
         float s = 0.0f; BOOL m = FALSE;
@@ -1261,14 +1319,14 @@ static size_t masterDepthGuard(Leg& L, size_t frameCount)
 
 // syncToFirst: every slave's UNDELAYED boundary to leg1's. The metric is
 // delay-neutral (each leg subtracts its own delay); the corrections are
-// bite-only; no baseline, no re-latch. A parked engine or heart-silent leg1
+// bite-only; no baseline, no re-latch. A yielded or heart-silent leg1
 // freezes the sync whole.
 static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
     if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;
     L.lastSyncMs = nowMs;
-    if (g_parked.load(std::memory_order_relaxed)) return 0;   // v9.7.0: no leg syncs while parked
+    if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
     if (nowMs - hbOutGet(0) > kSyncRefDeadMs) return 0;
     const long long off =
         (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
@@ -1737,7 +1795,6 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodFrames,
                           const char* why = "device thread silent > 5 s") {
     Leg& L = g_leg[idx];
     if (L.disabled) return false;
-    if (g_parked.load(std::memory_order_relaxed)) return false;   // v9.7.0: nothing reopens while parked
     static unsigned long long lastLog[4] = { 0, 0, 0, 0 };
     const unsigned long long now = GetTickCount64();
     L.lastReopenMs = now;
@@ -1752,13 +1809,7 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodFrames,
     L.relandPending = true;
     ma_device_id id; std::string nm;
     if (!pickDeviceCore(ctx, ma_device_type_playback, needle, &id, &nm)) return false;
-    // v9.7.0: the echo guard on every reopen too -- the source endpoint must
-    // never become a leg's device (a move mid-run must not build an echo loop)
-    if (memcmp(&id, &g_capIdSnap, sizeof(ma_device_id)) == 0) {
-        tlog( "[twinspeak] leg%d WATCHDOG: the picked device IS the source endpoint -- reopen refused\n", idx + 1);
-        return false;
-    }
-    bool ok = initLegDevice(idx, ctx, &id, periodFrames, true);
+    bool ok = initLegDevice(idx, ctx, &id, periodFrames, L.isExclusive);
     if (!ok && L.isExclusive) ok = initLegDevice(idx, ctx, &id, periodFrames, false);
     if (!ok) return false;
     if (ma_device_start(&L.dev) != MA_SUCCESS) return false;
@@ -1768,18 +1819,19 @@ static bool tryRestartLeg(int idx, ma_context* ctx, ma_uint32 periodFrames,
     g_periodFrames[idx] = L.dev.playback.internalPeriodSizeInFrames
                         ? (size_t)L.dev.playback.internalPeriodSizeInFrames
                         : g_periodFrames[idx];
-    if (twsCfg.pinOutputs && !isDefaultRenderEndpointId(L.id.wasapi)) {
-        // v9.7.0: one pin path -- non-default endpoints pinned; the default
-        // (the source, while the gate holds it) stays untouched so other
-        // players keep their own volume.
+    if (twsCfg.pinOutputs) {
         if (g_pin[idx].vol) { g_pin[idx].vol->Release(); g_pin[idx].vol = nullptr; }
         g_pin[idx].id = L.id.wasapi;
         if (L.id.wasapi[0]) {
-            g_pin[idx].vol = endpointVolFromIdString(L.id.wasapi);
-            if (g_pin[idx].vol) {
-                g_pin[idx].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
-                g_pin[idx].vol->SetMute(FALSE, nullptr);
-                tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- pinned 100%%\n", idx + 1);
+            if (isDefaultRenderEndpointId(L.id.wasapi)) {
+                tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- IS the default playback device, volume left alone\n", idx + 1);
+            } else {
+                g_pin[idx].vol = endpointVolFromIdString(L.id.wasapi);
+                if (g_pin[idx].vol) {
+                    g_pin[idx].vol->SetMasterVolumeLevelScalar(1.0f, nullptr);
+                    g_pin[idx].vol->SetMute(FALSE, nullptr);
+                    tlog( "[twinspeak] out%d: endpoint re-acquired after reopen -- pinned 100%%\n", idx + 1);
+                }
             }
         }
     }
@@ -1795,7 +1847,6 @@ static bool    g_capLoopback = true;   // the ONE capture path: render loopback
 static float   g_capPeriodMsF = 4.0f;
 
 static bool tryRestartCap(ma_context* ctx) {
-    if (g_parked.load(std::memory_order_relaxed)) return false;   // v9.7.0: no capture while parked
     static unsigned long long lastLog = 0;
     const unsigned long long now = GetTickCount64();
     if (now - lastLog >= 10000) {
@@ -2054,13 +2105,6 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         tlog( "[twinspeak] WASAPI context init failed\n");
         return 1;
     }
-    // v9.7.0: COM up front -- the default-source gate (before every device
-    // open) and the volume/pin machinery both call into MMDeviceEnumerator
-    // on THIS thread, so the init must precede them all
-    const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    if (!comOK)
-        tlog("[twinspeak] COM          : CoInitializeEx refused -- the default-device probes run\n"
-             "                            anyway (best effort); volume/pin endpoints may fail\n");
 
     // THE SOURCE: the specified OUTPUT device (render loopback, always)
     ma_device_id capId, id1, id2, id3;
@@ -2164,49 +2208,62 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         L.pktRs.assign((size_t)kInCh * kScratchFrames, 0.0f);
     }
 
-    // v9.7.0 THE DEFAULT-SOURCE GATE: the engine exists only while the
-    // Windows default render endpoint IS the configured source
-    // (input_device). Anywhere else: nothing is opened, nothing is held,
-    // other players play freely; the health loop re-opens when the default
-    // returns to the source. This replaces v9.6.0's per-leg yield guard
-    // (which could hold an exclusive stream on a leg while "released").
+    // boot yield: a leg on the Windows default render device (or with
+    // foreign ACTIVE sessions) starts RELEASED; the health loop re-grabs.
+    bool bootYield[4] = { false, false, false, false };
     {
         std::string defNm;
         const bool haveDef = defaultRenderName(&defNm);
-        const bool isSourceDefault = haveDef && containsCI(defNm, twsCfg.inputDevice);
-        if (!isSourceDefault) {
-            g_parked.store(true, std::memory_order_relaxed);
-            tlog( "[twinspeak] PARK        : the Windows default render device is \"%s\" -- the source\n"
-                    "            (\"%s\") is NOT the default -- the engine is DEACTIVATED: no device is\n"
-                    "            opened, none is held. It reactivates the moment the default returns to\n"
-                    "            the source.\n",
-                    haveDef ? defNm.c_str() : "(unknown)", twsCfg.inputDevice.c_str());
-        } else {
-            tlog( "[twinspeak] gate        : the Windows default render device IS the source (\"%s\") --\n"
-                    "            the engine opens fully (legs exclusive, capture shared loopback)\n",
-                    defNm.c_str());
+        for (int i = 0; i < 4; ++i) {
+            if (g_leg[i].disabled) continue;
+            const char* yn = legNeedle(i);
+            if (!yn[0]) continue;
+            if (haveDef && containsCI(defNm, yn)) {
+                bootYield[i] = true;
+                g_leg[i].yielded.store(true, std::memory_order_relaxed);
+                g_leg[i].isExclusive = true;
+                g_leg[i].lastReopenMs = GetTickCount64();
+                tlog("[twinspeak] leg%d BOOT-YIELD : the Windows default render device (\"%s\") matches\n"
+                     "                            this leg's needle -- starting the leg RELEASED (the DAC is\n"
+                     "                            never touched at boot); it reopens when the default moves\n"
+                     "                            away and the device is quiet\n",
+                     i + 1, defNm.c_str());
+                continue;
+            }
+            const int busy = foreignActiveSessions(yn);
+            if (busy > 0) {
+                bootYield[i] = true;
+                g_leg[i].yielded.store(true, std::memory_order_relaxed);
+                g_leg[i].isExclusive = true;
+                g_leg[i].lastReopenMs = GetTickCount64();
+                tlog("[twinspeak] leg%d BOOT-YIELD : %d foreign audio session(s) ACTIVE on this leg's device\n"
+                     "                            (not the default) -- starting the leg RELEASED so those live\n"
+                     "                            streams are not invalidated; it reopens when they finish\n",
+                     i + 1, busy);
+            } else if (busy < 0) {
+                tlog("[twinspeak] leg%d BOOT-YIELD : session probe unavailable -- opening normally (fail-open)\n", i + 1);
+            }
         }
     }
-
     const int openOrder[4] = { 1, 0, 2, 3 };
     auto legIdPtr = [&](int i) -> ma_device_id* {
         return (i == 0) ? &id1 : (i == 1) ? &id2 : &id3;
     };
     bool okLeg[4] = { false, false, false, false };
-    const bool parkAtBoot = g_parked.load(std::memory_order_relaxed);
     for (int oi = 0; oi < 4; ++oi) {
         const int i = openOrder[oi];
-        if (g_leg[i].disabled || parkAtBoot) { okLeg[i] = true; continue; }
+        if (g_leg[i].disabled) { okLeg[i] = true; continue; }
+        if (bootYield[i])      { okLeg[i] = true; continue; }
         okLeg[i] = initLegDevice(i, &ctx, legIdPtr(i), kOutPeriodFrames, true);
     }
     {
         bool anyFail = false;
         for (int i = 0; i < 4; ++i)
-            if (!okLeg[i] && !g_leg[i].disabled && !parkAtBoot) anyFail = true;
+            if (!okLeg[i] && !bootYield[i] && !g_leg[i].disabled) anyFail = true;
         if (anyFail) {
             tlog( "[twinspeak] align_modes: exclusive refused on a leg -- reopening the WASAPI legs shared\n");
             for (int i = 0; i < 4; ++i) {
-                if (g_leg[i].disabled || parkAtBoot) continue;
+                if (g_leg[i].disabled || bootYield[i]) continue;
                 if (okLeg[i]) {
                     ma_device_uninit(&g_leg[i].dev);
                     memset(&g_leg[i].dev, 0, sizeof(g_leg[i].dev));
@@ -2217,15 +2274,12 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         }
     }
     for (int i = 0; i < 4; ++i) {
-        if (g_leg[i].disabled || parkAtBoot) continue;
-        if (!okLeg[i]) {
-            tlog( "[twinspeak] giving up -- a playback device could not be opened in any mode\n");
-            return 1;
-        }
+        if (okLeg[i] || bootYield[i] || g_leg[i].disabled) continue;
+        tlog( "[twinspeak] giving up -- a playback device could not be opened in any mode\n");
+        return 1;
     }
 
-    // THE CAPTURE: loopback on the render endpoint, always (parked at boot:
-    // not opened at all)
+    // THE CAPTURE: loopback on the render endpoint, always
     ma_device_config cc = ma_device_config_init(ma_device_type_loopback);
     cc.sampleRate = kSampleRate;
     cc.periodSizeInMilliseconds = capPeriodMs;
@@ -2237,19 +2291,12 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
     cc.capture.shareMode = ma_share_mode_shared;
     cc.wasapi.usage = ma_wasapi_usage_pro_audio;
     memset(&g_capDev, 0, sizeof(g_capDev));
-    ma_result cr = parkAtBoot ? MA_SUCCESS : ma_device_init(&ctx, &cc, &g_capDev);
+    ma_result cr = ma_device_init(&ctx, &cc, &g_capDev);
     if (cr != MA_SUCCESS) {
         tlog( "[twinspeak] output-as-source open FAILED: %s -- the render endpoint refused the\n"
                 "                            loopback read (busy format change, endpoint disabled?); check --list\n",
                 ma_result_description(cr));
         return 1;
-    }
-    g_capIdSnap = capId;   // v9.7.0: the echo guard's reference for leg reopens
-    if (!parkAtBoot && ma_device_start(&g_capDev) != MA_SUCCESS) {
-        // v9.7.0 (bug fix): the boot path inited the capture but never
-        // STARTED it -- the old flow leaned on the watchdog's 5-s-silent
-        // tryRestartCap to bring it up. Start it here, immediately.
-        tlog( "[twinspeak] capture START failed at boot -- the watchdog will retry in 5 s\n");
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -2302,6 +2349,7 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         L.lateSwitches.store(0, std::memory_order_relaxed);
     }
 
+    const bool comOK = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     if (twsCfg.volumeFollow) {
         std::string volNeedles[2];
         int nN = 0;
@@ -2323,9 +2371,13 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
             g_volFollowLive.store(true, std::memory_order_relaxed);
         }
     }
-    if (twsCfg.pinOutputs && !g_parked.load(std::memory_order_relaxed)) {
+    if (twsCfg.pinOutputs) {
         for (int i = 0; i < 4; ++i) {
             if (g_leg[i].disabled) continue;
+            if (g_leg[i].yielded.load(std::memory_order_relaxed)) {
+                tlog("[twinspeak] out%d: leg RELEASED (boot yield) -- endpoint pin not applicable until it reopens\n", i + 1);
+                continue;
+            }
             if (isDefaultRenderEndpointId(g_leg[i].id.wasapi)) {
                 tlog("[twinspeak] out%d: endpoint IS the default playback device -- volume left alone (no 100%% pin)\n", i + 1);
                 continue;
@@ -2363,7 +2415,7 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         for (int oi = 0; oi < 4; ++oi) {
             const int i = openOrder[oi];
             Leg& L = g_leg[i];
-            if (L.disabled || parkAtBoot) continue;
+            if (L.disabled || L.yielded.load(std::memory_order_relaxed)) continue;
             if (ma_device_start(&L.dev) != MA_SUCCESS) sAll = MA_ERROR;
         }
         if (sAll != MA_SUCCESS) {
@@ -2373,12 +2425,13 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
     }
 
     // start align: every leg opens its stream on the same instant
-    if (twsCfg.clockSync && !g_parked.load(std::memory_order_relaxed)) {
+    if (twsCfg.clockSync) {
         const unsigned long long alignT0 = GetTickCount64();
         for (;;) {
             bool all = true;
             for (int i = 0; i < 4; ++i) {
                 if (g_leg[i].disabled) continue;
+                if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
                 if (g_leg[i].popped.load(std::memory_order_acquire) == 0) { all = false; break; }
             }
             if (all) break;
@@ -2390,12 +2443,14 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
         bool missing = false;
         for (int i = 0; i < 4; ++i) {
             if (g_leg[i].disabled) continue;
+            if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
             fs[i] = g_leg[i].firstSwitchUs.load(std::memory_order_acquire);
             if (fs[i]) ++nPart; else missing = true;
         }
         if (missing || nPart < 2) {
-            tlog("[twinspeak] start align  : a leg never handed in its first buffer switch (dead) --\n"
-                 "                            alignment skipped (the watchdog owns a dead leg)\n");
+            tlog("[twinspeak] start align  : a leg never handed in its first buffer switch (dead or released) --\n"
+                 "                            alignment skipped (the watchdog owns a dead leg; a released leg\n"
+                 "                            aligns itself on its quiet reopen)\n");
         } else {
             int ref = -1;
             for (int i = 0; i < 4; ++i)
@@ -2572,7 +2627,7 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
             for (int oi = 0; oi < 4; ++oi) {
                 const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;
                 Leg& W = g_leg[i];
-                if (W.disabled || g_parked.load(std::memory_order_relaxed)) continue;
+                if (W.disabled || W.yielded.load(std::memory_order_relaxed)) continue;
                 const unsigned long long hb = hbOutGet(i);
                 const bool stale = (hb == 0) || (nowMs - hb) > 5000;
                 if (stale && nowMs - colLastMs[i] >= 10000) {
@@ -2581,59 +2636,57 @@ static int engineMainCore(const char* iniPath, bool fgForce, bool guiMode) {
                 }
             }
         }
-        // v9.7.0 THE DEFAULT-SOURCE GATE (runtime): the engine exists only
-        // while the Windows default render endpoint IS the source. When it
-        // is not: every device -- all legs and the capture -- is released at
-        // once (nothing held, no "device in use" anywhere); when it is
-        // again: the whole engine reactivates through the same open path as
-        // boot (legs exclusive, capture shared loopback) and the rings
-        // re-anchor on the next switches.
-        {
+        // the yield guard: release the leg on the default device; re-grab when free
+        if (!g_powerPark.load(std::memory_order_relaxed)) {
             std::string defName;
-            const bool haveDef = defaultRenderName(&defName);
-            const bool isSourceDefault = haveDef && containsCI(defName, twsCfg.inputDevice);
-            if (isSourceDefault && g_parked.load(std::memory_order_relaxed)) {
-                // WAKE: the default returned to the source -- reactivate.
-                g_parked.store(false, std::memory_order_relaxed);
-                tlog("[twinspeak] WAKE        : the Windows default render device is the source (\"%s\") again\n"
-                     "                            -- reactivating: reopening the legs (exclusive) and the capture\n"
-                     "                            (shared loopback); other players see the default busy once more\n",
-                     defName.c_str());
-                for (int oi = 0; oi < 4; ++oi) {
-                    const int i = openOrder[oi];
-                    if (g_leg[i].disabled) continue;
-                    tryRestartLeg(i, &ctx, kOutPeriodFrames, "the engine reactivated");
-                }
-                tryRestartCap(&ctx);
-            } else if (!isSourceDefault && !g_parked.load(std::memory_order_relaxed)) {
-                // PARK: the default moved OFF the source -- release everything.
-                g_parked.store(true, std::memory_order_relaxed);
-                tlog("[twinspeak] PARK        : the Windows default render device is now \"%s\" -- the source\n"
-                     "                            (\"%s\") is NOT the default: the engine DEACTIVATES. Every device\n"
-                     "                            (all legs, the capture) is released; other players play freely\n",
-                     haveDef ? defName.c_str() : "(unknown)", twsCfg.inputDevice.c_str());
-                if (g_capDev.pContext) { ma_device_uninit(&g_capDev); memset(&g_capDev, 0, sizeof(g_capDev)); }
+            if (defaultRenderName(&defName)) {
                 for (int i = 0; i < 4; ++i) {
-                    Leg& L = g_leg[i];
-                    if (L.disabled) continue;
-                    if (L.dev.pContext) { ma_device_uninit(&L.dev); memset(&L.dev, 0, sizeof(L.dev)); }
-                    if (g_pin[i].vol) { g_pin[i].vol->Release(); g_pin[i].vol = nullptr; }
+                    if (g_leg[i].disabled) continue;
+                    const char* yneedle = legNeedle(i);
+                    if (!yneedle[0]) continue;
+                    Leg& Y = g_leg[i];
+                    const bool mine = containsCI(defName, yneedle);
+                    if (mine && !Y.yielded.load(std::memory_order_relaxed)) {
+                        Y.yielded.store(true, std::memory_order_relaxed);
+                        tlog("[twinspeak] leg%d YIELD     : the Windows default render device (\"%s\") matches\n"
+                             "                            this leg's needle (\"%s\") -- released (the stream is\n"
+                             "                            NOT closed; the park clears when the default moves elsewhere)\n",
+                             i + 1, defName.c_str(), yneedle);
+                        Y.lastReopenMs = nowMs;
+                    } else if (!mine && Y.yielded.load(std::memory_order_relaxed)) {
+                        const int busy = foreignActiveSessions(yneedle);
+                        if (busy > 0) {
+                            static unsigned long long lastBusyLog[4] = { 0, 0, 0, 0 };
+                            if (nowMs - lastBusyLog[i] >= 5000) {
+                                tlog("[twinspeak] leg%d YIELD     : the default moved away, but %d foreign audio\n"
+                                     "                            session(s) are still ACTIVE on this device --\n"
+                                     "                            holding the release until they finish\n",
+                                     i + 1, busy);
+                                lastBusyLog[i] = nowMs;
+                            }
+                        } else {
+                            if (Y.yielded.exchange(false, std::memory_order_relaxed)) {
+                                tlog("[twinspeak] leg%d YIELD     : the default device no longer matches this leg\n"
+                                     "                            -- park CLEARED, the pump resumes on the live ring\n",
+                                     i + 1);
+                                Y.lastReopenMs = nowMs;
+                            }
+                        }
+                    }
                 }
-                g_hbCap.store(0, std::memory_order_relaxed);
             }
         }
         // the power guard: resume rebuilds
         if (g_powerWoken.exchange(false)) {
             g_powerPark.store(false, std::memory_order_relaxed);
             tlog("[twinspeak] power guard : system resume -- rebuilding the capture and any DEAD leg\n");
-            if (!g_parked.load(std::memory_order_relaxed)) {
-                tryRestartCap(&ctx);
-                for (int oi = 0; oi < 4; ++oi) {
-                    const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;
-                    if (g_leg[i].disabled || g_parked.load(std::memory_order_relaxed)) continue;
-                    if (nowMs - hbOutGet(i) <= 5000) continue;
-                    tryRestartLeg(i, &ctx, kOutPeriodFrames);
-                }
+            tryRestartCap(&ctx);
+            for (int oi = 0; oi < 4; ++oi) {
+                const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;
+                if (g_leg[i].disabled) continue;
+                if (g_leg[i].yielded.load(std::memory_order_relaxed)) continue;
+                if (nowMs - hbOutGet(i) <= 5000) continue;
+                tryRestartLeg(i, &ctx, kOutPeriodFrames);
             }
         }
 

@@ -1,4 +1,4 @@
-// twinspeak_core.h -- v9.7.0 the audio-routing core's contract.
+// twinspeak_core.h -- v9.6.0 the audio-routing core's contract.
 //
 // The engine is split in two files:
 //   twinspeak_core.cpp : miniaudio in, the four legs out. NOTHING else.
@@ -6,17 +6,10 @@
 //                        buffer switch per device, the packet-mode depth
 //                        servo, the futex mix crew, the keep-alive, the
 //                        chime, the tick WAV, the volume pin/watch, the
-//                        watchdog restarts, the power guard, the
-//                        default-source gate, the health line. Every symbol
-//                        below is owned by the core; the shell only calls
-//                        what is declared here.
+//                        watchdog restarts, the power guard, the health
+//                        line. Every symbol below is owned by the core;
+//                        the shell only calls what is declared here.
 //   twinspeak.cpp     : the GUI + the ini + main(). No audio code.
-//
-// v9.7.0 THE DEFAULT-SOURCE GATE: the engine exists ONLY while the Windows
-//   default render endpoint IS the configured source (input_device).
-//   Anywhere else: nothing is opened or held (no "device in use" for other
-//   players); the health loop reopens the whole engine when the default
-//   returns to the source. (This replaces v9.6.0's per-leg yield guard.)
 //
 // v9.6.0 ROUTING (field-directed, the simple four-leg flow):
 //   capture = miniaudio loopback on the SPECIFIED OUTPUT DEVICE
