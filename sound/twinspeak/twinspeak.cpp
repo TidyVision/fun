@@ -3,9 +3,6 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "d2d1.lib")     // v9.6.0: the GPU tab strip (D2D1CreateFactory)
-#pragma comment(lib, "d3d11.lib")    // D3D11CreateDevice -- the strip's device
-#pragma comment(lib, "dwrite.lib")   // DWriteCreateFactory -- the strip's glyphs
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "winmm.lib")
@@ -1202,7 +1199,7 @@ static std::string cfgValueText(const std::string& key) {
     else if (key == "center_eq_freq")    { snprintf(b, 64, "%g", twsCfg.centerEqFreq); return b; }
     else if (key == "center_eq_gain")    { snprintf(b, 64, "%g", twsCfg.centerEqGain); return b; }
     else if (key == "center_eq_q")       { snprintf(b, 64, "%g", twsCfg.centerEqQ); return b; }
-    else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
+                else if (key.rfind("eq_slot", 0) == 0 && key.size() > 8 &&
              key[7] >= '1' && key[7] <= '5') {
         const int n = key[7] - '1';
         const std::string t = key.substr(8);
@@ -1212,21 +1209,12 @@ static std::string cfgValueText(const std::string& key) {
         else if (t == "_q")    { snprintf(b, 64, "%g", twsCfg.eqSlotQ[n]); return b; }
     }
     else if (key == "center_eq")         return boolText(twsCfg.centerEq);
-    // v9.6.0 repair: packet_mode / parallel_mix / chimes / gui_theme are LIVE
-    // keys kIniKeys still writes on save -- their cfgValueText lines were
-    // lost in the v9.6.0 cleanup, so every GUI save wrote them EMPTY (an
-    // empty value reloads as ON/theme-0), silently resetting a user's OFF
-    // toggles and theme choice.
-    else if (key == "packet_mode")       return boolText(twsCfg.packetMode);
-    else if (key == "parallel_mix")      return boolText(twsCfg.parallelMix);
-    else if (key == "chimes")            return boolText(twsCfg.chimes);
-    else if (key == "gui_theme")        { snprintf(b, 64, "%d", g_theme); return b; }
-    else if (key == "input_device")      return twsCfg.inputDevice;
-    else if (key == "output_device1")    return twsCfg.outputDevice1;
+        else if (key == "input_device")      return twsCfg.inputDevice;
+        else if (key == "output_device1")    return twsCfg.outputDevice1;
     else if (key == "output_device2")    return twsCfg.outputDevice2;
     else if (key == "output_device3")    return twsCfg.outputDevice3;   // v8.4.0
     else if (key == "output_device4")    return twsCfg.outputDevice4;   // v9.1.4: leg4's fold target
-    else if (key == "startup_engine")   return boolText(twsCfg.startupEngine);   // v7.1.2
+        else if (key == "startup_engine")   return boolText(twsCfg.startupEngine);   // v7.1.2
     else if (key == "gui_window_x")     { snprintf(b, 64, "%d", g_guiWinX); return b; }   // v7.1.20
     else if (key == "gui_window_y")     { snprintf(b, 64, "%d", g_guiWinY); return b; }   // v7.1.20
     return "";
@@ -4371,11 +4359,6 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    // v9.6.0: the ORIGINAL engineMain loaded the ini itself (it died with the
-    // old engine); the core reads twsCfg only, so the console path loads here
-    // -- exactly the guiMain call at the GUI seam. A fresh machine gets the
-    // template written, then a refusal naming input_device/output_device1.
-    if (!loadIni(iniPath.c_str())) writeTemplate(iniPath.c_str());
     const int rc = twsEngineRun(iniPath.c_str(), fgForce, false);
     if (hInstance) CloseHandle(hInstance);
     return rc;
