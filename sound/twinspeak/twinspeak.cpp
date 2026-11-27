@@ -64,6 +64,108 @@
 //    request on every leg) -- no busy wait anywhere in the engine.
 //
 //  CHANGELOG (condensed; full notes in CHANGELOG.txt):
+//    v9.6.0 THE CONSISTENCY ROUND (the audit fixes: cross-device sync was
+//            dead in BOTH modes, starvation was a hole, the final clamp
+//            was a crackle generator, and the capture had no watchdog).
+//            (1) THE SYNC TOKEN SPLIT: masterDepthGuard and syncToFirst
+//            shared ONE rate-limit token (L.lastSyncMs) -- the master's
+//            guard always spent it first, so syncToFirst's body NEVER ran:
+//            the only cross-leg correction in packet_mode = off was dead
+//            code, unreachable since the field it read was stamped a few
+//            lines above. syncToFirst gets its OWN token (lastXSyncMs).
+//            (2) THE PACKET-MODE CROSS-LEG STEER: packet mode had NO
+//            cross-leg mechanism at all -- each leg independently held
+//            delay+anchor+floor, so any period/buffer/start difference
+//            between devices was a PERMANENT inter-leg offset only the
+//            delay knobs could trim. The slave legs' servo target now
+//            tracks LEG1's boundary (the delay-neutral metric,
+//            syncToFirst's own arithmetic, clamp +-240 fr, freeze on a
+//            dead/yielded/settling reference) -- a late leg grinds its
+//            backlog through the SAME PI + slew anti-wobble discipline
+//            (<= 0.2 ppm/period near target), never a skip.
+//            (3) THE HOLD FILL: a packet-mode starvation break left the
+//            period's tail as hard SILENCE -- a hole, a click, exactly
+//            when the ring was driest. The tail now repeats the last
+//            mixed frame (the v8.4.7 pad semantics the comments always
+//            promised): mid-period breaks hold the period's own last
+//            frame, a whole-period break holds the previous period's
+//            tail. The pop-floor idle (a silent cable parked on its
+//            delay prefill) keeps its silence -- idle is not starvation.
+//            (4) THE SOFT KNEE: the keep-alive sum ended in a HARD +-1.0
+//            clamp -- leg1's mix sums up to six terms per output slot
+//            and hot 5.1/stereo routinely crossed full scale, so every
+//            loud peak flat-topped (the crackle no servo could fix). The
+//            knee is a C1-continuous tangent curve from 0.95 (exact
+//            below the knee, asymptote 1.0), applied at the device layer
+//            and at leg2's center-EQ clamp.
+//            (5) THE ANCHOR RECONCILIATION: anchorFrames was set ONCE at
+//            boot (1.5 x the REQUESTED period) and never followed the
+//            device -- a watchdog reopen that landed shared, or a driver
+//            that negotiated periods x N, left the servo aiming at the
+//            OLD mode's anchor forever (a permanent trim bend = pitch
+//            error). legUpdateAnchor() recomputes it from the REAL
+//            internalPeriodSizeInFrames x internalPeriods (cross-rate
+//            converted) at EVERY (re)open.
+//            (6) THE CAPTURE WATCHDOG: the source feeding every leg had
+//            NONE -- a capture thread that died outside a power event
+//            left every leg parked on its delay prefill forever. Same
+//            v3.8 test as the legs (stale > 5 s), with the IDLE
+//            carve-out: a silent source legitimately stops heartbeating,
+//            so the watchdog only fires when the source's own sessions
+//            are ACTIVE (the stream should be running and is not).
+//            (7) THE RESUME GATE: power-resume rebuilt the capture
+//            UNCONDITIONALLY -- a healthy stream was torn down on every
+//            wake (gap + settle + servo reseed, every time). The
+//            no-shutdown rule now covers the capture too: a heartbeat
+//            that survived the sleep is live, untouched.
+//            (8) PERIOD-NORMALIZED EMAs: the servo's EMA alphas were
+//            hardwired to the 768-fr request (768/48000, 96/48000) with
+//            once-per-period updates -- a leg on any OTHER negotiated
+//            period (the align_modes shared fallback, a driver clamp)
+//            ran time constants scaled by actualPeriod/768 (at 96 fr the
+//            "8 s" slow EMA was 1 s -- exactly the load-wave wobble
+//            v9.5.5 was built to kill). The alphas are now computed from
+//            THIS leg's real period: tau is 1 s / 8 s of REAL TIME on
+//            every device.
+//            (9) THE CORE MAP: the ticket wrap landed audio threads on
+//            LP 0 (the core reserved for DPCs/ISRs) on small machines,
+//            and never guaranteed the mains their own core. New map:
+//            LP 0 is NEVER an audio core; leg1 always gets its own LP;
+//            the rears wrap to the capture's LP (the tiny fan-out
+//            callback) before ever sharing the mains.
+//            (10) THE RT LOG: the late-switch warning and the depth/sync
+//            guard lines logged from the DEVICE CALLBACK -- a critical
+//            section + vfprintf + fflush taken exactly when the thread
+//            was already late, stretching a small glitch into a long
+//            one. rtlog() is a single-producer lock-free line ring
+//            (one vsnprintf into a slot, one release store); the health
+//            thread drains it once a second.
+//            (11) THE BITE'S VERDICT WINDOW: the quiet-window bite
+//            tested the chunk JUST PLAYED but dropped the OLDEST frames
+//            (the ones about to play NEXT) -- a burst starting right
+//            after a silent chunk skipped 5 ms of program. Ring::peekZero
+//            tests the frames the drop will actually consume.
+//            (12) THE REOPEN FADE-IN: a watchdog/landing reopen started
+//            at full level on the first mixed frame -- the hard cut at
+//            the gap (DAC wake, landing discard) could step. The first
+//            5 ms after a reopen landing ramp in from silence.
+//            THE PSYCHOACOUSTIC LFE CHAIN (field-directed, the Equalizer
+//            APO recipe hardcoded): every ch4 fold (leg1's built-in fold
+//            + leg4's fold to leg2/leg3) now runs HP 42 Hz x2 Q 0.707
+//            (24 dB/oct -- the 3-inch driver never flaps on sub-bass it
+//            cannot move), PK 60 Hz +3.0 dB Q 1.4 and PK 90 Hz +2.0 dB
+//            Q 1.4 (the missing-fundamental boosts -- the brain
+//            reconstructs the 30-40 Hz fundamental the HP removed), and
+//            PK 125 Hz -2.0 dB Q 2.0 (the cabinet-resonance scoop), five
+//            RBJ biquads in-engine, always on, silence contract and all.
+//            LATENCY/PITCH STANCE (field-directed: "lowest latency whilst
+//            still having the most minimal pitch oscillation"): the
+//            v9.5.6 geometry stands (768 fr x1 exclusive request, 384 fr
+//            floor -- sim-proven, both cut by the same loop sims that
+//            proved the servo); the pitch wins come from the anchor now
+//            matching reality (#5 -- a wrong anchor was a PERMANENT trim
+//            bend), the time-normalized EMAs (#8), and the steer riding
+//            the proven PI+slew discipline (#2) instead of skips.
 //    v9.5.0 PACKET MODE (field-directed: "have a packet mode system built
 //            into twinspeak where it immediately corrects any mismatches
 //            and also resamples in the most efficient way to a device's
@@ -3456,7 +3558,7 @@
 // v7.9.0: ONE version constant. The startup banner used to carry a stale
 // hard-coded "v7.1.19" string no matter the real build -- every version-
 // bearing string now quotes this (banner, ini template header).
-#define TWS_VERSION "9.5.9"
+#define TWS_VERSION "9.6.0"
 #include <propsys.h>
 #include <propidl.h>
 #include <mmdeviceapi.h>
@@ -3621,8 +3723,13 @@ static constexpr long kPktFloorFr    = 384;  // v9.5.6: 8.0 ms -- one VAC burst 
                                               // every burst arrival gap)
 static constexpr long kPktMaxPpm      = 4000;
 // v9.5.1 SERVO v2: steer the AVERAGED depth, engage with hysteresis.
-static constexpr double kPktEmaAlpha  = 768.0 / 48000.0;  // v9.5.3: ~1 s of packets at the 16 ms bite (alpha scales
-                                                           // with the period; the average stays a second of REAL time)
+// v9.6.0: the alpha CONSTANTS are retired -- the per-leg period differs
+// (the align_modes shared fallback, a driver clamp), so the time constants
+// are computed per leg from THIS leg's real period (L.pktEmaAlpha /
+// L.pktEmaSlowAlpha, set at every (re)open by legUpdateServoTuning): a
+// 1 s / 8 s tau of REAL TIME on every device, not just on a 768-fr one.
+static constexpr double kPktEmaTauFast = 1.0;    // ~1 s of REAL time (was 768/48000)
+static constexpr double kPktEmaTauSlow = 8.0;    // tau ~8 s: load waves cannot move it (was 96/48000)
 static constexpr long    kPktEngageFr = 8;    // |EMA err| above this: bend the rate
 static constexpr long    kPktRelaxFr  = 2;    // |EMA err| below this AND |bias| < 1 ppm: back to bit-exact
 static constexpr double  kPktBiasKI   = 0.05; // v9.5.4 servo v3: ppm of bias learned per packet per frame of
@@ -3637,13 +3744,50 @@ static constexpr double  kPktBiasLeak = 0.05; // v9.5.4d: ppm of bias HEALED per
 // v9.5.5 SERVO v5 HOLD-AND-SMOOTH (the loop-model-proven form; every
 // gated heuristic tried first -- hold-and-step, freeze bands, integral
 // clamps -- either wobbled under load or limit-cycled: hunt_jitter.py)
-static constexpr double  kPktEmaSlowAlpha = 96.0 / 48000.0;  // once-per-period, tau ~8 s: load waves cannot move it
+// (v9.6.0: the slow-alpha constant is retired with the fast one above)
 static constexpr double  kPktPiKp  = 2.0;    // P on the slow EMA (stability)
 static constexpr double  kPktPiKi  = 5e-4;   // I on the slow EMA (exact convergence)
 static constexpr double  kPktAwKb  = 0.1;    // back-calculation anti-windup
 static constexpr double  kPktSlewSlow = 0.2; // ppm/period steady-state (0.0036 cents/s -- inaudible motion)
 static constexpr double  kPktSlewFast = 5.0; // ppm/period while |tgt-appl| > 150 ppm (a brief glide)
 static constexpr double  kPktSlewThr  = 150.0; // ppm: the fast/slow slew threshold
+// ---- v9.6.0 THE CROSS-LEG STEER (packet mode's missing sync half) ----
+// A slave leg's servo target rides leg1's boundary (the delay-neutral
+// metric, syncToFirst's own arithmetic). The steer is a DEPTH OFFSET on
+// the PI's setpoint, clamped to +-kSteerMaxFr: a leg that is LATE vs
+// leg1 sees its target lowered (the PI drains the excess through the
+// same slew-limited rate bend -- no skip, no click), an EARLY leg sees
+// it raised (the PI refills). The clamp bounds the interplay with the
+// anti-starvation floor: the steer can never push a target below the
+// leg's own delay + lookahead.
+static constexpr long    kSteerMaxFr   = 240; // +-5 ms of setpoint travel, the warden bite's own size
+static constexpr long    kSteerDeadFr  = 16;  // inside 1/3 ms: hold (crystal-level -- do not chase)
+static constexpr unsigned kSteerSettleMs = 2000; // the steer's startup hush, kSyncSettleMs's discipline
+// ---- v9.6.0 THE SOFT KNEE (the hard-clamp crackle fix) ----
+// Leg1's mix sums up to six terms per output slot; hot content crosses
+// full scale routinely and the old hard +-1.0 clamp flat-topped every
+// peak (crackle no servo could fix). The knee is C1-continuous at the
+// entry (slope exactly 1.0, like a true soft limiter's) and approaches
+// 1.0 asymptotically: a 6 dB-over sine maps to ~0.997, a 20 dB-over
+// square's 2.0-sum maps to ~0.928 -- audibly a gentle loudness
+// compression on the peaks instead of a shaved square wave.
+static constexpr double kKneeThresh   = 0.95;
+// (v9.6.0b: kKneeK is retired -- the knee is the scaled tangent
+// y = th + (1-th)*tanh(over/(1-th)); its slope at the seam is exactly 1.0
+// and its asymptote is exactly 1.0 with no hardness knob and no guard)
+// ---- v9.6.0 THE RT LOG (the device-thread tlog fix) ----
+// The late-switch warning and the guard lines logged from the callback
+// through the locked logger -- a CS + vfprintf + fflush exactly when the
+// thread was already late. rtlog() is a single-producer lock-free line
+// ring; the health thread drains it once a second.
+static constexpr int kRtLogLines = 32;        // slots (audio threads emit rate-limited, never bursty)
+static constexpr int kRtLogLen   = 200;       // bytes per line (the ASCII engine lines fit)
+// ---- v9.6.0 THE PARK/UNPARK + REOPEN FADES ----
+// The soft park's program fade-out and the unpark/reopen fade-in. 5 ms
+// each: long enough that the ramp itself is inaudible, short enough to
+// stay inside one 16 ms period at the engine's bite.
+static constexpr unsigned kParkFadeFr   = (unsigned)kSampleRate / 200;   // 5 ms out
+static constexpr unsigned kReopenFadeFr = (unsigned)kSampleRate / 200;   // 5 ms in
 // (v9.0.1: kReplayMaxPeriods retired -- lastBlock's only consumer was the
 // KS lapse guard's re-prime, gone with the backend.)
 
@@ -3984,6 +4128,30 @@ struct Ring {
         }
         return n;
     }
+    // v9.6.0: are the next n frames (the OLDEST, exactly what a
+    // discardOldest(n) would consume) bit-zero? The quiet-window bite's
+    // VERDICT must test the frames being DROPPED, not the chunk that just
+    // played -- a burst starting right after a silent chunk must not be
+    // skipped. Wrap-aware, two scans at the seam, word-wise like bitZero8.
+    bool peekZero(size_t n) const {
+        const unsigned long long t = tail.load(std::memory_order_relaxed);
+        const unsigned long long h = head.load(std::memory_order_acquire);
+        size_t avail = (size_t)(h - t);
+        if (n > avail) n = avail;
+        size_t off = ((size_t)t & mask) * stride;
+        while (n) {
+            size_t frames = cap - (size_t)t % cap;   // to the seam
+            if (frames > n) frames = n;
+            // whole frames, whole 8-byte words (stride 8 = 8 floats = 4 words)
+            const size_t words = frames * (stride / 2);
+            const unsigned long long* w = (const unsigned long long*)&buf[off];
+            for (size_t i = 0; i < words; ++i)
+                if (w[i]) return false;
+            off = 0;
+            n -= frames;
+        }
+        return true;
+    }
     // v6.5: bulk prefill in chunks -- a chunk must NEVER exceed cap:
     // pushOverwrite clamps n > cap by dropping from src, which would
     // silently lose the overshoot (the harness caught exactly that).
@@ -4060,6 +4228,33 @@ struct Leg {
     double              pktPiI       = 0.0;   // v9.5.5 servo v5: the PI integrator (on the slow EMA)
     double              pktAppliedPpm = 0.0;  // v9.5.5 servo v5: the SLEW-LIMITED applied trim (the pitch)
     bool                pktEngagedOn = false; // v9.5.1: the servo's hysteresis latch
+    // v9.6.0 PERIOD-NORMALIZED EMAs: the alphas are computed from THIS
+    // leg's real negotiated period (legUpdateServoTuning, at every
+    // (re)open) -- tau is 1 s / 8 s of REAL TIME on every device. The
+    // old constants assumed 768 fr; a leg on 96 fr ran the "8 s" slow
+    // EMA at 1 s (the load-wave wobble v9.5.5 was built to kill).
+    double              pktEmaAlpha     = 768.0 / 48000.0;
+    double              pktEmaSlowAlpha = 96.0  / 48000.0;
+    // v9.6.0 THE CROSS-LEG STEER (packet mode's missing sync half): this
+    // leg's servo target tracks leg1's boundary (delay-neutral metric),
+    // computed on the device thread, spent as a depth offset on the PI's
+    // setpoint. lastSteerMs rate-limits the look (its own token -- the
+    // v9.5.9 bug was one token shared with the depth guard).
+    long                pktSteerFr   = 0;      // the live steer offset (target = delay+anchor+floor+steer)
+    unsigned long long  lastSteerMs  = 0;      // the steer's look token
+    // v9.6.0 THE REOPEN FADE-IN: a reopen landing starts at level 0 and
+    // ramps in over kReopenFadeFr frames -- the hard cut at the gap (DAC
+    // wake, landing discard) never steps. Set by the landing, consumed by
+    // the switch.
+    size_t              reopenFadeFr = 0;
+    // v9.6.0 THE PARK FADES + THE HOLD FILL: the soft park's fade-out
+    // counter and its edge detector, and the whole-period hold's saved
+    // tail. All device-thread only.
+    size_t              parkFadeOut   = 0;
+    bool                wasYieldedFade = false;
+    unsigned long long  holdFills     = 0;
+    bool                holdValid     = false;
+    float               lastOut[kOutCh1] = { 0.0f, 0.0f };
     // ---- v8.4.7 -> v8.4.20 THE SYNC STATE (per leg, no key, no UI).
     // v8.4.20: the reference is LEG1 again (a real hardware crystal -- the
     // mains are the anchor the ears calibrate against). Leg1's own ring
@@ -4076,6 +4271,13 @@ struct Leg {
     unsigned long long     syncDrops     = 0;
     unsigned long long     syncPads      = 0;
     unsigned long long     lastSyncLogMs = 0;
+    // v9.6.0 THE SYNC TOKEN SPLIT: this is SYNCTOFIRST'S OWN TOKEN. The
+    // old code shared lastSyncMs with masterDepthGuard -- and the master
+    // guard ran FIRST in every switch (and stamps the field), so
+    // syncToFirst's rate-limit check always saw a fresh stamp and its
+    // body NEVER ran: the only cross-leg correction in packet_mode = off
+    // was unreachable dead code. Two functions, two tokens, both live.
+    unsigned long long     lastXSyncMs   = 0;
     // v8.4.11/8.4.16/8.4.17: the warden bite state (this leg's device
     // thread only, the same single-writer discipline). lastBiteMs
     // rate-limits the 240-frame bite to one per 2 s (LATE drop and EARLY
@@ -4363,22 +4565,39 @@ static void cpuPinThreadToLp(const int slotIdx)
         g_cpu.ok[slotIdx] = false;  // never try this slot again this run
 }
 
-// v9.2.0: THE AUDIO CORE MAP. Five realtime threads, five cores, no
-// sharing: capture owns LP 1, leg1..4 own LP 2..5 (LP 0 stays with the
-// system -- DPCs and ISRs bias low). If the machine has fewer slots than
-// tickets, the map wraps and threads share cores only by necessity; a
-// machine that cannot even name a slot leaves everything floating (the
-// scheduler's default spread). The ticket is STABLE across watchdog
-// reopens: a replacement thread lands on the SAME core its dead one had.
-// (tickets: capture + the four legs = 5)
+// v9.2.0: THE AUDIO CORE MAP. v9.6.0 THE SMALL-BOX MAP. Five realtime
+// threads, and the old ticket was (1 + coreIdx) % lpPinnable: on a
+// 4-core box leg3's wrap landed on LP 0 -- the core deliberately left
+// to the system (DPCs and ISRs bias low) -- and on a 2-core box
+// capture and leg2 stacked one LP under two TIME_CRITICAL threads.
+// The new map keeps every rule that matters:
+//   - LP 0 is NEVER an audio core (the system's own).
+//   - capture -> LP 1 (unchanged, coreIdx 0).
+//   - leg1 (the MAINS) -> LP 2 (coreIdx 1) and NEVER wraps: the mains
+//     are the sync reference and the heaviest mix -- on any box with
+//     >= 2 pinnable LPs they own their core outright.
+//   - leg2 (center) -> LP 3, leg3 (rears) -> LP 4 when they exist.
+//   - the WRAP (a small box) folds the extra legs onto the CAPTURE's
+//     LP 1 first (its callback is a dumb fan-out memcpy, ~1% load,
+//     the cheapest neighbor by far) before ever stacking leg1.
+// The ticket is STABLE across watchdog reopens: a replacement thread
+// lands on the SAME core its dead one had. (tickets: capture + the
+// four legs = 5)
 static int audioCoreTicket(const int coreIdx)
 {
-    if (g_cpu.lpTotal < 2) return -1;   // one LP: everything floats (the system owns it)
-    // LP 0 stays with the system; the tickets start at LP 1 and wrap the
-    // pinnable table (a small box SHARES rather than stacks -- 2 LPs:
-    // capture+leg2+leg4 on LP 1, leg1+leg3 on LP 0; 6+ LPs: every thread
-    // its own core)
-    return (1 + coreIdx) % g_cpu.lpPinnable;
+    if (g_cpu.lpPinnable < 2) return -1;   // one LP: everything floats (the system owns it)
+    const int n = g_cpu.lpPinnable;        // pinnable LPs (index 0..n-1; slot 0 = the system's LP)
+    // v9.6.0: the linear map -- capture=1, leg1=2, leg2=3, leg3=4,
+    // leg4=5; LP 0 is never issued.
+    int slot = 1 + coreIdx;
+    if (slot >= n) {
+        // the wrap: the extra legs share the CAPTURE's LP (the cheap
+        // fan-out) rather than the mains' or LP 0. (slot-n+1) keeps the
+        // mapping stable per coreIdx and lands in 1..n-1.
+        slot = 1 + ((slot - n) % (n - 1));
+    }
+    if (slot <= 0 || slot >= n) return -1;  // cannot happen; the belt
+    return slot;
 }
 // v9.2.0: the pin happens INSIDE the thread, at its first callback, so the
 // reopen path (a new thread) re-pins identically -- same ticket, same core.
@@ -4483,6 +4702,85 @@ static void tlog(const char* fmt, ...) {
         fflush(stdout);
     }
     LeaveCriticalSection(&g_logCS);
+}
+
+// --------------------------------------- v9.6.0 THE RT LOG (SPSC lines) ----
+// The late-switch warning and the depth/sync guard lines used to call
+// tlog straight from the device callback -- EnterCriticalSection +
+// vfprintf + fflush taken with five other threads as writers, exactly
+// when the thread was already late: a small glitch stretched into a
+// long one. rtlog() is the RT-safe replacement for AUDIO-THREAD lines:
+// one vsnprintf into a private stack buffer (no locks, no allocation,
+// bounded work), one CAS to claim a slot, one release store of the
+// head. The health thread drains the ring once a second (rtLogDrain ->
+// tlog, the locked logger, on ITS OWN schedule). A full ring drops the
+// line with a count (audio threads emit rate-limited; a drop is the
+// right failure, never a block).
+struct RtLogLine { char s[kRtLogLen]; };
+static RtLogLine         g_rtLog[kRtLogLines];
+static std::atomic<int>  g_rtLogHead{0};      // total lines ever published (monotonic)
+static std::atomic<int>  g_rtLogNext{0};      // the writers' slot claim (CAS by the producers)
+static void rtlog(const char* fmt, ...) {
+    char buf[kRtLogLen];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;                        // nothing formatted: drop
+    // claim the next slot: five legs share this ring, so the claim is a
+    // CAS on the shared cursor; bounded retries, then drop (never block)
+    int cl = g_rtLogNext.load(std::memory_order_relaxed);
+    bool claimed = false;
+    for (int t = 0; t < 4 && !claimed; ++t) {
+        const int nx = cl + 1;
+        if (g_rtLogNext.compare_exchange_weak(cl, nx,
+                std::memory_order_relaxed, std::memory_order_relaxed)) claimed = true;
+    }
+    if (!claimed) return;                      // contended: drop (rate-limited emitters, a rarity)
+    const int slot = cl & (kRtLogLines - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    memcpy(g_rtLog[slot].s, buf, sizeof(g_rtLog[slot].s));   // copy whole: the head store gates the read
+    g_rtLogHead.store(cl + 1, std::memory_order_release);
+}
+static void rtLogDrain() {
+    const int h = g_rtLogHead.load(std::memory_order_acquire);
+    static int g_rtLogRead = 0;                // the reader's own cursor (health thread only)
+    const int maxRead = g_rtLogRead + kRtLogLines;   // a legging reader never spews a whole wrapped ring
+    while (g_rtLogRead < h && g_rtLogRead < maxRead) {
+        const RtLogLine& l = g_rtLog[g_rtLogRead & (kRtLogLines - 1)];
+        if (l.s[0]) tlog("%s", l.s);
+        ++g_rtLogRead;
+    }
+    if (g_rtLogRead >= maxRead && g_rtLogRead < h) {
+        // a full ring wrapped past us: skip the stale tail, keep the newest
+        tlog("[twinspeak] rtlog        : %d device-thread line(s) dropped (the line ring wrapped)\n",
+             h - g_rtLogRead);
+        g_rtLogRead = h;
+    }
+}
+static_assert((kRtLogLines & (kRtLogLines - 1)) == 0, "the RT log line count must be a power of two");
+
+// ------------------------------------ v9.6.0 THE SOFT KNEE (the clamp) ----
+// The final +-1.0 clamp after the keep-alive sum was a hard clipper:
+// leg1's mix sums up to six terms per output and hot 5.1/stereo content
+// crosses full scale routinely -- every crossing flat-topped (the
+// crackle). The knee is exact below the threshold and a scaled tangent
+// curve above: y = th + (1-th)*tanh((x-th)/(1-th)). Slope at the seam
+// is EXACTLY 1.0 (C1-continuous, a true soft limiter's entry) and the
+// asymptote is EXACTLY 1.0 (no guard clamp -- a guard re-creates the
+// flat-top it exists to remove; the first cut of this exact function
+// shipped with one and the harness caught it). The map: 1.0 -> 0.988
+// (-0.1 dB), 1.1 -> 0.9997, 1.2+ -> 1.0 to float precision, approached
+// with every derivative ~0 -- a gentle loudness compression on the
+// peaks instead of a shaved square wave.
+static inline float softKnee(const float x) {
+    if (x <= (float)kKneeThresh && x >= -(float)kKneeThresh) return x;   // below the knee: bit-exact
+    const float a  = (x > 0.0f) ? x : -x;
+    const float th = (float)kKneeThresh;
+    const float over = a - th;
+    const float room = 1.0f - th;    // the curve's travel: th -> 1.0
+    const float y = th + room * tanhf(over / room);
+    return (x > 0.0f) ? y : -y;
 }
 
 // v9.0.1 THE THREE-LINE CONSOLE STATUS (field-directed: "make the console
@@ -5002,7 +5300,7 @@ static size_t masterDepthGuard(Leg& L, size_t frameCount)
             L.wardenPads++;
             if (nowMs - L.lastSyncLogMs >= 10000) {
                 L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] depth out1    : ring %lld fr under its anchor -- the guard armed a %d-frame pad\n"
+                rtlog("[twinspeak] depth out1    : ring %lld fr under its anchor -- the guard armed a %d-frame pad\n"
                      "                            budget (%llu total; the stall is delivered across the next\n"
                      "                            switches -- a held sample, never a hole)\n",
                      over, kDriftCorrectFr, (unsigned long long)L.wardenPads);
@@ -5034,8 +5332,13 @@ static size_t masterDepthGuard(Leg& L, size_t frameCount)
 static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
 {
     const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - L.lastSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
-    L.lastSyncMs = nowMs;
+    // v9.6.0 THE SYNC TOKEN SPLIT: this is SYNCTOFIRST'S OWN TOKEN. The
+    // old check read lastSyncMs -- the SAME field masterDepthGuard stamps
+    // a few lines earlier in every switch -- so this body never ran: the
+    // master guard always spent the token first, and the only cross-leg
+    // correction in packet_mode = off was unreachable dead code.
+    if (nowMs - L.lastXSyncMs < kSyncNudgeMs) return 0;   // slow: one look per window
+    L.lastXSyncMs = nowMs;
     // leg1 must be ALIVE as a reference: not yielded, its device callback
     // heartbeating. Otherwise freeze (nudge nothing).
     if (g_leg[0].yielded.load(std::memory_order_relaxed)) return 0;
@@ -5083,7 +5386,7 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
             L.wardenPads++;
             if (nowMs - L.lastSyncLogMs >= 10000) {
                 L.lastSyncLogMs = nowMs;
-                tlog("[twinspeak] sync out%d     : %lld fr early vs out1 -- the guard armed a %d-frame pad\n"
+                rtlog("[twinspeak] sync out%d     : %lld fr early vs out1 -- the guard armed a %d-frame pad\n"
                      "                            budget (%llu total; the stall is delivered across the next\n"
                      "                            switches -- a held sample, never a hole)\n",
                      idx + 1, err, kDriftCorrectFr, (unsigned long long)L.wardenPads);
@@ -5099,6 +5402,111 @@ static size_t syncToFirst(int idx, Leg& L, size_t frameCount)
         return 0;
     }
     return 0;                                           // below the bite threshold: hold
+}
+
+// --------------------------- v9.6.0 THE PACKET-MODE CROSS-LEG STEER --------
+// Packet mode had NO cross-leg mechanism at all: the servo (skipped for
+// slaves by the `!pktOn && idx != 0` gate) held each leg independently at
+// delay + anchor + floor, so any difference in negotiated period, device
+// buffer, or DAC start between the legs was a PERMANENT inter-leg offset
+// only the user's delay knobs could trim. This is the packet-mode half of
+// syncToFirst: the slave's servo target tracks LEG1's boundary through
+// the delay-neutral metric (each leg subtracts its own delay -- a delay
+// knob on one leg can never drag the others), spent as a depth OFFSET on
+// the PI's setpoint. The correction rides the SAME PI + slew anti-wobble
+// discipline as the depth servo (<= 0.2 ppm/period near target -- a rate
+// bend, never a skip, never a click), and the freeze conditions mirror
+// syncToFirst's (a dead/yielded/settling leg1 is not a clock to follow).
+// Device-thread only, called from bufferSwitchFill before the pop loop.
+static void pktSteerToFirst(int idx, Leg& L)
+{
+    long steer = 0;
+    const unsigned long long nowMs = GetTickCount64();
+    if (nowMs - L.lastSteerMs < kSyncNudgeMs) return;   // one look per window (own token)
+    L.lastSteerMs = nowMs;
+    bool live = true;
+    do {
+        if (idx == 0) { live = false; break; }          // leg1 is the reference; it never steers
+        // the reference must be ALIVE: not yielded, heartbeating, and
+        // past BOTH legs' settle hush (the prefills and the start-align
+        // pads are through before the first correction).
+        if (g_leg[0].yielded.load(std::memory_order_relaxed)) { live = false; break; }
+        if (L.yielded.load(std::memory_order_relaxed)) { live = false; break; }
+        if (nowMs - hbOutGet(0) > kSyncRefDeadMs) { live = false; break; }
+        if (nowMs - hbOutGet(idx) > kSyncRefDeadMs) { live = false; break; }
+        if (nowMs - L.lastReopenMs < kSteerSettleMs) { live = false; break; }
+        if (nowMs - g_leg[0].lastReopenMs < kSteerSettleMs) { live = false; break; }
+        const unsigned long long fsUs = L.firstSwitchUs.load(std::memory_order_relaxed);
+        if (fsUs == 0) { live = false; break; }
+        // v8.4.15's delay-neutral metric, exactly: each boundary shifted
+        // forward by its own delay, the difference is the inter-leg offset
+        // (+ = this leg LATE vs leg1 = its boundary sits deeper in the
+        // capture stream than leg1's).
+        const long long off =
+            (long long)(L.raw.seqTail.load(std::memory_order_relaxed)
+                        + (long long)L.delayFrames)
+            - (long long)(g_leg[0].raw.seqTail.load(std::memory_order_relaxed)
+                          + (long long)g_leg[0].delayFrames);
+        // target offset: LATE -> steer NEGATIVE (lower the setpoint, the
+        // PI drains the excess through the rate bend); EARLY -> positive
+        // (raise it, the PI refills). Dead-band: crystal level, hold.
+        long t = -off;
+        if (t >  kSteerDeadFr)  t -= kSteerDeadFr;
+        else if (t < -kSteerDeadFr) t += kSteerDeadFr;
+        else t = 0;
+        if (t >  kSteerMaxFr) t =  kSteerMaxFr;         // the travel clamp (+-5 ms)
+        if (t < -kSteerMaxFr) t = -kSteerMaxFr;
+        steer = t;
+    } while (false);
+    // v9.6.0 THE FREEZE: a dead/yielded/settling reference is not a clock
+    // to follow -- and a LATCHED steer is not a safe setpoint to keep (the
+    // reference's boundary is not advancing; the offset is meaningless).
+    // The steer ramps to zero at 1/8 of its travel per look (a full
+    // release in ~0.8 s), smooth on the same scale the servo moves.
+    if (!live) {
+        if (L.pktSteerFr >  kSteerMaxFr / 8) L.pktSteerFr -= kSteerMaxFr / 8;
+        else if (L.pktSteerFr < -kSteerMaxFr / 8) L.pktSteerFr += kSteerMaxFr / 8;
+        else L.pktSteerFr = 0;
+        return;
+    }
+    L.pktSteerFr = steer;
+}
+
+// ------------------- v9.6.0 SERVO TUNING + ANCHOR RECONCILIATION -----------
+// (a) anchorFrames was set ONCE at ring init (1.5 x the REQUESTED period)
+// and never followed the device again: a watchdog reopen that landed
+// shared, or a driver that negotiated periods x N, left the servo aiming
+// at the OLD mode's anchor forever -- a permanent trim bend (a pitch
+// error on a matched clock). The anchor is now reconciled from the REAL
+// device geometry at EVERY (re)open: period x periods, converted from the
+// device's own rate to 48k source frames (the ring is 48k space).
+// (b) the EMA alphas are computed from THIS leg's real period so the
+// servo's time constants are 1 s / 8 s of REAL TIME on every device
+// (the constants assumed 768 fr; at 96 fr the "8 s" slow EMA ran 1 s).
+// Main-thread only (the device fields are set before start / inside a
+// reopen, before the new device thread exists).
+static void legUpdateServoTuning(int idx)
+{
+    Leg& L = g_leg[idx];
+    const ma_device* d = &L.dev;
+    unsigned periodFr = d->playback.internalPeriodSizeInFrames;
+    unsigned periods  = d->playback.internalPeriods;
+    unsigned rate     = d->playback.internalSampleRate;
+    if (!periodFr || !periods) { periodFr = kOutPeriodFrames; periods = kOutPeriods; }
+    if (!rate) rate = (unsigned)kSampleRate;
+    // the REAL device buffer, in SOURCE (48k) frames -- the space the ring
+    // and the servo live in. floored at one period so a bogus report can
+    // never zero the anchor.
+    double buf48 = (double)periodFr * (double)periods * (double)kSampleRate / (double)rate;
+    long long anchor = (long long)(buf48 + 0.5);
+    const long long minAnchor = (long long)periodFr * (long long)kSampleRate / (long long)rate;
+    if (anchor < minAnchor) anchor = minAnchor;
+    if (anchor > 4096) anchor = 4096;   // a runaway report: 85 ms of anchor is not physics
+    L.anchorFrames = (size_t)anchor;
+    // tau = period / rate seconds per update; alpha = update / (tau + update)
+    const double upd = (double)periodFr / (double)rate;   // seconds between once-per-period updates
+    L.pktEmaAlpha     = upd / (kPktEmaTauFast + upd);
+    L.pktEmaSlowAlpha = upd / (kPktEmaTauSlow + upd);
 }
 
 // v8.1.0 forward declarations: the stripped switch sits at the TOP of the
@@ -5117,6 +5525,7 @@ static void centerEqFlushZ();                    // defined next to g_ceq
 static void surroundBassFlushZ();                // v8.5.1, defined next to g_sbeq
 static void rearCombFlushZ();                    // v9.1.0, defined next to g_rcomb
 static void centerVirtualFlushZ();               // v9.1.1, defined next to g_cvc
+static void lfePsyFlushZ(const int leg);         // v9.6.0, defined next to g_lfe
 static bool bitZero8(const float* p, size_t n);         // v6.6.9, defined below
 static void landReopenedRing(int idx);           // v8.4.14: the deferred reopen landing (defined in the reopen section)
 static std::atomic<bool> g_tickOn{false};        // moved up from the tick block (v8.1.0)
@@ -5274,6 +5683,30 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const size_t servoPad = syncToFirst(idx, L, frameCount);
         if (servoPad > padFr) padFr = servoPad;
     }
+    // v9.6.0 THE PACKET-MODE CROSS-LEG STEER: packet mode's slaves never
+    // ran syncToFirst (the `!pktOn` gate above) and had NO cross-leg
+    // mechanism at all -- each leg held its own delay+anchor+floor, so
+    // any period/buffer/start difference between devices was a PERMANENT
+    // inter-leg offset only the delay knobs could trim. The steer runs
+    // now (self-rate-limited, own token): it bends this leg's servo
+    // TARGET toward leg1's boundary through the same PI + slew
+    // discipline -- a rate bend, never a skip. leg1 is the reference and
+    // never steers (pktSteerFr stays 0 from init/reopen).
+    if (pktOn && idx != 0) pktSteerToFirst(idx, L);
+    // v9.6.0 THE PARK/UNPARK + REOPEN FADES: a mid-run soft park (the
+    // yield_default flag) used to keep playing LIVE audio -- the flag was
+    // never read here -- and an unpark/reopen cut straight to full level
+    // on the freshest post-eviction audio (a content jump). The park now
+    // fades the program out over kParkFadeFr and plays zeros while the
+    // flag holds (the ring keeps being popped, the boundary stays fresh,
+    // the wobble keeps running in sumLegExtras -- the DAC never sees a
+    // hole); the unpark and a reopen landing fade IN over
+    // kReopenFadeFr. Device-thread state only, one period of edge
+    // detection, no atomics needed beyond the flag itself.
+    const bool yNow = L.yielded.load(std::memory_order_relaxed);
+    if (yNow && !L.wasYieldedFade) L.parkFadeOut = kParkFadeFr;
+    if (!yNow && L.wasYieldedFade) L.reopenFadeFr = kReopenFadeFr;   // the unpark edge rides the reopen fade
+    L.wasYieldedFade = yNow;
     // v8.4.23 THE MASK-COPY-MASK FAN-OUT: each leg's raw ring IS the private
     // copy; the switch MASKS the popped chunk to the leg's own channels.
     static const unsigned char kLegMask[3][kInCh] = {
@@ -5325,13 +5758,27 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             // the span/partial-pop guards below, which read it fresh.
             if (done == 0) {
                 if (L.pktDepthEma < 0.0) L.pktDepthEma = (double)avail;
-                L.pktDepthEma += kPktEmaAlpha * ((double)avail - L.pktDepthEma);
+                L.pktDepthEma += L.pktEmaAlpha * ((double)avail - L.pktDepthEma);
                 if (L.pktDepthEma2 < 0.0) L.pktDepthEma2 = (double)avail;
-                L.pktDepthEma2 += kPktEmaSlowAlpha * ((double)avail - L.pktDepthEma2);
+                L.pktDepthEma2 += L.pktEmaSlowAlpha * ((double)avail - L.pktDepthEma2);
+            }
+            // v9.6.0: the setpoint carries the CROSS-LEG STEER (see
+            // pktSteerToFirst). The floor is the leg's OWN safety net:
+            // steer - floor must keep the target above delay + 64 fr
+            // (kPktFloorFr minus the steer clamp already guarantees it,
+            // the belt clamps again).
+            long long steerFr = (long long)L.pktSteerFr;
+            {
+                const long long minTgt = (long long)L.delayFrames + 64;
+                const long long tgt = (long long)L.delayFrames
+                                    + (long long)L.anchorFrames + (long long)kPktFloorFr
+                                    + steerFr;
+                if (tgt < minTgt) steerFr -= (minTgt - tgt);   // never starve the span
             }
             const long long perr = (long long)(L.pktDepthEma2 + 0.5)
                                  - (long long)L.delayFrames
-                                 - (long long)L.anchorFrames - (long long)kPktFloorFr;
+                                 - (long long)L.anchorFrames - (long long)kPktFloorFr
+                                 - steerFr;
             long ptrim = 0;
             if      (perr >  kPktEngageFr) L.pktEngagedOn = true;
             else if (perr < -kPktEngageFr) L.pktEngagedOn = true;
@@ -5454,7 +5901,6 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             n = (usable < take) ? usable : take;
         }
         if (n == 0) break;
-        const unsigned long long seqBefore = L.raw.seqTail.load(std::memory_order_relaxed);
         L.raw.pop(sc, n);
         // v8.4.25 THE PROOF METER: the peak |ch3| of the RAW capture,
         // measured before volume and before the mask -- the level the cable
@@ -5546,6 +5992,42 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
             skipMix = (L.zeroFast && bitZero8(sc, rawK));
             pktRetrack(L, sc, rawK);
         }
+        // v9.6.0 THE PARK FADE-OUT: while the yield_default soft park
+        // holds, the program fades to zero over kParkFadeFr and stays
+        // there -- the DAC keeps its stream and its wobble (the flag is
+        // the park; the fade is the courtesy). The pop loop keeps
+        // running (the boundary stays fresh for the unpark); only the
+        // mixed output is scaled. Applied AFTER the mix so the EQ/combs
+        // keep their state warm through the park.
+        if (L.parkFadeOut) {
+            const size_t nfade = (L.parkFadeOut < produced) ? L.parkFadeOut : produced;
+            for (size_t i = 0; i < nfade; ++i) {
+                const float g = (float)(L.parkFadeOut - i) / (float)kParkFadeFr;
+                float* o = dst + i * L.outCh;
+                for (int c = 0; c < L.outCh; ++c) o[c] *= g;
+            }
+            for (size_t i = nfade; i < produced; ++i) {
+                float* o = dst + i * L.outCh;
+                for (int c = 0; c < L.outCh; ++c) o[c] = 0.0f;
+            }
+            L.parkFadeOut = (L.parkFadeOut > produced) ? (L.parkFadeOut - produced) : 0;
+        }
+        // v9.6.0 THE REOPEN FADE-IN: the first kReopenFadeFr frames after
+        // a reopen landing (or an unpark edge, above) ramp in from
+        // silence -- the hard cut at the gap (DAC wake, landing discard)
+        // never steps. Scales the mixed chunk in place; the fade state
+        // survives across chunks (a 5 ms fade spans a 16 ms period's
+        // tail and the next period's head).
+        if (L.reopenFadeFr) {
+            const size_t nfade = (L.reopenFadeFr < produced) ? L.reopenFadeFr : produced;
+            for (size_t i = 0; i < nfade; ++i) {
+                const float g = 1.0f - (float)L.reopenFadeFr / (float)kReopenFadeFr
+                              + (float)i / (float)kReopenFadeFr;
+                float* o = dst + i * L.outCh;
+                for (int c = 0; c < L.outCh; ++c) o[c] *= g;
+            }
+            L.reopenFadeFr = (L.reopenFadeFr > produced) ? (L.reopenFadeFr - produced) : 0;
+        }
         // v6.6.9: silence compression -- a bit-zero masked chunk needs no mix.
         if (skipMix) {
             if (idx == 1) centerEqFlushZ();
@@ -5572,8 +6054,14 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         // v8.4.21 QUIET-WINDOW DRIFT CORRECTION (dormant in packet mode --
         // the guards never arm a bite; kept whole for packet_mode = off).
         if (L.biteDue) {
-            const bool chunkQuiet = (L.zeroFast && bitZero8(sc, n));
-            if (chunkQuiet || L.biteForced) {
+            // v9.6.0 THE BITE'S VERDICT WINDOW: the old quiet test read the
+            // chunk JUST PLAYED (bitZero8(sc, n)) but the drop consumes the
+            // OLDEST frames -- the ones about to play NEXT. A burst starting
+            // right after a silent chunk skipped 5 ms of program (a click).
+            // The verdict now tests the frames the drop will actually eat
+            // (Ring::peekZero). The forced valve is unchanged.
+            const bool dropQuiet = (L.biteDue <= L.raw.count()) && L.raw.peekZero(L.biteDue);
+            if (dropQuiet || L.biteForced) {
                 const size_t drop = L.biteDue;
                 L.raw.discardOldest(drop);
                 L.biteDue = 0;
@@ -5584,7 +6072,7 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
                 const unsigned long long dbn = GetTickCount64();
                 if (dbn - L.lastSyncLogMs >= 10000) {
                     L.lastSyncLogMs = dbn;
-                    tlog("[twinspeak] drift out%d    : %llu fr of drift dropped inside a silent window\n"
+                    rtlog("[twinspeak] drift out%d    : %llu fr of drift dropped inside a silent window\n"
                          "                            (%llu total; a skip inside digital silence cannot click)\n",
                          idx + 1, (unsigned long long)drop, (unsigned long long)L.syncDrops);
                 }
@@ -5604,10 +6092,50 @@ static void bufferSwitchFill(int idx, float* out, size_t frameCount) {
         const unsigned long long nowMs = GetTickCount64();
         if (nowMs - L.lastSyncLogMs >= 10000) {
             L.lastSyncLogMs = nowMs;
-            tlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; the warden\n"
+            rtlog("[twinspeak] sync out%d     : running early vs out1 -- padded %d frames (%llu total; the warden\n"
                  "                            bite, %d fr / %u ms max, a held sample, never a hole)\n",
                  idx + 1, kDriftCorrectFr, (unsigned long long)L.syncPads, kDriftCorrectFr, kDriftIntervalMs);
         }
+    }
+    // v9.6.0 THE HOLD FILL (the starvation hole fix): a packet-mode break
+    // (avail < take, or the engaged path's delay-floor guard) left the
+    // period's tail as hard SILENCE -- the comments promised "the
+    // callback's remaining frames hold the last mixed frame" but no such
+    // code existed; the tail was a hole, a click, exactly when the ring
+    // was driest (burst troughs, post-reopen, capture hiccups). The tail
+    // now repeats the last mixed frame -- the v8.4.7 pad semantics, made
+    // real: a mid-period break holds THIS period's last mixed frame; a
+    // whole-period break holds the PREVIOUS period's tail (L.lastOut --
+    // one frame saved per period, updated only on a fully mixed period,
+    // so a held frame is never a stale pre-gap sample). Two carve-outs:
+    // the IDLE case (the pop floor parked on its delay prefill, capture
+    // heartbeat stale -- idle is not starvation, silence is correct and
+    // the held frame would drone) and the first period ever (no frame
+    // held yet -- silence, as before).
+    if (pktOn && done + padApplied < frameCount) {
+        const unsigned long long hb = g_hbCap.load(std::memory_order_relaxed);
+        const bool flowing = hb && (GetTickCount64() - hb) <= 250;
+        if (flowing && done + padApplied > 0) {
+            const float* holdSrc = out + (done + padApplied - 1) * L.outCh;
+            for (size_t i = done + padApplied; i < frameCount; ++i)
+                memcpy(out + i * L.outCh, holdSrc, L.outCh * sizeof(float));
+            L.holdFills++;
+        } else if (flowing && L.holdValid) {
+            // a whole-period shortfall: hold the previous period's saved tail
+            for (size_t i = 0; i < frameCount; ++i)
+                memcpy(out + i * L.outCh, L.lastOut, L.outCh * sizeof(float));
+            L.holdFills += frameCount;
+        }
+    }
+    // v9.6.0: save this period's tail for the next whole-period hold --
+    // only when the period was (at least partly) mixed, never from a
+    // period that was itself a hold (a held frame must never become the
+    // new reference; one drone period maximum, then silence if the ring
+    // stays dry -- the honest starvation signal).
+    if (pktOn && done > 0) {
+        const float* src = out + (done - 1) * L.outCh;
+        for (int c = 0; c < L.outCh; ++c) L.lastOut[c] = src[c];
+        L.holdValid = true;
     }
     // v8.1.0 SHORTFALL RULE: the hole plays silence, counted -- never a
     // restart, never an escalation. (v8.4.7: the sync pad's frame is not a
@@ -5699,8 +6227,12 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
                 const float s = g_kaTable[ka];
                 float l = out[(done + i) * och + 0] + s;
                 float r = out[(done + i) * och + 1] + s;
-                if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
-                if (r >  1.0f) r =  1.0f; else if (r < -1.0f) r = -1.0f;
+                // v9.6.0 THE SOFT KNEE: the hard +-1.0 clamp flat-topped
+                // every over-full-scale sum (leg1's mix sums up to six
+                // terms per slot -- hot 5.1 crossed it routinely). The
+                // knee is bit-exact below 0.95 and C1-continuous above.
+                l = softKnee(l);
+                r = softKnee(r);
                 out[(done + i) * och + 0] = l;
                 out[(done + i) * och + 1] = r;
             }
@@ -5728,8 +6260,9 @@ static void sumLegExtras(int idx, float* out, ma_uint32 frameCount) {
                 chSel = -1;
             }
         }
-        if (l >  1.0f) l =  1.0f; else if (l < -1.0f) l = -1.0f;
-        if (r >  1.0f) r =  1.0f; else if (r < -1.0f) r = -1.0f;
+        // v9.6.0: the soft knee (see the run path above)
+        l = softKnee(l);
+        r = softKnee(r);
         out[i * och + 0] = l;
         out[i * och + 1] = r;
     }
@@ -5755,7 +6288,11 @@ static void playCore(int idx, float* out, ma_uint32 frameCount) {
                 const unsigned long long nowMs = GetTickCount64();
                 if (nowMs - L.lastLateLogMs >= 10000) {
                     L.lastLateLogMs = nowMs;
-                    tlog("[twinspeak] leg%d device    : switch served %.2f ms after the previous one (%.2f ms period)\n"
+                    // v9.6.0: rtlog, not tlog -- this fires EXACTLY when the
+                    // thread is already late; a CS + vfprintf + fflush here
+                    // stretched a small glitch into a long one (the ring is
+                    // lock-free; the health thread drains it off-deadline).
+                    rtlog("[twinspeak] leg%d device    : switch served %.2f ms after the previous one (%.2f ms period)\n"
                          "                            -- %.2f ms of device-buffer margin left%s (%llu late switch(es) since boot)\n",
                          idx + 1, gapMs, periodMs, 2.0 * periodMs - gapMs,
                          gapMs > 2.0 * periodMs
@@ -5813,6 +6350,8 @@ static CenterEq g_ceq;
 static void centerEqFlushZ()
 {
     if (g_ceq.on) { g_ceq.z1 = 0.0f; g_ceq.z2 = 0.0f; }
+    // v9.6.0: the psychoacoustic LFE chain rides the same silence contract
+    lfePsyFlushZ(1);
 }
 
 static void centerEqInit() {
@@ -5839,6 +6378,82 @@ static void centerEqInit() {
     g_ceq.b2 = (float)(b2 / a0); g_ceq.a1 = (float)(a1 / a0);
     g_ceq.a2 = (float)(a2 / a0);
     g_ceq.z1 = g_ceq.z2 = 0.0f;
+}
+
+// ------------------------ v9.6.0 THE PSYCHOACOUSTIC LFE CHAIN ----------------
+// Field-directed (the Equalizer APO recipe, hardcoded): the 3-inch-driver
+// safety net + the missing-fundamental trick, in-engine, always on, on
+// EVERY ch4 (LFE) fold term -- leg1's built-in fold AND leg4's fold to
+// leg2/leg3. The chain, in order:
+//   HP  42 Hz Q 0.707  x2  (cascaded = 24 dB/oct -- the 30-40 Hz content
+//                           that makes a small driver flap and distort
+//                           never reaches it)
+//   PK  60 Hz Q 1.4  +3.0 dB  \ the BRAIN HACK: the 1st and 2nd harmonics
+//   PK  90 Hz Q 1.4  +2.0 dB  / boosted so the brain reconstructs the
+//                              30-40 Hz fundamental the HP removed
+//   PK 125 Hz Q 2.0  -2.0 dB   the MUD SCOOP: the cabinet resonance
+// Five RBJ biquads, transposed DF2 (the center EQ's exact op structure),
+// coefficients computed ONCE at startup. ONE state chain, shared by every
+// fold site: only one thread mixes a given leg at a time, and leg1/leg2/
+// leg3 each have their OWN Leg-scoped state? No -- the folds are per-leg
+// threads, so the state is PER LEG (three chains, indexed by leg; the
+// zeroFast skip contract flushes each chain on its own leg's silence).
+// The silence contract (the center EQ's): an all-zero LFE lane RESETS
+// its chain instead of feeding it (a biquad fed zeros still rings; a
+// silent lane must contribute exactly zero).
+struct LfePsyChain {
+    float z1 = 0.0f, z2 = 0.0f;
+};
+struct LfePsy {
+    // per-stage coefficients (b0,b1,b2,a1,a2) and per-leg state pairs
+    float b0[5] = {1,1,1,1,1}, b1[5] = {0,0,0,0,0}, b2[5] = {0,0,0,0,0};
+    float a1[5] = {0,0,0,0,0}, a2[5] = {0,0,0,0,0};
+    LfePsyChain st[3];   // legs 1,2,3 (leg1's fold, leg4-to-leg2, leg4-to-leg3)
+};
+static LfePsy g_lfe;
+// the chain's spec, one place: stage, type (true = HP), f0, Q, gain dB
+static void lfePsyInit() {
+    struct Spec { bool hp; double f, q, g; };
+    static const Spec spec[5] = {
+        { true,  42.0, 0.707, 0.0 },
+        { true,  42.0, 0.707, 0.0 },
+        { false, 60.0, 1.4,  +3.0 },
+        { false, 90.0, 1.4,  +2.0 },
+        { false,125.0, 2.0,  -2.0 },
+    };
+    for (int s = 0; s < 5; ++s) {
+        const double A     = pow(10.0, spec[s].g / 40.0);
+        const double w0    = kTwoPi * spec[s].f / (double)kSampleRate;
+        const double alpha = sin(w0) / (2.0 * spec[s].q);
+        double b0, b1, b2, a0, a1, a2;
+        if (spec[s].hp) {
+            b0 = (1.0 + cos(w0)) / 2.0;  b1 = -(1.0 + cos(w0));  b2 = (1.0 + cos(w0)) / 2.0;
+            a0 =  1.0 + alpha;           a1 = -2.0 * cos(w0);    a2 =  1.0 - alpha;
+        } else {
+            b0 =  1.0 + alpha * A;       b1 = -2.0 * cos(w0);    b2 =  1.0 - alpha * A;
+            a0 =  1.0 + alpha / A;       a1 = -2.0 * cos(w0);    a2 =  1.0 - alpha / A;
+        }
+        g_lfe.b0[s] = (float)(b0 / a0); g_lfe.b1[s] = (float)(b1 / a0);
+        g_lfe.b2[s] = (float)(b2 / a0); g_lfe.a1[s] = (float)(a1 / a0);
+        g_lfe.a2[s] = (float)(a2 / a0);
+    }
+    for (int l = 0; l < 3; ++l) { g_lfe.st[l].z1 = 0.0f; g_lfe.st[l].z2 = 0.0f; }
+}
+// one sample through the five stages (transposed DF2 per stage, chained)
+static inline float lfePsyRun(const int leg, const float x) {
+    float y = x;
+    LfePsyChain& c = g_lfe.st[leg];
+    for (int s = 0; s < 5; ++s) {
+        const float t = g_lfe.b0[s] * y + c.z1;
+        c.z1 = g_lfe.b1[s] * y - g_lfe.a1[s] * t + c.z2;
+        c.z2 = g_lfe.b2[s] * y - g_lfe.a2[s] * t;
+        y = t;
+    }
+    return y;
+}
+static inline void lfePsyFlushZ(const int leg) {
+    g_lfe.st[leg].z1 = 0.0f;
+    g_lfe.st[leg].z2 = 0.0f;
 }
 
 // ------------------------------ v8.5.1 surround bass restore (the hollow) ----
@@ -5878,6 +6493,8 @@ static void surroundBassFlushZ()
         g_sbeq.z1L = 0.0f; g_sbeq.z2L = 0.0f;
         g_sbeq.z1R = 0.0f; g_sbeq.z2R = 0.0f;
     }
+    // v9.6.0: the psychoacoustic LFE chain rides the same silence contract
+    lfePsyFlushZ(0);
 }
 
 // One sample through the peaking section (transposed DF2, the center EQ's
@@ -5950,6 +6567,8 @@ static void rearCombFlushZ()
 {
     memset(g_rcomb.bufL, 0, sizeof(g_rcomb.bufL));
     memset(g_rcomb.bufR, 0, sizeof(g_rcomb.bufR));
+    // v9.6.0: the psychoacoustic LFE chain rides the same silence contract
+    lfePsyFlushZ(2);
 }
 
 // One sample through the comb: y = x + ((1 - frac) * x[-24] + frac * x[-25]),
@@ -6814,11 +7433,19 @@ static void mixCrewLeg1(const float gL, const float gR, const float gLfe,
     // (s5/s6 fall back to the RAW sample when the SCAN said dead -- the
     // serial ternary, lane by lane; a dead bass lane does not read the
     // worker's stale terms)
+    // v9.6.0: the lfe term runs through THE PSYCHOACOUSTIC LFE CHAIN
+    // (lfePsyRun, leg 0's state) -- the 3-inch-driver HP + the missing-
+    // fundamental boosts + the mud scoop, hardcoded (see g_lfe). The
+    // chain is applied to the PRE-gain sample so the gain knob scales
+    // the shaped bass, not the other way around. The LFE lane's own
+    // silence contract: the switch's skipMix flushes the chain on an
+    // all-zero block; a nonzero block runs every sample (the same
+    // discipline the surround-bass lanes use).
     if (g_centerFold) {
         for (size_t i = 0; i < n; ++i) {
             const float* f = sc + i * kInCh;
             float* o = chunk + i * kOutCh1;
-            const float lfe = gLfe * f[3];
+            const float lfe = gLfe * lfePsyRun(0, f[3]);
             const float cf  = cLive ? gC * Lc->term[i] : 0.0f;
             const float s5  = (g_sbeq.on && slLive) ? L5->term[i] : f[4];
             const float s6  = (g_sbeq.on && srLive) ? L6->term[i] : f[5];
@@ -6829,7 +7456,7 @@ static void mixCrewLeg1(const float gL, const float gR, const float gLfe,
         for (size_t i = 0; i < n; ++i) {
             const float* f = sc + i * kInCh;
             float* o = chunk + i * kOutCh1;
-            const float lfe = gLfe * f[3];
+            const float lfe = gLfe * lfePsyRun(0, f[3]);
             const float s5  = (g_sbeq.on && slLive) ? L5->term[i] : f[4];
             const float s6  = (g_sbeq.on && srLive) ? L6->term[i] : f[5];
             o[0] = gL * f[0] + lfe + gRL * L6r->term[i] + gSL * s5 - 0.5f * gSR * s6;
@@ -6969,7 +7596,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                 g_ceq.z2 = 0.0f;
                 for (size_t i = 0; i < n; ++i) {
                     float c = 0.0f;
-                    if (lfe4g != 0.0f) c = lfe4g * sc[i * kInCh + 3];   // v9.1.4: the LFE rides a dead center
+                    if (lfe4g != 0.0f) c = lfe4g * lfePsyRun(1, sc[i * kInCh + 3]);   // v9.1.4 + v9.6.0: the LFE rides a dead center, through the psychoacoustic chain
                     chunk[i * 2 + 0] = c;
                     chunk[i * 2 + 1] = c;
                 }
@@ -6980,11 +7607,12 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
                     g_ceq.z1 = g_ceq.b1 * x - g_ceq.a1 * y + g_ceq.z2;
                     g_ceq.z2 = g_ceq.b2 * x - g_ceq.a2 * y;
                     float c = gC * y;
-                    if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4: the fold rides the same sum
-                    // the boost can push past full scale; clamp here so the
-                    // EQ mode is self-contained (the device layer would clip
-                    // the same peak a moment later, after the keep-alive sum)
-                    if (c >  1.0f) c =  1.0f; else if (c < -1.0f) c = -1.0f;
+                    if (lfe4g != 0.0f) c += lfe4g * lfePsyRun(1, sc[i * kInCh + 3]);   // v9.1.4 + v9.6.0: the fold rides the same sum, through the chain
+                    // the boost can push past full scale; the v9.6.0 soft
+                    // knee replaces the old hard clamp (the same curve the
+                    // device layer applies a moment later -- self-contained,
+                    // but gentle on the peaks now)
+                    c = softKnee(c);
                     chunk[i * 2 + 0] = c;
                     chunk[i * 2 + 1] = c;
                 }
@@ -6992,7 +7620,7 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
         } else {
             for (size_t i = 0; i < n; ++i) {
                 float c = gC * sc[i * kInCh + 2];
-                if (lfe4g != 0.0f) c += lfe4g * sc[i * kInCh + 3];   // v9.1.4
+                if (lfe4g != 0.0f) c += lfe4g * lfePsyRun(1, sc[i * kInCh + 3]);   // v9.1.4 + v9.6.0
                 chunk[i * 2 + 0] = c;
                 chunk[i * 2 + 1] = c;
             }
@@ -7027,8 +7655,9 @@ static void mixBlock(int idx, const float* sc, float* chunk, size_t n) {
             chunk[i * 2 + 0] = gRL * f[kRearLCh] + kSurroundSplit * gRL * f[kSideLCh];   // rear L ch7 + side L ch5 at 60%
             chunk[i * 2 + 1] = gRR * f[kRearRCh] + kSurroundSplit * gRR * f[kSideRCh];   // rear R ch8 + side R ch6 at 60%
             if (gLfe4 != 0.0f) {
-                chunk[i * 2 + 0] += gLfe4 * f[3];
-                chunk[i * 2 + 1] += gLfe4 * f[3];
+                const float lfe = gLfe4 * lfePsyRun(2, f[3]);   // v9.1.4 + v9.6.0: through the psychoacoustic chain
+                chunk[i * 2 + 0] += lfe;
+                chunk[i * 2 + 1] += lfe;
             }
         }
     }
@@ -8070,6 +8699,14 @@ static bool initLegDevice(int idx, ma_context* ctx, const ma_device_id* id,
     L.pktAppliedPpm = 0.0;  // v9.5.5 servo v5: the applied trim starts at zero
     L.isExclusive = wantExcl;
     L.id = *id;
+    // v9.6.0 THE ANCHOR RECONCILIATION: recompute anchorFrames and the
+    // EMA alphas from the REAL negotiated geometry (period x periods,
+    // rate-converted to 48k source frames) on EVERY open and reopen --
+    // the old code set the anchor once at boot (1.5 x the REQUEST) and a
+    // reopen that landed shared, or a driver that doubled the buffer,
+    // left the servo aiming at the old mode's anchor forever (a permanent
+    // trim bend = a pitch error on a matched clock).
+    legUpdateServoTuning(idx);
     return true;
 }
 
@@ -8123,6 +8760,15 @@ static void landReopenedRing(int idx) {
     } else if (idx == 1) {
         centerEqFlushZ();
     }
+    // v9.6.0: the reopen FADE-IN arms here, on the same thread that will
+    // spend it -- the landing's first mixed period ramps in from silence
+    // (the hard cut at the gap never steps). Also resets the park edge
+    // detector so a park/unpark cycle during the dead window is not
+    // double-counted, and holds the ONE-SHOT hold reference (the first
+    // period after the gap must not hold pre-gap audio if it starves).
+    L.reopenFadeFr = kReopenFadeFr;
+    L.holdValid    = false;
+    L.parkFadeOut  = 0;
 }
 
 // ------------------------------------------------- v3.8 watchdog restarts --
@@ -12547,6 +13193,10 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     // v6.5.18: center dialogue EQ coefficients (ini: center_eq*)
     centerEqInit();
 
+    // v9.6.0: the psychoacoustic LFE chain's coefficients (hardcoded,
+    // field-directed -- the Equalizer APO recipe; see g_lfe)
+    lfePsyInit();
+
     // v8.5.1: surround bass restore coefficients (ini: surround_bass*)
     surroundBassInit();
 
@@ -12893,18 +13543,11 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         const float delayMs = (i == 0) ? g_cfg.delay1Ms
                           : (i == 1) ? g_cfg.delay2Ms
                           : g_cfg.offset3Ms;           // v8.4.0: the rears' own knob (v8.4.11: ONE rear leg)
-        const size_t devPeriodFr  = (L.dev.playback.internalPeriodSizeInFrames
-                                     ? L.dev.playback.internalPeriodSizeInFrames : kOutPeriodFrames);
+        // v9.6.0: the anchor/alpha math moved into legUpdateServoTuning
+        // (called by initLegDevice on every open -- see the ANCHOR
+        // RECONCILIATION note there); devPeriodFr is no longer needed here.
         L.delayFrames = (size_t)((double)kSampleRate * delayMs / 1000.0);
         L.delayMs     = delayMs;
-        // v8.4.18 THE PER-LEG ANCHOR: this leg's REAL device buffer -- the
-        // sound card's own pre-load and the floor the pipeline physically
-        // allows. v9.5.6: 1.5 x the negotiated period (the callback
-        // interval is the physics; the old 2x double-covered it -- on the
-        // field's WASAPI legs 96 fr -> 144 fr = 3.0 ms, on a KS leg 768 ->
-        // 1152 fr = 24.0 ms). The depth guard holds the ring at delay +
-        // this; margin 0 is the DAC reading silence.
-        L.anchorFrames = devPeriodFr + devPeriodFr / 2;
         // v9.5.1: 200 ms over the delay -- the 512 fr servo floor + a
         // full burst of jitter headroom must fit below the cap.
         L.raw.init(L.delayFrames + (size_t)(kSampleRate / 1000 * 200), kInCh);
@@ -12932,8 +13575,15 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         L.padBudget    = 0;                                            // v8.4.19: no pad pending on a fresh run
         L.biteDue      = 0;                                            // v8.4.21: no armed drift bite either
         L.biteForced   = false;
-        L.pktDepthEma  = -1.0;                                         // v9.5.1: the EMA reseeds on the first packet
-        L.pktEngagedOn = false;                                        // v9.5.1: the hysteresis latch starts open
+    // v9.6.0: the new Leg fields the switch owns (per run, like the clocks):
+    L.pktSteerFr   = 0;
+    L.lastSteerMs  = 0;
+    L.parkFadeOut  = 0;
+    L.wasYieldedFade = false;
+    L.reopenFadeFr = 0;
+    L.holdFills    = 0;
+    L.holdValid    = false;
+    for (int c = 0; c < kOutCh1; ++c) L.lastOut[c] = 0.0f;
         L.pktBiasPpm   = 0.0;                                          // v9.5.4 servo v3: the integrator starts cold
         L.pktDepthEma2 = -1.0;                                         // v9.5.5 servo v5: the slow EMA reseeds too
         L.pktPiI       = 0.0;                                          // v9.5.5 servo v5: the PI integrator starts cold
@@ -13266,14 +13916,20 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            and a STARVED leg is never reopened (only a thread that stopped\n"
            "                            switching entirely is).\n");
     tlog("[twinspeak] packet mode   : %s -- every leg measures its ring depth EVERY packet and trims\n"
-           "                            its playout ratio to hold it at delay + anchor (err = depth -\n"
-           "                            delay - anchor; trim = clamp(%d ppm x err, +-%d ppm), a sub-0.1%%\n"
-           "                            rate bend -- the Adesso-class clock sink never dries the ring, no\n"
-           "                            warden bite, no held frame). trim = 0 on a matched clock rides the\n"
-           "                            BIT-EXACT path unchanged; a non-48k endpoint re-opens AT its native\n"
-           "                            rate and the ENGINE resamples 48k -> device rate (Hermite 4-point).\n",
+           "                            its playout ratio to hold it at delay + anchor + %d fr floor (err = depth -\n"
+           "                            delay - anchor - floor; the v9.5.5 PI + slew servo, <= 0.2 ppm/period\n"
+           "                            near target -- a sub-0.1%% rate bend, the Adesso-class clock sink never\n"
+           "                            dries the ring, no warden bite, no skip). trim = 0 on a matched clock\n"
+           "                            rides the BIT-EXACT path unchanged; a non-48k endpoint re-opens AT its\n"
+           "                            native rate and the ENGINE resamples 48k -> device rate (Hermite 4-point).\n"
+           "                            v9.6.0: the slave legs' servo TARGET tracks leg1's boundary (the\n"
+           "                            delay-neutral cross-leg steer, +-240 fr, through the same PI + slew\n"
+           "                            discipline -- a rate bend, never a skip); a starvation break HOLDS the\n"
+           "                            last mixed frame (never a silence hole); the anchor follows the REAL\n"
+           "                            negotiated geometry on every (re)open; the EMAs are time-normalized\n"
+           "                            per leg (1 s / 8 s of REAL time at any period).\n",
            g_cfg.packetMode ? "ON (v9.5.0 default)" : "OFF (packet_mode = off -- the v9.4.0 warden discipline)",
-           (int)kPktPpmPerFrame, (int)kPktMaxPpm);
+           (int)kPktFloorFr);
     tlog("[twinspeak] drift warden  : %s -- frame-interval ledger: every captured frame is stamped, every\n"
            "                            real frame that crosses a leg's play boundary advances that leg's stream\n"
            "                            position, and the health line's 'drift' column is the measured inter-speaker\n"
@@ -13287,10 +13943,13 @@ static int engineMain(const std::string& iniPath, bool fgForce,
            "                            sync above; v8.4.11: the warden bite corrects creep, never accepts it);\n"
            "                            the cable clock itself stays measurement-only.\n",
            g_cfg.driftGuard ? "ON" : "observe-only (drift_guard = off)", g_cfg.driftCorrectMs);
-    tlog("[twinspeak] power guard   : %s -- suspend parks the legs, resume rebuilds capture + both\n"
-           "                            legs, and any leg consuming beyond +-10%% for 2 s is reopened\n"
-           "                            fresh. The v6.5.1 field log: an S5 came back from sleep at ~42%%\n"
-           "                            consumption with a fresh heartbeat and glitched forever.\n",
+    tlog("[twinspeak] power guard   : %s -- suspend parks the legs, resume rebuilds only what DIED\n"
+           "                            (v9.6.0: a capture or leg whose heartbeat survived the sleep is\n"
+           "                            live -- no rebuild, no gap), and any leg consuming beyond +-10%%\n"
+           "                            for 2 s is reopened fresh. v9.6.0: the CAPTURE has its own watchdog\n"
+           "                            now (a stale heartbeat with ACTIVE source sessions = the thread is\n"
+           "                            gone -> reopen by name; a silent source legitimately stops\n"
+           "                            heartbeating and is left alone).\n",
            g_cfg.powerGuard ? "ON" : "OFF (power_guard = off -- v6.5.1 behavior)");
     tlog("[twinspeak] leg1 (mains)   : \"%s\" | %s | period %u fr x%u (the constant request)\n",
            n1.c_str(),
@@ -13300,6 +13959,14 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     tlog("[twinspeak] route out1     : FL = %.2f*ch1 + %.2f*ch4(LFE) | FR = %.2f*ch2 + %.2f*ch4(LFE)\n"
          "                            the output is STEREO L+R only (the second mask -- no channel\n"
          "                            conversion anywhere downstream, no upmix risk by construction)\n"
+         "                            v9.6.0: every ch4 (LFE) fold term runs through THE PSYCHOACOUSTIC\n"
+         "                            CHAIN, hardcoded (the Equalizer APO recipe): HP 42 Hz x2 Q 0.707\n"
+         "                            (24 dB/oct -- the small driver never flaps on sub-bass it cannot\n"
+         "                            move) + PK 60 Hz +3.0 dB Q 1.4 + PK 90 Hz +2.0 dB Q 1.4 (the\n"
+         "                            missing-fundamental boosts -- the brain reconstructs the 30-40 Hz\n"
+         "                            the HP removed) + PK 125 Hz -2.0 dB Q 2.0 (the cabinet-resonance\n"
+         "                            scoop) -- no frequency folds into a harmonic mess; always on,\n"
+         "                            every LFE site (leg1's fold + leg4's fold to leg2/leg3)\n"
          "                            + the rear fold (SL onto L, SR onto R at gain_rl/gain_rr) when\n"
          "                            leg3 is EMPTY (v8.4.26, the matrix-encoding effect, no delay)\n"
          "                            + the universal 20 Hz @ 0.1%% keep-alive on FL/FR (v8.4.5, every gap)\n",
@@ -13508,6 +14175,9 @@ static int engineMain(const std::string& iniPath, bool fgForce,
     while (g_run.load()) {
         Sleep(1000);
         ++sec;
+        // v9.6.0: drain the RT log ring (the device threads' lines land
+        // here, on the health thread's own schedule -- never on theirs)
+        rtLogDrain();
         const unsigned long long nowMs0 = GetTickCount64();   // v9.5.1: the off-meter's idle gate
         // v6.0 measured clock offset per leg: dCaptured/dPopped - 1 (both
         // counters integrate the real clocks; pop phase cancels in the
@@ -13626,6 +14296,40 @@ static int engineMain(const std::string& iniPath, bool fgForce,
                     tryRestartLeg(i, &ctx, kOutPeriodFrames);
                 }
             }
+            // v9.6.0 THE CAPTURE WATCHDOG (the audit's #5): the source
+            // feeding EVERY leg had none -- a capture thread that died
+            // outside a power event (endpoint invalidated, driver reset)
+            // left every leg parked on its delay prefill forever, silence
+            // until a manual restart. Same v3.8 test, with the IDLE
+            // carve-out: a silent source legitimately stops heartbeating
+            // (loopback parks, a quiet cable delivers nothing), so a
+            // stale heartbeat ALONE is not death. The gate is the
+            // source's OWN sessions: when they are ACTIVE the stream
+            // should be running -- a stale heartbeat then means the
+            // thread is gone. foreignActiveSessions(-1) reads the
+            // CAPTURE needle's sessions (see its contract), is
+            // fail-open (a probe failure reopens conservatively -- a
+            // needless reopen of a live stream is recoverable, permanent
+            // silence is not), and the 10 s cooldown caps the cadence.
+            {
+                const unsigned long long hbCap = g_hbCap.load(std::memory_order_relaxed);
+                const bool capStale = !hbCap || (nowMs - hbCap) > 5000;
+                static unsigned long long lastCapWdMs = 0;
+                if (capStale && nowMs - lastCapWdMs >= 10000) {
+                    lastCapWdMs = nowMs;
+                    // The gate is the SOURCE's own sessions: ACTIVE sessions
+                    // mean the stream should be running -- a stale heartbeat
+                    // then means the thread is gone. foreignActiveSessions is
+                    // fail-closed on probe failure (-1 -> != 0 -> reopen; a
+                    // needless reopen of a live stream is recoverable,
+                    // permanent silence is not). The 10 s cooldown caps the
+                    // cadence either way. (In loopback/output-as-source the
+                    // needle is the RENDER endpoint's own name -- its
+                    // sessions are exactly what the loopback tap mirrors.)
+                    if (foreignActiveSessions(g_capNeedle) != 0)
+                        tryRestartCap(&ctx);
+                }
+            }
         }
         // v6.5.2: while parked (suspend in flight) the heartbeats go stale
         // by definition -- do NOT storm reopen attempts at a device the OS
@@ -13710,15 +14414,38 @@ static int engineMain(const std::string& iniPath, bool fgForce,
         // ---- v6.5.2 power guard: resume rebuild + collapse sentinel ----
         if (g_cfg.powerGuard && g_powerWoken.exchange(false)) {
             g_powerPark.store(false, std::memory_order_relaxed);
-            tlog("[twinspeak] power guard : system resume -- rebuilding the capture and any DEAD leg\n"
-                 "                            (a post-sleep stream is never trusted: the field log\n"
-                 "                            shows an S5 consuming at ~42%% with a fresh heartbeat; v9.5.8:\n"
-                 "                            a leg whose heartbeat SURVIVED the sleep is live -- the\n"
-                 "                            no-shutdown rule leaves it untouched)\n");
-            tryRestartCap(&ctx);
+            // v9.6.0 THE RESUME GATE (the audit's #11): the old path
+            // rebuilt the capture UNCONDITIONALLY -- a perfectly healthy
+            // stream was torn down on EVERY wake (a gap + the 2 s settle +
+            // a cold servo reseed, every single time, the exact glitch the
+            // no-shutdown rule was written to prevent). The gate mirrors
+            // the legs': a heartbeat that survived the sleep (fresh within
+            // 5 s of now, or the woken-stream grace -- the callback may
+            // tick once the graph re-clocks) is a LIVE stream and is left
+            // untouched; only a stale one is reopened.
+            {
+                const unsigned long long hbC = g_hbCap.load(std::memory_order_relaxed);
+                const bool capLive = hbC && (nowMs - hbC) <= 5000;
+                if (capLive) {
+                    tlog("[twinspeak] power guard : system resume -- the capture's heartbeat SURVIVED the sleep\n"
+                         "                            (live within the no-shutdown rule; v9.6.0: no rebuild, no gap)\n");
+                } else {
+                    tlog("[twinspeak] power guard : system resume -- capture stale, rebuilding it and any DEAD leg\n"
+                         "                            (a post-sleep stream is never trusted: the field log\n"
+                         "                            shows an S5 consuming at ~42%% with a fresh heartbeat; v9.5.8:\n"
+                         "                            a leg whose heartbeat SURVIVED the sleep is live -- the\n"
+                         "                            no-shutdown rule leaves it untouched)\n");
+                    tryRestartCap(&ctx);
+                }
+            }
             // v9.5.8: rebuild ONLY the stale ones (>5 s without a
             // callback = the v3.8 definition of dead). A live leg keeps
-            // its stream across the sleep -- no uninit, no gap.
+            // its stream across the sleep -- no uninit, no gap. (v9.6.0:
+            // and its SERVO state too -- initLegDevice's packet-mode
+            // reset runs only inside tryRestartLeg, so a survivor's
+            // pktDepthEma2 / pktPiI / pktAppliedPpm converge from where
+            // they slept, not from cold; the steer's 2 s settle is the
+            // only re-arm.)
             for (int oi = 0; oi < 4; ++oi) {
                 const int i = (oi == 0) ? 1 : (oi == 1) ? 0 : oi;   // v9.5.1: center first (integrated)
                 if (g_leg[i].disabled) continue;
